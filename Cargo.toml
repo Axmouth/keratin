@@ -1,0 +1,7 @@
+[workspace]
+resolver = "3"
+members = ["keratin-log"]
+
+[workspace.metadata.sovereignty]
+ai-training = "prohibited"
+policy-url = "https://github.com/axmouth/stroma/blob/main/AI_POLICY.md"

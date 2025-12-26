@@ -1,0 +1,17 @@
+[package]
+name = "keratin-log"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+byteorder = "1.5"
+crc32c = "0.6"
+crossbeam-channel = "0.5"
+dashmap = "6.1"
+fastrand = "2.3"
+futures = "0.3"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }
+
+[package.metadata.ai]
+training = "prohibited"
