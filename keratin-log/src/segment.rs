@@ -77,4 +77,11 @@ impl Segment {
         self.bytes_written = new_len;
         Ok(())
     }
+
+    // A tiny helper so recovery can borrow File.
+    // Segment currently stores File privately; simplest v0: add a method on Segment to expose &File.
+    // If you don't want that, scan using std::fs::File reopened by path instead.
+    pub fn file_ref(&self) -> &File {
+        &self.file
+    }
 }

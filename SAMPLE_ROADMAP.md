@@ -210,3 +210,11 @@ Important: `list_expired` should not scan the whole world anymore.
    Keratin should be “log per namespace.” Let the wrapper decide directory layout.
 
 ---
+
+TODO: Page-aligned segment preallocation (Avoid growth stalls)
+
+TODO: Background compactor threads
+
+TODO: Direct I/O option?
+
+TODO: proper error handling (a way to propagate and retry? start by logging at least. return error on failed writes?)

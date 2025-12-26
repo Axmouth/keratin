@@ -71,7 +71,10 @@ impl LogReader {
                         pos = next_pos; // next byte position in this file
                         out.push(r);
                     }
-                    None => break,
+                    None => {
+                        // No forward progress possible → EOF
+                        return Ok(out);
+                    }
                 }
             }
         }
@@ -199,7 +202,7 @@ impl LogReader {
                     }
         }
         bases.sort_unstable();
-        Ok(bases.into_iter().filter(|b| *b <= offset).last())
+        Ok(bases.into_iter().rfind(|b| *b <= offset))
     }
 }
 

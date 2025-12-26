@@ -130,7 +130,7 @@ impl Log {
             let mut seg = Segment::open(f, base)?;
             // Scan from header_len; our Segment header is fixed size:
             let header_len = (8 + 2 + 2 + 4 + 8 + 8 + 32 + 4) as u64;
-            let scan = scan_last_good(seg_file_ref(&seg)?, header_len, 64 * 1024)?;
+            let scan = scan_last_good(seg.file_ref(), header_len, 64 * 1024)?;
             if scan.last_good_pos < seg.bytes_written {
                 // truncate partial tail
                 seg.set_len(scan.last_good_pos)?;
@@ -458,15 +458,4 @@ fn open_or_create_segment_pair(
     };
 
     Ok((seg, idx))
-}
-
-// A tiny helper so recovery can borrow File.
-// Segment currently stores File privately; simplest v0: add a method on Segment to expose &File.
-// If you don't want that, scan using std::fs::File reopened by path instead.
-fn seg_file_ref(seg: &Segment) -> io::Result<&File> {
-    // implement Segment::file_ref() -> &File instead, recommended.
-    Err(io::Error::new(
-        io::ErrorKind::Other,
-        "implement Segment::file_ref",
-    ))
 }

@@ -26,3 +26,18 @@ impl Default for KeratinConfig {
         }
     }
 }
+
+impl KeratinConfig {
+    pub fn test_default() -> Self {
+        Self {
+            segment_max_bytes: 256 * 1024 * 1024,
+            index_stride_bytes: 64 * 1024,
+            max_batch_bytes: 1024 * 1024,
+            max_batch_records: 4096,
+            batch_linger_ms: 5,
+            default_durability: Durability::AfterFsync,
+            fsync_interval_ms: 5,
+            flush_target_bytes: 32 * 1024 * 1024,
+        }
+    }
+}
