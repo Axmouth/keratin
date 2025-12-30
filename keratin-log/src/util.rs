@@ -1,4 +1,7 @@
-use std::{path::{Path, PathBuf}, time::{Duration, SystemTime, UNIX_EPOCH}};
+use std::{
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
+};
 
 use anyhow::Context;
 
@@ -30,7 +33,6 @@ impl Drop for TempDir {
         std::fs::remove_dir_all(&self.root).unwrap();
     }
 }
-
 
 pub fn latest_segment(root: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
     let seg_dir = root.as_ref().join("segments");
@@ -73,7 +75,8 @@ pub fn all_segments(root: impl AsRef<Path>) -> Vec<PathBuf> {
         .collect();
 
     bases.sort_unstable();
-    bases.into_iter()
+    bases
+        .into_iter()
         .map(|b| seg_dir.join(format!("{:020}.log", b)))
         .collect()
 }

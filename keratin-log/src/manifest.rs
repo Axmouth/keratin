@@ -14,6 +14,7 @@ pub struct Manifest {
     pub index_stride_bytes: u32,
     pub active_base_offset: u64,
     pub next_offset: u64,
+    pub head_offset: u64,
 }
 
 impl Manifest {
@@ -24,6 +25,7 @@ impl Manifest {
             index_stride_bytes,
             active_base_offset: 0,
             next_offset: 0,
+            head_offset: 0,
         }
     }
 
@@ -35,7 +37,12 @@ impl Manifest {
         root.join("tmp").join("manifest.new")
     }
 
-    pub fn load_or_create(root: &Path, now_ms: u64, segment_max_bytes: u64, index_stride_bytes: u32) -> io::Result<Self> {
+    pub fn load_or_create(
+        root: &Path,
+        now_ms: u64,
+        segment_max_bytes: u64,
+        index_stride_bytes: u32,
+    ) -> io::Result<Self> {
         let p = Self::path(root);
         match File::open(&p) {
             Ok(mut f) => Self::read_from(&mut f),
@@ -54,36 +61,55 @@ impl Manifest {
 
         // header: magic(8) ver(2) flags(2) header_len(4) crc(4) then payload
         if buf.len() < 8 + 2 + 2 + 4 + 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest too small"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest too small",
+            ));
         }
         if &buf[0..8] != MAN_MAGIC {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad manifest magic"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad manifest magic",
+            ));
         }
         let ver = u16::from_be_bytes(buf[8..10].try_into().unwrap());
         if ver != MAN_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad manifest version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad manifest version",
+            ));
         }
         let header_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
         if header_len != 8 + 2 + 2 + 4 + 4 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "unexpected manifest header_len"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "unexpected manifest header_len",
+            ));
         }
         let stored_crc = u32::from_be_bytes(buf[16..20].try_into().unwrap());
         let payload = &buf[20..];
-        let crc = crc32c(payload) as u32;
+        let crc = crc32c(payload);
         if crc != stored_crc {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest crc mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest crc mismatch",
+            ));
         }
 
         // payload v1:
-        // created_ts(8) segment_max(8) index_stride(4) pad(4) active_base(8) next_offset(8)
-        if payload.len() != 8 + 8 + 4 + 4 + 8 + 8 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "manifest payload len mismatch"));
+        // created_ts(8) segment_max(8) index_stride(4) pad(4) active_base(8) next_offset(8) head_offset(8)
+        if payload.len() != 8 + 8 + 4 + 4 + 8 + 8 + 8 {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "manifest payload len mismatch",
+            ));
         }
         let created_ts_ms = u64::from_be_bytes(payload[0..8].try_into().unwrap());
         let segment_max_bytes = u64::from_be_bytes(payload[8..16].try_into().unwrap());
         let index_stride_bytes = u32::from_be_bytes(payload[16..20].try_into().unwrap());
         let active_base_offset = u64::from_be_bytes(payload[24..32].try_into().unwrap());
         let next_offset = u64::from_be_bytes(payload[32..40].try_into().unwrap());
+        let head_offset = u64::from_be_bytes(payload[40..48].try_into().unwrap());
 
         Ok(Self {
             created_ts_ms,
@@ -91,6 +117,7 @@ impl Manifest {
             index_stride_bytes,
             active_base_offset,
             next_offset,
+            head_offset,
         })
     }
 
@@ -100,7 +127,11 @@ impl Manifest {
         let tmp = Self::tmp_path(root);
         let finalp = Self::path(root);
 
-        let mut f = OpenOptions::new().create(true).truncate(true).write(true).open(&tmp)?;
+        let mut f = OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .write(true)
+            .open(&tmp)?;
 
         // header
         let header_len: u32 = (8 + 2 + 2 + 4 + 4) as u32;
@@ -118,8 +149,9 @@ impl Manifest {
         payload.extend_from_slice(&0u32.to_be_bytes()); // pad
         payload.extend_from_slice(&self.active_base_offset.to_be_bytes());
         payload.extend_from_slice(&self.next_offset.to_be_bytes());
+        payload.extend_from_slice(&self.head_offset.to_be_bytes());
 
-        let crc = crc32c(&payload) as u32;
+        let crc = crc32c(&payload);
         out.extend_from_slice(&crc.to_be_bytes());
         out.extend_from_slice(&payload);
 
@@ -135,4 +167,15 @@ impl Manifest {
         fs::rename(&tmp, &finalp)?;
         Ok(())
     }
+}
+
+#[test]
+fn manifest_roundtrip() {
+    let dir = crate::util::test_dir("test_data/manifest_roundtrip");
+    let m1 = Manifest::default_new(123, 4096, 128);
+    m1.store_atomic(&dir.root).unwrap();
+    let m2 = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
+    assert_eq!(m1.created_ts_ms, m2.created_ts_ms);
+    assert_eq!(m1.segment_max_bytes, m2.segment_max_bytes);
+    assert_eq!(m1.index_stride_bytes, m2.index_stride_bytes);
 }

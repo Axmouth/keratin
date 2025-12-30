@@ -1,0 +1,18 @@
+[package]
+name = "stroma-core"
+version = "0.1.0"
+edition = "2024"
+
+[dependencies]
+keratin-log ={ path = "../../keratin-log" }
+async-trait = "0.1"
+bitvec = "1.0"
+blake3 = "1.8"
+crc32c = "0.6"
+dashmap = "6.0"
+fastrand = "2.3"
+hashbrown = "0.16"
+parking_lot = "0.12"
+similar-asserts = "1"
+thiserror = "2.0"
+tokio = { version = "1", features = ["full"] }

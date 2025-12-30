@@ -46,14 +46,24 @@ impl Segment {
         }
         let ver = u16::from_be_bytes(hdr[8..10].try_into().unwrap());
         if ver != LOG_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad log version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad log version",
+            ));
         }
         let base = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
         if base != expected_base {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "log base offset mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log base offset mismatch",
+            ));
         }
         let len = file.metadata()?.len();
-        Ok(Self { base_offset: base, file, bytes_written: len })
+        Ok(Self {
+            base_offset: base,
+            file,
+            bytes_written: len,
+        })
     }
 
     pub fn append_bytes(&mut self, data: &[u8]) -> io::Result<u64> {

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "3"
-members = ["keratin-log"]
+members = ["keratin-log", "stroma/core"]
 
 [workspace.metadata.sovereignty]
 ai-training = "prohibited"

@@ -1,19 +1,30 @@
 use std::collections::VecDeque;
 use std::io;
+use std::sync::Arc;
+use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
-use crate::KeratinConfig;
 use crate::durability::Durability;
-use crate::log::{AppendResult, Log};
+use crate::keratin::WriterCmd;
+use crate::log::{AppendResult, Log, LogState};
 use crate::record::Message;
+use crate::{KResult, KeratinConfig};
 
 #[derive(Debug, Clone)]
 pub struct IoError {
     msg: String,
 }
+
+impl std::fmt::Display for IoError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        write!(f, "{}", self.msg)?;
+        Ok(())
+    }
+}
+
 impl From<io::Error> for IoError {
     fn from(value: io::Error) -> Self {
         Self {
@@ -29,7 +40,7 @@ pub struct AppendReq {
 }
 
 pub struct WriterHandle {
-    pub tx: Sender<AppendReq>,
+    pub tx: Sender<WriterCmd>,
 }
 
 struct PendingAck {
@@ -46,13 +57,23 @@ fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
         .any(|p| p.durability >= Durability::AfterFsync)
 }
 
-pub fn spawn_writer(mut log: Log, cfg: KeratinConfig) -> WriterHandle {
-    let (tx, rx) = crossbeam_channel::bounded::<AppendReq>(1024);
-    std::thread::spawn(move || writer_loop(&mut log, cfg, rx));
+pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
+    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024);
+    std::thread::spawn(move || writer_loop(&mut log, cfg, rx, state));
     WriterHandle { tx }
 }
 
-fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
+fn handle_non_append(log: &mut Log, cmd: WriterCmd) -> KResult<()> {
+    match cmd {
+        WriterCmd::Append(_) => return Ok(()),
+        WriterCmd::Truncate { before, respond_to } => {
+            respond_to.send(log.truncate_before(before));
+        }
+    }
+    Ok(())
+}
+
+fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state: Arc<LogState>) {
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let mut last_fsync = Instant::now();
 
@@ -72,15 +93,24 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
             let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
 
             if commit_due {
-                let _ = commit(log, &mut pending, &mut durable_offset, &mut last_fsync);
+                let _ = commit(
+                    log,
+                    &mut pending,
+                    &mut durable_offset,
+                    &mut last_fsync,
+                    state.clone(),
+                );
             }
 
             // If we can block freely (no pending fsync-needed acks), block.
             if !pending_needs_fsync(&pending) {
                 match rx.recv() {
-                    Ok(r) => {
+                    Ok(WriterCmd::Append(r)) => {
                         first = r;
                         break;
+                    }
+                    Ok(cmd) => {
+                        handle_non_append(log, cmd);
                     }
                     Err(_) => return,
                 }
@@ -90,9 +120,15 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
             let deadline = last_fsync + fsync_interval;
 
             // Try to grab work without blocking.
-            if let Ok(r) = rx.try_recv() {
-                first = r;
-                break;
+            match rx.try_recv() {
+                Ok(WriterCmd::Append(r)) => {
+                    first = r;
+                    break;
+                }
+                Ok(cmd) => {
+                    handle_non_append(log, cmd);
+                }
+                _ => (),
             }
 
             // If we reached the deadline, loop again to commit.
@@ -114,10 +150,13 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
             && total_bytes < cfg.max_batch_bytes
         {
             match rx.try_recv() {
-                Ok(r) => {
+                Ok(WriterCmd::Append(r)) => {
                     total_records += r.records.len();
                     total_bytes += r.records.iter().map(|b| b.bytes_len()).sum::<usize>();
                     reqs.push(r);
+                }
+                Ok(cmd) => {
+                    handle_non_append(log, cmd);
                 }
                 Err(_) => break,
             }
@@ -131,10 +170,13 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
                 && total_bytes < cfg.max_batch_bytes
             {
                 match rx.try_recv() {
-                    Ok(r) => {
+                    Ok(WriterCmd::Append(r)) => {
                         total_records += r.records.len();
                         total_bytes += r.records.iter().map(|m| m.bytes_len()).sum::<usize>();
                         reqs.push(r);
+                    }
+                    Ok(cmd) => {
+                        handle_non_append(log, cmd);
                     }
                     Err(_) => core::hint::spin_loop(),
                 }
@@ -148,6 +190,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
             let dur = r.durability.unwrap_or(cfg.default_durability);
             match log.stage_append_batch(&r.records, now) {
                 Ok((ar, end_offset)) => {
+                    state.tail.store(end_offset + 1, Ordering::Release);
                     if dur == Durability::AfterWrite {
                         let _ = r.respond_to.send(Ok(ar));
                     } else {
@@ -170,7 +213,13 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
         let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
 
         if commit_due {
-            let _ = commit(log, &mut pending, &mut durable_offset, &mut last_fsync);
+            let _ = commit(
+                log,
+                &mut pending,
+                &mut durable_offset,
+                &mut last_fsync,
+                state.clone(),
+            );
         } else if log.should_flush() {
             let _ = log.flush_buffers();
         }
@@ -179,7 +228,9 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<AppendReq>) {
         if total_bytes >= (cfg.max_batch_bytes / 2) {
             linger = (linger + Duration::from_millis(1)).min(linger_max);
         } else if total_bytes < 64 * 1024 && pending.is_empty() {
-            linger = linger.saturating_sub(Duration::from_millis(1)).max(linger_min);
+            linger = linger
+                .saturating_sub(Duration::from_millis(1))
+                .max(linger_min);
         }
     }
 }
@@ -189,10 +240,12 @@ fn commit(
     pending: &mut VecDeque<PendingAck>,
     durable_offset: &mut u64,
     last_fsync: &mut Instant,
+    state: Arc<LogState>,
 ) -> Result<(), io::Error> {
     log.flush_buffers()?;
     log.fsync()?;
     *durable_offset = log.durable_watermark();
+    state.durable.store(*durable_offset, Ordering::Release);
     *last_fsync = Instant::now();
 
     while let Some(front) = pending.front() {
@@ -203,44 +256,6 @@ fn commit(
             break;
         }
     }
-    Ok(())
-}
-
-fn reqs_len_hint_small(total_bytes: usize, pending: &VecDeque<PendingAck>) -> bool {
-    total_bytes < 64 * 1024 && pending.is_empty()
-}
-
-/// Flush staged buffers to files, and optionally fsync.
-/// Then ACK pending requests whose end_offset is now durable.
-fn flush_and_maybe_fsync(
-    log: &mut Log,
-    pending: &mut VecDeque<PendingAck>,
-    durable_offset: &mut u64,
-    do_fsync: bool,
-) -> Result<(), io::Error> {
-    // Write staged bytes to OS (log+idx). Returns flushed watermark if you want it.
-    if do_fsync || log.should_flush() {
-        log.flush_buffers()?;
-    }
-
-    if do_fsync {
-        log.fsync()?;
-        // After fsync, everything we flushed becomes durable. We need a durable watermark.
-        // Easiest: have Log expose last_staged_end_offset; or return it from flush_buffers.
-        // For now assume Log tracks it:
-        *durable_offset = log.durable_watermark();
-
-        // Ack all pending whose end_offset <= durable_offset
-        while let Some(front) = pending.front() {
-            if front.end_offset <= *durable_offset {
-                let p = pending.pop_front().unwrap();
-                let _ = p.respond_to.send(Ok(p.result));
-            } else {
-                break;
-            }
-        }
-    }
-
     Ok(())
 }
 

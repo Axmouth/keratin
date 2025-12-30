@@ -31,19 +31,23 @@ impl Index {
         header.extend_from_slice(&base_offset.to_be_bytes());
         header.extend_from_slice(&created_ts_ms.to_be_bytes());
         header.extend_from_slice(&16u16.to_be_bytes()); // entry_len
-        header.extend_from_slice(&0u16.to_be_bytes());  // reserved0
-        header.extend_from_slice(&[0u8; 32]);           // reserved
+        header.extend_from_slice(&0u16.to_be_bytes()); // reserved0
+        header.extend_from_slice(&[0u8; 32]); // reserved
         // header crc
         let crc = crc32c::crc32c(&header);
         header.extend_from_slice(&(crc).to_be_bytes());
 
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&header)?;
-        
+
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
 
-        Ok(Self { base_offset, file, last_rel_offset: None })
+        Ok(Self {
+            base_offset,
+            file,
+            last_rel_offset: None,
+        })
     }
 
     pub fn open(mut file: File, expected_base: u64) -> io::Result<Self> {
@@ -56,24 +60,37 @@ impl Index {
         }
         let version = u16::from_be_bytes(hdr[8..10].try_into().unwrap());
         if version != IDX_VERSION {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "bad idx version"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bad idx version",
+            ));
         }
         let base = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
         if base != expected_base {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "idx base offset mismatch"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idx base offset mismatch",
+            ));
         }
 
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
 
-        Ok(Self { base_offset: base, file, last_rel_offset: None })
+        Ok(Self {
+            base_offset: base,
+            file,
+            last_rel_offset: None,
+        })
     }
 
     pub fn append_entry(&mut self, e: IdxEntry) -> io::Result<()> {
-        if let Some(last) = self.last_rel_offset {
-            if e.rel_offset < last {
-                return Err(io::Error::new(io::ErrorKind::InvalidData, "idx rel_offset not monotonic"));
-            }
+        if let Some(last) = self.last_rel_offset
+            && e.rel_offset < last
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "idx rel_offset not monotonic",
+            ));
         }
         let mut buf = [0u8; 16];
         buf[0..4].copy_from_slice(&e.rel_offset.to_be_bytes());

@@ -4,7 +4,7 @@ use crate::util::unix_millis;
 
 pub const RECORD_MAGIC: u16 = 0x4B52; // "KR"
 pub const RECORD_VERSION: u16 = 1;
-pub const RECORD_HEADER_LEN: usize = 2 + 2 + 2 + 2 + 4+ 4 + 8 + 8;
+pub const RECORD_HEADER_LEN: usize = 2 + 2 + 2 + 2 + 4 + 4 + 8 + 8;
 
 /// Disk format is big-endian.
 #[derive(Debug, Clone)]
@@ -33,8 +33,16 @@ pub enum RecordError {
 /// Encode a record into `dst`, appending bytes.
 /// Returns the file position delta (bytes written).
 pub fn encode_record(dst: &mut Vec<u8>, r: &Record<'_>) -> Result<usize, RecordError> {
-    let header_len: u32 = r.headers.len().try_into().map_err(|_| RecordError::LengthOverflow)?;
-    let payload_len: u32 = r.payload.len().try_into().map_err(|_| RecordError::LengthOverflow)?;
+    let header_len: u32 = r
+        .headers
+        .len()
+        .try_into()
+        .map_err(|_| RecordError::LengthOverflow)?;
+    let payload_len: u32 = r
+        .payload
+        .len()
+        .try_into()
+        .map_err(|_| RecordError::LengthOverflow)?;
 
     let start_len = dst.len();
 
@@ -67,9 +75,7 @@ pub fn encode_record(dst: &mut Vec<u8>, r: &Record<'_>) -> Result<usize, RecordE
 /// On success, returns (record_meta, total_bytes_consumed, crc_ok).
 ///
 /// This is designed for sequential scanning in recovery.
-pub fn decode_record_prefix<'a>(
-    buf: &'a [u8],
-) -> Result<(DecodedRecord<'a>, usize), RecordError> {
+pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usize), RecordError> {
     // Fixed header without CRC (32 bytes)
     // Need at least fixed header: magic(2)+ver(2)+flags(2)+res(2)+hlen(4)+plen(4)+ts(8)+off(8), crc (4) comes later
     const FIXED: usize = 2 + 2 + 2 + 2 + 4 + 4 + 8 + 8;
@@ -143,7 +149,6 @@ pub struct DecodedRecord<'a> {
     pub payload: &'a [u8],
 }
 
-
 #[derive(Debug, Clone)]
 pub struct Message {
     pub flags: u16,
@@ -178,10 +183,7 @@ impl Message {
     }
 
     pub fn bytes_len(&self) -> usize {
-        RECORD_HEADER_LEN
-        + self.headers.len()
-        + self.payload.len()
-        + 4 // crc
+        RECORD_HEADER_LEN + self.headers.len() + self.payload.len() + 4 // crc
     }
 }
 
@@ -220,4 +222,3 @@ impl ReceivedMessage {
         })
     }
 }
-

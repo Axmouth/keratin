@@ -76,7 +76,9 @@ async fn wal_recovery_continuity() {
     let dir = util::test_dir("wal_recovery_continuity");
 
     {
-        let k = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+        let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
 
         // Phase 1
         let mut batch = vec![];
@@ -101,7 +103,9 @@ async fn wal_recovery_continuity() {
         k.append_batch(batch, None).await.unwrap();
     } // crash
 
-    let k = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
 
     // Phase 3
     let mut batch = vec![];
@@ -127,7 +131,9 @@ async fn wal_durability_fence() {
     let dir = util::test_dir("wal_durability_fence");
 
     {
-        let k = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+        let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
 
         // A – weak durability
         let mut a = vec![];
@@ -138,7 +144,9 @@ async fn wal_durability_fence() {
                 payload: format!("a-{i}").into_bytes(),
             });
         }
-        k.append_batch(a, Some(Durability::AfterWrite)).await.unwrap();
+        k.append_batch(a, Some(Durability::AfterWrite))
+            .await
+            .unwrap();
 
         // B – durability fence
         let mut b = vec![];
@@ -149,7 +157,9 @@ async fn wal_durability_fence() {
                 payload: format!("b-{i}").into_bytes(),
             });
         }
-        k.append_batch(b, Some(Durability::AfterFsync)).await.unwrap();
+        k.append_batch(b, Some(Durability::AfterFsync))
+            .await
+            .unwrap();
 
         // C – weak tail
         let mut c = vec![];
@@ -160,10 +170,14 @@ async fn wal_durability_fence() {
                 payload: format!("c-{i}").into_bytes(),
             });
         }
-        k.append_batch(c, Some(Durability::AfterWrite)).await.unwrap();
+        k.append_batch(c, Some(Durability::AfterWrite))
+            .await
+            .unwrap();
     } // crash immediately
 
-    let k = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
     let got = k.reader().scan_from(0, 20_000).unwrap();
 
     // A and B must exist, C must not

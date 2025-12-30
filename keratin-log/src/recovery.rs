@@ -1,7 +1,7 @@
 use std::fs::File;
 use std::io::{self, Read, Seek, SeekFrom};
 
-use crate::record::{decode_record_prefix, RecordError};
+use crate::record::{RecordError, decode_record_prefix};
 
 pub struct ScanResult {
     pub last_good_pos: u64,
@@ -47,7 +47,10 @@ pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::R
                 }
                 Err(_bad) => {
                     // corruption / partial write -> stop; truncate to last_good_pos
-                    return Ok(ScanResult { last_good_pos, last_offset });
+                    return Ok(ScanResult {
+                        last_good_pos,
+                        last_offset,
+                    });
                 }
             }
         }
@@ -62,5 +65,8 @@ pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::R
     }
 
     // If we ended with leftover undecodable bytes, treat as truncated/partial.
-    Ok(ScanResult { last_good_pos, last_offset })
+    Ok(ScanResult {
+        last_good_pos,
+        last_offset,
+    })
 }

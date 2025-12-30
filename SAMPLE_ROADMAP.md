@@ -218,3 +218,13 @@ TODO: Background compactor threads
 TODO: Direct I/O option?
 
 TODO: proper error handling (a way to propagate and retry? start by logging at least. return error on failed writes?)
+
+TODO: Single writer safety lock per log (+ regression test)
+
+TODO: Asyncify scan
+
+TODO: Option to get stream instead of vec?
+
+TODO: Batch inputs coming in smaller sets better?
+
+TODO: Memory benchmarks. Launch X Keratin instances, write a bunch of messages, measure peak memory

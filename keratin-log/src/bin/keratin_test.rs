@@ -22,7 +22,11 @@ fn main() {
         // write 100k messages
         for i in 0..3_000u64 {
             let payload = format!("msg-{i}").into_bytes();
-            let msg = Message { flags: 2, headers: vec![], payload };
+            let msg = Message {
+                flags: 2,
+                headers: vec![],
+                payload,
+            };
             k.append_batch(vec![msg], None).await.unwrap();
         }
 

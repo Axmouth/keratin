@@ -162,7 +162,11 @@ async fn wal_segment_roll_continuity() {
 async fn wal_high_contention_storm() {
     let dir = util::test_dir("wal_storm");
 
-    let k = Arc::new(Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap());
+    let k = Arc::new(
+        Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap(),
+    );
 
     let mut handles = vec![];
     for p in 0..8 {
@@ -176,7 +180,9 @@ async fn wal_high_contention_storm() {
                     payload: format!("p{p}-{i}").into_bytes(),
                 });
             }
-            k.append_batch(batch, Some(Durability::AfterFsync)).await.unwrap();
+            k.append_batch(batch, Some(Durability::AfterFsync))
+                .await
+                .unwrap();
         }));
     }
 

@@ -1,26 +1,43 @@
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::{Duration, Instant},
 };
 
-use tokio::sync::oneshot;
-
 use crate::{
-    Durability, LogReader,
-    index::{IdxEntry, Index},
+    index::Index,
     manifest::Manifest,
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
     segment::Segment,
-    writer::{self, IoError},
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     pub base_offset: u64,
     pub count: u32,
+}
+
+#[derive(Debug, Clone)]
+pub struct LogState {
+    pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
+    pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
+    pub durable: Arc<AtomicU64>, // inclusive; last fsynced offset (u64::MAX if none)
+}
+
+impl LogState {
+    pub fn new(head: u64, tail: u64, durable: u64) -> Self {
+        Self {
+            head: Arc::new(AtomicU64::new(head)),
+            tail: Arc::new(AtomicU64::new(tail)),
+            durable: Arc::new(AtomicU64::new(durable)),
+        }
+    }
 }
 
 pub struct Log {
@@ -38,6 +55,8 @@ pub struct Log {
     pub index: Index,
     pub next_offset: u64,
     last_index_at_log_pos: u64,
+
+    log_state: Arc<LogState>,
 
     // stats
     pub stats: IoStats,
@@ -80,6 +99,7 @@ impl Log {
         segment_max_bytes: u64,
         index_stride_bytes: u32,
         flush_target_bytes: usize,
+        log_state: Arc<LogState>,
     ) -> io::Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("segments"))?;
@@ -111,6 +131,7 @@ impl Log {
                 write_buf: Vec::with_capacity(16 * 1024 * 1024),
                 idx_buf: Vec::with_capacity(256 * 1024),
                 stats: IoStats::new(),
+                log_state,
                 last_stats_dump: Instant::now(),
                 manifest_flush_interval: Duration::from_millis(500),
                 last_manifest_flush: Instant::now(),
@@ -174,6 +195,7 @@ impl Log {
             last_index_at_log_pos,
             write_buf: Vec::with_capacity(16 * 1024 * 1024),
             idx_buf: Vec::with_capacity(256 * 1024),
+            log_state,
             stats: IoStats::new(),
             last_stats_dump: Instant::now(),
             manifest_flush_interval: Duration::from_millis(500),
@@ -202,10 +224,7 @@ impl Log {
 
         // Ensure we have capacity for large sequential writes
         // Estimate worst-case record size; same as before
-        let estimated: usize = payloads
-            .iter()
-            .map(|p|p.bytes_len())
-            .sum();
+        let estimated: usize = payloads.iter().map(|p| p.bytes_len()).sum();
 
         // If staging this would exceed segment capacity once flushed, roll.
         // NOTE: active.bytes_written is on-disk bytes; we also have write_buf pending.
@@ -350,6 +369,14 @@ impl Log {
         self.durable_offset
     }
 
+    pub fn flushed_watermark(&self) -> u64 {
+        self.durable_offset
+    }
+
+    pub fn next_offset(&self) -> u64 {
+        self.next_offset
+    }
+
     #[inline]
     pub fn should_flush(&self) -> bool {
         self.write_buf.len() >= self.flush_target_bytes
@@ -377,6 +404,97 @@ impl Log {
 
         Ok(())
     }
+
+    /// Delete whole sealed segments whose max offset < `before`.
+    /// NOTE: v0 is *segment-granular* retention. It will not trim inside the active segment.
+    pub fn truncate_before(&mut self, before: u64) -> io::Result<u64> {
+        // Nothing to do
+        let cur_head = self.manifest.head_offset; // add this to manifest
+        if before <= cur_head {
+            return Ok(cur_head);
+        }
+
+        // Must not delete data that might still be needed for durability semantics.
+        // We force durability before deleting anything.
+        self.flush_buffers()?;
+        self.fsync()?;
+
+        let seg_dir = self.root.join("segments");
+        let mut bases = list_segment_bases(&seg_dir)?;
+        bases.sort_unstable();
+
+        if bases.is_empty() {
+            // degenerate; keep head consistent
+            self.manifest.head_offset = before;
+            self.manifest.store_atomic(&self.root)?;
+            return Ok(before);
+        }
+
+        // Active segment is the last base (by construction: you always roll to new_base=next_offset).
+        let active_base = *bases.last().unwrap();
+
+        // Identify deletable sealed bases (everything except active), using the property:
+        // sealed segment [base_i, base_{i+1}) => last_offset = base_{i+1}-1
+        let mut deletable: Vec<u64> = Vec::new();
+        for w in bases.windows(2) {
+            let base = w[0];
+            let next_base = w[1];
+            let last_offset = next_base.saturating_sub(1);
+
+            if last_offset < before {
+                deletable.push(base);
+            } else {
+                // since bases sorted and last_offset grows, we can stop early
+                break;
+            }
+        }
+
+        // Never delete the active segment in v0 (no mid-segment trim).
+        deletable.retain(|&b| b != active_base);
+
+        // If nothing deletable, we can still advance head only up to the first base >= before? No.
+        // In v0 we keep head truthful to "first readable". That is:
+        // - if we didn't delete any segment, head doesn't change.
+        if deletable.is_empty() {
+            return Ok(cur_head);
+        }
+
+        // Delete files (best-effort: delete idx + log; ignore NotFound for idempotence)
+        for base in &deletable {
+            let lp = seg_log_path(&self.root, *base);
+            let ip = seg_idx_path(&self.root, *base);
+
+            match fs::remove_file(&ip) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+            match fs::remove_file(&lp) {
+                Ok(_) => {}
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Err(e) => return Err(e),
+            }
+        }
+
+        // Compute new head = smallest remaining base (after deletions)
+        let mut remaining = list_segment_bases(&seg_dir)?;
+        remaining.sort_unstable();
+
+        let new_head = remaining.first().copied().unwrap_or(self.next_offset);
+
+        // Persist + publish head
+        self.manifest.head_offset = new_head;
+        self.manifest.store_atomic(&self.root)?;
+        self.log_state.head.store(new_head, Ordering::Release);
+
+        Ok(new_head)
+    }
+
+    fn cleanup_orphans(seg_dir: &Path) -> io::Result<()> {
+        // remove .idx with no .log and vice versa
+        // optional: keep it conservative
+        Ok(())
+    }
 }
 
 // ---- helpers
@@ -394,10 +512,10 @@ fn list_segment_bases(dir: &Path) -> io::Result<Vec<u64>> {
         let ent = ent?;
         let name = ent.file_name();
         let Some(s) = name.to_str() else { continue };
-        if let Some(stem) = s.strip_suffix(".log") {
-            if let Ok(base) = stem.parse::<u64>() {
-                out.push(base);
-            }
+        if let Some(stem) = s.strip_suffix(".log")
+            && let Ok(base) = stem.parse::<u64>()
+        {
+            out.push(base);
         }
     }
     Ok(out)
@@ -433,13 +551,16 @@ fn open_or_create_segment_pair(
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
 
+    // TODO: reeval truncate
     let logf = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&log_path)?;
     let idxf = OpenOptions::new()
         .create(true)
+        .truncate(false)
         .read(true)
         .write(true)
         .open(&idx_path)?;

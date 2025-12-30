@@ -1,28 +1,28 @@
 mod config;
-mod log;
-mod writer;
-mod reader;
 mod durability;
-mod manifest;
 mod index;
+mod keratin;
+mod log;
+mod manifest;
+mod reader;
 mod record;
 mod recovery;
 mod segment;
-mod keratin;
 pub mod util;
+mod writer;
 
 pub use config::*;
 pub use durability::Durability;
-pub use log::{AppendResult};
 pub use keratin::Keratin;
-pub use reader::LogReader;
+pub use log::AppendResult;
+pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
 
 #[derive(Debug)]
 pub enum KeratinError {
     // ===== External / environmental =====
-    Io(std::io::Error),               // kernel / filesystem failure
-    OutOfSpace,                  // ENOSPC / EDQUOT etc
+    Io(std::io::Error), // kernel / filesystem failure
+    OutOfSpace,         // ENOSPC / EDQUOT etc
     PermissionDenied,
     DeviceGone,
 
@@ -35,8 +35,8 @@ pub enum KeratinError {
     TruncatedRecord,
 
     // ===== Logical invariants =====
-    OffsetRegression,            // non-monotonic append
-    SegmentOverflow,             // would exceed segment max
+    OffsetRegression, // non-monotonic append
+    SegmentOverflow,  // would exceed segment max
     SegmentNotFound,
     IndexNotFound,
 

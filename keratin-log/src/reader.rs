@@ -176,9 +176,10 @@ impl LogReader {
                         }
 
                         if let Some(o) = want
-                            && rec.offset > o {
-                                return Ok(None);
-                            }
+                            && rec.offset > o
+                        {
+                            return Ok(None);
+                        }
                     }
                     Err(crate::record::RecordError::Truncated) => break,
                     Err(_) => return Ok(None),
@@ -197,9 +198,10 @@ impl LogReader {
             let e = e?;
             if let Some(s) = e.file_name().to_str()
                 && let Some(stem) = s.strip_suffix(".log")
-                    && let Ok(b) = stem.parse::<u64>() {
-                        bases.push(b);
-                    }
+                && let Ok(b) = stem.parse::<u64>()
+            {
+                bases.push(b);
+            }
         }
         bases.sort_unstable();
         Ok(bases.into_iter().rfind(|b| *b <= offset))
