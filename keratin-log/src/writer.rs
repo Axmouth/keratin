@@ -67,7 +67,9 @@ fn handle_non_append(log: &mut Log, cmd: WriterCmd) -> KResult<()> {
     match cmd {
         WriterCmd::Append(_) => return Ok(()),
         WriterCmd::Truncate { before, respond_to } => {
-            respond_to.send(log.truncate_before(before));
+            respond_to.send(log.truncate_before(before)).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "could not notify truncate")
+            })?;
         }
     }
     Ok(())
@@ -84,6 +86,12 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
     let linger_max = Duration::from_millis(cfg.batch_linger_ms.max(1));
     let mut linger = Duration::from_millis(0);
 
+    let weight = |r: &AppendReq| -> (usize, usize) {
+        let recs = r.records.len();
+        let bytes = r.records.iter().map(|m| m.bytes_len()).sum::<usize>();
+        (recs, bytes)
+    };
+
     loop {
         // ===== 1) Wait for first request (or commit deadline) =====
         let first: AppendReq;
@@ -93,13 +101,32 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
             let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
 
             if commit_due {
-                let _ = commit(
+                // TODO: More sophisticarted back off/rewind and redo batching
+                let mut error_count = 0;
+                while let Err(e) = commit(
                     log,
                     &mut pending,
                     &mut durable_offset,
                     &mut last_fsync,
                     state.clone(),
-                );
+                ) {
+                    fail_all_pending(
+                        &mut pending,
+                        &format!("Internal Error while commiting: {e}"),
+                    );
+
+                    if error_count > 3 {
+                        fail_all_pending(
+                            &mut pending,
+                            "Internal Error while commiting writes over 3 times",
+                        );
+                        std::thread::sleep(Duration::from_millis(1000));
+                        break;
+                    }
+
+                    error_count += 1;
+                    std::thread::sleep(Duration::from_millis(200));
+                }
             }
 
             // If we can block freely (no pending fsync-needed acks), block.
@@ -110,9 +137,17 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                         break;
                     }
                     Ok(cmd) => {
-                        handle_non_append(log, cmd);
+                        if let Err(e) = handle_non_append(log, cmd) {
+                            fail_all_pending(
+                                &mut pending,
+                                &format!("Internal Error in processing write command: {e:?}"),
+                            );
+                        }
                     }
-                    Err(_) => return,
+                    Err(_) => {
+                        // Assumed disconnected during cleanup
+                        return;
+                    }
                 }
             }
 
@@ -126,9 +161,16 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                     break;
                 }
                 Ok(cmd) => {
-                    handle_non_append(log, cmd);
+                    if let Err(e) = handle_non_append(log, cmd) {
+                        fail_all_pending(
+                            &mut pending,
+                            &format!("Internal Error in processing write command: {e:?}"),
+                        );
+                    }
                 }
-                _ => (),
+                Err(_) => {
+                    // Assumed disconnected during cleanup
+                }
             }
 
             // If we reached the deadline, loop again to commit.
@@ -156,9 +198,17 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                     reqs.push(r);
                 }
                 Ok(cmd) => {
-                    handle_non_append(log, cmd);
+                    if let Err(e) = handle_non_append(log, cmd) {
+                        fail_all_pending(
+                            &mut pending,
+                            &format!("Internal Error in processing write command: {e:?}"),
+                        );
+                    }
                 }
-                Err(_) => break,
+                Err(_) => {
+                    // Assumed disconnected during cleanup
+                    break;
+                }
             }
         }
 
@@ -176,9 +226,20 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                         reqs.push(r);
                     }
                     Ok(cmd) => {
-                        handle_non_append(log, cmd);
+                        if let Err(e) = handle_non_append(log, cmd) {
+                            fail_all_pending(
+                                &mut pending,
+                                &format!("Internal Error in processing write command: {e:?}"),
+                            );
+                        }
                     }
-                    Err(_) => core::hint::spin_loop(),
+                    Err(e) => {
+                        fail_all_pending(
+                            &mut pending,
+                            &format!("Internal Error receiving events: {e}"),
+                        );
+                        core::hint::spin_loop()
+                    }
                 }
             }
         }
@@ -250,8 +311,13 @@ fn commit(
 
     while let Some(front) = pending.front() {
         if front.end_offset <= *durable_offset {
-            let p = pending.pop_front().unwrap();
-            let _ = p.respond_to.send(Ok(p.result));
+            let p = pending.pop_front().ok_or(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "pending ack to commit should exist",
+            ))?;
+            p.respond_to.send(Ok(p.result)).map_err(|_| {
+                io::Error::new(io::ErrorKind::BrokenPipe, "could not notify commit")
+            })?;
         } else {
             break;
         }
@@ -260,6 +326,7 @@ fn commit(
 }
 
 fn fail_all_pending(pending: &mut VecDeque<PendingAck>, msg: &str) {
+    tracing::error!("{}", msg);
     while let Some(p) = pending.pop_front() {
         let _ = p.respond_to.send(Err(IoError {
             msg: msg.to_string(),

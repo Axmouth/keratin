@@ -1,3 +1,4 @@
+mod batcher;
 mod config;
 mod durability;
 mod index;
