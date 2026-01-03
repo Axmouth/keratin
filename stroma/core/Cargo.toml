@@ -16,3 +16,4 @@ parking_lot = "0.12"
 similar-asserts = "1"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
+tracing = "0.1"

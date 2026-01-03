@@ -71,6 +71,80 @@ pub fn encode_record(dst: &mut Vec<u8>, r: &Record<'_>) -> Result<usize, RecordE
     Ok(dst.len() - start_len)
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ByteRemainder {
+    Missing(usize),
+    Extra(usize),
+    Zero,
+}
+
+/// Attempt to decode a record header from `buf` beginning at offset 0.
+/// On success, returns (record_meta, remaining_bytes).
+///
+/// This is designed for sequential scanning faster.
+pub fn decode_header_prefix<'a>(buf: &[u8]) -> Result<(DecodedHeader, ByteRemainder), RecordError> {
+    // Fixed header without CRC (32 bytes)
+    // Need at least fixed header: magic(2)+ver(2)+flags(2)+res(2)+hlen(4)+plen(4)+ts(8)+off(8), crc (4) comes later
+    const FIXED: usize = 2 + 2 + 2 + 2 + 4 + 4 + 8 + 8;
+    if buf.len() < FIXED {
+        return Err(RecordError::Truncated);
+    }
+
+    let magic = u16::from_be_bytes([buf[0], buf[1]]);
+    if magic != RECORD_MAGIC {
+        return Err(RecordError::BadMagic(magic));
+    }
+
+    let version = u16::from_be_bytes([buf[2], buf[3]]);
+    if version != RECORD_VERSION {
+        return Err(RecordError::BadVersion(version));
+    }
+
+    let flags = u16::from_be_bytes([buf[4], buf[5]]);
+    // reserved0 at [6..8]
+    let header_len = u32::from_be_bytes(buf[8..12].try_into().unwrap());
+    let payload_len = u32::from_be_bytes(buf[12..16].try_into().unwrap());
+    let timestamp_ms = u64::from_be_bytes(buf[16..24].try_into().unwrap());
+    let offset = u64::from_be_bytes(buf[24..32].try_into().unwrap());
+
+    let var_total = (header_len as usize)
+        .checked_add(payload_len as usize)
+        .and_then(|v| v.checked_add(4)) // crc
+        .ok_or(RecordError::LengthOverflow)?;
+
+    let total_len = FIXED
+        .checked_add(var_total)
+        .ok_or(RecordError::LengthOverflow)?;
+
+    let decoded_header = DecodedHeader {
+        flags,
+        timestamp_ms,
+        offset,
+        header_len,
+        payload_len
+    };
+
+    let buf_len = buf.len();
+    let res = if buf_len > total_len {
+        ByteRemainder::Extra(buf_len - total_len)
+    } else if buf_len < total_len {
+        ByteRemainder::Missing(total_len - buf_len)
+    } else {
+        ByteRemainder::Zero
+    };
+
+    Ok((decoded_header, res))
+}
+
+#[derive(Debug)]
+pub struct DecodedHeader {
+    pub flags: u16,
+    pub timestamp_ms: u64,
+    pub offset: u64,
+    pub header_len: u32,
+    pub payload_len: u32,
+}
+
 /// Attempt to decode a record from `buf` beginning at offset 0.
 /// On success, returns (record_meta, total_bytes_consumed, crc_ok).
 ///

@@ -1,4 +1,4 @@
-use crate::Durability;
+use crate::KDurability;
 
 #[derive(Debug, Clone, Copy)]
 pub struct KeratinConfig {
@@ -7,7 +7,7 @@ pub struct KeratinConfig {
     pub max_batch_bytes: usize,
     pub max_batch_records: usize,
     pub batch_linger_ms: u64,
-    pub default_durability: Durability,
+    pub default_durability: KDurability,
     pub fsync_interval_ms: u64,
     pub flush_target_bytes: usize,
 }
@@ -20,7 +20,7 @@ impl Default for KeratinConfig {
             max_batch_bytes: 1024 * 1024,
             max_batch_records: 4096,
             batch_linger_ms: 5,
-            default_durability: Durability::AfterFsync,
+            default_durability: KDurability::AfterFsync,
             fsync_interval_ms: 5,
             flush_target_bytes: 32 * 1024 * 1024,
         }
@@ -35,7 +35,7 @@ impl KeratinConfig {
             max_batch_bytes: 1024 * 1024,
             max_batch_records: 4096,
             batch_linger_ms: 5,
-            default_durability: Durability::AfterFsync,
+            default_durability: KDurability::AfterFsync,
             fsync_interval_ms: 5,
             flush_target_bytes: 32 * 1024 * 1024,
         }

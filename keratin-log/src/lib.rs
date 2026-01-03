@@ -12,7 +12,7 @@ pub mod util;
 mod writer;
 
 pub use config::*;
-pub use durability::Durability;
+pub use durability::KDurability;
 pub use keratin::Keratin;
 pub use log::AppendResult;
 pub use reader::{LogReader, OwnedRecord};

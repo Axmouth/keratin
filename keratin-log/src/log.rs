@@ -1,4 +1,5 @@
 use std::{
+    collections::BTreeMap,
     fs::{self, OpenOptions},
     io,
     path::{Path, PathBuf},
@@ -8,6 +9,8 @@ use std::{
     },
     time::{Duration, Instant},
 };
+
+use parking_lot::RwLock;
 
 use crate::{
     index::Index,
@@ -65,6 +68,8 @@ pub struct Log {
     last_manifest_flush: Instant,
 
     pub flush_target_bytes: usize, // e.g. 16MB
+
+    segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
 }
 
 #[derive(Default)]
@@ -100,7 +105,7 @@ impl Log {
         index_stride_bytes: u32,
         flush_target_bytes: usize,
         log_state: Arc<LogState>,
-    ) -> io::Result<Self> {
+    ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("segments"))?;
         fs::create_dir_all(root.join("tmp"))?;
@@ -114,14 +119,16 @@ impl Log {
 
         // If no segments exist, create first with base=0.
         if bases.is_empty() {
-            let (seg, idx) = create_segment_pair(&root, 0, now_ms)?;
+            let (seg, idx, seg_path) = create_segment_pair(&root, 0, now_ms)?;
             manifest.active_base_offset = 0;
             manifest.next_offset = 0;
             manifest.store_atomic(&root)?;
             let next_offset: u64 = manifest.next_offset;
             let initial: u64 = next_offset.saturating_sub(1);
 
-            return Ok(Self {
+            let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter([(0, seg_path)])));
+
+            return Ok((Self {
                 root,
                 last_index_at_log_pos: seg.bytes_written,
                 active: seg,
@@ -138,17 +145,18 @@ impl Log {
                 staged_end_offset: initial,
                 durable_offset: initial,
                 flush_target_bytes,
-            });
+                segment_mapping: segment_mapping.clone(),
+            }, segment_mapping));
         }
 
         // Repair/scan all segments, compute true next_offset.
         let mut computed_next = 0u64;
-        for &base in &bases {
-            let log_path = seg_log_path(&root, base);
+        for (base, _base_path) in &bases {
+            let log_path = seg_log_path(&root, *base);
             let f = OpenOptions::new().read(true).write(true).open(&log_path)?;
             // open header to get header_len (fixed in our Segment::open, but we know it)
             // We'll trust Segment::open to validate base.
-            let mut seg = Segment::open(f, base)?;
+            let mut seg = Segment::open(f, *base)?;
             // Scan from header_len; our Segment header is fixed size:
             let header_len = (8 + 2 + 2 + 4 + 8 + 8 + 32 + 4) as u64;
             let scan = scan_last_good(seg.file_ref(), header_len, 64 * 1024)?;
@@ -159,21 +167,25 @@ impl Log {
             if let Some(last) = scan.last_offset {
                 computed_next = computed_next.max(last.saturating_add(1));
             } else {
-                computed_next = computed_next.max(base);
+                computed_next = computed_next.max(*base);
             }
 
             // Repair idx length too (best-effort).
-            let idx_path = seg_idx_path(&root, base);
+            let idx_path = seg_idx_path(&root, *base);
             if idx_path.exists() {
                 let idxf = OpenOptions::new().read(true).write(true).open(&idx_path)?;
-                let mut idx = Index::open(idxf, base)?;
+                let mut idx = Index::open(idxf, *base)?;
                 idx.repair_truncate_to_entries()?;
             }
         }
 
+        let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter(bases.clone())));
+
         // Choose active segment: last base.
-        let active_base = *bases.last().unwrap();
-        let (active, index) = open_or_create_segment_pair(&root, active_base, now_ms)?;
+        let (active_base, _active_base_path) = bases.last().expect("Already checked empty").clone();
+        let (active, index, seg_path) = open_or_create_segment_pair(&root, active_base, now_ms)?;
+
+        segment_mapping.write().insert(active_base, seg_path);
 
         // Recompute next_offset from computed_next; reconcile with manifest (prefer computed).
         let next_offset = computed_next.max(manifest.next_offset);
@@ -186,7 +198,7 @@ impl Log {
         let last_index_at_log_pos = active.bytes_written;
         let initial: u64 = next_offset.saturating_sub(1);
 
-        Ok(Self {
+        Ok((Self {
             root,
             manifest,
             active,
@@ -203,7 +215,8 @@ impl Log {
             staged_end_offset: initial,
             durable_offset: initial,
             flush_target_bytes,
-        })
+            segment_mapping: segment_mapping.clone(),
+        }, segment_mapping))
     }
 
     pub fn stage_append_batch(
@@ -390,9 +403,11 @@ impl Log {
         self.fsync()?;
 
         let new_base = self.next_offset;
-        let (seg, idx) = create_segment_pair(&self.root, new_base, now_ms)?;
+        let (seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
         self.active = seg;
         self.index = idx;
+
+        self.segment_mapping.write().insert(new_base, new_seg_path);
 
         self.last_index_at_log_pos = self.active.bytes_written;
 
@@ -420,7 +435,13 @@ impl Log {
         self.fsync()?;
 
         let seg_dir = self.root.join("segments");
-        let mut bases = list_segment_bases(&seg_dir)?;
+        // let mut bases = list_segment_bases(&seg_dir)?;
+        let mut bases = self
+            .segment_mapping
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<(u64, PathBuf)>>();
         bases.sort_unstable();
 
         if bases.is_empty() {
@@ -431,14 +452,14 @@ impl Log {
         }
 
         // Active segment is the last base (by construction: you always roll to new_base=next_offset).
-        let active_base = *bases.last().unwrap();
+        let (active_base, _) = *bases.last().expect("Already checked if empty");
 
         // Identify deletable sealed bases (everything except active), using the property:
         // sealed segment [base_i, base_{i+1}) => last_offset = base_{i+1}-1
         let mut deletable: Vec<u64> = Vec::new();
         for w in bases.windows(2) {
-            let base = w[0];
-            let next_base = w[1];
+            let (base, _) = w[0];
+            let (next_base, _) = w[1];
             let last_offset = next_base.saturating_sub(1);
 
             if last_offset < before {
@@ -463,6 +484,7 @@ impl Log {
         for base in &deletable {
             let lp = seg_log_path(&self.root, *base);
             let ip = seg_idx_path(&self.root, *base);
+            self.segment_mapping.write().remove(base);
 
             match fs::remove_file(&ip) {
                 Ok(_) => {}
@@ -477,10 +499,20 @@ impl Log {
         }
 
         // Compute new head = smallest remaining base (after deletions)
-        let mut remaining = list_segment_bases(&seg_dir)?;
+        // let mut remaining = list_segment_bases(&seg_dir)?;
+        let mut remaining = self
+            .segment_mapping
+            .read()
+            .iter()
+            .map(|(k, v)| (*k, v.clone()))
+            .collect::<Vec<(u64, PathBuf)>>();
         remaining.sort_unstable();
 
-        let new_head = remaining.first().copied().unwrap_or(self.next_offset);
+        let new_head = remaining
+            .first()
+            .map(|(v, _)| v)
+            .copied()
+            .unwrap_or(self.next_offset);
 
         // Persist + publish head
         self.manifest.head_offset = new_head;
@@ -506,7 +538,7 @@ fn seg_idx_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.idx", base))
 }
 
-fn list_segment_bases(dir: &Path) -> io::Result<Vec<u64>> {
+fn list_segment_bases(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     let mut out = Vec::new();
     for ent in fs::read_dir(dir)? {
         let ent = ent?;
@@ -515,13 +547,13 @@ fn list_segment_bases(dir: &Path) -> io::Result<Vec<u64>> {
         if let Some(stem) = s.strip_suffix(".log")
             && let Ok(base) = stem.parse::<u64>()
         {
-            out.push(base);
+            out.push((base, ent.path()));
         }
     }
     Ok(out)
 }
 
-fn create_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segment, Index)> {
+fn create_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
 
@@ -540,14 +572,14 @@ fn create_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segme
 
     let seg = Segment::create(logf, base, now_ms)?;
     let idx = Index::create(idxf, base, now_ms)?;
-    Ok((seg, idx))
+    Ok((seg, idx, log_path))
 }
 
 fn open_or_create_segment_pair(
     root: &Path,
     base: u64,
     now_ms: u64,
-) -> io::Result<(Segment, Index)> {
+) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
 
@@ -578,5 +610,5 @@ fn open_or_create_segment_pair(
         Index::open(idxf, base)?
     };
 
-    Ok((seg, idx))
+    Ok((seg, idx, idx_path))
 }

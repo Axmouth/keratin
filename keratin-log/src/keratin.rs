@@ -1,19 +1,23 @@
+use std::collections::BTreeMap;
 use std::io;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::atomic::Ordering;
+use parking_lot::RwLock;
 use tokio::sync::oneshot;
 
 use crate::log::{AppendResult, Log, LogState};
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::writer::{AppendReq, IoError, WriterHandle};
-use crate::{Durability, KeratinConfig};
+use crate::{KDurability, KeratinConfig};
 
+#[derive(Debug)]
 pub struct Keratin {
     root: std::path::PathBuf,
     tx: crossbeam_channel::Sender<WriterCmd>,
     log_state: Arc<LogState>,
+    segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
 }
 
 pub enum WriterCmd {
@@ -31,7 +35,7 @@ impl Keratin {
 
         let log_state = Arc::new(LogState::new(0, 0, 0));
 
-        let log = Log::open(
+        let (log, segment_mapping) = Log::open(
             &root,
             now,
             cfg.segment_max_bytes,
@@ -54,17 +58,18 @@ impl Keratin {
             root,
             tx,
             log_state,
+            segment_mapping,
         })
     }
 
     pub fn reader(&self) -> LogReader {
-        LogReader::new(&self.root)
+        LogReader::new(&self.root, self.segment_mapping.clone())
     }
 
     pub async fn append_batch(
         &self,
         payloads: Vec<Message>,
-        durability: Option<Durability>,
+        durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
         let (tx, rx) = oneshot::channel();
         let req = crate::writer::AppendReq {

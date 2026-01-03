@@ -180,7 +180,7 @@ async fn wal_high_contention_storm() {
                     payload: format!("p{p}-{i}").into_bytes(),
                 });
             }
-            k.append_batch(batch, Some(Durability::AfterFsync))
+            k.append_batch(batch, Some(KDurability::AfterFsync))
                 .await
                 .unwrap();
         }));

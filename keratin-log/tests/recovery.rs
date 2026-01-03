@@ -144,7 +144,7 @@ async fn wal_durability_fence() {
                 payload: format!("a-{i}").into_bytes(),
             });
         }
-        k.append_batch(a, Some(Durability::AfterWrite))
+        k.append_batch(a, Some(KDurability::AfterWrite))
             .await
             .unwrap();
 
@@ -157,7 +157,7 @@ async fn wal_durability_fence() {
                 payload: format!("b-{i}").into_bytes(),
             });
         }
-        k.append_batch(b, Some(Durability::AfterFsync))
+        k.append_batch(b, Some(KDurability::AfterFsync))
             .await
             .unwrap();
 
@@ -170,7 +170,7 @@ async fn wal_durability_fence() {
                 payload: format!("c-{i}").into_bytes(),
             });
         }
-        k.append_batch(c, Some(Durability::AfterWrite))
+        k.append_batch(c, Some(KDurability::AfterWrite))
             .await
             .unwrap();
     } // crash immediately

@@ -8,22 +8,13 @@ use std::{
 };
 
 use dashmap::DashMap;
-use keratin_log::{Durability as KDurability, Keratin, KeratinConfig, Message as KMessage};
+use keratin_log::{KDurability as KDurability, Keratin, KeratinConfig, Message as KMessage};
 
 use crate::{
+    Result, StromaError,
     event::StromaEvent,
     state::{GroupState, Offset, UnixMillis},
 };
-
-#[derive(thiserror::Error, Debug)]
-pub enum StromaError {
-    #[error("io: {0}")]
-    Io(String),
-    #[error("decode: {0}")]
-    Decode(String),
-}
-
-type Result<T> = std::result::Result<T, StromaError>;
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
     StromaError::Io(e.to_string())
@@ -42,7 +33,7 @@ fn event_msg(ev: &StromaEvent) -> Result<KMessage> {
     })
 }
 
-#[derive(Clone, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
 struct Key {
     tp: String,
     part: u32,
@@ -63,13 +54,17 @@ impl Default for SnapshotConfig {
     }
 }
 
+#[derive(Debug)]
 pub struct Stroma {
     root: PathBuf,
     keratin_cfg: KeratinConfig,
     snap_cfg: SnapshotConfig,
 
-    // One Keratin per (tp,part)
-    logs: DashMap<(String, u32), Arc<Keratin>>,
+    // One Keratin per (tp,part) for message payloads.
+    msg_logs_by_tp_part: DashMap<(String, u32), Arc<Keratin>>,
+
+    // One Keratin per (tp,part), events log
+    logs_by_tp_part: DashMap<(String, u32), Arc<Keratin>>,
 
     // Materialized group state
     groups: DashMap<Key, GroupState>,
@@ -79,6 +74,7 @@ pub struct Stroma {
 }
 
 impl Stroma {
+
     pub async fn open(
         root: impl AsRef<Path>,
         keratin_cfg: KeratinConfig,
@@ -86,6 +82,7 @@ impl Stroma {
     ) -> Result<Self> {
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("events")).map_err(io_err)?;
+        fs::create_dir_all(root.join("messages")).map_err(io_err)?;
         fs::create_dir_all(root.join("snapshots")).map_err(io_err)?;
         fs::create_dir_all(root.join("tmp")).map_err(io_err)?;
 
@@ -93,7 +90,8 @@ impl Stroma {
             root,
             keratin_cfg,
             snap_cfg,
-            logs: DashMap::new(),
+            msg_logs_by_tp_part: DashMap::new(),
+            logs_by_tp_part: DashMap::new(),
             groups: DashMap::new(),
             applied_upto: DashMap::new(),
         };
@@ -105,6 +103,14 @@ impl Stroma {
     }
 
     // ---------------- Paths / naming ----------------
+
+    pub fn root(&self) -> PathBuf {
+        self.root.clone()
+    }
+
+    fn messages_root(&self) -> PathBuf {
+        self.root.join("messages")
+    }
 
     fn events_root(&self) -> PathBuf {
         self.root.join("events")
@@ -127,6 +133,12 @@ impl Stroma {
             }
         }
         out
+    }
+
+    fn msg_tp_part_dir(&self, tp: &str, part: u32) -> PathBuf {
+        self.messages_root()
+            .join(Self::enc_component(tp))
+            .join(format!("{:010}", part))
     }
 
     fn tp_part_dir(&self, tp: &str, part: u32) -> PathBuf {
@@ -160,7 +172,7 @@ impl Stroma {
     async fn log(&self, tp: &str, part: u32) -> Result<Arc<Keratin>> {
         let key = (tp.to_string(), part);
 
-        if let Some(v) = self.logs.get(&key) {
+        if let Some(v) = self.logs_by_tp_part.get(&key) {
             return Ok(v.value().clone());
         }
 
@@ -170,11 +182,28 @@ impl Stroma {
         let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
         let k = Arc::new(k);
 
-        self.logs.insert(key.clone(), k.clone());
+        self.logs_by_tp_part.insert(key.clone(), k.clone());
         self.applied_upto
             .entry(key)
             .or_insert_with(|| AtomicU64::new(0));
 
+        Ok(k)
+    }
+
+    async fn msg_log(&self, tp: &str, part: u32) -> Result<Arc<Keratin>> {
+        let key = (tp.to_string(), part);
+
+        if let Some(v) = self.msg_logs_by_tp_part.get(&key) {
+            return Ok(v.value().clone());
+        }
+
+        let dir = self.msg_tp_part_dir(tp, part);
+        fs::create_dir_all(&dir).map_err(io_err)?;
+
+        let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
+        let k = Arc::new(k);
+
+        self.msg_logs_by_tp_part.insert(key, k.clone());
         Ok(k)
     }
 
@@ -607,7 +636,9 @@ impl Stroma {
                     continue;
                 }
                 let part_str = part_ent.file_name().to_string_lossy().to_string();
-                let part = part_str.parse::<u32>().unwrap_or(0); // directory name is our own format
+                let part = part_str
+                    .parse::<u32>()
+                    .map_err(|_| StromaError::Decode(format!("bad partition dir: {part_str}")))?; // directory name is our own format
                 partitions.push((tp_dirname.clone(), part));
             }
         }
@@ -662,7 +693,7 @@ impl Stroma {
 
                 // Ensure the Keratin instance is registered under the real topic string.
                 let tp = ev.tp().to_string();
-                self.logs
+                self.logs_by_tp_part
                     .entry((tp.clone(), part))
                     .or_insert_with(|| k.clone());
 
@@ -708,7 +739,151 @@ impl Stroma {
     // Until then, snapshots give fast startup even if the event log grows.
 }
 
-// TODO: add flags to avoid in release builds or such? with default
+impl Stroma {
+    /// Append a batch of message payloads and return assigned offsets (like Rocks).
+    pub async fn append_messages_batch(
+        &self,
+        tp: &str,
+        part: u32,
+        payloads: &[Vec<u8>],
+    ) -> Result<Vec<Offset>> {
+        if payloads.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        let log = self.msg_log(tp, part).await?;
+        let mut msgs = Vec::with_capacity(payloads.len());
+        for p in payloads {
+            msgs.push(KMessage {
+                flags: 0,
+                headers: vec![],
+                payload: p.clone(),
+            });
+        }
+
+        let ar = log
+            .append_batch(msgs, None)
+            .await
+            .map_err(io_err)?;
+
+        let mut out = Vec::with_capacity(ar.count as usize);
+        let mut o = ar.base_offset;
+        for _ in 0..ar.count {
+            out.push(o);
+            o += 1;
+        }
+        Ok(out)
+    }
+
+    pub async fn append_message(&self, tp: &str, part: u32, payload: &[u8]) -> Result<Offset> {
+        let v = self
+            .append_messages_batch(tp, part, &[payload.to_vec()])
+            .await?;
+        Ok(v[0])
+    }
+
+    pub async fn fetch_message_by_offset(
+        &self,
+        tp: &str,
+        part: u32,
+        off: Offset,
+    ) -> Result<Option<Vec<u8>>> {
+        let log = self.msg_log(tp, part).await?;
+        let reader = log.reader();
+        let rec = reader.fetch(off).map_err(io_err)?;
+        Ok(rec.map(|r| r.payload))
+    }
+
+    pub async fn scan_messages_from(
+        &self,
+        tp: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+    ) -> Result<Vec<(Offset, Vec<u8>)>> {
+        let log = self.msg_logs_by_tp_part.get(&(tp.to_string(), part)).ok_or(StromaError::NotFound)?;
+        let reader = log.reader();
+        let got = reader.scan_from(from, max).map_err(io_err)?;
+        Ok(got.into_iter().map(|r| (r.offset, r.payload)).collect())
+    }
+
+    pub async fn current_next_offset(&self, tp: &str, part: u32) -> Result<Offset> {
+        let log = self.msg_log(tp, part).await?;
+        Ok(log.next_offset())
+    }
+
+    /// Optional (used by cleanup_topic): truncate message log.
+    pub async fn truncate_messages_before(
+        &self,
+        tp: &str,
+        part: u32,
+        before: Offset,
+    ) -> Result<u64> {
+        let log = self.msg_log(tp, part).await?;
+        log.truncate_before(before).await.map_err(io_err)
+    }
+
+    pub async fn cleanup_topic_partition(&self, tp: &str, part: u32) -> Result<()> {
+        let cutoff = self.safe_truncate_before(tp, part);
+        if cutoff == 0 {
+            return Ok(());
+        }
+
+        self.snapshot_partition(tp, part).await?;
+        self.truncate_partition_log(tp, part, cutoff).await?;
+        Ok(())
+    }
+
+    /// Only offsets < min(acked_until of every group) are globally deletable.
+    fn safe_truncate_before(&self, tp: &str, part: u32) -> Offset {
+        self.groups
+            .iter()
+            .filter(|g| g.key().tp == tp && g.key().part == part)
+            .map(|g| g.value().acked_until())
+            .min()
+            .unwrap_or(0)
+    }
+
+    pub fn list_groups(&self) -> Vec<(String, u32, String)> {
+        self.groups
+            .iter()
+            .map(|e| (e.key().tp.clone(), e.key().part, e.key().group.clone()))
+            .collect()
+    }
+
+    pub fn is_acked(&self, tp: &str, part: u32, group: &str, off: Offset) -> Result<bool> {
+        let k = Key {
+            tp: tp.into(),
+            part,
+            group: group.into(),
+        };
+        Ok(self
+            .groups
+            .get(&k)
+            .map(|g| g.is_acked(off))
+            .unwrap_or(false))
+    }
+
+    pub fn count_inflight(&self, tp: &str, part: u32, group: &str) -> Result<usize> {
+        let k = Key {
+            tp: tp.into(),
+            part,
+            group: group.into(),
+        };
+        Ok(self.groups.get(&k).map(|g| g.inflight_len()).unwrap_or(0))
+    }
+
+    pub fn list_topics(&self) -> Vec<String> {
+        self.groups
+            .iter()
+            .map(|g| g.key().tp.clone())
+            .collect::<std::collections::HashSet<_>>()
+            .into_iter()
+            .collect()
+    }
+}
+
+// TODO: add flags to avoid in release builds or such? with default (Currently used by tests)
 impl Stroma {
     pub async fn mark_inflight_one(
         &self,

@@ -10,7 +10,7 @@ fn main() {
         max_batch_bytes: 512 * 1024,
         max_batch_records: 1024,
         batch_linger_ms: 1,
-        default_durability: Durability::AfterFsync,
+        default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 1,
         flush_target_bytes: 16 * 1024 * 1024,
     };

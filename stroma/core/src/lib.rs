@@ -1,13 +1,12 @@
 mod event;
 mod state;
-mod store;
 mod stroma;
 
-use async_trait::async_trait;
+use keratin_log::KDurability;
 use thiserror::Error;
 
 pub use stroma::{SnapshotConfig, Stroma};
-
+pub use keratin_log::KeratinConfig;
 pub use state::GroupState;
 
 pub type Offset = u64;
@@ -46,6 +45,16 @@ pub enum Durability {
     AfterReplicated, // for later; can map to AfterFsync initially
 }
 
+impl From<Durability> for KDurability {
+    fn from(value: Durability) -> Self {
+        match value {
+            Durability::AfterWrite => KDurability::AfterWrite,
+            Durability::AfterFsync => KDurability::AfterFsync,
+            Durability::AfterReplicated => KDurability::AfterFsync,
+        }
+    }
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     pub base_offset: Offset,
@@ -54,6 +63,9 @@ pub struct AppendResult {
 
 #[derive(Debug, Error)]
 pub enum StromaError {
+    #[error("decode: {0}")]
+    Decode(String),
+
     #[error("io: {0}")]
     Io(String),
 

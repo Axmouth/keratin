@@ -1,8 +1,15 @@
+use std::collections::BTreeMap;
 use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
+use std::time::Instant;
 
-use crate::record::{DecodedRecord, decode_record_prefix};
+use parking_lot::RwLock;
+
+use crate::record::{
+    ByteRemainder, DecodedRecord, RECORD_HEADER_LEN, decode_header_prefix, decode_record_prefix,
+};
 
 #[derive(Debug, Clone)]
 pub struct OwnedRecord {
@@ -15,12 +22,17 @@ pub struct OwnedRecord {
 
 pub struct LogReader {
     root: PathBuf,
+    segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
 }
 
 impl LogReader {
-    pub fn new(root: impl AsRef<Path>) -> Self {
+    pub fn new(
+        root: impl AsRef<Path>,
+        segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+    ) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
+            segment_mapping,
         }
     }
 
@@ -40,41 +52,34 @@ impl LogReader {
     }
 
     pub fn scan_from(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
-        let mut out = Vec::new();
+        let mut out = Vec::with_capacity(max);
         let mut cur = from;
 
+        let mut i = 0;
         while out.len() < max {
+            i += 1;
+            // dbg!(i);
+            // let now = std::time::Instant::now();
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
                 None => break,
             };
 
             let mut log = self.open_log(base)?;
-            let mut pos = self.seek_near(base, cur)?;
+            let pos = self.seek_near(base, cur)?;
 
-            loop {
-                if out.len() >= max {
-                    break;
-                }
+            let before_cur = cur;
+            let before_len = out.len();
 
-                match self.scan_forward(&mut log, pos, None)? {
-                    Some((r, next_pos)) => {
-                        // Enforce monotonic offsets from requested `cur`
-                        if r.offset < cur {
-                            // This indicates stale/incorrect index seek position. Skip it.
-                            // (In practice, seek_near finds <= target, so we may read earlier offsets.)
-                            pos = next_pos;
-                            continue;
-                        }
+            self.scan_forward_exact(&mut log, pos, &mut cur, None, &mut out, max)?;
 
-                        cur = r.offset + 1; // logical next offset
-                        pos = next_pos; // next byte position in this file
-                        out.push(r);
-                    }
-                    None => {
-                        // No forward progress possible → EOF
-                        return Ok(out);
-                    }
+            if cur == before_cur && out.len() == before_len {
+                if let Some(next) = self.next_segment_base(base) {
+                    // next segment offsets start at `next`
+                    cur = cur.max(next);
+                    continue;
+                } else {
+                    break; // no more segments
                 }
             }
         }
@@ -135,14 +140,90 @@ impl LogReader {
         Ok(best_pos)
     }
 
+    fn scan_forward_exact(
+        &self,
+        file: &mut std::fs::File,
+        start_pos: u64,
+        cur: &mut u64,
+        want: Option<u64>,
+        out: &mut Vec<OwnedRecord>,
+        max: usize,
+    ) -> io::Result<()> {
+        const SLAB: usize = 4096; // SSD page aligned
+
+        let mut buf = vec![0u8; SLAB];
+        let mut window: Vec<u8> = Vec::with_capacity(SLAB * 2);
+        let mut file_pos = start_pos;
+
+        file.seek(SeekFrom::Start(start_pos))?;
+
+        while out.len() < max {
+            // Ensure we have enough data to attempt a decode
+            if window.len() < RECORD_HEADER_LEN {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    return Ok(()); // EOF
+                }
+                window.extend_from_slice(&buf[..n]);
+                continue;
+            }
+
+            match decode_record_prefix(&window) {
+                Ok((rec, used)) => {
+                    let rec_start = file_pos;
+                    let next_pos = rec_start + used as u64;
+
+                    // Enforce monotonic offsets
+                    if rec.offset < *cur {
+                        window.drain(..used);
+                        file_pos = next_pos;
+                        continue;
+                    }
+
+                    *cur = rec.offset + 1;
+
+                    if want.map(|o| rec.offset == o).unwrap_or(true) {
+                        out.push(to_owned(rec));
+                        if out.len() >= max {
+                            return Ok(());
+                        }
+                    }
+
+                    window.drain(..used);
+                    file_pos = next_pos;
+                }
+
+                Err(crate::record::RecordError::Truncated) => {
+                    // Need more bytes
+                    let n = file.read(&mut buf)?;
+                    if n == 0 {
+                        return Ok(()); // EOF in middle of record
+                    }
+                    window.extend_from_slice(&buf[..n]);
+                }
+
+                Err(e) => {
+                    // Corruption: resync by shifting one byte forward
+                    tracing::error!("{:#?}", e);
+                    window.drain(..1);
+                    file_pos += 1;
+                }
+            }
+        }
+
+        Ok(())
+    }
+
     fn scan_forward(
         &self,
         log: &mut std::fs::File,
         start_pos: u64,
         want: Option<u64>,
     ) -> io::Result<Option<(OwnedRecord, u64)>> {
-        let mut buf = vec![0u8; 64 * 1024];
-        let mut window: Vec<u8> = Vec::new();
+        // TODO: Match storage unit for most ssds?
+        let mut buf = vec![0u8; 2 * 1024];
+        let mut window: Vec<u8> = Vec::with_capacity(2 * 1024);
+        // TODO: Read header only and use to optimize read exact length? Consume
 
         // Where we are in the file (byte position) at the start of `window`
         let mut file_pos = start_pos;
@@ -192,19 +273,33 @@ impl LogReader {
         }
     }
 
+    fn next_segment_base(&self, base: u64) -> Option<u64> {
+        self.segment_mapping
+            .read()
+            .range((base + 1)..)
+            .next()
+            .map(|(k, _)| *k)
+    }
+
     fn find_segment_base(&self, offset: u64) -> io::Result<Option<u64>> {
-        let mut bases = Vec::new();
-        for e in std::fs::read_dir(self.root.join("segments"))? {
-            let e = e?;
-            if let Some(s) = e.file_name().to_str()
-                && let Some(stem) = s.strip_suffix(".log")
-                && let Ok(b) = stem.parse::<u64>()
-            {
-                bases.push(b);
-            }
-        }
-        bases.sort_unstable();
-        Ok(bases.into_iter().rfind(|b| *b <= offset))
+        // let mut bases = Vec::new();
+        // for e in std::fs::read_dir(self.root.join("segments"))? {
+        //     let e = e?;
+        //     if let Some(s) = e.file_name().to_str()
+        //         && let Some(stem) = s.strip_suffix(".log")
+        //         && let Ok(b) = stem.parse::<u64>()
+        //     {
+        //         bases.push(b);
+        //     }
+        // }
+        // bases.sort_unstable();
+        // Ok(bases.into_iter().rfind(|b| *b <= offset))
+        Ok(self
+            .segment_mapping
+            .read()
+            .keys()
+            .copied()
+            .rfind(|b| *b <= offset))
     }
 }
 

@@ -1,5 +1,5 @@
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
-pub enum Durability {
+pub enum KDurability {
     AfterWrite,
     AfterFsync,
     AfterReplicated, // reserved

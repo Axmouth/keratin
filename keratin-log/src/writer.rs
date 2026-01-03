@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, Sender};
 use tokio::sync::oneshot;
 
-use crate::durability::Durability;
+use crate::durability::KDurability;
 use crate::keratin::WriterCmd;
 use crate::log::{AppendResult, Log, LogState};
 use crate::record::Message;
@@ -35,7 +35,7 @@ impl From<io::Error> for IoError {
 
 pub struct AppendReq {
     pub records: Vec<Message>,
-    pub durability: Option<Durability>,
+    pub durability: Option<KDurability>,
     pub respond_to: oneshot::Sender<Result<AppendResult, IoError>>,
 }
 
@@ -45,7 +45,7 @@ pub struct WriterHandle {
 
 struct PendingAck {
     end_offset: u64, // inclusive
-    durability: Durability,
+    durability: KDurability,
     respond_to: oneshot::Sender<Result<AppendResult, IoError>>,
     result: AppendResult,
 }
@@ -54,7 +54,7 @@ struct PendingAck {
 fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
     pending
         .iter()
-        .any(|p| p.durability >= Durability::AfterFsync)
+        .any(|p| p.durability >= KDurability::AfterFsync)
 }
 
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
@@ -191,7 +191,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
             match log.stage_append_batch(&r.records, now) {
                 Ok((ar, end_offset)) => {
                     state.tail.store(end_offset + 1, Ordering::Release);
-                    if dur == Durability::AfterWrite {
+                    if dur == KDurability::AfterWrite {
                         let _ = r.respond_to.send(Ok(ar));
                     } else {
                         pending.push_back(PendingAck {
