@@ -6,7 +6,7 @@ use keratin_log::KDurability;
 use thiserror::Error;
 
 pub use stroma::{SnapshotConfig, Stroma};
-pub use keratin_log::KeratinConfig;
+pub use keratin_log::{AppendReceipt, AppendResult, KeratinConfig};
 pub use state::GroupState;
 
 pub type Offset = u64;
@@ -53,12 +53,6 @@ impl From<Durability> for KDurability {
             Durability::AfterReplicated => KDurability::AfterFsync,
         }
     }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct AppendResult {
-    pub base_offset: Offset,
-    pub count: u32,
 }
 
 #[derive(Debug, Error)]

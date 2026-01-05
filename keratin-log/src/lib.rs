@@ -63,3 +63,13 @@ impl From<std::io::Error> for KeratinError {
         }
     }
 }
+
+pub struct AppendReceipt {
+    pub result_rx: tokio::sync::oneshot::Receiver<Result<AppendResult, writer::IoError>>,
+}
+
+impl AppendReceipt {
+    pub async fn wait(self) -> Result<AppendResult, writer::IoError> {
+        self.result_rx.await.unwrap_or_else(|_| Err(writer::IoError::new("writer dropped")))
+    }
+}

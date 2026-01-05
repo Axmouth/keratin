@@ -81,6 +81,7 @@ pub struct IoStats {
     pub manifest: Duration,
     pub batches: u64,
     pub records: u64,
+    pub bytes: u64,
 }
 
 impl IoStats {
@@ -93,6 +94,7 @@ impl IoStats {
             manifest: Duration::ZERO,
             batches: 0u64,
             records: 0u64,
+            bytes: 0u64,
         }
     }
 }
@@ -294,8 +296,8 @@ impl Log {
         }
 
         self.stats.encode += t_encode.elapsed();
+        self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
         self.stats.records += payloads.len() as u64;
-        self.stats.batches += 1;
 
         let end_offset = self.next_offset - 1;
         self.staged_end_offset = end_offset;
@@ -304,6 +306,84 @@ impl Log {
             AppendResult {
                 base_offset,
                 count: payloads.len() as u32,
+            },
+            end_offset,
+        ))
+    }
+    
+    pub fn stage_append(
+        &mut self,
+        payload: &Message,
+        now_ms: u64,
+    ) -> io::Result<(AppendResult, u64)> {
+
+        // Ensure we have capacity for large sequential writes
+        // Estimate worst-case record size; same as before
+        let estimated: usize = payload.bytes_len();
+
+        // If staging this would exceed segment capacity once flushed, roll.
+        // NOTE: active.bytes_written is on-disk bytes; we also have write_buf pending.
+        let pending_bytes = self.write_buf.len() as u64;
+        if self.active.bytes_written + pending_bytes + estimated as u64
+            > self.manifest.segment_max_bytes
+        {
+            self.roll(now_ms)?;
+        }
+
+        let base_offset = self.next_offset;
+
+        // Reserve to avoid realloc
+        self.write_buf.reserve(estimated);
+        // Index entries are sparse; reserve modestly
+        self.idx_buf
+            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+
+        let t_encode = Instant::now();
+
+            let offset = self.next_offset;
+
+            let r = Record {
+                flags: payload.flags,
+                timestamp_ms: now_ms,
+                offset,
+                headers: &payload.headers,
+                payload: &payload.payload,
+            };
+
+            // record starts at: on-disk bytes + pending bytes + current buffer len
+            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
+
+            encode_record(&mut self.write_buf, &r)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+            // Maybe emit an idx entry (encode into idx_buf, not to file)
+            if (record_start_pos - self.last_index_at_log_pos)
+                >= self.manifest.index_stride_bytes as u64
+            {
+                let rel = (offset - self.active.base_offset) as u32;
+
+                // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
+                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
+                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
+                self.idx_buf
+                    .extend_from_slice(&record_start_pos.to_be_bytes());
+
+                self.last_index_at_log_pos = record_start_pos;
+            }
+
+            self.next_offset += 1;
+
+        self.stats.encode += t_encode.elapsed();
+        self.stats.bytes += payload.bytes_len() as u64;
+        self.stats.records += 1;
+
+        let end_offset = self.next_offset - 1;
+        self.staged_end_offset = end_offset;
+
+        Ok((
+            AppendResult {
+                base_offset,
+                count: 1,
             },
             end_offset,
         ))
@@ -329,7 +409,7 @@ impl Log {
         // periodic stat print (keep it here so it measures real IO)
         if self.last_stats_dump.elapsed() > Duration::from_secs(1) {
             println!(
-                "KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms",
+                "KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms bytes={} kbytes/batch={} rec/batch={}",
                 self.stats.batches,
                 self.stats.records,
                 self.stats.encode.as_millis(),
@@ -337,6 +417,9 @@ impl Log {
                 self.stats.idx_write.as_millis(),
                 self.stats.fsync.as_millis(),
                 self.stats.manifest.as_millis(),
+                self.stats.bytes,
+                (self.stats.bytes / 1024) / (self.stats.batches.max(1)),
+                self.stats.records / self.stats.batches.max(1)
             );
             self.stats = IoStats::default();
             self.last_stats_dump = Instant::now();
@@ -487,13 +570,21 @@ impl Log {
             self.segment_mapping.write().remove(base);
 
             match fs::remove_file(&ip) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    tracing::info!("{} removed", ip.display())
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    tracing::warn!("{} not found during truncating", ip.display());
+                }
                 Err(e) => return Err(e),
             }
             match fs::remove_file(&lp) {
-                Ok(_) => {}
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {}
+                Ok(_) => {
+                    tracing::info!("{} removed", lp.display())
+                }
+                Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                    tracing::warn!("{} not found during truncating", lp.display());
+                }
                 Err(e) => return Err(e),
             }
         }

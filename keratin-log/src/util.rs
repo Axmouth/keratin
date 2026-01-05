@@ -4,6 +4,7 @@ use std::{
 };
 
 use anyhow::Context;
+use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Milliseconds since UNIX epoch
 pub type UnixMillis = u64;
@@ -79,4 +80,19 @@ pub fn all_segments(root: impl AsRef<Path>) -> Vec<PathBuf> {
         .into_iter()
         .map(|b| seg_dir.join(format!("{:020}.log", b)))
         .collect()
+}
+
+pub fn init_tracing() {
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+
+    tracing_subscriber::registry()
+        .with(filter)
+        .with(
+            tracing_subscriber::fmt::layer()
+                .with_target(true)
+                .with_thread_ids(true)
+                .with_line_number(true)
+                .with_file(true),
+        )
+        .init();
 }

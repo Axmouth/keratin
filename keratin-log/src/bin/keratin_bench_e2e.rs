@@ -51,7 +51,7 @@ async fn main() {
         index_stride_bytes: 64 * 1024,
         max_batch_bytes: 4 * 1024 * 1024,
         max_batch_records: 2048,
-        batch_linger_ms: 2,
+        batch_linger_ms: 5,
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 2,
         flush_target_bytes: 32 * 1024 * 1024,

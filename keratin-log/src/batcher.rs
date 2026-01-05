@@ -37,6 +37,14 @@ pub enum Deadline {
     In(Duration),  // due in ...
 }
 
+impl<T, W> BatcherCore<T, W>
+where
+    W: FnMut(&T) -> (usize, usize),
+{
+    pub fn set_linger(&mut self, linger: Duration) {
+        self.cfg.linger = linger;
+    }
+}
 
 /// Deterministic batching state machine.
 ///
@@ -79,6 +87,18 @@ where
 
     pub fn is_empty(&self) -> bool {
         self.items.is_empty()
+    }
+
+    pub fn len(&self) -> usize {
+        self.items.len()
+    }
+
+    pub fn total_bytes(&self) -> usize {
+        self.total_bytes
+    }
+
+    pub fn total_records(&self) -> usize {
+        self.total_records
     }
 
     pub fn time_until_deadline(&self, now: Instant) -> Option<Duration> {
