@@ -17,9 +17,9 @@ fn main() {
         max_batch_bytes: 8 * 1024 * 1024,
         max_batch_records: 8192,
         batch_linger_ms: 25,
-        default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 25,
         flush_target_bytes: 32 * 1024 * 1024,
+        default_durability: KDurability::AfterFsync,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
@@ -44,8 +44,9 @@ fn main() {
                             headers: vec![],
                             payload: vec![0u8; 1024],
                         };
-                        let r = k.append_enqueue(msg, None).unwrap();
-                        receipts.push(r);
+                        let (completion, rx) = KeratinAppendCompletion::pair();
+                        k.append_enqueue(msg, None, completion).unwrap();
+                        receipts.push(rx);
                         total.fetch_add(1, Ordering::SeqCst);
                     }
                     // let target = i * cfg.segment_max_bytes / 1024;
@@ -63,8 +64,8 @@ fn main() {
             receipts.append(&mut receipts_partial);
         }
 
-        for r in receipts {
-            r.wait().await.unwrap();
+        for rx in receipts {
+            rx.await.unwrap().unwrap();
         }
 
         let secs = start.elapsed().as_secs_f64();

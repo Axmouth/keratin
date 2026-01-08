@@ -164,9 +164,26 @@ impl Manifest {
         if finalp.exists() {
             let _ = fs::remove_file(&finalp);
         }
+
         fs::rename(&tmp, &finalp)?;
+
+        fsync_dir(root)?;
+
         Ok(())
     }
+}
+
+#[cfg(unix)]
+fn fsync_dir(path: &Path) -> io::Result<()> {
+    use std::fs::File;
+    let dir = File::open(path)?;
+    dir.sync_all()
+}
+
+#[cfg(windows)]
+fn fsync_dir(_path: &Path) -> io::Result<()> {
+    // Windows rename() is already metadata-durable.
+    Ok(())
 }
 
 #[test]

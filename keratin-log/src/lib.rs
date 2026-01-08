@@ -18,6 +18,7 @@ pub use keratin::Keratin;
 pub use log::AppendResult;
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
+pub use writer::IoError;
 
 #[derive(Debug)]
 pub enum KeratinError {
@@ -64,12 +65,39 @@ impl From<std::io::Error> for KeratinError {
     }
 }
 
-pub struct AppendReceipt {
-    pub result_rx: tokio::sync::oneshot::Receiver<Result<AppendResult, writer::IoError>>,
+pub struct KeratinAppendCompletion {
+    pub result_tx: tokio::sync::oneshot::Sender<Result<AppendResult, writer::IoError>>,
 }
 
-impl AppendReceipt {
-    pub async fn wait(self) -> Result<AppendResult, writer::IoError> {
-        self.result_rx.await.unwrap_or_else(|_| Err(writer::IoError::new("writer dropped")))
+
+pub trait AppendCompletion<E>: Send + 'static
+where
+    E: std::error::Error + Send + Sync + 'static,
+{
+    fn complete(self: Box<Self>, res: Result<AppendResult, E>);
+}
+
+pub trait CompletionPair<E, > {
+    type Receiver;
+
+    fn pair() -> (Box<dyn AppendCompletion<E>>, Self::Receiver);
+}
+
+
+impl AppendCompletion<writer::IoError> for KeratinAppendCompletion {
+    fn complete(self: Box<Self>, res: Result<AppendResult, writer::IoError>) {
+        let _ = self.result_tx.send(res);
+    }
+}
+
+impl CompletionPair<writer::IoError> for KeratinAppendCompletion {
+    type Receiver = tokio::sync::oneshot::Receiver<Result<AppendResult, writer::IoError>>;
+
+    fn pair() -> (Box<dyn AppendCompletion<writer::IoError>>, Self::Receiver) {
+        let (result_tx, rx) = tokio::sync::oneshot::channel();
+        (
+            Box::new(KeratinAppendCompletion { result_tx }),
+            rx,
+        )
     }
 }

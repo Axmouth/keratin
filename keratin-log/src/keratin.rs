@@ -10,7 +10,7 @@ use crate::log::{AppendResult, Log, LogState};
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::writer::{AppendPayload, AppendReq, IoError, WriterHandle};
-use crate::{AppendReceipt, KDurability, KeratinConfig};
+use crate::{AppendCompletion, CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig};
 
 #[derive(Debug)]
 pub struct Keratin {
@@ -71,18 +71,17 @@ impl Keratin {
         &self,
         payload: Message,
         durability: Option<KDurability>,
-    ) -> Result<AppendReceipt, IoError> {
-        let (tx, rx) = oneshot::channel();
-
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<(), IoError> {
         self.tx
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::One(payload),
                 durability,
-                respond_to: tx,
+                completion,
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
-        Ok(AppendReceipt { result_rx: rx })
+        Ok(())
     }
 
     pub async fn append(
@@ -90,11 +89,12 @@ impl Keratin {
         payload: Message,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
-        let (tx, rx) = oneshot::channel();
+        let (completion, rx) = KeratinAppendCompletion::pair();
+
         let req = crate::writer::AppendReq {
             records: AppendPayload::One(payload),
             durability,
-            respond_to: tx,
+            completion,
         };
         self.tx
             .send(WriterCmd::Append(req))
@@ -107,18 +107,17 @@ impl Keratin {
         &self,
         payloads: Vec<Message>,
         durability: Option<KDurability>,
-    ) -> Result<AppendReceipt, IoError> {
-        let (tx, rx) = oneshot::channel();
-
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<(), IoError> {
         self.tx
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::Many(payloads),
                 durability,
-                respond_to: tx,
+                completion,
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
-        Ok(AppendReceipt { result_rx: rx })
+        Ok(())
     }
 
     pub async fn append_batch(
@@ -126,11 +125,12 @@ impl Keratin {
         payloads: Vec<Message>,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
-        let (tx, rx) = oneshot::channel();
+        let (completion, rx) = KeratinAppendCompletion::pair();
+        
         let req = crate::writer::AppendReq {
             records: AppendPayload::Many(payloads),
             durability,
-            respond_to: tx,
+            completion,
         };
         self.tx
             .send(WriterCmd::Append(req))

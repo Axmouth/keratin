@@ -7,7 +7,7 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tokio::sync::oneshot;
 
-use crate::KeratinConfig;
+use crate::{AppendCompletion, KeratinConfig};
 use crate::batcher::{BatcherConfig, BatcherCore, Deadline, FlushReason, PushResult};
 use crate::durability::KDurability;
 use crate::keratin::WriterCmd;
@@ -26,6 +26,8 @@ impl IoError {
         }
     }
 }
+
+impl std::error::Error for IoError {}
 
 impl std::fmt::Display for IoError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
@@ -50,7 +52,7 @@ pub enum AppendPayload {
 pub struct AppendReq {
     pub records: AppendPayload,
     pub durability: Option<KDurability>,
-    pub respond_to: oneshot::Sender<Result<AppendResult, IoError>>,
+    pub completion: Box<dyn AppendCompletion<IoError>>,
 }
 
 impl AppendPayload {
@@ -76,7 +78,7 @@ pub struct WriterHandle {
 struct PendingAck {
     end_offset: u64, // inclusive
     durability: KDurability,
-    respond_to: oneshot::Sender<Result<AppendResult, IoError>>,
+    respond_to: Box<dyn AppendCompletion<IoError>>,
     result: AppendResult,
 }
 
@@ -235,7 +237,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                             linger_min,
                             linger_max,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             items = batcher.len(),
                             records = batcher.total_records(),
                             bytes = batcher.total_bytes(),
@@ -266,7 +268,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                             linger_min,
                             linger_max,
                         );
-                        tracing::info!(
+                        tracing::debug!(
                             items = batcher.len(),
                             records = batcher.total_records(),
                             bytes = batcher.total_bytes(),
@@ -315,36 +317,36 @@ fn stage_reqs(
                 Ok((ar, end_offset)) => {
                     state.tail.store(end_offset + 1, Ordering::Release);
                     if dur == KDurability::AfterWrite {
-                        let _ = r.respond_to.send(Ok(ar));
+                        r.completion.complete(Ok(ar));
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
                             durability: dur,
-                            respond_to: r.respond_to,
+                            respond_to: r.completion,
                             result: ar,
                         });
                     }
                 }
                 Err(e) => {
-                    let _ = r.respond_to.send(Err(e.into()));
+                    r.completion.complete(Err(e.into()));
                 }
             },
             AppendPayload::Many(messages) => match log.stage_append_batch(&messages, now_ms) {
                 Ok((ar, end_offset)) => {
                     state.tail.store(end_offset + 1, Ordering::Release);
                     if dur == KDurability::AfterWrite {
-                        let _ = r.respond_to.send(Ok(ar));
+                        r.completion.complete(Ok(ar));
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
                             durability: dur,
-                            respond_to: r.respond_to,
+                            respond_to: r.completion,
                             result: ar,
                         });
                     }
                 }
                 Err(e) => {
-                    let _ = r.respond_to.send(Err(e.into()));
+                    r.completion.complete(Err(e.into()));
                 }
             },
         }
@@ -430,7 +432,7 @@ fn shutdown_fail_unstaged(
 ) {
     let reqs = batcher.flush();
     for r in reqs {
-        let _ = r.respond_to.send(Err(IoError {
+        r.completion.complete(Err(IoError {
             msg: msg.to_string(),
         }));
     }
@@ -455,7 +457,7 @@ fn commit(
                 io::ErrorKind::InvalidData,
                 "pending ack to commit should exist",
             ))?;
-            let _ = p.respond_to.send(Ok(p.result));
+            p.respond_to.complete(Ok(p.result));
         } else {
             break;
         }
@@ -469,7 +471,7 @@ fn commit(
 fn fail_all_pending(pending: &mut VecDeque<PendingAck>, err_msg: impl AsRef<str>) {
     tracing::error!("{}", err_msg.as_ref());
     while let Some(p) = pending.pop_front() {
-        let _ = p.respond_to.send(Err(IoError {
+        p.respond_to.complete(Err(IoError {
             msg: err_msg.as_ref().to_string(),
         }));
     }

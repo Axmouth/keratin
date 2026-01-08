@@ -8,7 +8,7 @@ use std::{
 };
 
 use dashmap::DashMap;
-use keratin_log::{AppendReceipt, KDurability as KDurability, Keratin, KeratinConfig, Message as KMessage};
+use keratin_log::{AppendCompletion, IoError, KDurability as KDurability, Keratin, KeratinConfig, Message as KMessage};
 
 use crate::{
     Result, StromaError,
@@ -775,17 +775,17 @@ impl Stroma {
         Ok(out)
     }
 
-    pub async fn append_message(&self, tp: &str, part: u32, payload: &[u8]) -> Result<AppendReceipt> {
+    pub async fn append_message(&self, tp: &str, part: u32, payload: &[u8], completion: Box<dyn AppendCompletion<IoError>>) -> Result<()> {
         let log = self.msg_log(tp, part).await?;
-        let ar = log
+        log
             .append_enqueue(KMessage {
                 flags: 0,
                 headers: vec![],
                 payload: payload.to_vec(),
-            }, None)
+            }, None, completion)
             .map_err(io_err)?;
 
-        Ok(ar)
+        Ok(())
     }
 
     pub async fn fetch_message_by_offset(

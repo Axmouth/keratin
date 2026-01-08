@@ -5,9 +5,9 @@ mod stroma;
 use keratin_log::KDurability;
 use thiserror::Error;
 
-pub use stroma::{SnapshotConfig, Stroma};
-pub use keratin_log::{AppendReceipt, AppendResult, KeratinConfig};
+pub use keratin_log::{AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion, KeratinConfig};
 pub use state::GroupState;
+pub use stroma::{SnapshotConfig, Stroma};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
