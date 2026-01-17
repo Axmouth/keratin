@@ -32,9 +32,9 @@ struct Entry<T> {
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deadline {
-    None,          // no active batch
-    DueNow,        // deadline reached or overflow/impossible
-    In(Duration),  // due in ...
+    None,         // no active batch
+    DueNow,       // deadline reached or overflow/impossible
+    In(Duration), // due in ...
 }
 
 impl<T, W> BatcherCore<T, W>

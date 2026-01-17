@@ -7,6 +7,7 @@ use std::time::Instant;
 
 use parking_lot::RwLock;
 
+use crate::Message;
 use crate::record::{
     ByteRemainder, DecodedRecord, RECORD_HEADER_LEN, decode_header_prefix, decode_record_prefix,
 };
@@ -18,6 +19,16 @@ pub struct OwnedRecord {
     pub offset: u64,
     pub headers: Vec<u8>,
     pub payload: Vec<u8>,
+}
+
+impl OwnedRecord {
+    pub fn to_message(self) -> Message {
+        Message {
+            flags: self.flags,
+            headers: self.headers,
+            payload: self.payload,
+        }
+    }
 }
 
 pub struct LogReader {
@@ -55,11 +66,7 @@ impl LogReader {
         let mut out = Vec::with_capacity(max);
         let mut cur = from;
 
-        let mut i = 0;
         while out.len() < max {
-            i += 1;
-            // dbg!(i);
-            // let now = std::time::Instant::now();
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
                 None => break,

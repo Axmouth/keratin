@@ -65,10 +65,10 @@ impl From<std::io::Error> for KeratinError {
     }
 }
 
+#[derive(Debug)]
 pub struct KeratinAppendCompletion {
     pub result_tx: tokio::sync::oneshot::Sender<Result<AppendResult, writer::IoError>>,
 }
-
 
 pub trait AppendCompletion<E>: Send + 'static
 where
@@ -77,12 +77,11 @@ where
     fn complete(self: Box<Self>, res: Result<AppendResult, E>);
 }
 
-pub trait CompletionPair<E, > {
+pub trait CompletionPair<E> {
     type Receiver;
 
     fn pair() -> (Box<dyn AppendCompletion<E>>, Self::Receiver);
 }
-
 
 impl AppendCompletion<writer::IoError> for KeratinAppendCompletion {
     fn complete(self: Box<Self>, res: Result<AppendResult, writer::IoError>) {
@@ -95,9 +94,6 @@ impl CompletionPair<writer::IoError> for KeratinAppendCompletion {
 
     fn pair() -> (Box<dyn AppendCompletion<writer::IoError>>, Self::Receiver) {
         let (result_tx, rx) = tokio::sync::oneshot::channel();
-        (
-            Box::new(KeratinAppendCompletion { result_tx }),
-            rx,
-        )
+        (Box::new(KeratinAppendCompletion { result_tx }), rx)
     }
 }

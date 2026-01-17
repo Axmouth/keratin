@@ -130,25 +130,28 @@ impl Log {
 
             let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter([(0, seg_path)])));
 
-            return Ok((Self {
-                root,
-                last_index_at_log_pos: seg.bytes_written,
-                active: seg,
-                index: idx,
-                next_offset,
-                manifest,
-                write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                idx_buf: Vec::with_capacity(256 * 1024),
-                stats: IoStats::new(),
-                log_state,
-                last_stats_dump: Instant::now(),
-                manifest_flush_interval: Duration::from_millis(500),
-                last_manifest_flush: Instant::now(),
-                staged_end_offset: initial,
-                durable_offset: initial,
-                flush_target_bytes,
-                segment_mapping: segment_mapping.clone(),
-            }, segment_mapping));
+            return Ok((
+                Self {
+                    root,
+                    last_index_at_log_pos: seg.bytes_written,
+                    active: seg,
+                    index: idx,
+                    next_offset,
+                    manifest,
+                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
+                    idx_buf: Vec::with_capacity(256 * 1024),
+                    stats: IoStats::new(),
+                    log_state,
+                    last_stats_dump: Instant::now(),
+                    manifest_flush_interval: Duration::from_millis(500),
+                    last_manifest_flush: Instant::now(),
+                    staged_end_offset: initial,
+                    durable_offset: initial,
+                    flush_target_bytes,
+                    segment_mapping: segment_mapping.clone(),
+                },
+                segment_mapping,
+            ));
         }
 
         // Repair/scan all segments, compute true next_offset.
@@ -200,25 +203,28 @@ impl Log {
         let last_index_at_log_pos = active.bytes_written;
         let initial: u64 = next_offset.saturating_sub(1);
 
-        Ok((Self {
-            root,
-            manifest,
-            active,
-            index,
-            next_offset,
-            last_index_at_log_pos,
-            write_buf: Vec::with_capacity(16 * 1024 * 1024),
-            idx_buf: Vec::with_capacity(256 * 1024),
-            log_state,
-            stats: IoStats::new(),
-            last_stats_dump: Instant::now(),
-            manifest_flush_interval: Duration::from_millis(500),
-            last_manifest_flush: Instant::now(),
-            staged_end_offset: initial,
-            durable_offset: initial,
-            flush_target_bytes,
-            segment_mapping: segment_mapping.clone(),
-        }, segment_mapping))
+        Ok((
+            Self {
+                root,
+                manifest,
+                active,
+                index,
+                next_offset,
+                last_index_at_log_pos,
+                write_buf: Vec::with_capacity(16 * 1024 * 1024),
+                idx_buf: Vec::with_capacity(256 * 1024),
+                log_state,
+                stats: IoStats::new(),
+                last_stats_dump: Instant::now(),
+                manifest_flush_interval: Duration::from_millis(500),
+                last_manifest_flush: Instant::now(),
+                staged_end_offset: initial,
+                durable_offset: initial,
+                flush_target_bytes,
+                segment_mapping: segment_mapping.clone(),
+            },
+            segment_mapping,
+        ))
     }
 
     pub fn stage_append_batch(
@@ -310,13 +316,12 @@ impl Log {
             end_offset,
         ))
     }
-    
+
     pub fn stage_append(
         &mut self,
         payload: &Message,
         now_ms: u64,
     ) -> io::Result<(AppendResult, u64)> {
-
         // Ensure we have capacity for large sequential writes
         // Estimate worst-case record size; same as before
         let estimated: usize = payload.bytes_len();
@@ -340,38 +345,38 @@ impl Log {
 
         let t_encode = Instant::now();
 
-            let offset = self.next_offset;
+        let offset = self.next_offset;
 
-            let r = Record {
-                flags: payload.flags,
-                timestamp_ms: now_ms,
-                offset,
-                headers: &payload.headers,
-                payload: &payload.payload,
-            };
+        let r = Record {
+            flags: payload.flags,
+            timestamp_ms: now_ms,
+            offset,
+            headers: &payload.headers,
+            payload: &payload.payload,
+        };
 
-            // record starts at: on-disk bytes + pending bytes + current buffer len
-            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
+        // record starts at: on-disk bytes + pending bytes + current buffer len
+        let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
 
-            encode_record(&mut self.write_buf, &r)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+        encode_record(&mut self.write_buf, &r)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
-            // Maybe emit an idx entry (encode into idx_buf, not to file)
-            if (record_start_pos - self.last_index_at_log_pos)
-                >= self.manifest.index_stride_bytes as u64
-            {
-                let rel = (offset - self.active.base_offset) as u32;
+        // Maybe emit an idx entry (encode into idx_buf, not to file)
+        if (record_start_pos - self.last_index_at_log_pos)
+            >= self.manifest.index_stride_bytes as u64
+        {
+            let rel = (offset - self.active.base_offset) as u32;
 
-                // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
-                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-                self.idx_buf
-                    .extend_from_slice(&record_start_pos.to_be_bytes());
+            // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
+            self.idx_buf.extend_from_slice(&rel.to_be_bytes());
+            self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
+            self.idx_buf
+                .extend_from_slice(&record_start_pos.to_be_bytes());
 
-                self.last_index_at_log_pos = record_start_pos;
-            }
+            self.last_index_at_log_pos = record_start_pos;
+        }
 
-            self.next_offset += 1;
+        self.next_offset += 1;
 
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payload.bytes_len() as u64;
@@ -644,7 +649,11 @@ fn list_segment_bases(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
-fn create_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segment, Index, PathBuf)> {
+fn create_segment_pair(
+    root: &Path,
+    base: u64,
+    now_ms: u64,
+) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
 

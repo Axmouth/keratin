@@ -211,6 +211,8 @@ Important: `list_expired` should not scan the whole world anymore.
 
 ---
 
+TODO: Enqueue event?
+
 TODO: Page-aligned segment preallocation (Avoid growth stalls)
 
 TODO: Background compactor threads

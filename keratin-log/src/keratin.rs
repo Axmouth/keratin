@@ -10,7 +10,9 @@ use crate::log::{AppendResult, Log, LogState};
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::writer::{AppendPayload, AppendReq, IoError, WriterHandle};
-use crate::{AppendCompletion, CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig};
+use crate::{
+    AppendCompletion, CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig,
+};
 
 #[derive(Debug)]
 pub struct Keratin {
@@ -126,7 +128,7 @@ impl Keratin {
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
         let (completion, rx) = KeratinAppendCompletion::pair();
-        
+
         let req = crate::writer::AppendReq {
             records: AppendPayload::Many(payloads),
             durability,

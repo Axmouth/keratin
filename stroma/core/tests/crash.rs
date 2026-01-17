@@ -10,9 +10,9 @@ async fn truncated_delta_does_not_corrupt_state() {
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
     for i in 0..1000 {
-        st.mark_inflight_one("t", 0, "g", i, 1000).await.unwrap();
+        st.mark_inflight_one("t", 0, i, 1000).await.unwrap();
         if i % 4 == 0 {
-            st.ack_one("t", 0, "g", i).await.unwrap();
+            st.ack_one("t", 0, i).await.unwrap();
         }
     }
 

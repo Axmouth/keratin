@@ -8,12 +8,17 @@ use std::{
 };
 
 use dashmap::DashMap;
-use keratin_log::{AppendCompletion, IoError, KDurability as KDurability, Keratin, KeratinConfig, Message as KMessage};
+use keratin_log::{
+    AppendCompletion, CompletionPair, IoError, KDurability, Keratin, KeratinAppendCompletion,
+    KeratinConfig, Message,
+};
+use tokio::sync::RwLock;
 
 use crate::{
     Result, StromaError,
     event::StromaEvent,
-    state::{GroupState, Offset, UnixMillis},
+    sequencer::{PublishIntent, run_msg_sequencer},
+    state::{Offset, QueueState, UnixMillis},
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -24,9 +29,9 @@ fn decode_err(e: impl std::fmt::Display) -> StromaError {
     StromaError::Decode(e.to_string())
 }
 
-fn event_msg(ev: &StromaEvent) -> Result<KMessage> {
+pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     let payload = ev.encode().map_err(io_err)?;
-    Ok(KMessage {
+    Ok(Message {
         flags: 0,
         headers: vec![],
         payload,
@@ -34,10 +39,15 @@ fn event_msg(ev: &StromaEvent) -> Result<KMessage> {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Hash)]
-struct Key {
+pub(crate) struct Key {
     tp: String,
     part: u32,
-    group: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Hash)]
+pub struct KeyRef<'a> {
+    pub tp: &'a str,
+    pub part: u32,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -54,27 +64,56 @@ impl Default for SnapshotConfig {
     }
 }
 
+#[derive(Debug, Clone)]
+pub struct GlobalDLQ {
+    pub tp: String,
+    pub part: u32,
+}
+
+impl GlobalDLQ {
+    pub async fn new(tp: &str, part: u32) -> Result<Self> {
+        Ok(Self {
+            tp: tp.to_string(),
+            part,
+        })
+    }
+
+    // TODO: Helper to create DLQ message, with metadata about original message. (stabilize headers format first)
+
+    pub fn to_custom_dlq(&self) -> crate::state::CustomDLQ {
+        crate::state::CustomDLQ {
+            tp: self.tp.clone(),
+            part: self.part,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct Stroma {
-    root: PathBuf,
-    keratin_cfg: KeratinConfig,
-    snap_cfg: SnapshotConfig,
+    pub(crate) root: PathBuf,
+    pub(crate) keratin_cfg: KeratinConfig,
+    pub(crate) snap_cfg: SnapshotConfig,
 
     // One Keratin per (tp,part) for message payloads.
-    msg_logs_by_tp_part: DashMap<(String, u32), Arc<Keratin>>,
+    pub(crate) msg_logs_by_tp_part: Arc<DashMap<(Box<str>, u32), Arc<Keratin>>>,
 
     // One Keratin per (tp,part), events log
-    logs_by_tp_part: DashMap<(String, u32), Arc<Keratin>>,
+    pub(crate) logs_by_tp_part: Arc<DashMap<(Box<str>, u32), Arc<Keratin>>>,
 
-    // Materialized group state
-    groups: DashMap<Key, GroupState>,
+    pub(crate) msg_sequencers:
+        Arc<DashMap<(Box<str>, u32), tokio::sync::mpsc::Sender<PublishIntent>>>,
+
+    // Materialized queue state
+    pub(crate) queues: Arc<DashMap<(Box<str>, u32), QueueState>>,
+
+    // Global DLQ topic
+    pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
 
     // For each (tp,part): highest Keratin offset we have applied into memory
-    applied_upto: DashMap<(String, u32), AtomicU64>,
+    pub(crate) applied_upto: DashMap<(Box<str>, u32), AtomicU64>,
 }
 
 impl Stroma {
-
     pub async fn open(
         root: impl AsRef<Path>,
         keratin_cfg: KeratinConfig,
@@ -90,10 +129,12 @@ impl Stroma {
             root,
             keratin_cfg,
             snap_cfg,
-            msg_logs_by_tp_part: DashMap::new(),
-            logs_by_tp_part: DashMap::new(),
-            groups: DashMap::new(),
+            msg_logs_by_tp_part: Arc::new(DashMap::new()),
+            logs_by_tp_part: Arc::new(DashMap::new()),
+            msg_sequencers: Arc::new(DashMap::new()),
+            queues: Arc::new(DashMap::new()),
             applied_upto: DashMap::new(),
+            global_dlq: Arc::new(RwLock::new(None)),
         };
 
         // Recover from existing snapshot files + replay events.
@@ -153,26 +194,21 @@ impl Stroma {
             .join(format!("{:010}", part))
     }
 
-    fn snap_file(&self, tp: &str, part: u32, group: &str) -> PathBuf {
+    fn snap_file(&self, tp: &str, part: u32) -> PathBuf {
         self.snap_dir(tp, part)
-            .join(format!("{}.snap", Self::enc_component(group)))
+            .join(format!("{}.snap", Self::enc_component(tp)))
     }
 
-    fn snap_tmp_file(&self, tp: &str, part: u32, group: &str) -> PathBuf {
-        self.root.join("tmp").join(format!(
-            "{}_{}_{}.snap.new",
-            Self::enc_component(tp),
-            part,
-            Self::enc_component(group),
-        ))
+    fn snap_tmp_file(&self, tp: &str, part: u32) -> PathBuf {
+        self.root
+            .join("tmp")
+            .join(format!("{}_{}.snap.new", Self::enc_component(tp), part,))
     }
 
     // ---------------- Core accessors ----------------
 
     async fn log(&self, tp: &str, part: u32) -> Result<Arc<Keratin>> {
-        let key = (tp.to_string(), part);
-
-        if let Some(v) = self.logs_by_tp_part.get(&key) {
+        if let Some(v) = self.logs_by_tp_part.get(&(tp.into(), part)) {
             return Ok(v.value().clone());
         }
 
@@ -182,18 +218,16 @@ impl Stroma {
         let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
         let k = Arc::new(k);
 
-        self.logs_by_tp_part.insert(key.clone(), k.clone());
+        self.logs_by_tp_part.insert((tp.into(), part), k.clone());
         self.applied_upto
-            .entry(key)
+            .entry((tp.into(), part))
             .or_insert_with(|| AtomicU64::new(0));
 
         Ok(k)
     }
 
     async fn msg_log(&self, tp: &str, part: u32) -> Result<Arc<Keratin>> {
-        let key = (tp.to_string(), part);
-
-        if let Some(v) = self.msg_logs_by_tp_part.get(&key) {
+        if let Some(v) = self.msg_logs_by_tp_part.get(&(tp.into(), part)) {
             return Ok(v.value().clone());
         }
 
@@ -203,55 +237,91 @@ impl Stroma {
         let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
         let k = Arc::new(k);
 
-        self.msg_logs_by_tp_part.insert(key, k.clone());
+        self.msg_logs_by_tp_part
+            .insert((tp.into(), part), k.clone());
         Ok(k)
     }
 
-    fn group_entry(
+    async fn msg_sequencer(
         &self,
         tp: &str,
         part: u32,
-        group: &str,
-    ) -> dashmap::mapref::one::RefMut<'_, Key, GroupState> {
-        let key = Key {
-            tp: tp.into(),
-            part,
-            group: group.into(),
-        };
-        self.groups.entry(key).or_insert_with(GroupState::new)
+    ) -> Result<tokio::sync::mpsc::Sender<PublishIntent>> {
+        let _ = self.msg_log(tp, part).await?;
+        let _ = self.log(tp, part).await?;
+        let _ = self.queue_entry(tp, part);
+        if let Some(v) = self.msg_sequencers.get(&(tp.into(), part)) {
+            return Ok(v.value().clone());
+        }
+
+        let (tx, rx) = tokio::sync::mpsc::channel(1000);
+        let msg_log_map = self.msg_logs_by_tp_part.clone();
+        let event_log_map = self.logs_by_tp_part.clone();
+        let queue_state_map = self.queues.clone();
+
+        let tp_box: Box<str> = tp.into();
+        tokio::spawn(async move {
+            tracing::info!("queue task STARTED for {} {}", tp_box, part);
+            let res = run_msg_sequencer(
+                rx,
+                &tp_box,
+                part,
+                msg_log_map,
+                event_log_map,
+                queue_state_map,
+            )
+            .await;
+            tracing::error!("queue task EXITED for {} {}: {:?}", tp_box, part, res);
+        });
+
+        self.msg_sequencers.insert((tp.into(), part), tx.clone());
+        Ok(tx)
+    }
+
+    fn queue_entry(
+        &self,
+        tp: &str,
+        part: u32,
+    ) -> dashmap::mapref::one::RefMut<'_, (Box<str>, u32), QueueState> {
+        self.queues
+            .entry((tp.into(), part))
+            .or_insert_with(|| QueueState::new(tp.into(), part))
     }
 
     fn applied_upto_entry(
         &self,
         tp: &str,
         part: u32,
-    ) -> dashmap::mapref::one::RefMut<'_, (String, u32), AtomicU64> {
+    ) -> dashmap::mapref::one::RefMut<'_, (Box<str>, u32), AtomicU64> {
         self.applied_upto
-            .entry((tp.to_string(), part))
+            .entry((tp.into(), part))
             .or_insert_with(|| AtomicU64::new(0))
     }
 
     // ---------------- Event apply rules ----------------
 
-    fn apply_event_inmem(&self, ev: &StromaEvent) -> Result<()> {
+    async fn apply_event_inmem(&self, ev: &StromaEvent) -> Result<()> {
         match ev {
+            StromaEvent::Enqueue {
+                tp,
+                part,
+                off,
+                retries,
+            } => {
+                let mut gs = self.queue_entry(tp, *part);
+                gs.enqueue(*off, *retries);
+            }
             StromaEvent::MarkInflight {
                 tp,
                 part,
-                group,
                 off,
                 deadline,
             } => {
-                let mut gs = self.group_entry(tp, *part, group);
+                let mut gs = self.queue_entry(tp, *part);
                 gs.mark_inflight(*off, *deadline);
             }
-            StromaEvent::Ack {
-                tp,
-                part,
-                group,
-                off,
-            } => {
-                let mut gs = self.group_entry(tp, *part, group);
+            StromaEvent::Ack { tp, part, off } => {
+                let mut gs = self.queue_entry(tp, *part);
                 // ✅ Accept ACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate ACKs
@@ -259,22 +329,30 @@ impl Stroma {
                 // ACK is idempotent and safe.
                 gs.ack(*off);
             }
-            StromaEvent::ClearInflight {
+            StromaEvent::Nack {
                 tp,
                 part,
-                group,
                 off,
+                requeue,
             } => {
-                let mut gs = self.group_entry(tp, *part, group);
+                let mut gs = self.queue_entry(tp, *part);
+                // ✅ Accept NACK even if not inflight:
+                // - race with expiry worker
+                // - duplicate NACKs
+                // - late NACK after consumer retry
+                // NACK is idempotent and safe.
+                gs.nack(*off, *requeue);
+            }
+            StromaEvent::DeadLetter { tp, part, off } => {
+                let mut gs = self.queue_entry(tp, *part);
+                gs.dead_letter(*off);
+            }
+            StromaEvent::ClearInflight { tp, part, off } => {
+                let mut gs = self.queue_entry(tp, *part);
                 gs.clear_inflight(*off);
             }
-            StromaEvent::ResetGroup { tp, part, group } => {
-                let k = Key {
-                    tp: tp.clone(),
-                    part: *part,
-                    group: group.clone(),
-                };
-                self.groups.remove(&k);
+            StromaEvent::ResetQueue { tp, part } => {
+                self.queues.remove(&(tp.clone(), *part));
             }
             StromaEvent::Snapshot { .. } => {
                 // If you keep Snapshot events inside the event log later, you'd load it here.
@@ -312,7 +390,7 @@ impl Stroma {
 
         // Apply in memory after durable accept.
         for ev in evs {
-            self.apply_event_inmem(ev)?;
+            self.apply_event_inmem(ev).await?;
         }
 
         // Update applied watermark:
@@ -329,7 +407,6 @@ impl Stroma {
         &self,
         tp: &str,
         part: u32,
-        group: &str,
         entries: &[(Offset, UnixMillis)],
     ) -> Result<()> {
         if entries.is_empty() {
@@ -339,9 +416,8 @@ impl Stroma {
         let mut evs = Vec::with_capacity(entries.len());
         for &(off, deadline) in entries {
             evs.push(StromaEvent::MarkInflight {
-                tp: tp.to_string(),
+                tp: tp.into(),
                 part,
-                group: group.to_string(),
                 off,
                 deadline,
             });
@@ -355,7 +431,7 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn ack_batch(&self, tp: &str, part: u32, group: &str, offs: &[Offset]) -> Result<()> {
+    pub async fn ack_batch(&self, tp: &str, part: u32, offs: &[Offset]) -> Result<()> {
         if offs.is_empty() {
             return Ok(());
         }
@@ -363,9 +439,8 @@ impl Stroma {
         let mut evs = Vec::with_capacity(offs.len());
         for &off in offs {
             evs.push(StromaEvent::Ack {
-                tp: tp.to_string(),
+                tp: tp.into(),
                 part,
-                group: group.to_string(),
                 off,
             });
         }
@@ -378,17 +453,10 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn clear_inflight(
-        &self,
-        tp: &str,
-        part: u32,
-        group: &str,
-        off: Offset,
-    ) -> Result<()> {
+    pub async fn clear_inflight(&self, tp: &str, part: u32, off: Offset) -> Result<()> {
         let ev = StromaEvent::ClearInflight {
-            tp: tp.to_string(),
+            tp: tp.into(),
             part,
-            group: group.to_string(),
             off,
         };
         let upto = self
@@ -398,65 +466,57 @@ impl Stroma {
         Ok(())
     }
 
-    pub fn lowest_unacked_offset(&self, tp: &str, part: u32, group: &str) -> Result<Offset> {
-        let k = Key {
-            tp: tp.to_string(),
-            part,
-            group: group.to_string(),
-        };
+    pub fn lowest_unacked_offset(&self, tp: &str, part: u32) -> Result<Offset> {
         Ok(self
-            .groups
-            .get(&k)
+            .queues
+            .get(&(tp.into(), part))
             .map(|g| g.lowest_unacked_offset())
             .unwrap_or(0))
     }
 
-    pub fn is_inflight_or_acked(
-        &self,
-        tp: &str,
-        part: u32,
-        group: &str,
-        off: Offset,
-    ) -> Result<bool> {
-        let k = Key {
-            tp: tp.to_string(),
-            part,
-            group: group.to_string(),
-        };
+    pub fn is_inflight_or_acked(&self, tp: &str, part: u32, off: Offset) -> Result<bool> {
         Ok(self
-            .groups
-            .get(&k)
+            .queues
+            .get(&(tp.into(), part))
             .map(|g| g.is_inflight_or_acked(off))
             .unwrap_or(false))
     }
 
+    pub fn is_enqueued(&self, tp: &str, part: u32, off: Offset) -> Result<bool> {
+        Ok(self
+            .queues
+            .get(&(tp.into(), part))
+            .map(|q| q.is_enqueued(off))
+            .unwrap_or(false))
+    }
+
+    pub fn filter_not_enqueued<T>(&self, tp: &str, part: u32, items: &mut Vec<(Offset, T)>) {
+        if let Some(q) = self.queues.get(&(tp.into(), part)) {
+            q.filter_not_enqueued(items);
+        } else {
+            items.clear();
+        }
+    }
+
     pub fn next_expiry_hint(&self) -> Result<Option<UnixMillis>> {
         Ok(self
-            .groups
+            .queues
             .iter_mut()
             .filter_map(|mut e| e.value_mut().next_expiry_hint())
             .min())
     }
 
-    pub fn list_expired(
-        &self,
-        now: UnixMillis,
-        max: usize,
-    ) -> Result<Vec<(String, u32, String, Offset)>> {
+    pub fn list_expired(&self, now: UnixMillis, max: usize) -> Result<Vec<(String, u32, Offset)>> {
         let mut out = Vec::new();
 
-        for mut kv in self.groups.iter_mut() {
+        for mut kv in self.queues.iter_mut() {
             if out.len() >= max {
                 break;
             }
             let want = max - out.len();
             for off in kv.value_mut().pop_expired(now, want) {
-                out.push((
-                    kv.key().tp.clone(),
-                    kv.key().part,
-                    kv.key().group.clone(),
-                    off,
-                ));
+                let (tp, part) = kv.key();
+                out.push((tp.to_string(), *part, off));
                 if out.len() >= max {
                     break;
                 }
@@ -470,10 +530,10 @@ impl Stroma {
     //
     // Snapshot files make restart fast:
     // - durable event log = Keratin partition log
-    // - snapshot per (tp,part,group): { last_applied_event_offset, groupstate_blob }
+    // - snapshot per (tp,part): { last_applied_event_offset, queue_state_blob }
     //
     // Recovery loads snapshots, then replays events AFTER the minimum snapshot offset,
-    // skipping events already covered by each group's snapshot.
+    // skipping events already covered by each queue's snapshot.
 
     async fn maybe_snapshot(&self, tp: &str, part: u32, applied_upto: Offset) -> Result<()> {
         let every = self.snap_cfg.every_events.max(1);
@@ -493,12 +553,12 @@ impl Stroma {
         let dir = self.snap_dir(tp, part);
         fs::create_dir_all(&dir).map_err(io_err)?;
 
-        // snapshot all groups for this partition (simple v0; later you can do incremental / max-bytes)
-        for e in self.groups.iter() {
-            if e.key().tp == tp && e.key().part == part {
-                let group = e.key().group.clone();
+        // snapshot all queues for this partition (simple v0; later you can do incremental / max-bytes)
+        for e in self.queues.iter() {
+            let (key_tp, key_part) = e.key();
+            if key_tp.as_ref() == tp && *key_part == part {
                 let blob = e.value().encode_snapshot();
-                self.write_group_snapshot(tp, part, &group, applied_upto, &blob)?;
+                self.write_queue_snapshot(tp, part, applied_upto, &blob)?;
             }
         }
 
@@ -508,16 +568,15 @@ impl Stroma {
         Ok(())
     }
 
-    fn write_group_snapshot(
+    fn write_queue_snapshot(
         &self,
         tp: &str,
         part: u32,
-        group: &str,
         last_applied_event_offset: Offset,
         blob: &[u8],
     ) -> Result<()> {
-        let tmp = self.snap_tmp_file(tp, part, group);
-        let final_path = self.snap_file(tp, part, group);
+        let tmp = self.snap_tmp_file(tp, part);
+        let final_path = self.snap_file(tp, part);
 
         if let Some(parent) = tmp.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;
@@ -572,7 +631,7 @@ impl Stroma {
         Ok(())
     }
 
-    fn read_group_snapshot(&self, path: &Path) -> Result<Option<(Offset, Vec<u8>)>> {
+    fn read_queue_snapshot(&self, path: &Path) -> Result<Option<(Offset, Vec<u8>)>> {
         if !path.exists() {
             return Ok(None);
         }
@@ -658,21 +717,21 @@ impl Stroma {
     }
 
     async fn recover_one_log(&self, k: Arc<Keratin>, part: u32) -> Result<()> {
-        // 1) Load all snapshot files for this partition into groups map + remember per-group snapshot offsets
+        // 1) Load all snapshot files for this partition into queues map + remember per-queue snapshot offsets
         //    We cannot pre-know tp; snapshot directory is keyed by encoded tp, but the snapshot file
-        //    itself does not embed tp/group. So: in v0, we load snapshots only when we know tp.
+        //    itself does not embed tp. So: in v0, we load snapshots only when we know tp.
         //
         // Practical approach v0:
-        // - Don’t “discover snapshots by scanning filesystem blindly”.
+        // - Don’t "discover snapshots by scanning filesystem blindly".
         // - Instead, do replay from 0 once per partition (still OK early).
         //
-        // If you want fast restarts now, we do it properly:
-        // - store snapshots under snapshots/<enc(tp)>/<part>/<enc(group)>.snap
-        // - and during replay, when we see tp/group, we attempt to load its snapshot once.
+        // For fast restarts now:
+        // - store snapshots under snapshots/<enc(tp)>/<part>/<enc(tp)>.snap
+        // - and during replay, when we see tp, we attempt to load its snapshot once.
 
         // We'll cache loaded snapshot offsets here:
-        let snap_applied_for: DashMap<(String, String), Offset> = DashMap::new();
-        // (tp, group) -> last_applied_event_offset
+        let snap_applied_for: DashMap<Box<str>, Offset> = DashMap::new();
+        // tp -> last_applied_event_offset
 
         let reader = k.reader();
         let tail = k.next_offset();
@@ -692,35 +751,34 @@ impl Stroma {
                 let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
 
                 // Ensure the Keratin instance is registered under the real topic string.
-                let tp = ev.tp().to_string();
+                let tp = ev.tp();
                 self.logs_by_tp_part
-                    .entry((tp.clone(), part))
+                    .entry((tp.into(), part))
                     .or_insert_with(|| k.clone());
 
-                // Best-effort: load snapshot for (tp,group) once, and if snapshot's last_applied >= rec.offset, skip.
-                let group = ev.group().to_string();
-                let key = (tp.clone(), group.clone());
+                // Best-effort: load snapshot for (tp) once, and if snapshot's last_applied >= rec.offset, skip.
+                let key = tp;
 
-                if !snap_applied_for.contains_key(&key) {
+                if !snap_applied_for.contains_key(key) {
                     // try read snapshot file
-                    let sp = self.snap_file(&tp, part, &group);
-                    if let Some((snap_upto, blob)) = self.read_group_snapshot(&sp)? {
+                    let sp = self.snap_file(&tp, part);
+                    if let Some((snap_upto, blob)) = self.read_queue_snapshot(&sp)? {
                         {
-                            let mut gs = self.group_entry(&tp, part, &group);
+                            let mut gs = self.queue_entry(&tp, part);
                             gs.load_snapshot(&blob).map_err(io_err)?;
                         }
-                        snap_applied_for.insert(key.clone(), snap_upto);
+                        snap_applied_for.insert(key.into(), snap_upto);
                     } else {
-                        snap_applied_for.insert(key.clone(), 0);
+                        snap_applied_for.insert(key.into(), 0);
                     }
                 }
 
-                let snap_upto = *snap_applied_for.get(&key).unwrap().value();
+                let snap_upto = *snap_applied_for.get(key).unwrap().value();
                 if rec.offset <= snap_upto {
                     continue; // covered by snapshot
                 }
 
-                self.apply_event_inmem(&ev)?;
+                self.apply_event_inmem(&ev).await?;
                 self.applied_upto_entry(&tp, part)
                     .store(rec.offset + 1, Ordering::Release);
             }
@@ -732,7 +790,7 @@ impl Stroma {
     // ---------------- Future: truncation hook ----------------
     //
     // Once Keratin supports truncate_before(before_offset),
-    // you can compute a safe cutoff:
+    // we can compute a safe cutoff:
     //   cutoff = min(last_applied_event_offset in all snapshots for this partition)
     // and call log.truncate_before(cutoff).
     //
@@ -754,17 +812,14 @@ impl Stroma {
         let log = self.msg_log(tp, part).await?;
         let mut msgs = Vec::with_capacity(payloads.len());
         for p in payloads {
-            msgs.push(KMessage {
+            msgs.push(Message {
                 flags: 0,
                 headers: vec![],
                 payload: p.clone(),
             });
         }
 
-        let ar = log
-            .append_batch(msgs, None)
-            .await
-            .map_err(io_err)?;
+        let ar = log.append_batch(msgs, None).await.map_err(io_err)?;
 
         let mut out = Vec::with_capacity(ar.count as usize);
         let mut o = ar.base_offset;
@@ -775,15 +830,132 @@ impl Stroma {
         Ok(out)
     }
 
-    pub async fn append_message(&self, tp: &str, part: u32, payload: &[u8], completion: Box<dyn AppendCompletion<IoError>>) -> Result<()> {
-        let log = self.msg_log(tp, part).await?;
-        log
-            .append_enqueue(KMessage {
-                flags: 0,
-                headers: vec![],
-                payload: payload.to_vec(),
-            }, None, completion)
+    pub async fn append_message(
+        &self,
+        tp: &str,
+        part: u32,
+        payload: &[u8],
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<()> {
+        let (inner_completion, rx) = KeratinAppendCompletion::pair();
+        let msg_log = self.msg_log(tp, part).await?;
+        let _ = self.queue_entry(tp, part);
+        msg_log
+            .append_enqueue(
+                Message {
+                    flags: 0,
+                    headers: vec![],
+                    payload: payload.to_vec(),
+                },
+                None,
+                inner_completion,
+            )
             .map_err(io_err)?;
+        let log = self.log(tp, part).await?;
+        let tp: Box<str> = tp.into();
+        let queues = self.queues.clone();
+        tokio::spawn(async move {
+            let res = rx.await;
+
+            let append_result = match res {
+                Ok(Ok(offset)) => offset,
+                Ok(Err(err)) => {
+                    println!("Derp err 3 {}", err);
+                    completion.complete(Err(err));
+                    return;
+                }
+                Err(err) => {
+                    println!("Derp err 4 {}", err);
+                    completion.complete(Err(IoError::new("Channel closed")));
+                    return;
+                }
+            };
+            let offset = append_result.base_offset;
+
+            // TODO: emit Enqueue event too in some form
+            let ev = StromaEvent::Enqueue {
+                retries: 0,
+                tp: tp.clone(),
+                part,
+                off: offset,
+            };
+
+            let msg = match event_msg(&ev) {
+                Ok(msg) => msg,
+                Err(err) => {
+                    println!("Derp err 5 {}", err);
+                    completion.complete(Err(IoError::new(err)));
+                    return;
+                }
+            };
+            match log.append_enqueue(msg, None, completion).map_err(io_err) {
+                Ok(()) => {
+                    if let Some(mut q) = queues.get_mut(&(tp, part)) {
+                        q.enqueue(offset, 0);
+                    }
+                }
+                Err(_err) => {}
+            };
+        });
+
+        // let intent = PublishIntent {
+        //     tp: tp.into(),
+        //     part,
+        //     payload: payload.to_vec(),
+        //     outer_completion: completion,
+        // };
+        // let sequencer = self.msg_sequencer(tp, part).await.map_err(|e| {
+        //     tracing::error!("Errrr {}", e);
+        //     e
+        // })?;
+        // sequencer
+        //     .send(intent)
+        //     .await
+        //     .map_err(|e| {
+        //         tracing::error!("{} derp failed to send intent..", e);
+        //         StromaError::Io("Failed to enqueue message".into())})?;
+
+        Ok(())
+    }
+
+    pub async fn ack_enqueue(
+        &self,
+        tp: &str,
+        part: u32,
+        offset: Offset,
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<()> {
+        let ev = StromaEvent::Ack {
+            tp: tp.into(),
+            part,
+            off: offset,
+        };
+
+        let log = self.log(tp, part).await?;
+        let msg = event_msg(&ev)?;
+        log.append_enqueue(msg, None, completion).map_err(io_err)?;
+
+        Ok(())
+    }
+
+    pub async fn nack_enqueue(
+        &self,
+        tp: &str,
+        part: u32,
+        offset: Offset,
+        requeue: bool,
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<()> {
+        let ev = StromaEvent::Nack {
+            tp: tp.into(),
+            part,
+            off: offset,
+            requeue,
+        };
+
+        let log = self.log(tp, part).await?;
+        let msg = event_msg(&ev)?;
+        log.append_enqueue(msg, None, completion).map_err(io_err)?;
 
         Ok(())
     }
@@ -793,11 +965,11 @@ impl Stroma {
         tp: &str,
         part: u32,
         off: Offset,
-    ) -> Result<Option<Vec<u8>>> {
+    ) -> Result<Option<Message>> {
         let log = self.msg_log(tp, part).await?;
         let reader = log.reader();
-        let rec = reader.fetch(off).map_err(io_err)?;
-        Ok(rec.map(|r| r.payload))
+        let rec = reader.fetch(off).map_err(io_err)?.map(|r| r.to_message());
+        Ok(rec)
     }
 
     pub async fn scan_messages_from(
@@ -807,7 +979,10 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>)>> {
-        let log = self.msg_logs_by_tp_part.get(&(tp.to_string(), part)).ok_or(StromaError::NotFound)?;
+        let log = self
+            .msg_logs_by_tp_part
+            .get(&(tp.into(), part))
+            .ok_or(StromaError::NotFound)?;
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
         Ok(got.into_iter().map(|r| (r.offset, r.payload)).collect())
@@ -840,49 +1015,52 @@ impl Stroma {
         Ok(())
     }
 
-    /// Only offsets < min(acked_until of every group) are globally deletable.
+    /// Only offsets < min(acked_until of every queue) are globally deletable.
     fn safe_truncate_before(&self, tp: &str, part: u32) -> Offset {
-        self.groups
+        self.queues
             .iter()
-            .filter(|g| g.key().tp == tp && g.key().part == part)
+            .filter(|g| {
+                let (k_tp, k_part) = g.key();
+                k_tp.as_ref() == tp && *k_part == part
+            })
             .map(|g| g.value().acked_until())
             .min()
             .unwrap_or(0)
     }
 
-    pub fn list_groups(&self) -> Vec<(String, u32, String)> {
-        self.groups
+    pub fn list_queues(&self) -> Vec<(Box<str>, u32)> {
+        self.queues
             .iter()
-            .map(|e| (e.key().tp.clone(), e.key().part, e.key().group.clone()))
+            .map(|e| {
+                let (tp, part) = e.key();
+                (tp.clone(), *part)
+            })
             .collect()
     }
 
-    pub fn is_acked(&self, tp: &str, part: u32, group: &str, off: Offset) -> Result<bool> {
-        let k = Key {
-            tp: tp.into(),
-            part,
-            group: group.into(),
-        };
+    pub fn is_acked(&self, tp: &str, part: u32, off: Offset) -> Result<bool> {
         Ok(self
-            .groups
-            .get(&k)
+            .queues
+            .get(&(tp.into(), part))
             .map(|g| g.is_acked(off))
             .unwrap_or(false))
     }
 
-    pub fn count_inflight(&self, tp: &str, part: u32, group: &str) -> Result<usize> {
-        let k = Key {
-            tp: tp.into(),
-            part,
-            group: group.into(),
-        };
-        Ok(self.groups.get(&k).map(|g| g.inflight_len()).unwrap_or(0))
+    pub fn count_inflight(&self, tp: &str, part: u32) -> Result<usize> {
+        Ok(self
+            .queues
+            .get(&(tp.into(), part))
+            .map(|g| g.inflight_len())
+            .unwrap_or(0))
     }
 
-    pub fn list_topics(&self) -> Vec<String> {
-        self.groups
+    pub fn list_topics(&self) -> Vec<Box<str>> {
+        self.queues
             .iter()
-            .map(|g| g.key().tp.clone())
+            .map(|g| {
+                let (tp, _) = g.key();
+                tp.clone()
+            })
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect()
@@ -895,16 +1073,14 @@ impl Stroma {
         &self,
         tp: &str,
         part: u32,
-        group: &str,
         off: Offset,
         deadline: UnixMillis,
     ) -> Result<()> {
-        self.mark_inflight_batch(tp, part, group, &[(off, deadline)])
-            .await
+        self.mark_inflight_batch(tp, part, &[(off, deadline)]).await
     }
 
-    pub async fn ack_one(&self, tp: &str, part: u32, group: &str, off: Offset) -> Result<()> {
-        self.ack_batch(tp, part, group, &[off]).await
+    pub async fn ack_one(&self, tp: &str, part: u32, off: Offset) -> Result<()> {
+        self.ack_batch(tp, part, &[off]).await
     }
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32) -> Result<()> {
@@ -917,20 +1093,15 @@ impl Stroma {
         log.truncate_before(before).await.map_err(io_err)
     }
 
-    pub fn debug_dump_group(&self, tp: &str, part: u32, group: &str) -> String {
-        let k = Key {
-            tp: tp.into(),
-            part,
-            group: group.into(),
-        };
-        self.groups
-            .get(&k)
+    pub fn debug_dump_queue(&self, tp: &str, part: u32) -> String {
+        self.queues
+            .get(&(tp.into(), part))
             .map(|g| format!("{:#?}", g.canonical()))
             .unwrap_or_else(|| "<empty>".into())
     }
 
     pub fn validate(&self) -> Result<()> {
-        for g in self.groups.iter() {
+        for g in self.queues.iter() {
             let gs = g.value();
 
             for (off, _) in gs.dump_inflight() {
@@ -953,35 +1124,31 @@ impl Stroma {
 trait EventView {
     fn tp(&self) -> &str;
     fn part(&self) -> u32;
-    fn group(&self) -> &str;
 }
 
 impl EventView for StromaEvent {
     fn tp(&self) -> &str {
         match self {
+            StromaEvent::Enqueue { tp, .. } => tp,
             StromaEvent::MarkInflight { tp, .. } => tp,
             StromaEvent::Ack { tp, .. } => tp,
+            StromaEvent::Nack { tp, .. } => tp,
+            StromaEvent::DeadLetter { tp, .. } => tp,
             StromaEvent::ClearInflight { tp, .. } => tp,
-            StromaEvent::ResetGroup { tp, .. } => tp,
+            StromaEvent::ResetQueue { tp, .. } => tp,
             StromaEvent::Snapshot { tp, .. } => tp,
         }
     }
     fn part(&self) -> u32 {
         match self {
+            StromaEvent::Enqueue { part, .. } => *part,
             StromaEvent::MarkInflight { part, .. } => *part,
             StromaEvent::Ack { part, .. } => *part,
+            StromaEvent::Nack { part, .. } => *part,
+            StromaEvent::DeadLetter { part, .. } => *part,
             StromaEvent::ClearInflight { part, .. } => *part,
-            StromaEvent::ResetGroup { part, .. } => *part,
+            StromaEvent::ResetQueue { part, .. } => *part,
             StromaEvent::Snapshot { part, .. } => *part,
-        }
-    }
-    fn group(&self) -> &str {
-        match self {
-            StromaEvent::MarkInflight { group, .. } => group,
-            StromaEvent::Ack { group, .. } => group,
-            StromaEvent::ClearInflight { group, .. } => group,
-            StromaEvent::ResetGroup { group, .. } => group,
-            StromaEvent::Snapshot { group, .. } => group,
         }
     }
 }

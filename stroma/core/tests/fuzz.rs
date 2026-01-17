@@ -1,10 +1,10 @@
-use stroma_core::GroupState;
+use stroma_core::QueueState;
 
 #[test]
 fn random_operations_never_break_invariants() {
     fastrand::seed(0xC0FFEE);
 
-    let mut g = GroupState::new();
+    let mut g = QueueState::new("test".into(), 0);
 
     for _ in 0..50_000 {
         let o = fastrand::u64(0..2000);

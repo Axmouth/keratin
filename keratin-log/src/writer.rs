@@ -7,12 +7,12 @@ use std::time::{Duration, Instant};
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use tokio::sync::oneshot;
 
-use crate::{AppendCompletion, KeratinConfig};
 use crate::batcher::{BatcherConfig, BatcherCore, Deadline, FlushReason, PushResult};
 use crate::durability::KDurability;
 use crate::keratin::WriterCmd;
 use crate::log::{AppendResult, Log, LogState};
 use crate::record::Message;
+use crate::{AppendCompletion, KeratinConfig};
 
 #[derive(Debug, Clone)]
 pub struct IoError {

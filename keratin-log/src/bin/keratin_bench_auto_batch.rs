@@ -60,7 +60,7 @@ fn main() {
 
         let mut receipts = vec![];
         for handle in handles {
-            let mut receipts_partial= handle.await.unwrap();
+            let mut receipts_partial = handle.await.unwrap();
             receipts.append(&mut receipts_partial);
         }
 

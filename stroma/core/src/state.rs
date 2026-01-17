@@ -7,6 +7,32 @@ pub type Offset = u64;
 pub type UnixMillis = u64;
 
 pub const ACK_WINDOW: usize = 8192; // fixed bounded memory
+
+#[derive(Debug, Clone)]
+pub struct DLQDiscordSettings {
+    pub max_retries: u32,
+}
+
+impl Default for DLQDiscordSettings {
+    fn default() -> Self {
+        Self { max_retries: 5 }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct CustomDLQ {
+    pub tp: String,
+    pub part: u32,
+}
+
+#[derive(Debug, Clone, Default)]
+pub enum DLQDiscardPolicy {
+    #[default]
+    Discard,
+    GlobalDQL,
+    CustomDQL(CustomDLQ), // tp, part
+}
+
 /// Durable-ish semantics:
 /// - ACKs are allowed out-of-order.
 /// - We maintain a contiguous ACK frontier `acked_until`:
@@ -16,10 +42,13 @@ pub const ACK_WINDOW: usize = 8192; // fixed bounded memory
 /// - Inflight is a lease: offset -> deadline.
 /// - Expiry heap is an acceleration structure and may contain stale entries.
 #[derive(Debug, Clone)]
-pub struct GroupState {
+pub struct QueueState {
+    topic: String,
+    partition: u32,
+
     // ----- ACK state -----
     // Lowest offset that is NOT ACKed (frontier).
-    acked_until: Offset,
+    settled_until: Offset,
 
     // Bounded window of out-of-order ACKs for offsets in [ack_window_base, ack_window_base + ACK_WINDOW)
     ack_window_base: Offset,
@@ -29,11 +58,21 @@ pub struct GroupState {
     // offset -> deadline_ts
     inflight: hashbrown::HashMap<Offset, UnixMillis>,
 
-    // min-heap via Reverse(deadline), contains stale entries; validated against inflight map
+    // ----- Enqueued -----
+    // offset -> retries
+    enqueued: hashbrown::HashMap<Offset, u32>,
+
+    // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
     expiry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
 
     // best-effort hint
     min_deadline_hint: Option<UnixMillis>,
+
+    // what to do on DLQ
+    dlq_policy: DLQDiscardPolicy,
+
+    // when to send to DLQ
+    dlq_settings: DLQDiscordSettings,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -71,15 +110,20 @@ pub enum AckOutcome {
     Applied, // advanced frontier or set bit
 }
 
-impl GroupState {
-    pub fn new() -> Self {
+impl QueueState {
+    pub fn new(topic: String, partition: u32) -> Self {
         Self {
-            acked_until: 0,
+            topic,
+            partition,
+            settled_until: 0,
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
             inflight: hashbrown::HashMap::new(),
+            enqueued: hashbrown::HashMap::new(),
             expiry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
+            dlq_policy: DLQDiscardPolicy::Discard,
+            dlq_settings: DLQDiscordSettings::default(),
         }
     }
 
@@ -87,13 +131,13 @@ impl GroupState {
 
     #[inline]
     pub fn acked_until(&self) -> Offset {
-        self.acked_until
+        self.settled_until
     }
 
     /// True if this offset is known ACKed.
     #[inline]
     pub fn is_acked(&self, offset: Offset) -> bool {
-        if offset < self.acked_until {
+        if offset < self.settled_until {
             return true;
         }
 
@@ -116,9 +160,18 @@ impl GroupState {
         self.is_acked(offset) || self.is_inflight(offset)
     }
 
+    #[inline]
+    pub fn is_enqueued(&self, offset: Offset) -> bool {
+        self.enqueued.contains_key(&offset)
+    }
+
+    pub fn filter_not_enqueued<T>(&self, items: &mut Vec<(Offset, T)>) {
+        items.retain(|(off, _)| self.enqueued.contains_key(off));
+    }
+
     pub fn ack(&mut self, offset: u64) {
-        if offset < self.acked_until {
-            // already acked
+        if offset < self.settled_until {
+            // already settled
             self.inflight.remove(&offset); // best-effort cleanup
             return;
         }
@@ -130,8 +183,8 @@ impl GroupState {
             self.recompute_hint_if_needed();
         }
 
-        if offset == self.acked_until {
-            self.acked_until += 1;
+        if offset == self.settled_until {
+            self.settled_until += 1;
             self.advance_frontier();
             return;
         }
@@ -142,7 +195,144 @@ impl GroupState {
             self.ack_bits.set(idx, true);
         } else {
             // far ack: leave for persistence/event log (still applied logically by replay later)
-            // (Your materialized model can ignore or store it; see note below.)
+            // (Materialized model can ignore or store it.)
+        }
+    }
+
+    // TODO: move non storage related logic elsewhere?
+    pub fn nack(&mut self, offset: u64, requeue: bool) {
+        if requeue {
+            // We check if we should DLQ based on retry count
+            let retries = self.enqueued.entry(offset).or_insert(0);
+
+            if *retries >= self.dlq_settings.max_retries {
+                // Send to DLQ
+                self.dead_letter(offset);
+                self.enqueued.remove(&offset);
+            } else {
+                *retries += 1;
+                // Requeue logic: application specific, here we just clear inflight so it can be redelivered
+                self.inflight.remove(&offset);
+                // Add back to expiry heap for redelivery
+                // TODO: Create a requeue Event instead?
+                // TODO: Using zero deadline means immediate redelivery. Current solution to keep it deterministic on recovery.
+                // TODO: Or nvm, adding to enqueued map should be enough now.
+                // self.expiry_heap.push((Reverse(0), offset));
+                self.recompute_hint_if_needed();
+            }
+
+            // We let redelivery logic handle requeue
+            return;
+        }
+
+        // Do fallible parts first
+        self.dead_letter(offset);
+
+        // todo: WIP
+        if offset < self.settled_until {
+            // already settled
+            self.inflight.remove(&offset); // best-effort cleanup
+            return;
+        }
+
+        // NACK beats inflight: always remove inflight if present
+        let removed = self.inflight.remove(&offset);
+        if removed.is_some() {
+            // heap can have stale entries now
+            self.recompute_hint_if_needed();
+        }
+    }
+
+    // TODO: move non storage related logic elsewhere?
+    pub fn dead_letter(&mut self, offset: u64) {
+        // let global_dlq = &stroma.global_dlq;
+
+        // // Do fallible parts first
+        // let dlq = match &self.dlq_policy {
+        //     DLQDiscardPolicy::Discard => {
+        //         // no DLQ; just discard
+        //     return Ok(());
+        //     }
+        //     DLQDiscardPolicy::GlobalDQL => match global_dlq.blocking_read().as_ref().map(|d| d.to_custom_dlq()) {
+        //         Some(c) => c,
+        //         None => {
+        //             // no global DLQ configured; discard
+        //             return Ok(());
+        //         }
+        //     },
+        //     DLQDiscardPolicy::CustomDQL(c) => c.clone(),
+        // };
+
+        // // We enqueue the message to the DLQ topic/partition.
+        // let msg = match stroma.fetch_message_by_offset(&self.topic, self.partition, offset).await? {
+        //     Some(msg) => msg,
+        //     None => {
+        //         // message not found; cannot DLQ
+        //         return Ok(());
+        //     }
+        // };
+        // let (completion, _) = KeratinAppendCompletion::pair();
+        // let bytes = Message::encode_msg(&msg, offset).map_err(|e| StromaError::Corruption(e.to_string()))?;
+        // stroma.append_message(&dlq.tp, dlq.part, &bytes, completion).await?;
+
+        // TODO: WIP
+        if offset < self.settled_until {
+            // already acked
+            self.inflight.remove(&offset); // best-effort cleanup
+            return;
+        }
+
+        // beats inflight: always remove inflight if present
+        let removed = self.inflight.remove(&offset);
+        if removed.is_some() {
+            // heap can have stale entries now
+            self.recompute_hint_if_needed();
+        }
+
+        if offset == self.settled_until {
+            self.settled_until += 1;
+            self.advance_frontier();
+            return;
+        }
+
+        let end = self.ack_window_base + ACK_WINDOW as u64;
+        if offset < end {
+            let idx = (offset - self.ack_window_base) as usize;
+            self.ack_bits.set(idx, true);
+        } else {
+            // leave for persistence/event log (still applied logically by replay later)
+            // (Materialized model can ignore or store it.)
+        }
+    }
+
+    pub fn reject(&mut self, offset: u64) {
+        // TODO: WIP - currently same as nack, must reque into dql which must be implemented
+        if offset < self.settled_until {
+            // already acked
+            self.inflight.remove(&offset); // best-effort cleanup
+            return;
+        }
+
+        // NACK beats inflight: always remove inflight if present
+        let removed = self.inflight.remove(&offset);
+        if removed.is_some() {
+            // heap can have stale entries now
+            self.recompute_hint_if_needed();
+        }
+
+        if offset == self.settled_until {
+            self.settled_until += 1;
+            self.advance_frontier();
+            return;
+        }
+
+        let end = self.ack_window_base + ACK_WINDOW as u64;
+        if offset < end {
+            let idx = (offset - self.ack_window_base) as usize;
+            self.ack_bits.set(idx, true);
+        } else {
+            // far nack: leave for persistence/event log (still applied logically by replay later)
+            // (Materialized model can ignore or store it.)
         }
     }
 
@@ -156,19 +346,19 @@ impl GroupState {
     fn advance_frontier(&mut self) {
         loop {
             // Is acked_until represented inside window?
-            if self.acked_until < self.ack_window_base {
+            if self.settled_until < self.ack_window_base {
                 break;
             }
-            let idx = (self.acked_until - self.ack_window_base) as usize;
+            let idx = (self.settled_until - self.ack_window_base) as usize;
             if idx >= ACK_WINDOW || !self.ack_bits[idx] {
                 break;
             }
             self.ack_bits.set(idx, false);
-            self.acked_until += 1;
+            self.settled_until += 1;
         }
 
         // Slide the window so its base follows acked_until (keeps bits "near" the frontier).
-        let new_base = self.acked_until;
+        let new_base = self.settled_until;
         let delta = new_base.saturating_sub(self.ack_window_base);
         if delta == 0 {
             return;
@@ -191,12 +381,25 @@ impl GroupState {
 
     #[inline]
     pub fn lowest_unacked_offset(&self) -> Offset {
-        self.acked_until
+        self.settled_until
     }
 
     #[inline]
     pub fn lowest_not_acked_offset(&self) -> Offset {
-        self.acked_until
+        self.settled_until
+    }
+
+    pub fn get_enqueued_retries(&self, offset: Offset) -> Option<u32> {
+        self.enqueued.get(&offset).copied()
+    }
+
+    pub fn enqueue(&mut self, offset: Offset, retries: u32) {
+        if self.is_acked(offset) {
+            return;
+        }
+        // TODO: check if it exists in message log?
+
+        self.enqueued.insert(offset, retries);
     }
 
     // ---------------- Inflight API ----------------
@@ -206,6 +409,7 @@ impl GroupState {
         if self.is_acked(offset) {
             return;
         }
+        self.enqueued.remove(&offset);
         self.inflight.insert(offset, deadline);
         self.expiry_heap.push((Reverse(deadline), offset));
         self.min_deadline_hint = Some(match self.min_deadline_hint {
@@ -326,7 +530,7 @@ impl GroupState {
     /// Find next deliverable offset in [from, upper).
     /// Skips inflight and (bounded) acked entries.
     pub fn next_deliverable(&self, from: Offset, upper: Offset) -> Offset {
-        let mut off = from.max(self.acked_until);
+        let mut off = from.max(self.settled_until);
 
         while off < upper {
             if self.inflight.contains_key(&off) {
@@ -354,12 +558,12 @@ impl GroupState {
     }
 
     pub fn reset(&mut self) {
-        *self = GroupState::new();
+        *self = QueueState::new(self.topic.clone(), self.partition);
     }
 
     // Snapshot/recovery setters (used by recover.rs)
     pub fn set_acked_until(&mut self, v: Offset) {
-        self.acked_until = v;
+        self.settled_until = v;
         // keep window consistent with new frontier
         self.ack_window_base = v;
         self.ack_bits.fill(false);
@@ -433,11 +637,12 @@ impl GroupState {
         Ok(())
     }
 
+    // TODO: Add enqueued state?
     pub fn encode_snapshot(&self) -> Vec<u8> {
         let mut out = Vec::new();
 
         // acked_until
-        out.extend_from_slice(&self.acked_until.to_be_bytes());
+        out.extend_from_slice(&self.settled_until.to_be_bytes());
 
         // ack window
         out.extend_from_slice(&self.ack_window_base.to_be_bytes());
@@ -451,10 +656,16 @@ impl GroupState {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
+        out.extend_from_slice(&(self.enqueued.len() as u32).to_be_bytes());
+        for (&off, e) in self.enqueued.iter() {
+            out.extend_from_slice(&off.to_be_bytes());
+            out.extend_from_slice(&e.to_be_bytes());
+        }
 
         out
     }
 
+    // TODO: Add enqueued state?
     pub fn load_snapshot(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
         use std::io::{Error, ErrorKind};
 
@@ -469,7 +680,7 @@ impl GroupState {
 
         self.reset();
 
-        self.acked_until = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.settled_until = u64::from_be_bytes(take::<8>(&mut bytes)?);
         let base = u64::from_be_bytes(take::<8>(&mut bytes)?);
 
         let win_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
@@ -487,15 +698,23 @@ impl GroupState {
             self.mark_inflight(off, dl);
         }
 
+        let enqueued_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        for _ in 0..enqueued_len {
+            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
+            self.enqueue(off, retries);
+        }
+
         Ok(())
     }
 
-    pub fn canonical(&self) -> CanonicalGroupState {
+    // TODO: Add enqueued state?
+    pub fn canonical(&self) -> CanonicalQueueState {
         let mut inflight: Vec<_> = self.inflight.iter().map(|(&o, &d)| (o, d)).collect();
         inflight.sort_unstable();
 
-        CanonicalGroupState {
-            acked_until: self.acked_until,
+        CanonicalQueueState {
+            acked_until: self.settled_until,
             ack_window_base: self.ack_window_base,
             ack_bits: self.ack_bits_bytes(),
             inflight,
@@ -504,7 +723,7 @@ impl GroupState {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct CanonicalGroupState {
+pub struct CanonicalQueueState {
     pub acked_until: u64,
     pub ack_window_base: u64,
     pub ack_bits: Vec<u8>,
@@ -513,11 +732,11 @@ pub struct CanonicalGroupState {
 
 #[cfg(test)]
 mod tests {
-    use super::{GroupState, Offset};
+    use super::{Offset, QueueState};
 
     #[test]
     fn frontier_is_monotonic() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         for _i in 0..10_000 {
             s.ack(fastrand::u64(0..5000));
@@ -527,7 +746,7 @@ mod tests {
 
     #[test]
     fn next_deliverable_never_returns_acked_or_inflight() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         for i in 0..2000 {
             if i % 3 == 0 {
@@ -552,7 +771,7 @@ mod tests {
 
     #[test]
     fn expired_offsets_are_removed_exactly_once() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         for i in 0..1000 {
             s.mark_inflight(i, 100);
@@ -567,7 +786,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip_is_identity() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         for i in 0..1000 {
             s.mark_inflight(i, 1000 + i);
@@ -578,7 +797,7 @@ mod tests {
 
         let snap = s.encode_snapshot();
 
-        let mut s2 = GroupState::new();
+        let mut s2 = QueueState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
 
         assert_eq!(s.canonical(), s2.canonical());
@@ -586,7 +805,7 @@ mod tests {
 
     #[test]
     fn random_ops_never_break_invariants() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         for _ in 0..1_000_000 {
             let o = fastrand::u64(0..30000);
@@ -614,7 +833,7 @@ mod tests {
 
     #[test]
     fn out_of_order_acks_advance_frontier() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         // ACK 2 and 4 out-of-order; frontier stays at 0
         s.ack(2);
@@ -644,7 +863,7 @@ mod tests {
 
     #[test]
     fn ack_removes_inflight() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         s.mark_inflight(10, 1000);
         assert!(s.is_inflight_or_acked(10));
@@ -660,7 +879,8 @@ mod tests {
 
     #[test]
     fn mark_inflight_ignored_if_already_acked() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
+
         s.ack_batch(&[0, 1, 2, 3, 4]);
         assert_eq!(s.acked_until(), 5);
 
@@ -671,7 +891,7 @@ mod tests {
 
     #[test]
     fn expiry_hint_tracks_min_deadline_and_handles_updates() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         s.mark_inflight(10, 500);
         assert_eq!(s.next_expiry_hint(), Some(500));
@@ -681,7 +901,6 @@ mod tests {
 
         // update 11 to later deadline; heap now has stale(400) + current(700).
         s.mark_inflight(11, 700);
-
         s.recompute_hint_if_needed();
         // hint may still be 400 until recompute/pop; force recompute
         assert_eq!(s.next_expiry_hint(), Some(500));
@@ -689,7 +908,7 @@ mod tests {
 
     #[test]
     fn pop_expired_skips_stale_heap_entries() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         // inflight 1 deadline 10
         s.mark_inflight(1, 10);
@@ -697,7 +916,6 @@ mod tests {
         s.mark_inflight(1, 30);
         // inflight 2 deadline 20
         s.mark_inflight(2, 20);
-
         // At now=15, only offset 2 is not expired; offset 1 has current deadline 30.
         let expired = s.pop_expired(15, 300);
         assert!(expired.is_empty());
@@ -716,7 +934,7 @@ mod tests {
 
     #[test]
     fn clear_inflight_removes_and_hint_updates() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         s.mark_inflight(1, 10);
         s.mark_inflight(2, 20);
@@ -733,7 +951,7 @@ mod tests {
 
     #[test]
     fn is_inflight_or_acked_behaves() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
 
         s.mark_inflight(5, 100);
         assert!(s.is_inflight_or_acked(5));
@@ -758,7 +976,7 @@ mod tests {
 
     #[test]
     fn ack_batch_handles_duplicates() {
-        let mut s = GroupState::new();
+        let mut s = QueueState::new("test".into(), 0);
         let v: Vec<Offset> = vec![2, 2, 0, 1, 1, 3];
         s.ack_batch(&v);
         assert_eq!(s.acked_until(), 4);

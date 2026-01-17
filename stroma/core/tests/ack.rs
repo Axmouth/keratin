@@ -1,8 +1,8 @@
-use stroma_core::GroupState;
+use stroma_core::QueueState;
 
 #[test]
 fn out_of_order_acks_never_skip_frontier() {
-    let mut g = GroupState::new();
+    let mut g = QueueState::new("test".into(), 0);
 
     for i in 0..1000 {
         g.mark_inflight(i, 0);

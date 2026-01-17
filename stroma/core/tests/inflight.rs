@@ -1,8 +1,8 @@
-use stroma_core::GroupState;
+use stroma_core::QueueState;
 
 #[test]
 fn expired_messages_are_redelivered_and_never_lost() {
-    let mut g = GroupState::new();
+    let mut g = QueueState::new("test".into(), 0);
 
     for i in 0..100 {
         g.mark_inflight(i, 1000);

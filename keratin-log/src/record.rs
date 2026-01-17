@@ -121,7 +121,7 @@ pub fn decode_header_prefix<'a>(buf: &[u8]) -> Result<(DecodedHeader, ByteRemain
         timestamp_ms,
         offset,
         header_len,
-        payload_len
+        payload_len,
     };
 
     let buf_len = buf.len();

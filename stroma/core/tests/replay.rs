@@ -8,21 +8,19 @@ async fn snapshot_delta_replay_is_deterministic() {
     let kcfg = KeratinConfig::test_default();
     let scfg = SnapshotConfig::default();
 
-    let st = Stroma::open(&dir.root, kcfg.clone(), scfg.clone())
-        .await
-        .unwrap();
+    let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
     for i in 0..500 {
-        st.mark_inflight_one("t", 0, "g", i, 1000000000 + i)
+        st.mark_inflight_one("t", 0, i, 1000000000 + i)
             .await
             .unwrap();
         if i.is_multiple_of(3) {
-            st.ack_one("t", 0, "g", i).await.unwrap();
+            st.ack_one("t", 0, i).await.unwrap();
         }
     }
 
     // snapshot logical state BEFORE drop
-    let before = st.debug_dump_group("t", 0, "g");
+    let before = st.debug_dump_queue("t", 0);
 
     // force persistence so restart is deterministic
     st.snapshot_partition("t", 0).await.unwrap();
@@ -31,7 +29,7 @@ async fn snapshot_delta_replay_is_deterministic() {
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
-    let after = st2.debug_dump_group("t", 0, "g");
+    let after = st2.debug_dump_queue("t", 0);
 
     assert_eq!(before, after);
 }
