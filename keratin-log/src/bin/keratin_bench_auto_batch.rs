@@ -14,11 +14,11 @@ fn main() {
     let cfg = KeratinConfig {
         segment_max_bytes: 256 * 1024 * 1024,
         index_stride_bytes: 64 * 1024,
-        max_batch_bytes: 8 * 1024 * 1024,
+        max_batch_bytes: 12 * 1024 * 1024,
         max_batch_records: 8192,
         batch_linger_ms: 25,
         fsync_interval_ms: 25,
-        flush_target_bytes: 32 * 1024 * 1024,
+        flush_target_bytes: 48 * 1024 * 1024,
         default_durability: KDurability::AfterFsync,
     };
 

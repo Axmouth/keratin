@@ -89,13 +89,50 @@ fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
         .any(|p| p.durability >= KDurability::AfterFsync)
 }
 
+enum NotifyMsg {
+    One { item: NotifyItem },
+    Batch(Vec<NotifyItem>),
+}
+
+struct NotifyItem {
+    completion: Box<dyn AppendCompletion<IoError> + Send>,
+    result: Result<AppendResult, IoError>,
+}
+
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
-    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024);
-    std::thread::spawn(move || writer_loop(&mut log, cfg, rx, state));
+    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(1024);
+
+    std::thread::spawn(move || notifier_loop(notify_rx));
+
+    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024 );
+
+    std::thread::spawn(move || writer_loop(&mut log, cfg, rx, state, notify_tx));
+
     WriterHandle { tx }
 }
 
-fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state: Arc<LogState>) {
+fn notifier_loop(rx: Receiver<NotifyMsg>) {
+    while let Ok(msg) = rx.recv() {
+        match msg {
+            NotifyMsg::One { item } => {
+                item.completion.complete(item.result);
+            }
+            NotifyMsg::Batch(items) => {
+                for item in items {
+                    item.completion.complete(item.result);
+                }
+            }
+        }
+    }
+}
+
+fn writer_loop(
+    log: &mut Log,
+    cfg: KeratinConfig,
+    rx: Receiver<WriterCmd>,
+    state: Arc<LogState>,
+    notify_tx: Sender<NotifyMsg>,
+) {
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let mut last_fsync = Instant::now();
 
@@ -132,7 +169,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
         if let Some((FlushReason::Timeout, reqs)) = batcher.flush_if_due(Instant::now())
             && !reqs.is_empty()
         {
-            let total_bytes = stage_reqs(log, &cfg, &state, &mut pending, reqs);
+            let total_bytes = stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
             post_stage_commit_and_tune(
                 log,
                 &cfg,
@@ -142,6 +179,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                 &mut last_fsync,
                 fsync_interval,
                 total_bytes,
+                &notify_tx,
                 &mut linger,
                 linger_min,
                 linger_max,
@@ -158,6 +196,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
             &mut durable_offset,
             &mut last_fsync,
             fsync_interval,
+            &notify_tx,
         );
 
         // (C) Compute how long we may wait for the next cmd.
@@ -223,7 +262,8 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                         // nothing flushed yet
                     }
                     PushResult::One((_why, reqs)) => {
-                        let total_bytes = stage_reqs(log, &cfg, &state, &mut pending, reqs);
+                        let total_bytes =
+                            stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
                         post_stage_commit_and_tune(
                             log,
                             &cfg,
@@ -233,6 +273,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                             &mut last_fsync,
                             fsync_interval,
                             total_bytes,
+                            &notify_tx,
                             &mut linger,
                             linger_min,
                             linger_max,
@@ -247,8 +288,8 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                     }
                     PushResult::Two((why1, reqs1), (why2, reqs2)) => {
                         // Very rare but must be lossless (stale barrier + size flush).
-                        let b1 = stage_reqs(log, &cfg, &state, &mut pending, reqs1);
-                        let b2 = stage_reqs(log, &cfg, &state, &mut pending, reqs2);
+                        let b1 = stage_reqs(log, &cfg, &state, &mut pending, reqs1, &notify_tx);
+                        let b2 = stage_reqs(log, &cfg, &state, &mut pending, reqs2, &notify_tx);
 
                         // Use combined bytes for tuning.
                         let total_bytes = b1.saturating_add(b2);
@@ -264,6 +305,7 @@ fn writer_loop(log: &mut Log, cfg: KeratinConfig, rx: Receiver<WriterCmd>, state
                             &mut last_fsync,
                             fsync_interval,
                             total_bytes,
+                            &notify_tx,
                             &mut linger,
                             linger_min,
                             linger_max,
@@ -303,6 +345,7 @@ fn stage_reqs(
     state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
     reqs: Vec<AppendReq>,
+    notify_tx: &Sender<NotifyMsg>,
 ) -> usize {
     let now_ms = crate::util::unix_millis();
 
@@ -317,7 +360,14 @@ fn stage_reqs(
                 Ok((ar, end_offset)) => {
                     state.tail.store(end_offset + 1, Ordering::Release);
                     if dur == KDurability::AfterWrite {
-                        r.completion.complete(Ok(ar));
+                        notify_tx
+                            .send(NotifyMsg::One {
+                                item: NotifyItem {
+                                    completion: r.completion,
+                                    result: Ok(ar),
+                                },
+                            })
+                            .ok();
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
@@ -335,7 +385,14 @@ fn stage_reqs(
                 Ok((ar, end_offset)) => {
                     state.tail.store(end_offset + 1, Ordering::Release);
                     if dur == KDurability::AfterWrite {
-                        r.completion.complete(Ok(ar));
+                        notify_tx
+                            .send(NotifyMsg::One {
+                                item: NotifyItem {
+                                    completion: r.completion,
+                                    result: Ok(ar),
+                                },
+                            })
+                            .ok();
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
@@ -363,6 +420,7 @@ fn maybe_commit_due(
     durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
+    notify_tx: &Sender<NotifyMsg>,
 ) {
     let needs_commit = pending_needs_fsync(pending);
     let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
@@ -372,13 +430,25 @@ fn maybe_commit_due(
     }
 
     let mut error_count = 0;
-    while let Err(e) = commit(log, pending, durable_offset, last_fsync, state.clone()) {
-        fail_all_pending(pending, format!("Internal Error while commiting: {e}"));
+    while let Err(e) = commit(
+        log,
+        pending,
+        durable_offset,
+        last_fsync,
+        state.clone(),
+        &notify_tx,
+    ) {
+        fail_all_pending(
+            pending,
+            format!("Internal Error while commiting: {e}"),
+            notify_tx,
+        );
 
         if error_count > 3 {
             fail_all_pending(
                 pending,
                 "Internal Error while commiting writes over 3 times",
+                notify_tx,
             );
             std::thread::sleep(Duration::from_millis(1000));
             break;
@@ -400,6 +470,7 @@ fn post_stage_commit_and_tune(
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
+    notify_tx: &Sender<NotifyMsg>,
     linger: &mut Duration,
     linger_min: Duration,
     linger_max: Duration,
@@ -409,7 +480,14 @@ fn post_stage_commit_and_tune(
     let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
 
     if commit_due {
-        let _ = commit(log, pending, durable_offset, last_fsync, state.clone());
+        let _ = commit(
+            log,
+            pending,
+            durable_offset,
+            last_fsync,
+            state.clone(),
+            &notify_tx,
+        );
     } else if log.should_flush() {
         let _ = log.flush_buffers();
     }
@@ -444,6 +522,7 @@ fn commit(
     durable_offset: &mut u64,
     last_fsync: &mut Instant,
     state: Arc<LogState>,
+    notify_tx: &Sender<NotifyMsg>,
 ) -> Result<(), io::Error> {
     log.flush_buffers()?;
     log.fsync()?;
@@ -451,15 +530,27 @@ fn commit(
     state.durable.store(*durable_offset, Ordering::Release);
     *last_fsync = Instant::now();
 
+    let mut ready = Vec::new();
+
     while let Some(front) = pending.front() {
         if front.end_offset <= *durable_offset {
-            let p = pending.pop_front().ok_or(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "pending ack to commit should exist",
-            ))?;
-            p.respond_to.complete(Ok(p.result));
+            let p = pending.pop_front().unwrap();
+            ready.push(NotifyItem {
+                completion: p.respond_to,
+                result: Ok(p.result),
+            });
         } else {
             break;
+        }
+    }
+
+    if !ready.is_empty() {
+        if ready.len() == 1 {
+            if let Some(item) = ready.pop() {
+                notify_tx.send(NotifyMsg::One { item }).ok();
+            }
+        } else {
+            notify_tx.send(NotifyMsg::Batch(ready)).ok();
         }
     }
 
@@ -468,11 +559,22 @@ fn commit(
     Ok(())
 }
 
-fn fail_all_pending(pending: &mut VecDeque<PendingAck>, err_msg: impl AsRef<str>) {
+fn fail_all_pending(
+    pending: &mut VecDeque<PendingAck>,
+    err_msg: impl AsRef<str>,
+    notify_tx: &Sender<NotifyMsg>,
+) {
     tracing::error!("{}", err_msg.as_ref());
+    let mut items = Vec::new();
+
     while let Some(p) = pending.pop_front() {
-        p.respond_to.complete(Err(IoError {
-            msg: err_msg.as_ref().to_string(),
-        }));
+        items.push(NotifyItem {
+            completion: p.respond_to,
+            result: Err(IoError {
+                msg: err_msg.as_ref().to_string(),
+            }),
+        });
     }
+
+    notify_tx.send(NotifyMsg::Batch(items)).ok();
 }

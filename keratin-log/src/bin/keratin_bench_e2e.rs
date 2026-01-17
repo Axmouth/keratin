@@ -66,7 +66,6 @@ async fn main() {
     let now = Instant::now();
 
     let mut handles_p = vec![];
-    let mut handles_c = vec![];
     // -------- producers --------
     for pid in 0..PRODUCERS {
         let k = k.clone();
@@ -105,54 +104,48 @@ async fn main() {
     }
 
     // -------- consumers --------
-    for _cid in 0..CONSUMERS {
-        let k = k.clone();
-        let consumed = consumed.clone();
-        let produced = produced.clone();
-        let seen_eos = seen_eos.clone();
+    let consumed_ref = consumed.clone();
+    let produced_ref = produced.clone();
+    let handle_c = tokio::spawn(async move {
+        let mut next_offset = 0u64;
+        let mut seen = HashSet::new();
+        let reader = k.reader();
 
-        let handle = tokio::spawn(async move {
-            let mut next_offset = 0u64;
-            let mut seen = HashSet::new();
-            let reader = k.reader();
+        // while seen_eos.load(Ordering::SeqCst) < PRODUCERS as u64 {
+        while {
+            let c = consumed_ref.load(Ordering::SeqCst);
+            c == 0 || c < produced_ref.load(Ordering::SeqCst)
+        } {
+            let msgs = reader.scan_from(next_offset, 4096).unwrap();
 
-            // while seen_eos.load(Ordering::SeqCst) < PRODUCERS as u64 {
-            while {
-                let c = consumed.load(Ordering::SeqCst);
-                c == 0 || c < produced.load(Ordering::SeqCst)
-            } {
-                let msgs = reader.scan_from(next_offset, 4096).unwrap();
-
-                if msgs.is_empty() {
-                    tokio::time::sleep(Duration::from_millis(1)).await;
-                    continue;
-                }
-
-                for m in &msgs {
-                    assert_eq!(m.offset, next_offset);
-
-                    let (pid, seq) = decode_record(&m.payload);
-
-                    // if seq == u64::MAX {
-                    //     println!("found eos!");
-                    //     seen_eos.fetch_add(1, Ordering::SeqCst);
-                    //     next_offset = m.offset + 1;
-                    //     continue;
-                    // }
-
-                    assert!(
-                        seen.insert((pid, seq)),
-                        "duplicate message {:?}",
-                        (pid, seq)
-                    );
-                    next_offset = m.offset + 1;
-                }
-
-                consumed.fetch_add(msgs.len() as u64, Ordering::Relaxed);
+            if msgs.is_empty() {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+                continue;
             }
-        });
-        handles_c.push(handle);
-    }
+
+            for m in &msgs {
+                assert_eq!(m.offset, next_offset);
+
+                let (pid, seq) = decode_record(&m.payload);
+
+                // if seq == u64::MAX {
+                //     println!("found eos!");
+                //     seen_eos.fetch_add(1, Ordering::SeqCst);
+                //     next_offset = m.offset + 1;
+                //     continue;
+                // }
+
+                assert!(
+                    seen.insert((pid, seq)),
+                    "duplicate message {:?}",
+                    (pid, seq)
+                );
+                next_offset = m.offset + 1;
+            }
+
+            consumed_ref.fetch_add(msgs.len() as u64, Ordering::Relaxed);
+        }
+    });
 
     // -------- run --------
     let start = Instant::now();
@@ -161,9 +154,7 @@ async fn main() {
         handle.await.unwrap();
     }
 
-    for handle in handles_c {
-        handle.await.unwrap();
-    }
+    handle_c.await.unwrap();
 
     // drain
     tokio::time::sleep(Duration::from_secs(2)).await;
