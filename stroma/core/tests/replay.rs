@@ -39,8 +39,15 @@ async fn snapshot_delta_replay_is_deterministic() {
 #[tokio::test]
 async fn expired_messages_survive_restart() {
     let dir = test_dir("expiry_restart");
-    let st = Arc::new(Stroma::open(&dir.root, KeratinConfig::test_default(), SnapshotConfig::default()).await.unwrap());
-
+    let st = Arc::new(
+        Stroma::open(
+            &dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
 
     let (c, rx) = KeratinAppendCompletion::pair();
     st.append_message("t", 0, b"x", c).await.unwrap();
@@ -50,6 +57,12 @@ async fn expired_messages_survive_restart() {
     st.list_expired(100, 10).unwrap();
     drop(st);
 
-    let st2 = Stroma::open(&dir.root, KeratinConfig::test_default(), SnapshotConfig::default()).await.unwrap();
+    let st2 = Stroma::open(
+        &dir.root,
+        KeratinConfig::test_default(),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
     assert!(st2.is_enqueued("t", 0, offset).unwrap());
 }

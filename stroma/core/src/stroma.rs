@@ -9,7 +9,8 @@ use std::{
 
 use dashmap::DashMap;
 use keratin_log::{
-    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin, KeratinAppendCompletion, KeratinConfig, Message
+    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
+    KeratinAppendCompletion, KeratinConfig, Message,
 };
 use tokio::sync::RwLock;
 
@@ -854,9 +855,16 @@ impl Stroma {
                 off: msg_offset,
             };
 
-            match stroma.append_events_durable(&tp, part, &[ev], stroma.keratin_cfg.default_durability).await.map_err(io_err) {
+            match stroma
+                .append_events_durable(&tp, part, &[ev], stroma.keratin_cfg.default_durability)
+                .await
+                .map_err(io_err)
+            {
                 Ok(_event_offset) => {
-                    event_completion.complete(Ok(AppendResult {base_offset: msg_offset, count: 1}));
+                    event_completion.complete(Ok(AppendResult {
+                        base_offset: msg_offset,
+                        count: 1,
+                    }));
                 }
                 Err(err) => {
                     event_completion.complete(Err(IoError::new(err)));

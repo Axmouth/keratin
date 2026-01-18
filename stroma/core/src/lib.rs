@@ -1,6 +1,6 @@
 mod event;
-mod state;
 mod sequencer;
+mod state;
 mod stroma;
 
 use keratin_log::KDurability;
@@ -370,12 +370,15 @@ pub mod offset {
 }
 
 pub mod unix_millis {
-    use std::{sync::atomic::{AtomicU64, Ordering}, time::{SystemTime, UNIX_EPOCH}};
+    use std::{
+        sync::atomic::{AtomicU64, Ordering},
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     /// Wall-clock timestamp in milliseconds since the Unix epoch.
     ///
     /// ------------------------------------
-    /// 
+    ///
     /// #### Monotonicity:
     ///
     /// `UnixMillis::now()` is guaranteed to be **monotonic within a process**.
@@ -402,7 +405,7 @@ pub mod unix_millis {
         /// Wall-clock timestamp in milliseconds since the Unix epoch.
         ///
         /// ------------------------------------
-        /// 
+        ///
         /// #### Monotonicity"
         ///
         /// `UnixMillis::now()` is guaranteed to be **monotonic within a process**.
@@ -425,7 +428,9 @@ pub mod unix_millis {
                 .unwrap_or(0);
 
             let prev = LAST.fetch_max(real, Ordering::Relaxed);
-            Self { inner: prev.max(real) }
+            Self {
+                inner: prev.max(real),
+            }
         }
 
         #[inline]

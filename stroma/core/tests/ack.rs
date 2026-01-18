@@ -5,13 +5,15 @@ use stroma_core::{QueueState, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> Arc<Stroma> {
     let test_dir = test_dir("test_data");
-    Arc::new(Stroma::open(
-        &test_dir.root,
-        KeratinConfig::test_default(),
-        SnapshotConfig::default(),
+    Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
     )
-    .await
-    .unwrap())
 }
 
 #[test]
@@ -49,4 +51,3 @@ async fn acked_offsets_never_resurrect() {
     assert!(st.is_acked("t", 0, 5).unwrap());
     assert!(!st.is_enqueued("t", 0, 5).unwrap());
 }
-

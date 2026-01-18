@@ -104,7 +104,7 @@ pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> W
 
     std::thread::spawn(move || notifier_loop(notify_rx));
 
-    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024 );
+    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024);
 
     std::thread::spawn(move || writer_loop(&mut log, cfg, rx, state, notify_tx));
 

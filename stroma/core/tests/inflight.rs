@@ -5,13 +5,15 @@ use stroma_core::{QueueState, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> Arc<Stroma> {
     let test_dir = test_dir("test_data");
-    Arc::new(Stroma::open(
-        &test_dir.root,
-        KeratinConfig::test_default(),
-        SnapshotConfig::default(),
+    Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
     )
-    .await
-    .unwrap())
 }
 
 #[test]
@@ -105,7 +107,9 @@ async fn inflight_before_enqueue_is_ignored() {
     assert!(!st.is_inflight_or_acked("t", 0, 0).unwrap());
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, "s".as_bytes(), completion).await.unwrap();
+    st.append_message("t", 0, "s".as_bytes(), completion)
+        .await
+        .unwrap();
     let ar = rx.await.unwrap().unwrap();
     let offset = ar.base_offset;
 

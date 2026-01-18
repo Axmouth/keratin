@@ -195,11 +195,7 @@ impl StromaEvent {
                 put_u64(&mut out, *off);
                 put_u64(&mut out, *deadline);
             }
-            StromaEvent::Ack {
-                tp,
-                part,
-                off,
-            } => {
+            StromaEvent::Ack { tp, part, off } => {
                 put_u16(&mut out, EventType::Ack as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
@@ -217,21 +213,13 @@ impl StromaEvent {
                 put_u64(&mut out, *off);
                 put_bool(&mut out, *requeue);
             }
-            StromaEvent::DeadLetter {
-                tp,
-                part,
-                off,
-            } => {
+            StromaEvent::DeadLetter { tp, part, off } => {
                 put_u16(&mut out, EventType::DeadLetter as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
                 put_u64(&mut out, *off);
             }
-            StromaEvent::ClearInflight {
-                tp,
-                part,
-                off,
-            } => {
+            StromaEvent::ClearInflight { tp, part, off } => {
                 put_u16(&mut out, EventType::ClearInflight as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
@@ -242,11 +230,7 @@ impl StromaEvent {
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
             }
-            StromaEvent::Snapshot {
-                tp,
-                part,
-                blob,
-            } => {
+            StromaEvent::Snapshot { tp, part, blob } => {
                 put_u16(&mut out, EventType::Snapshot as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
@@ -312,11 +296,7 @@ impl StromaEvent {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::Ack {
-                    tp,
-                    part,
-                    off,
-                })
+                Ok(StromaEvent::Ack { tp, part, off })
             }
             x if x == EventType::Nack as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
@@ -334,21 +314,13 @@ impl StromaEvent {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::DeadLetter {
-                    tp,
-                    part,
-                    off,
-                })
+                Ok(StromaEvent::DeadLetter { tp, part, off })
             }
             x if x == EventType::ClearInflight as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::ClearInflight {
-                    tp,
-                    part,
-                    off,
-                })
+                Ok(StromaEvent::ClearInflight { tp, part, off })
             }
             x if x == EventType::ResetQueue as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
@@ -366,11 +338,7 @@ impl StromaEvent {
                     ));
                 }
                 let blob = bytes[i..i + len].to_vec();
-                Ok(StromaEvent::Snapshot {
-                    tp,
-                    part,
-                    blob,
-                })
+                Ok(StromaEvent::Snapshot { tp, part, blob })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

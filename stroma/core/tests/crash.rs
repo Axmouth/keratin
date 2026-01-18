@@ -28,13 +28,15 @@ async fn truncated_delta_does_not_corrupt_state() {
 #[tokio::test]
 async fn enqueue_is_durable_and_replayed() {
     let dir = test_dir("enqueue_replay");
-    let st = Arc::new(Stroma::open(
-        &dir.root,
-        KeratinConfig::test_default(),
-        SnapshotConfig::default(),
-    )
-    .await
-    .unwrap());
+    let st = Arc::new(
+        Stroma::open(
+            &dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
 
     let (completion, rx) = KeratinAppendCompletion::pair();
     st.append_message("t", 0, b"hello", completion)
@@ -60,13 +62,15 @@ async fn enqueue_is_durable_and_replayed() {
 #[tokio::test]
 async fn crash_between_message_and_enqueue_event_is_safe() {
     let test_dir = test_dir("test_data");
-    let st = Arc::new(Stroma::open(
-        &test_dir.root,
-        KeratinConfig::test_default(),
-        SnapshotConfig::default(),
-    )
-    .await
-    .unwrap());
+    let st = Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
 
     let (c, rx) = KeratinAppendCompletion::pair();
     st.append_message("t", 0, b"x", c).await.unwrap();
@@ -74,7 +78,13 @@ async fn crash_between_message_and_enqueue_event_is_safe() {
 
     drop(st);
 
-    let st2 = Stroma::open(&test_dir.root, KeratinConfig::test_default(), SnapshotConfig::default()).await.unwrap();
+    let st2 = Stroma::open(
+        &test_dir.root,
+        KeratinConfig::test_default(),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
     st2.validate().unwrap();
 
     // message may or may not exist, but must not be inflight/enqueued
