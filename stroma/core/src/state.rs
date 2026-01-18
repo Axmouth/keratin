@@ -555,6 +555,9 @@ impl QueueState {
         out
     }
 
+    /// Returns true iff this offset ever entered the delivery lifecycle
+    /// (i.e. enqueue or inflight).
+    /// Terminal-only operations (ack/reject without enqueue) do NOT create history.
     #[inline]
     fn has_history(&self, offset: Offset) -> bool {
         self.ready.contains(&offset)
