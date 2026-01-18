@@ -129,7 +129,7 @@ fn notifier_loop(rx: Receiver<NotifyMsg>) {
 fn writer_loop(
     log: &mut Log,
     cfg: KeratinConfig,
-    rx: Receiver<WriterCmd>,
+    writes_rx: Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
 ) {
@@ -226,7 +226,7 @@ fn writer_loop(
 
         // (D) Fetch next command (bounded).
         let cmd = if wait == Duration::MAX {
-            match rx.recv() {
+            match writes_rx.recv() {
                 Ok(c) => c,
                 Err(_) => {
                     shutdown_fail_unstaged(&mut batcher, "writer shutdown", FlushReason::Shutdown);
@@ -235,7 +235,7 @@ fn writer_loop(
                 }
             }
         } else {
-            match rx.recv_timeout(wait) {
+            match writes_rx.recv_timeout(wait) {
                 Ok(c) => c,
                 Err(RecvTimeoutError::Timeout) => {
                     // Either batch deadline or fsync deadline is due; loop will handle.

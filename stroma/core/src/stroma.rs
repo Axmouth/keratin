@@ -9,8 +9,7 @@ use std::{
 
 use dashmap::DashMap;
 use keratin_log::{
-    AppendCompletion, CompletionPair, IoError, KDurability, Keratin, KeratinAppendCompletion,
-    KeratinConfig, Message,
+    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin, KeratinAppendCompletion, KeratinConfig, Message
 };
 use tokio::sync::RwLock;
 
@@ -100,9 +99,6 @@ pub struct Stroma {
     // One Keratin per (tp,part), events log
     pub(crate) logs_by_tp_part: Arc<DashMap<(Box<str>, u32), Arc<Keratin>>>,
 
-    pub(crate) msg_sequencers:
-        Arc<DashMap<(Box<str>, u32), tokio::sync::mpsc::Sender<PublishIntent>>>,
-
     // Materialized queue state
     pub(crate) queues: Arc<DashMap<(Box<str>, u32), QueueState>>,
 
@@ -111,6 +107,10 @@ pub struct Stroma {
 
     // For each (tp,part): highest Keratin offset we have applied into memory
     pub(crate) applied_upto: DashMap<(Box<str>, u32), AtomicU64>,
+
+    pub(crate) msg_count: Arc<AtomicU64>,
+
+    pub(crate) event_count: Arc<AtomicU64>,
 }
 
 impl Stroma {
@@ -131,10 +131,11 @@ impl Stroma {
             snap_cfg,
             msg_logs_by_tp_part: Arc::new(DashMap::new()),
             logs_by_tp_part: Arc::new(DashMap::new()),
-            msg_sequencers: Arc::new(DashMap::new()),
             queues: Arc::new(DashMap::new()),
             applied_upto: DashMap::new(),
             global_dlq: Arc::new(RwLock::new(None)),
+            msg_count: Arc::new(AtomicU64::new(0)),
+            event_count: Arc::new(AtomicU64::new(0)),
         };
 
         // Recover from existing snapshot files + replay events.
@@ -240,42 +241,6 @@ impl Stroma {
         self.msg_logs_by_tp_part
             .insert((tp.into(), part), k.clone());
         Ok(k)
-    }
-
-    async fn msg_sequencer(
-        &self,
-        tp: &str,
-        part: u32,
-    ) -> Result<tokio::sync::mpsc::Sender<PublishIntent>> {
-        let _ = self.msg_log(tp, part).await?;
-        let _ = self.log(tp, part).await?;
-        let _ = self.queue_entry(tp, part);
-        if let Some(v) = self.msg_sequencers.get(&(tp.into(), part)) {
-            return Ok(v.value().clone());
-        }
-
-        let (tx, rx) = tokio::sync::mpsc::channel(1000);
-        let msg_log_map = self.msg_logs_by_tp_part.clone();
-        let event_log_map = self.logs_by_tp_part.clone();
-        let queue_state_map = self.queues.clone();
-
-        let tp_box: Box<str> = tp.into();
-        tokio::spawn(async move {
-            tracing::info!("queue task STARTED for {} {}", tp_box, part);
-            let res = run_msg_sequencer(
-                rx,
-                &tp_box,
-                part,
-                msg_log_map,
-                event_log_map,
-                queue_state_map,
-            )
-            .await;
-            tracing::error!("queue task EXITED for {} {}: {:?}", tp_box, part, res);
-        });
-
-        self.msg_sequencers.insert((tp.into(), part), tx.clone());
-        Ok(tx)
     }
 
     fn queue_entry(
@@ -431,7 +396,7 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn ack_batch(&self, tp: &str, part: u32, offs: &[Offset]) -> Result<()> {
+    pub async fn ack_batch(&self, tp: Box<str>, part: u32, offs: &[Offset]) -> Result<()> {
         if offs.is_empty() {
             return Ok(());
         }
@@ -439,16 +404,16 @@ impl Stroma {
         let mut evs = Vec::with_capacity(offs.len());
         for &off in offs {
             evs.push(StromaEvent::Ack {
-                tp: tp.into(),
+                tp: tp.clone(),
                 part,
                 off,
             });
         }
 
         let upto = self
-            .append_events_durable(tp, part, &evs, KDurability::AfterFsync)
+            .append_events_durable(&tp, part, &evs, KDurability::AfterFsync)
             .await?;
-        self.maybe_snapshot(tp, part, upto).await?;
+        self.maybe_snapshot(&tp, part, upto).await?;
 
         Ok(())
     }
@@ -486,7 +451,7 @@ impl Stroma {
         Ok(self
             .queues
             .get(&(tp.into(), part))
-            .map(|q| q.is_enqueued(off))
+            .map(|q| q.is_ready(off))
             .unwrap_or(false))
     }
 
@@ -506,6 +471,18 @@ impl Stroma {
             .min())
     }
 
+    pub fn next_deliverable(
+        &self,
+        topic: &str,
+        part: u32,
+        from: u64,
+        upper: u64,
+    ) -> Option<Offset> {
+        self.queues
+            .get(&(topic.into(), part))
+            .map(|qs| qs.next_deliverable(from, upper))
+    }
+
     pub fn list_expired(&self, now: UnixMillis, max: usize) -> Result<Vec<(String, u32, Offset)>> {
         let mut out = Vec::new();
 
@@ -514,7 +491,7 @@ impl Stroma {
                 break;
             }
             let want = max - out.len();
-            for off in kv.value_mut().pop_expired(now, want) {
+            for off in kv.value_mut().collect_expired(now, want) {
                 let (tp, part) = kv.key();
                 out.push((tp.to_string(), *part, off));
                 if out.len() >= max {
@@ -831,13 +808,13 @@ impl Stroma {
     }
 
     pub async fn append_message(
-        &self,
+        self: &Arc<Self>,
         tp: &str,
         part: u32,
         payload: &[u8],
-        completion: Box<dyn AppendCompletion<IoError>>,
+        event_completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
-        let (inner_completion, rx) = KeratinAppendCompletion::pair();
+        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let msg_log = self.msg_log(tp, part).await?;
         let _ = self.queue_entry(tp, part);
         msg_log
@@ -848,72 +825,44 @@ impl Stroma {
                     payload: payload.to_vec(),
                 },
                 None,
-                inner_completion,
+                msg_completion,
             )
             .map_err(io_err)?;
-        let log = self.log(tp, part).await?;
         let tp: Box<str> = tp.into();
-        let queues = self.queues.clone();
+        let stroma = self.clone();
         tokio::spawn(async move {
-            let res = rx.await;
+            let msg_res = msg_rx.await;
 
-            let append_result = match res {
-                Ok(Ok(offset)) => offset,
+            let msg_append_result = match msg_res {
+                Ok(Ok(ar)) => ar,
                 Ok(Err(err)) => {
-                    println!("Derp err 3 {}", err);
-                    completion.complete(Err(err));
+                    event_completion.complete(Err(err));
                     return;
                 }
-                Err(err) => {
-                    println!("Derp err 4 {}", err);
-                    completion.complete(Err(IoError::new("Channel closed")));
+                Err(_err) => {
+                    event_completion.complete(Err(IoError::new("Channel closed")));
                     return;
                 }
             };
-            let offset = append_result.base_offset;
+            let msg_offset = msg_append_result.base_offset;
 
             // TODO: emit Enqueue event too in some form
             let ev = StromaEvent::Enqueue {
                 retries: 0,
                 tp: tp.clone(),
                 part,
-                off: offset,
+                off: msg_offset,
             };
 
-            let msg = match event_msg(&ev) {
-                Ok(msg) => msg,
+            match stroma.append_events_durable(&tp, part, &[ev], stroma.keratin_cfg.default_durability).await.map_err(io_err) {
+                Ok(_event_offset) => {
+                    event_completion.complete(Ok(AppendResult {base_offset: msg_offset, count: 1}));
+                }
                 Err(err) => {
-                    println!("Derp err 5 {}", err);
-                    completion.complete(Err(IoError::new(err)));
-                    return;
+                    event_completion.complete(Err(IoError::new(err)));
                 }
-            };
-            match log.append_enqueue(msg, None, completion).map_err(io_err) {
-                Ok(()) => {
-                    if let Some(mut q) = queues.get_mut(&(tp, part)) {
-                        q.enqueue(offset, 0);
-                    }
-                }
-                Err(_err) => {}
             };
         });
-
-        // let intent = PublishIntent {
-        //     tp: tp.into(),
-        //     part,
-        //     payload: payload.to_vec(),
-        //     outer_completion: completion,
-        // };
-        // let sequencer = self.msg_sequencer(tp, part).await.map_err(|e| {
-        //     tracing::error!("Errrr {}", e);
-        //     e
-        // })?;
-        // sequencer
-        //     .send(intent)
-        //     .await
-        //     .map_err(|e| {
-        //         tracing::error!("{} derp failed to send intent..", e);
-        //         StromaError::Io("Failed to enqueue message".into())})?;
 
         Ok(())
     }
@@ -1006,6 +955,7 @@ impl Stroma {
 
     pub async fn cleanup_topic_partition(&self, tp: &str, part: u32) -> Result<()> {
         let cutoff = self.safe_truncate_before(tp, part);
+        tracing::warn!("cleanup cutoff: {}", cutoff);
         if cutoff == 0 {
             return Ok(());
         }
@@ -1023,7 +973,7 @@ impl Stroma {
                 let (k_tp, k_part) = g.key();
                 k_tp.as_ref() == tp && *k_part == part
             })
-            .map(|g| g.value().acked_until())
+            .map(|g| g.value().settled_until())
             .min()
             .unwrap_or(0)
     }
@@ -1080,7 +1030,7 @@ impl Stroma {
     }
 
     pub async fn ack_one(&self, tp: &str, part: u32, off: Offset) -> Result<()> {
-        self.ack_batch(tp, part, &[off]).await
+        self.ack_batch(tp.into(), part, &[off]).await
     }
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32) -> Result<()> {
@@ -1105,12 +1055,12 @@ impl Stroma {
             let gs = g.value();
 
             for (off, _) in gs.dump_inflight() {
-                if off < gs.acked_until() {
+                if off < gs.settled_until() {
                     return Err(StromaError::Decode("inflight < ack frontier".into()));
                 }
             }
 
-            if gs.ack_window_base() > gs.acked_until() {
+            if gs.ack_window_base() > gs.settled_until() {
                 return Err(StromaError::Decode("ack window base > frontier".into()));
             }
         }

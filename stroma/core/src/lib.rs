@@ -190,6 +190,140 @@ pub mod topic {
     }
 }
 
+pub mod group {
+    use thiserror::Error;
+
+    #[derive(Clone, Hash, Eq, PartialEq)]
+    pub struct Group {
+        inner: Box<str>,
+    }
+
+    impl Group {
+        pub fn parse(s: &str) -> std::result::Result<Self, GroupError> {
+            let b = s.as_bytes();
+            let len = b.len();
+
+            if len == 0 || len > 128 {
+                return Err(GroupError::InvalidLength);
+            }
+
+            if b[0] == b'.' || b[len - 1] == b'.' {
+                return Err(GroupError::DotEdge);
+            }
+
+            let mut prev_dot = false;
+
+            for &c in b {
+                let ok = c.is_ascii_lowercase()
+                    || c.is_ascii_digit()
+                    || c == b'.'
+                    || c == b'_'
+                    || c == b'-';
+
+                if !ok {
+                    return Err(GroupError::InvalidChar);
+                }
+
+                if c == b'.' {
+                    if prev_dot {
+                        return Err(GroupError::DoubleDot);
+                    }
+                    prev_dot = true;
+                } else {
+                    prev_dot = false;
+                }
+            }
+
+            Ok(Self { inner: s.into() })
+        }
+
+        pub fn as_str(&self) -> &str {
+            &self.inner
+        }
+    }
+
+    impl std::borrow::Borrow<str> for Group {
+        fn borrow(&self) -> &str {
+            &self.inner
+        }
+    }
+
+    #[derive(Debug, Error)]
+    pub enum GroupError {
+        #[error("topic must be 1–128 bytes")]
+        InvalidLength,
+        #[error("topic cannot start or end with '.'")]
+        DotEdge,
+        #[error("topic contains invalid characters")]
+        InvalidChar,
+        #[error("topic cannot contain consecutive dots")]
+        DoubleDot,
+    }
+
+    #[cfg(test)]
+    mod tests {
+        use super::*;
+
+        fn ok(s: &str) {
+            Group::parse(s).unwrap();
+        }
+
+        fn err(s: &str) {
+            assert!(Group::parse(s).is_err(), "{s:?} should be invalid");
+        }
+
+        #[test]
+        fn valid_topics() {
+            ok("orders");
+            ok("orders.processing");
+            ok("orders-v2");
+            ok("_dlq.orders");
+            ok("metrics_2026");
+            ok("a");
+            ok("a1_b-2.c");
+        }
+
+        #[test]
+        fn empty_and_length() {
+            err("");
+            err(&"a".repeat(129));
+            ok(&"a".repeat(128));
+        }
+
+        #[test]
+        fn case_and_ascii() {
+            err("Orders");
+            err("Ωmega");
+            err("hello💥");
+        }
+
+        #[test]
+        fn dot_rules() {
+            err(".orders");
+            err("orders.");
+            err("orders..processing");
+            ok("orders.processing");
+        }
+
+        #[test]
+        fn invalid_chars() {
+            err("orders!");
+            err("hello@world");
+            err("foo/bar");
+            err("foo bar");
+        }
+
+        #[test]
+        fn borrow_works() {
+            let t = Group::parse("orders").unwrap();
+            let mut map = std::collections::HashMap::new();
+            map.insert(t.clone(), 1);
+
+            assert_eq!(map.get("orders"), Some(&1));
+        }
+    }
+}
+
 pub mod partition {
     #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
     pub struct Partition {

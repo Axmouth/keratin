@@ -15,6 +15,6 @@ fn random_operations_never_break_invariants() {
         }
 
         // Since we never mention offsets >= 2000, frontier must never exceed 2000.
-        assert!(g.acked_until() <= 2000);
+        assert!(g.settled_until() <= 2000);
     }
 }

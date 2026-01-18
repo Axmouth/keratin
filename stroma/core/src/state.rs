@@ -1,12 +1,12 @@
 use std::cmp::Reverse;
-use std::collections::BinaryHeap;
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use bitvec::vec::BitVec;
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
-pub const ACK_WINDOW: usize = 8192; // fixed bounded memory
+pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
 #[derive(Debug, Clone)]
 pub struct DLQDiscordSettings {
@@ -33,14 +33,28 @@ pub enum DLQDiscardPolicy {
     CustomDQL(CustomDLQ), // tp, part
 }
 
-/// Durable-ish semantics:
-/// - ACKs are allowed out-of-order.
-/// - We maintain a contiguous ACK frontier `acked_until`:
-///   all offsets < acked_until are ACKed.
-/// - Out-of-order ACKs for offsets >= acked_until go into `acked_set`.
-///   We advance the frontier when possible.
-/// - Inflight is a lease: offset -> deadline.
-/// - Expiry heap is an acceleration structure and may contain stale entries.
+/// QueueState semantics:
+///
+/// Offsets move through a strict state machine:
+///
+///   Enqueue -> Ready -> Inflight -> (Ack | Nack | Expiry)
+///
+/// Rules:
+/// - An offset exists iff it is Enqueued or has delivery history.
+/// - READY is authoritative for delivery eligibility.
+/// - MARK_INFLIGHT requires READY.
+/// - ACK / REJECT / DLQ are terminal and advance the frontier.
+/// - NACK never creates offsets; it only transforms existing state.
+/// - EXPIRY requeues inflight offsets but never ACKs.
+/// - An offset may exist in at most one of {ready, inflight, acked}.
+/// - The ACK frontier is contiguous and monotonic.
+///
+/// All operations are idempotent and replay-safe.
+///
+/// Important invariants:
+/// - NACK never creates offsets; it only transforms existing state.
+/// - READY is the sole authority for delivery eligibility.
+/// - ACK / REJECT / DLQ are terminal.
 #[derive(Debug, Clone)]
 pub struct QueueState {
     topic: String,
@@ -58,9 +72,10 @@ pub struct QueueState {
     // offset -> deadline_ts
     inflight: hashbrown::HashMap<Offset, UnixMillis>,
 
-    // ----- Enqueued -----
+    // ----- Ready -----
     // offset -> retries
-    enqueued: hashbrown::HashMap<Offset, u32>,
+    ready: BTreeSet<Offset>,                  // readiness only
+    retries: hashbrown::HashMap<Offset, u32>, // retry metadata only
 
     // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
     expiry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
@@ -119,7 +134,8 @@ impl QueueState {
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
             inflight: hashbrown::HashMap::new(),
-            enqueued: hashbrown::HashMap::new(),
+            ready: BTreeSet::new(),
+            retries: hashbrown::HashMap::new(),
             expiry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
@@ -130,7 +146,7 @@ impl QueueState {
     // ---------------- ACK API ----------------
 
     #[inline]
-    pub fn acked_until(&self) -> Offset {
+    pub fn settled_until(&self) -> Offset {
         self.settled_until
     }
 
@@ -161,12 +177,12 @@ impl QueueState {
     }
 
     #[inline]
-    pub fn is_enqueued(&self, offset: Offset) -> bool {
-        self.enqueued.contains_key(&offset)
+    pub fn is_ready(&self, offset: Offset) -> bool {
+        self.ready.contains(&offset)
     }
 
     pub fn filter_not_enqueued<T>(&self, items: &mut Vec<(Offset, T)>) {
-        items.retain(|(off, _)| self.enqueued.contains_key(off));
+        items.retain(|(off, _)| self.ready.contains(off));
     }
 
     pub fn ack(&mut self, offset: u64) {
@@ -176,8 +192,10 @@ impl QueueState {
             return;
         }
 
-        // ACK beats inflight: always remove inflight if present
+        // SETTLE beats inflight: always remove inflight if present
         let removed = self.inflight.remove(&offset);
+        self.ready.remove(&offset);
+        self.retries.remove(&offset);
         if removed.is_some() {
             // heap can have stale entries now
             self.recompute_hint_if_needed();
@@ -194,53 +212,45 @@ impl QueueState {
             let idx = (offset - self.ack_window_base) as usize;
             self.ack_bits.set(idx, true);
         } else {
-            // far ack: leave for persistence/event log (still applied logically by replay later)
+            // far settle: leave for persistence/event log (still applied logically by replay later)
             // (Materialized model can ignore or store it.)
         }
     }
 
     // TODO: move non storage related logic elsewhere?
     pub fn nack(&mut self, offset: u64, requeue: bool) {
-        if requeue {
-            // We check if we should DLQ based on retry count
-            let retries = self.enqueued.entry(offset).or_insert(0);
-
-            if *retries >= self.dlq_settings.max_retries {
-                // Send to DLQ
-                self.dead_letter(offset);
-                self.enqueued.remove(&offset);
-            } else {
-                *retries += 1;
-                // Requeue logic: application specific, here we just clear inflight so it can be redelivered
-                self.inflight.remove(&offset);
-                // Add back to expiry heap for redelivery
-                // TODO: Create a requeue Event instead?
-                // TODO: Using zero deadline means immediate redelivery. Current solution to keep it deterministic on recovery.
-                // TODO: Or nvm, adding to enqueued map should be enough now.
-                // self.expiry_heap.push((Reverse(0), offset));
-                self.recompute_hint_if_needed();
-            }
-
-            // We let redelivery logic handle requeue
-            return;
-        }
-
-        // Do fallible parts first
-        self.dead_letter(offset);
-
-        // todo: WIP
         if offset < self.settled_until {
-            // already settled
-            self.inflight.remove(&offset); // best-effort cleanup
+            self.inflight.remove(&offset);
             return;
         }
 
-        // NACK beats inflight: always remove inflight if present
-        let removed = self.inflight.remove(&offset);
-        if removed.is_some() {
-            // heap can have stale entries now
-            self.recompute_hint_if_needed();
+        if !requeue {
+            self.ready.remove(&offset);
+            self.retries.remove(&offset);
+            self.dead_letter(offset);
+            return;
         }
+
+        let exists = self.inflight.contains_key(&offset)
+            || self.ready.contains(&offset)
+            || self.retries.contains_key(&offset);
+        if !exists {
+            return;
+        }
+
+        self.inflight.remove(&offset);
+
+        let retries = self.retries.entry(offset).or_insert(0);
+        if *retries >= self.dlq_settings.max_retries {
+            self.ready.remove(&offset);
+            self.retries.remove(&offset);
+            self.dead_letter(offset);
+            return;
+        }
+
+        *retries += 1;
+        self.ready.insert(offset);
+        self.recompute_hint_if_needed();
     }
 
     // TODO: move non storage related logic elsewhere?
@@ -389,27 +399,45 @@ impl QueueState {
         self.settled_until
     }
 
-    pub fn get_enqueued_retries(&self, offset: Offset) -> Option<u32> {
-        self.enqueued.get(&offset).copied()
+    pub fn get_retries(&self, offset: Offset) -> Option<u32> {
+        self.retries.get(&offset).copied()
     }
 
     pub fn enqueue(&mut self, offset: Offset, retries: u32) {
+        // We assume it is only used on messages that have been properly stored earlier
         if self.is_acked(offset) {
             return;
         }
-        // TODO: check if it exists in message log?
 
-        self.enqueued.insert(offset, retries);
+        self.ready.insert(offset);
+        self.retries.insert(offset, retries);
     }
 
     // ---------------- Inflight API ----------------
 
     /// Mark inflight for an offset. If offset is already ACKed, no-op.
     pub fn mark_inflight(&mut self, offset: Offset, deadline: UnixMillis) {
-        if self.is_acked(offset) {
+        // Below frontier is always acked
+        if offset < self.settled_until {
             return;
         }
-        self.enqueued.remove(&offset);
+
+        // Case 1: update existing inflight lease
+        if let Some(cur) = self.inflight.get_mut(&offset) {
+            *cur = deadline;
+            self.expiry_heap.push((Reverse(deadline), offset));
+            self.min_deadline_hint = Some(match self.min_deadline_hint {
+                None => deadline,
+                Some(m) => m.min(deadline),
+            });
+            return;
+        }
+
+        // Case 2: initial delivery — must be READY
+        if !self.ready.remove(&offset) {
+            return;
+        }
+
         self.inflight.insert(offset, deadline);
         self.expiry_heap.push((Reverse(deadline), offset));
         self.min_deadline_hint = Some(match self.min_deadline_hint {
@@ -440,32 +468,57 @@ impl QueueState {
 
     #[inline]
     pub fn next_expiry_hint(&mut self) -> Option<UnixMillis> {
-        self.recompute_hint_full();
-        self.min_deadline_hint
+        // self.recompute_hint_full();
+        // self.min_deadline_hint
+        while let Some(top) = self.expiry_heap.peek() {
+            let (Reverse(deadline), offset) = top;
+
+            match self.inflight.get(offset) {
+                Some(d) if *d == *deadline => {
+                    return Some(*deadline);
+                }
+                _ => {
+                    // stale heap entry → drop it
+                    self.expiry_heap.pop();
+                }
+            }
+        }
+
+        None
     }
 
-    /// Pop expired offsets (deadline <= now), up to max.
-    pub fn pop_expired(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
+    pub fn collect_expired(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let mut out = Vec::new();
 
-        while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
-            if ts > now || out.len() >= max {
+        while let Some(&(Reverse(deadline), off)) = self.expiry_heap.peek() {
+            if deadline > now || out.len() >= max {
                 break;
             }
+
             self.expiry_heap.pop();
 
-            // Validate against current inflight map (skip stale heap entries)
+            // validate against inflight (skip stale heap entries)
             match self.inflight.get(&off).copied() {
-                Some(cur_deadline) if cur_deadline == ts => {
+                Some(cur_deadline) if cur_deadline == deadline => {
                     self.inflight.remove(&off);
+                    self.ready.insert(off);
                     out.push(off);
                 }
                 _ => continue,
             }
         }
 
+        // heap may now be stale
         self.recompute_hint_if_needed();
+
         out
+    }
+
+    #[inline]
+    fn has_history(&self, offset: Offset) -> bool {
+        self.ready.contains(&offset)
+            || self.inflight.contains_key(&offset)
+            || self.retries.contains_key(&offset)
     }
 
     /// Walk heap until we find a valid inflight entry; rebuild if heap fully stale.
@@ -533,6 +586,11 @@ impl QueueState {
         let mut off = from.max(self.settled_until);
 
         while off < upper {
+            if !self.ready.contains(&off) {
+                off += 1;
+                continue;
+            }
+
             if self.inflight.contains_key(&off) {
                 off += 1;
                 continue;
@@ -656,10 +714,14 @@ impl QueueState {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
-        out.extend_from_slice(&(self.enqueued.len() as u32).to_be_bytes());
-        for (&off, e) in self.enqueued.iter() {
+        out.extend_from_slice(&(self.retries.len() as u32).to_be_bytes());
+        for (&off, e) in self.retries.iter() {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
+        }
+        out.extend_from_slice(&(self.ready.len() as u32).to_be_bytes());
+        for off in self.ready.iter() {
+            out.extend_from_slice(&off.to_be_bytes());
         }
 
         out
@@ -698,11 +760,17 @@ impl QueueState {
             self.mark_inflight(off, dl);
         }
 
-        let enqueued_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
-        for _ in 0..enqueued_len {
+        let retries_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        for _ in 0..retries_len {
             let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
-            self.enqueue(off, retries);
+            self.retries.insert(off, retries);
+        }
+
+        let ready_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        for _ in 0..ready_len {
+            let off: u64 = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.ready.insert(off);
         }
 
         Ok(())
@@ -735,12 +803,522 @@ mod tests {
     use super::{Offset, QueueState};
 
     #[test]
+    fn next_deliverable_requires_ready() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(5, 10); // ignored
+        s.ack(3);
+
+        assert_eq!(s.next_deliverable(0, 10), 10);
+
+        s.enqueue(5, 0);
+        assert_eq!(s.next_deliverable(0, 10), 5);
+    }
+
+    #[test]
+    fn reject_without_enqueue_is_noop() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.reject(7);
+
+        assert!(!s.has_history(7));
+    }
+
+    #[test]
+    fn reject_without_enqueue_is_terminal() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.reject(7);
+
+        assert!(s.is_acked(7));
+        assert!(!s.is_ready(7));
+        assert!(!s.is_inflight(7));
+    }
+
+    #[test]
+    fn nack_after_ack_is_noop() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 10);
+        s.ack(1);
+
+        s.nack(1, true);
+
+        assert!(s.is_acked(1));
+        assert!(!s.is_ready(1));
+        assert!(!s.is_inflight(1));
+        assert_eq!(s.get_retries(1), None);
+    }
+
+    #[test]
+    fn ack_without_enqueue_is_terminal_but_not_ready() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ack(3);
+
+        assert!(s.is_acked(3));
+        assert!(!s.is_ready(3));
+        assert!(!s.is_inflight(3));
+        assert_eq!(s.settled_until(), 0); // frontier doesn't move unless contiguous
+    }
+
+    #[test]
+    fn has_history_only_after_enqueue_or_delivery() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        // No history initially
+        assert!(!s.has_history(5));
+
+        // ACK alone does not create history
+        s.ack(5);
+        assert!(!s.has_history(5));
+
+        // ACK dominates future enqueue
+        s.enqueue(5, 0);
+        assert!(!s.has_history(5));
+    }
+
+    #[test]
+    fn enqueue_creates_history_if_not_acked() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(5, 0);
+        assert!(s.has_history(5));
+
+        s.mark_inflight(5, 10);
+        assert!(s.has_history(5));
+
+        s.ack(5);
+        assert!(!s.has_history(5));
+    }
+
+    #[test]
+    fn ack_without_enqueue_is_allowed() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ack(5);
+
+        assert!(s.is_acked(5));
+        assert_eq!(s.settled_until(), 0); // frontier does not advance
+        assert!(!s.is_ready(5));
+        assert!(!s.is_inflight(5));
+    }
+
+    #[test]
+    fn enqueue_after_ack_is_ignored() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ack(3);
+        s.enqueue(3, 0);
+
+        assert!(s.is_acked(3));
+        assert!(!s.is_ready(3));
+        assert_eq!(s.next_deliverable(0, 10), 10);
+    }
+
+    #[test]
+    fn ack_before_enqueue_advances_frontier_normally() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ack(0);
+        s.ack(1);
+        s.ack(2);
+
+        assert_eq!(s.settled_until(), 3);
+
+        s.enqueue(1, 0);
+        s.enqueue(2, 0);
+
+        assert!(!s.is_ready(1));
+        assert!(!s.is_ready(2));
+    }
+
+    #[test]
+    fn nack_without_enqueue_does_not_make_ready() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.nack(5, true);
+
+        assert!(!s.is_ready(5));
+        assert!(!s.is_inflight(5));
+        assert!(!s.is_acked(5));
+    }
+
+    #[test]
+    fn inflight_update_does_not_make_offset_ready() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 10);
+        s.mark_inflight(1, 20);
+
+        assert!(s.is_inflight(1));
+        assert!(!s.is_ready(1));
+    }
+
+    #[test]
+    fn expiry_makes_offset_ready() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(3, 0);
+        s.mark_inflight(3, 10);
+        s.collect_expired(10, 10);
+
+        assert!(s.is_ready(3));
+        assert_eq!(s.next_deliverable(0, 10), 3);
+    }
+
+    #[test]
+    fn only_ready_offsets_are_delivered() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        assert_eq!(s.next_deliverable(0, 10), 10);
+
+        s.enqueue(5, 0);
+        assert_eq!(s.next_deliverable(0, 10), 5);
+    }
+
+    #[test]
+    fn nack_hits_dlq_at_max_retries() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 10);
+        for _ in 0..s.dlq_settings.max_retries {
+            s.nack(1, true);
+            s.mark_inflight(1, 10);
+        }
+
+        s.nack(1, true);
+
+        assert!(!s.is_ready(1));
+        assert!(!s.is_inflight(1));
+        assert!(s.is_acked(1));
+    }
+
+    #[test]
+    fn offset_in_exactly_one_state() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ready.insert(5);
+        assert!(s.is_ready(5));
+        assert!(!s.is_inflight(5));
+
+        s.mark_inflight(5, 100);
+        assert!(!s.is_ready(5));
+        assert!(s.is_inflight(5));
+
+        s.nack(5, true);
+        assert!(s.is_ready(5));
+        assert!(!s.is_inflight(5));
+
+        s.ack(5);
+        assert!(s.is_acked(5));
+        assert!(!s.is_ready(5));
+        assert!(!s.is_inflight(5));
+    }
+
+    #[test]
+    fn retries_persist_across_redelivery() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ready.insert(1);
+        s.mark_inflight(1, 100);
+        s.nack(1, true);
+
+        s.mark_inflight(1, 200);
+        s.nack(1, true);
+
+        assert_eq!(s.get_retries(1), Some(2));
+    }
+
+    #[test]
+    fn expired_then_nacked_is_still_not_acked() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(2, 0);
+        s.mark_inflight(2, 10);
+        s.collect_expired(10, 10);
+        s.nack(2, true);
+
+        assert!(!s.is_acked(2));
+        assert_eq!(s.next_deliverable(0, 10), 2);
+    }
+
+    #[test]
+    fn reject_advances_frontier() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(0, 100);
+        s.reject(0);
+
+        assert!(s.is_acked(0));
+        assert_eq!(s.settled_until(), 1);
+    }
+
+    #[test]
+    fn nack_requeue_increments_retry() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 100);
+        s.nack(1, true);
+        assert_eq!(s.get_retries(1), Some(1));
+
+        s.mark_inflight(1, 100);
+        s.nack(1, true);
+        assert_eq!(s.get_retries(1), Some(2));
+    }
+
+    #[test]
+    fn nack_allows_redelivery() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 100);
+        s.nack(0, true);
+
+        assert_eq!(s.next_deliverable(0, 10), 0);
+    }
+
+    #[test]
+    fn nack_never_acks() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(3, 100);
+        s.nack(3, true);
+
+        assert!(!s.is_acked(3));
+        assert!(!s.is_inflight(3));
+        assert_eq!(s.settled_until(), 0);
+    }
+
+    #[test]
+    fn expiry_never_acks() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(5, 0);
+        s.mark_inflight(5, 10);
+        assert!(!s.is_acked(5));
+
+        let ex = s.collect_expired(10, 10);
+        assert_eq!(ex, vec![5]);
+
+        // Still NOT acked
+        assert!(!s.is_acked(5));
+        assert_eq!(s.settled_until(), 0);
+
+        // Offset 5 is now eligible again, but ordering is preserved
+        assert!(!s.is_inflight(5));
+        assert!(!s.is_acked(5));
+
+        // Earliest deliverable is still 0
+        let d = s.next_deliverable(0, 100);
+        assert_eq!(d, 5);
+    }
+
+    #[test]
+    fn expired_offset_delivered_after_frontier_advances() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(5, 0);
+        s.mark_inflight(5, 10);
+        s.collect_expired(10, 10);
+
+        // ACK 0..4
+        for i in 0..5 {
+            s.ack(i);
+        }
+
+        assert_eq!(s.settled_until(), 5);
+        assert_eq!(s.next_deliverable(0, 100), 5);
+    }
+
+    #[test]
+    fn expired_offsets_do_not_reappear_without_redelivery() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(3, 10);
+        s.collect_expired(10, 10);
+
+        assert!(!s.is_inflight(3));
+
+        // No operation should magically reinsert it
+        for _ in 0..10 {
+            s.collect_expired(20, 10);
+            s.clear_inflight(3);
+        }
+
+        assert!(!s.is_inflight(3));
+    }
+
+    #[test]
+    fn ack_before_expiry_prevents_expiry() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(7, 100);
+        s.ack(7);
+
+        let ex = s.collect_expired(200, 10);
+        assert!(ex.is_empty());
+
+        assert!(s.is_acked(7));
+        assert!(!s.is_inflight(7));
+    }
+
+    #[test]
+    fn expiry_does_not_interact_with_ack_window() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.ack(1); // out of order
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 10);
+
+        let ex = s.collect_expired(10, 10);
+        assert_eq!(ex, vec![0]);
+
+        // ACK window still intact
+        assert!(s.is_acked(1));
+        assert!(!s.is_acked(0));
+        assert_eq!(s.settled_until(), 0);
+    }
+
+    #[test]
+    fn expiry_hint_is_none_after_full_drain() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        for i in 0..50 {
+            s.mark_inflight(i, i + 10);
+        }
+
+        s.collect_expired(100, 100);
+
+        assert_eq!(s.inflight_len(), 0);
+        assert_eq!(s.next_expiry_hint(), None);
+    }
+
+    #[test]
+    fn next_deliverable_progresses_after_expiry() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(10, 0);
+        s.mark_inflight(0, 10);
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 10);
+        s.enqueue(12, 0);
+        s.mark_inflight(2, 10);
+
+        s.collect_expired(10, 10);
+
+        let d = s.next_deliverable(0, 10);
+        assert_eq!(d, 1);
+    }
+
+    #[test]
+    fn random_ops_with_expiry_never_violate_invariants() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        for _ in 0..200_000 {
+            let o = fastrand::u64(0..1000);
+            match fastrand::u8(0..6) {
+                0 => s.mark_inflight(o, fastrand::u64(0..1000)),
+                1 => s.clear_inflight(o),
+                2 => s.ack(o),
+                _ => {
+                    let _ = s.collect_expired(fastrand::u64(0..1000), 10);
+                }
+            }
+
+            // Invariants
+            if let Some(h) = s.next_expiry_hint() {
+                assert!(s.inflight.values().any(|&d| d == h));
+            }
+            assert!(s.settled_until() <= 1000);
+        }
+    }
+
+    #[test]
+    fn expired_offsets_are_removed_exactly_once() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        for i in 0..1000 {
+            s.enqueue(i, 0);
+            s.mark_inflight(i, 100);
+        }
+
+        let e1 = s.collect_expired(100, 2000);
+        let e2 = s.collect_expired(100, 2000);
+
+        assert_eq!(e1.len(), 1000);
+        assert!(e2.is_empty());
+        assert_eq!(s.inflight_len(), 0);
+    }
+
+    #[test]
+    fn updating_inflight_deadline_does_not_expire_early() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 10);
+        s.mark_inflight(1, 100); // update
+
+        let expired = s.collect_expired(50, 10);
+        assert!(expired.is_empty());
+
+        let expired = s.collect_expired(100, 10);
+        assert_eq!(expired, vec![1]);
+    }
+
+    #[test]
+    fn acked_offsets_never_expire() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.mark_inflight(5, 10);
+        s.ack(5);
+
+        let expired = s.collect_expired(100, 10);
+        assert!(expired.is_empty());
+        assert!(s.is_acked(5));
+    }
+
+    #[test]
+    fn inflight_below_frontier_is_ignored() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.ack(0);
+        s.ack(1);
+        s.ack(2);
+        assert_eq!(s.settled_until(), 3);
+
+        s.mark_inflight(1, 10); // should be ignored
+        assert_eq!(s.inflight_len(), 0);
+    }
+
+    #[test]
+    fn offset_not_in_multiple_states() {
+        let mut s = QueueState::new("test".into(), 0);
+
+        s.enqueue(5, 0);
+        s.mark_inflight(5, 10);
+
+        assert!(s.is_inflight(5));
+        assert!(!s.is_ready(5));
+
+        s.ack(5);
+        assert!(s.is_acked(5));
+        assert!(!s.is_inflight(5));
+        assert!(!s.is_ready(5));
+    }
+
+    #[test]
     fn frontier_is_monotonic() {
         let mut s = QueueState::new("test".into(), 0);
 
         for _i in 0..10_000 {
             s.ack(fastrand::u64(0..5000));
-            assert!(s.acked_until() <= 5000);
+            assert!(s.settled_until() <= 5000);
         }
     }
 
@@ -767,21 +1345,6 @@ mod tests {
 
             s.mark_inflight(d, 2000);
         }
-    }
-
-    #[test]
-    fn expired_offsets_are_removed_exactly_once() {
-        let mut s = QueueState::new("test".into(), 0);
-
-        for i in 0..1000 {
-            s.mark_inflight(i, 100);
-        }
-
-        let ex1 = s.pop_expired(100, 2000);
-        let ex2 = s.pop_expired(100, 2000);
-
-        assert_eq!(ex1.len(), 1000);
-        assert!(ex2.is_empty());
     }
 
     #[test]
@@ -814,12 +1377,12 @@ mod tests {
                 1 => s.clear_inflight(o),
                 2 => s.ack(o),
                 _ => {
-                    let _ = s.pop_expired(fastrand::u64(0..100_000), 100);
+                    let _ = s.collect_expired(fastrand::u64(0..100_000), 100);
                 }
             }
 
             // Hard invariants:
-            assert!(s.acked_until() <= 30000);
+            assert!(s.settled_until() <= 30000);
             if let Some(h) = s.next_expiry_hint() {
                 let assert_cond = s.inflight.values().any(|&d| d == h);
                 if !assert_cond {
@@ -838,22 +1401,22 @@ mod tests {
         // ACK 2 and 4 out-of-order; frontier stays at 0
         s.ack(2);
         s.ack(4);
-        assert_eq!(s.acked_until(), 0);
+        assert_eq!(s.settled_until(), 0);
         assert!(s.is_acked(2));
         assert!(s.is_acked(4));
         assert!(!s.is_acked(0));
 
         // ACK 0 should advance frontier to 1
         s.ack(0);
-        assert_eq!(s.acked_until(), 1);
+        assert_eq!(s.settled_until(), 1);
 
         // ACK 1 should advance to 3 (because 2 was already acked)
         s.ack(1);
-        assert_eq!(s.acked_until(), 3);
+        assert_eq!(s.settled_until(), 3);
 
         // ACK 3 should advance to 5 (because 4 was already acked)
         s.ack(3);
-        assert_eq!(s.acked_until(), 5);
+        assert_eq!(s.settled_until(), 5);
 
         // sanity: everything < 5 is acked now
         for o in 0..5 {
@@ -865,6 +1428,7 @@ mod tests {
     fn ack_removes_inflight() {
         let mut s = QueueState::new("test".into(), 0);
 
+        s.enqueue(10, 0);
         s.mark_inflight(10, 1000);
         assert!(s.is_inflight_or_acked(10));
         assert!(!s.is_acked(10));
@@ -882,9 +1446,11 @@ mod tests {
         let mut s = QueueState::new("test".into(), 0);
 
         s.ack_batch(&[0, 1, 2, 3, 4]);
-        assert_eq!(s.acked_until(), 5);
+        assert_eq!(s.settled_until(), 5);
 
+        s.enqueue(2, 0);
         s.mark_inflight(2, 123);
+        s.enqueue(4, 0);
         s.mark_inflight(4, 123);
         assert_eq!(s.inflight_len(), 0);
     }
@@ -893,50 +1459,45 @@ mod tests {
     fn expiry_hint_tracks_min_deadline_and_handles_updates() {
         let mut s = QueueState::new("test".into(), 0);
 
+        s.enqueue(10, 0);
         s.mark_inflight(10, 500);
         assert_eq!(s.next_expiry_hint(), Some(500));
 
+        s.enqueue(11, 0);
         s.mark_inflight(11, 400);
         assert_eq!(s.next_expiry_hint(), Some(400));
 
         // update 11 to later deadline; heap now has stale(400) + current(700).
         s.mark_inflight(11, 700);
         s.recompute_hint_if_needed();
-        // hint may still be 400 until recompute/pop; force recompute
+        // hint may still be 400 until recompute/pop, force recompute
         assert_eq!(s.next_expiry_hint(), Some(500));
     }
 
     #[test]
-    fn pop_expired_skips_stale_heap_entries() {
+    fn collect_expired_is_idempotent() {
         let mut s = QueueState::new("test".into(), 0);
 
-        // inflight 1 deadline 10
-        s.mark_inflight(1, 10);
-        // then update to deadline 30 (creates stale heap entry)
-        s.mark_inflight(1, 30);
-        // inflight 2 deadline 20
-        s.mark_inflight(2, 20);
-        // At now=15, only offset 2 is not expired; offset 1 has current deadline 30.
-        let expired = s.pop_expired(15, 300);
-        assert!(expired.is_empty());
-        assert_eq!(s.next_expiry_hint(), Some(20));
+        for i in 0..1000 {
+            s.enqueue(i, 0);
+            s.mark_inflight(i, 100);
+        }
 
-        // At now=25, offset 2 expires
-        let expired = s.pop_expired(25, 300);
-        assert_eq!(expired, vec![2]);
-        assert_eq!(s.next_expiry_hint(), Some(30));
+        let ex1 = s.collect_expired(100, 2000);
+        let ex2 = s.collect_expired(100, 2000);
 
-        // At now=35, offset 1 expires (stale deadline=10 entry should be ignored)
-        let expired = s.pop_expired(35, 300);
-        assert_eq!(expired, vec![1]);
-        assert_eq!(s.next_expiry_hint(), None);
+        assert_eq!(ex1.len(), 1000);
+        assert!(ex2.is_empty());
+        assert_eq!(s.inflight_len(), 0);
     }
 
     #[test]
     fn clear_inflight_removes_and_hint_updates() {
         let mut s = QueueState::new("test".into(), 0);
 
+        s.enqueue(1, 0);
         s.mark_inflight(1, 10);
+        s.enqueue(2, 0);
         s.mark_inflight(2, 20);
         assert_eq!(s.next_expiry_hint(), Some(10));
 
@@ -953,6 +1514,7 @@ mod tests {
     fn is_inflight_or_acked_behaves() {
         let mut s = QueueState::new("test".into(), 0);
 
+        s.enqueue(5, 0);
         s.mark_inflight(5, 100);
         assert!(s.is_inflight_or_acked(5));
         assert!(!s.is_acked(5));
@@ -967,7 +1529,7 @@ mod tests {
         s.ack(2);
         s.ack(3);
         s.ack(4);
-        assert_eq!(s.acked_until(), 6);
+        assert_eq!(s.settled_until(), 6);
         for o in 0..6 {
             assert!(s.is_inflight_or_acked(o));
             assert!(s.is_acked(o));
@@ -979,6 +1541,6 @@ mod tests {
         let mut s = QueueState::new("test".into(), 0);
         let v: Vec<Offset> = vec![2, 2, 0, 1, 1, 3];
         s.ack_batch(&v);
-        assert_eq!(s.acked_until(), 4);
+        assert_eq!(s.settled_until(), 4);
     }
 }

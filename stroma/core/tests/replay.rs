@@ -1,3 +1,5 @@
+use std::sync::Arc;
+
 use keratin_log::{KeratinConfig, util::test_dir};
 use similar_asserts::assert_eq;
 use stroma_core::*;
@@ -32,4 +34,22 @@ async fn snapshot_delta_replay_is_deterministic() {
     let after = st2.debug_dump_queue("t", 0);
 
     assert_eq!(before, after);
+}
+
+#[tokio::test]
+async fn expired_messages_survive_restart() {
+    let dir = test_dir("expiry_restart");
+    let st = Arc::new(Stroma::open(&dir.root, KeratinConfig::test_default(), SnapshotConfig::default()).await.unwrap());
+
+
+    let (c, rx) = KeratinAppendCompletion::pair();
+    st.append_message("t", 0, b"x", c).await.unwrap();
+    st.mark_inflight_one("t", 0, 0, 10).await.unwrap();
+    let offset = rx.await.unwrap().unwrap().base_offset;
+
+    st.list_expired(100, 10).unwrap();
+    drop(st);
+
+    let st2 = Stroma::open(&dir.root, KeratinConfig::test_default(), SnapshotConfig::default()).await.unwrap();
+    assert!(st2.is_enqueued("t", 0, offset).unwrap());
 }

@@ -12,5 +12,5 @@ fn out_of_order_acks_never_skip_frontier() {
         g.ack(i);
     }
 
-    assert_eq!(g.acked_until(), 1000);
+    assert_eq!(g.settled_until(), 1000);
 }
