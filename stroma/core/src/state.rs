@@ -33,6 +33,47 @@ pub enum DLQDiscardPolicy {
     CustomDQL(CustomDLQ), // tp, part
 }
 
+/// QueueState invariants and transitions:
+///
+/// States (per offset):
+/// - Absent        : no enqueue, no inflight, not acked
+/// - Ready         : enqueued, eligible for delivery
+/// - Inflight      : leased to a consumer
+/// - Acked         : terminal
+///
+/// Terminal rule:
+/// - ACK is final. Once acked, an offset can never re-enter Ready or Inflight.
+///
+/// Transitions:
+/// - enqueue:
+///   Absent -> Ready
+///   Acked  -> (ignored)
+///
+/// - mark_inflight:
+///   Ready     -> Inflight
+///   Inflight  -> Inflight (deadline update)
+///   others    -> (ignored)
+///
+/// - collect_expired:
+///   Inflight -> Ready
+///
+/// - nack(requeue=true):
+///   Inflight -> Ready (retry++)
+///   others   -> (ignored)
+///
+/// - nack(requeue=false) / reject:
+///   Inflight -> Acked
+///
+/// - ack:
+///   Ready    -> Acked
+///   Inflight -> Acked
+///   others   -> (idempotent)
+///
+/// Safety invariants:
+/// - An offset is never in Ready and Inflight at the same time
+/// - Inflight offsets are always >= settled_until
+/// - settled_until is monotonic
+///
 /// QueueState semantics:
 ///
 /// Offsets move through a strict state machine:
