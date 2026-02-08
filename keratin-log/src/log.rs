@@ -623,6 +623,12 @@ impl Log {
         // optional: keep it conservative
         Ok(())
     }
+
+    pub fn shutdown(&mut self) -> io::Result<()> {
+        self.flush_buffers()?;
+        self.fsync()?;
+        Ok(())
+    }
 }
 
 // ---- helpers

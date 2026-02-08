@@ -1,6 +1,7 @@
+#[cfg(windows)]
+use std::io;
 use std::{
-    path::{Path, PathBuf},
-    time::{SystemTime, UNIX_EPOCH},
+    path::{Path, PathBuf}, thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::Context;
@@ -31,8 +32,27 @@ pub struct TempDir {
 
 impl Drop for TempDir {
     fn drop(&mut self) {
-        std::fs::remove_dir_all(&self.root).unwrap();
+        println!("Dropping TempDir at {}", self.root.display());
+        let res = std::fs::remove_dir_all(&self.root).inspect_err(|err| {
+            println!("Error cleaning up temp dir {}: {err}", self.root.display());
+        });
+        if let Ok(()) = res {
+            println!("Cleaned up temp dir: {}", self.root.display());
+        }
     }
+}
+
+#[cfg(unix)]
+pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
+    use std::fs::File;
+    let dir = File::open(path)?;
+    dir.sync_all()
+}
+
+#[cfg(windows)]
+pub(crate) fn fsync_dir(_path: &Path) -> io::Result<()> {
+    // Windows rename() is already metadata-durable.
+    Ok(())
 }
 
 pub fn latest_segment(root: impl AsRef<Path>) -> anyhow::Result<PathBuf> {

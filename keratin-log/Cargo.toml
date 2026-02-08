@@ -11,6 +11,7 @@ crossbeam-channel = "0.5"
 dashmap = "6.1"
 fastrand = "2.3"
 futures = "0.3"
+fs2 = "0.4"
 parking_lot = "0.12"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }

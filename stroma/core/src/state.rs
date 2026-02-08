@@ -184,11 +184,22 @@ impl QueueState {
         }
     }
 
+    #[inline]
+    pub fn next_offset(&self) -> Offset {
+        self.ready.last().copied().unwrap_or(0)
+    }
+
     // ---------------- ACK API ----------------
 
     #[inline]
     pub fn settled_until(&self) -> Offset {
         self.settled_until
+    }
+
+    pub fn iter_ready_from(&self, from: Offset) -> impl Iterator<Item = Offset> + '_ {
+        self.ready
+            .range(from..)
+            .copied()
     }
 
     /// True if this offset is known ACKed.
@@ -509,6 +520,7 @@ impl QueueState {
 
     #[inline]
     pub fn next_expiry_hint(&mut self) -> Option<UnixMillis> {
+        self.recompute_hint_if_needed();
         // self.recompute_hint_full();
         // self.min_deadline_hint
         while let Some(top) = self.expiry_heap.peek() {

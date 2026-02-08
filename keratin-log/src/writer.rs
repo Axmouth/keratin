@@ -5,7 +5,6 @@ use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
 use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
-use tokio::sync::oneshot;
 
 use crate::batcher::{BatcherConfig, BatcherCore, Deadline, FlushReason, PushResult};
 use crate::durability::KDurability;
@@ -102,11 +101,17 @@ struct NotifyItem {
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
     let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(1024);
 
-    std::thread::spawn(move || notifier_loop(notify_rx));
+    std::thread::spawn(move || {
+        notifier_loop(notify_rx);
+        tracing::info!("Notifier loop exited");
+    });
 
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024);
 
-    std::thread::spawn(move || writer_loop(&mut log, cfg, rx, state, notify_tx));
+    std::thread::spawn(move || {
+        writer_loop(&mut log, cfg, rx, state, notify_tx);
+        tracing::info!("Writer loop exited")
+    });
 
     WriterHandle { tx }
 }
@@ -331,6 +336,8 @@ fn writer_loop(
                 }
             }
             WriterCmd::Shutdown => {
+                fail_all_pending(&mut pending, "writer shutdown", &notify_tx, false);
+                tracing::info!("Writer received shutdown command");
                 return;
             }
         }
@@ -436,12 +443,13 @@ fn maybe_commit_due(
         durable_offset,
         last_fsync,
         state.clone(),
-        &notify_tx,
+        notify_tx,
     ) {
         fail_all_pending(
             pending,
             format!("Internal Error while commiting: {e}"),
             notify_tx,
+            true,
         );
 
         if error_count > 3 {
@@ -449,6 +457,7 @@ fn maybe_commit_due(
                 pending,
                 "Internal Error while commiting writes over 3 times",
                 notify_tx,
+                true,
             );
             std::thread::sleep(Duration::from_millis(1000));
             break;
@@ -486,7 +495,7 @@ fn post_stage_commit_and_tune(
             durable_offset,
             last_fsync,
             state.clone(),
-            &notify_tx,
+            notify_tx,
         );
     } else if log.should_flush() {
         let _ = log.flush_buffers();
@@ -563,8 +572,13 @@ fn fail_all_pending(
     pending: &mut VecDeque<PendingAck>,
     err_msg: impl AsRef<str>,
     notify_tx: &Sender<NotifyMsg>,
+    error: bool,
 ) {
-    tracing::error!("{}", err_msg.as_ref());
+    if error {
+        tracing::error!("{}", err_msg.as_ref());
+    } else {
+        tracing::info!("{}", err_msg.as_ref());
+    }
     let mut items = Vec::new();
 
     while let Some(p) = pending.pop_front() {

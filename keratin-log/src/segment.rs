@@ -29,6 +29,7 @@ impl Segment {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&hdr)?;
         file.flush()?;
+        file.sync_all()?;
 
         Ok(Self {
             base_offset,

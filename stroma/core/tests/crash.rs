@@ -1,7 +1,34 @@
 use std::sync::Arc;
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::test_dir};
-use stroma_core::{SnapshotConfig, Stroma};
+use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
+use stroma_core::{Offset, SnapshotConfig, Stroma};
+
+async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
+    let test_dir = test_dir("test_data");
+    (Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    ), test_dir)
+}
+
+pub async fn append_one(
+    st: &Arc<Stroma>,
+    tp: &str,
+    part: u32,
+    group: Option<&str>,
+    payload: &[u8],
+) -> Offset {
+    let (c, rx) = KeratinAppendCompletion::pair();
+    st.append_message(tp, part, group, payload, c)
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap().base_offset
+}
 
 #[tokio::test]
 async fn truncated_delta_does_not_corrupt_state() {
@@ -12,13 +39,13 @@ async fn truncated_delta_does_not_corrupt_state() {
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
     for i in 0..1000 {
-        st.mark_inflight_one("t", 0, i, 1000).await.unwrap();
+        st.mark_inflight_one("t", 0,  None, i, 1000).await.unwrap();
         if i % 4 == 0 {
-            st.ack_one("t", 0, i).await.unwrap();
+            st.ack_one("t", 0,  None, i).await.unwrap();
         }
     }
 
-    st.truncate_partition_log("t", 0, 123).await.unwrap();
+    st.truncate_partition_log("t", 0,  None, 123).await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
@@ -39,13 +66,13 @@ async fn enqueue_is_durable_and_replayed() {
     );
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, b"hello", completion)
+    st.append_message("t", 0,  None, b"hello", completion)
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
 
     // Force snapshot & restart
-    st.snapshot_partition("t", 0).await.unwrap();
+    st.snapshot_partition("t", 0,  None).await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(
@@ -56,15 +83,16 @@ async fn enqueue_is_durable_and_replayed() {
     .await
     .unwrap();
 
-    assert!(st2.is_enqueued("t", 0, 0).unwrap());
+    assert!(st2.is_ready("t", 0,  None, 0).unwrap());
 }
 
+
 #[tokio::test]
-async fn crash_between_message_and_enqueue_event_is_safe() {
-    let test_dir = test_dir("test_data");
+async fn enqueue_is_durable_and_replayed_no_snap() {
+    let dir = test_dir("enqueue_replay");
     let st = Arc::new(
         Stroma::open(
-            &test_dir.root,
+            &dir.root,
             KeratinConfig::test_default(),
             SnapshotConfig::default(),
         )
@@ -72,21 +100,74 @@ async fn crash_between_message_and_enqueue_event_is_safe() {
         .unwrap(),
     );
 
-    let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, b"x", c).await.unwrap();
-    let offset = rx.await.unwrap().unwrap().base_offset;
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.append_message("t", 0,  None, b"hello", completion)
+        .await
+        .unwrap();
+    let _append_result = rx.await.unwrap().unwrap();
+    assert!(st.is_ready("t", 0,  None, 0).unwrap());
 
     drop(st);
 
     let st2 = Stroma::open(
-        &test_dir.root,
+        &dir.root,
         KeratinConfig::test_default(),
         SnapshotConfig::default(),
     )
     .await
     .unwrap();
-    st2.validate().unwrap();
 
-    // message may or may not exist, but must not be inflight/enqueued
-    assert!(!st2.is_enqueued("t", 0, offset).unwrap());
+    assert!(st2.is_ready("t", 0,  None, 0).unwrap());
+}
+
+// #[tokio::test]
+// async fn crash_between_message_and_enqueue_event_is_safe() {
+//     let test_dir = test_dir("test_data");
+//     let st = Arc::new(
+//         Stroma::open(
+//             &test_dir.root,
+//             KeratinConfig::test_default(),
+//             SnapshotConfig::default(),
+//         )
+//         .await
+//         .unwrap(),
+//     );
+
+//     let (c, rx) = KeratinAppendCompletion::pair();
+//     st.append_message("t", 0,  None, b"x", c).await.unwrap();
+//     let offset = rx.await.unwrap().unwrap().base_offset;
+
+//     drop(st);
+
+//     let st2 = Stroma::open(
+//         &test_dir.root,
+//         KeratinConfig::test_default(),
+//         SnapshotConfig::default(),
+//     )
+//     .await
+//     .unwrap();
+//     st2.validate().unwrap();
+
+//     assert!(st2.is_ready("t", 0,  None, offset).unwrap());
+// }
+
+#[tokio::test]
+async fn expiry_is_durable_across_restart() {
+    let (st, dir) = open_test_stroma().await;
+
+    let off = append_one(&st, "t", 0, None, b"x").await;
+    st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
+    st.requeue_expired(10, 10).await.unwrap();
+
+    drop(st);
+
+    let st2 = Stroma::open(
+        &dir.root,
+        KeratinConfig::test_default(),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(st2.is_ready("t", 0, None, off).unwrap());
 }

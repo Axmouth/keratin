@@ -42,6 +42,7 @@ impl Index {
 
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
+        file.sync_all()?;
 
         Ok(Self {
             base_offset,

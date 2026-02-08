@@ -1,5 +1,4 @@
 mod event;
-mod sequencer;
 mod state;
 mod stroma;
 
@@ -8,7 +7,7 @@ use thiserror::Error;
 
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage,
+    KeratinConfig, Message, ReceivedMessage, util::{TempDir, test_dir}
 };
 pub use state::QueueState;
 pub use stroma::{SnapshotConfig, Stroma};

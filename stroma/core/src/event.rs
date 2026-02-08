@@ -25,45 +25,53 @@ pub enum StromaEvent {
     Enqueue {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
         retries: u32,
     },
     MarkInflight {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
         deadline: UnixMillis,
     },
     Ack {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
     },
     Nack {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
         requeue: bool,
     },
     DeadLetter {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
     },
     ClearInflight {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         off: Offset,
     },
     ResetQueue {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
     },
     /// Snapshot is a complete state image for a single (tp,part).
     /// It’s OK if it’s “big”; it happens rarely.
     Snapshot {
         tp: Box<str>,
         part: u32,
+        group: Option<Box<str>>,
         /// Encoded QueueState snapshot payload (see state snapshot helpers below)
         blob: Vec<u8>,
     },
@@ -174,66 +182,77 @@ impl StromaEvent {
             StromaEvent::Enqueue {
                 tp,
                 part,
+                group,
                 off,
                 retries,
             } => {
                 put_u16(&mut out, EventType::Enqueue as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_u32(&mut out, *retries);
             }
             StromaEvent::MarkInflight {
                 tp,
                 part,
+                group,
                 off,
                 deadline,
             } => {
                 put_u16(&mut out, EventType::MarkInflight as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_u64(&mut out, *deadline);
             }
-            StromaEvent::Ack { tp, part, off } => {
+            StromaEvent::Ack { tp, part, group,  off } => {
                 put_u16(&mut out, EventType::Ack as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
             }
             StromaEvent::Nack {
                 tp,
                 part,
+                group,
                 off,
                 requeue,
             } => {
                 put_u16(&mut out, EventType::Nack as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_bool(&mut out, *requeue);
             }
-            StromaEvent::DeadLetter { tp, part, off } => {
+            StromaEvent::DeadLetter { tp, part, group,  off } => {
                 put_u16(&mut out, EventType::DeadLetter as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
             }
-            StromaEvent::ClearInflight { tp, part, off } => {
+            StromaEvent::ClearInflight { tp, part, group, off } => {
                 put_u16(&mut out, EventType::ClearInflight as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
             }
-            StromaEvent::ResetQueue { tp, part } => {
+            StromaEvent::ResetQueue { tp, part, group } => {
                 put_u16(&mut out, EventType::ResetQueue as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
             }
-            StromaEvent::Snapshot { tp, part, blob } => {
+            StromaEvent::Snapshot { tp, part, group,  blob } => {
                 put_u16(&mut out, EventType::Snapshot as u16);
                 put_str(&mut out, tp)?;
                 put_u32(&mut out, *part);
+                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 // TODO: Evaluate if u32 size limit(4gb?) is acceptable here
                 if blob.len() > u32::MAX as usize {
                     return Err(io::Error::new(
@@ -272,10 +291,17 @@ impl StromaEvent {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
                 let off = rd_u64(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let retries = rd_u32(bytes, &mut i)?;
                 Ok(StromaEvent::Enqueue {
                     tp,
                     part,
+                    group,
                     off,
                     retries,
                 })
@@ -283,11 +309,18 @@ impl StromaEvent {
             x if x == EventType::MarkInflight as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let off = rd_u64(bytes, &mut i)?;
                 let deadline = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::MarkInflight {
                     tp,
                     part,
+                    group,
                     off,
                     deadline,
                 })
@@ -295,17 +328,30 @@ impl StromaEvent {
             x if x == EventType::Ack as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::Ack { tp, part, off })
+                Ok(StromaEvent::Ack { tp, part, group, off })
             }
             x if x == EventType::Nack as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let off = rd_u64(bytes, &mut i)?;
                 let requeue = rd_bool(bytes, &mut i)?;
                 Ok(StromaEvent::Nack {
                     tp,
                     part,
+                    group,
                     off,
                     requeue,
                 })
@@ -313,23 +359,47 @@ impl StromaEvent {
             x if x == EventType::DeadLetter as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::DeadLetter { tp, part, off })
+                Ok(StromaEvent::DeadLetter { tp, part, group, off })
             }
             x if x == EventType::ClearInflight as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::ClearInflight { tp, part, off })
+                Ok(StromaEvent::ClearInflight { tp, part, group, off })
             }
             x if x == EventType::ResetQueue as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
-                Ok(StromaEvent::ResetQueue { tp, part })
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
+                Ok(StromaEvent::ResetQueue { tp, part, group })
             }
             x if x == EventType::Snapshot as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
+                let group_str = rd_box_str(bytes, &mut i)?;
+                let group = if group_str.is_empty() {
+                    None
+                } else {
+                    Some(group_str)
+                };
                 let len = rd_u32(bytes, &mut i)? as usize;
                 if i + len > bytes.len() {
                     return Err(io::Error::new(
@@ -338,7 +408,7 @@ impl StromaEvent {
                     ));
                 }
                 let blob = bytes[i..i + len].to_vec();
-                Ok(StromaEvent::Snapshot { tp, part, blob })
+                Ok(StromaEvent::Snapshot { tp, part, group, blob })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

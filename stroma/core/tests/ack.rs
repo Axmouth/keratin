@@ -1,11 +1,11 @@
 use std::sync::Arc;
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::test_dir};
-use stroma_core::{QueueState, SnapshotConfig, Stroma};
+use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
+use stroma_core::{Offset, QueueState, SnapshotConfig, Stroma};
 
-async fn open_test_stroma() -> Arc<Stroma> {
+async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
-    Arc::new(
+    let res = Arc::new(
         Stroma::open(
             &test_dir.root,
             KeratinConfig::test_default(),
@@ -13,7 +13,22 @@ async fn open_test_stroma() -> Arc<Stroma> {
         )
         .await
         .unwrap(),
-    )
+    );
+    (res, test_dir)
+}
+
+pub async fn append_one(
+    st: &Arc<Stroma>,
+    tp: &str,
+    part: u32,
+    group: Option<&str>,
+    payload: &[u8],
+) -> Offset {
+    let (c, rx) = KeratinAppendCompletion::pair();
+    st.append_message(tp, part, group, payload, c)
+        .await
+        .unwrap();
+    rx.await.unwrap().unwrap().base_offset
 }
 
 #[test]
@@ -33,15 +48,15 @@ fn out_of_order_acks_never_skip_frontier() {
 
 #[tokio::test]
 async fn acked_offsets_never_resurrect() {
-    let st = open_test_stroma().await;
+    let (st, _test_dir) = open_test_stroma().await;
 
     // ACK offset 5 before it exists
-    st.ack_one("t", 0, 5).await.unwrap();
+    st.ack_one("t", 0,  None, 5).await.unwrap();
 
     // Append messages until offsets advance past 5
     loop {
         let (c, rx) = KeratinAppendCompletion::pair();
-        st.append_message("t", 0, b"x", c).await.unwrap();
+        st.append_message("t", 0,  None, b"x", c).await.unwrap();
         let offset = rx.await.unwrap().unwrap().base_offset;
 
         if offset >= 5 {
@@ -50,6 +65,48 @@ async fn acked_offsets_never_resurrect() {
         }
     }
 
-    assert!(st.is_acked("t", 0, 5).unwrap());
-    assert!(!st.is_enqueued("t", 0, 5).unwrap());
+    assert!(st.is_acked("t", 0,  None, 5).unwrap());
+    assert!(!st.is_ready("t", 0,  None, 5).unwrap());
+}
+
+#[tokio::test]
+async fn expiry_never_resurrects_acked_offsets_after_restart() {
+    let (st, dir) = open_test_stroma().await;
+
+    let off = append_one(&st, "t", 0, None, b"x").await;
+    st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
+    st.ack_one("t", 0, None, off).await.unwrap();
+
+    st.requeue_expired(20, 10).await.unwrap();
+    drop(st);
+
+    let st2 = Stroma::open(
+        &dir.root,
+        KeratinConfig::test_default(),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    assert!(st2.is_acked("t", 0, None, off).unwrap());
+    assert!(!st2.is_ready("t", 0, None, off).unwrap());
+}
+
+#[tokio::test]
+async fn expiry_respects_max_retries() {
+    let (st, _dir) = open_test_stroma().await;
+
+    let off = append_one(&st, "t", 0, None, b"x").await;
+
+    for _ in 0..5 {
+        st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
+        st.requeue_expired(10, 10).await.unwrap();
+    }
+
+    // One more expiry should DLQ / ack terminally
+    st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
+    st.requeue_expired(10, 10).await.unwrap();
+
+    assert!(st.is_acked("t", 0, None, off).unwrap());
+    assert!(!st.is_ready("t", 0, None, off).unwrap());
 }

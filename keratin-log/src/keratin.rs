@@ -1,5 +1,7 @@
+use fs2::FileExt;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
+use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -20,6 +22,7 @@ pub struct Keratin {
     tx: crossbeam_channel::Sender<WriterCmd>,
     log_state: Arc<LogState>,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+    _lock: Option<File>,
 }
 
 pub enum WriterCmd {
@@ -34,6 +37,24 @@ pub enum WriterCmd {
 impl Keratin {
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> std::io::Result<Self> {
         let root = root.as_ref().to_path_buf();
+
+        std::fs::create_dir_all(&root)?;
+
+        let lock_path = root.join(".keratin.lock");
+        let lock_file = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&lock_path)?;
+
+        println!("Attempting to acquire lock on {}", lock_path.display());
+        // Try to acquire exclusive lock (non-blocking)
+        lock_file
+            .try_lock_exclusive()
+            .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, format!("Keratin already open for {}", root.display())))?;
+        println!("Lock acquired on {}", lock_path.display());
+
         let now = crate::util::unix_millis();
 
         let log_state = Arc::new(LogState::new(0, 0, 0));
@@ -62,6 +83,7 @@ impl Keratin {
             tx,
             log_state,
             segment_mapping,
+            _lock: Some(lock_file),
         })
     }
 
@@ -163,5 +185,17 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    pub fn shutdown(&self) -> std::io::Result<()> {
+        self.tx
+            .send(WriterCmd::Shutdown)
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        println!("Shutdown command sent to writer");
+        println!("Releasing lock on {}", self.root.join(".keratin.lock").display());
+        self._lock.as_ref().map(|f| f.unlock()).transpose()?;
+        self._lock.as_ref().map(|f| f.sync_all()).transpose()?;
+        println!("Lock released on {}", self.root.join(".keratin.lock").display());
+        Ok(())
     }
 }

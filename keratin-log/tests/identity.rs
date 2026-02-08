@@ -3,6 +3,36 @@ use std::sync::Arc;
 use keratin_log::*;
 
 #[tokio::test]
+async fn open_fails_when_already_open() {
+    let dir = util::test_dir("keratin_lock");
+
+    let cfg = KeratinConfig::test_default();
+
+    // First open should succeed
+    let k1 = Keratin::open(&dir.root, cfg)
+        .await
+        .expect("first open should succeed");
+
+    // Second open on same directory should fail
+    let k2 = Keratin::open(&dir.root, cfg).await;
+
+    assert!(
+        k2.is_err(),
+        "second open on same root must fail"
+    );
+
+    // Drop first instance
+    drop(k1);
+
+    // Now it should succeed again
+    let k3 = Keratin::open(&dir.root, cfg)
+        .await
+        .expect("open after drop should succeed");
+
+    drop(k3);
+}
+
+#[tokio::test]
 async fn wal_append_scan_identity() {
     let dir = util::test_dir("wal_identity");
 

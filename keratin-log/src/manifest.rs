@@ -4,6 +4,8 @@ use std::path::{Path, PathBuf};
 
 use crc32c::crc32c;
 
+use crate::util::fsync_dir;
+
 const MAN_MAGIC: &[u8; 8] = b"KERATIN\0";
 const MAN_VERSION: u16 = 1;
 
@@ -171,19 +173,6 @@ impl Manifest {
 
         Ok(())
     }
-}
-
-#[cfg(unix)]
-fn fsync_dir(path: &Path) -> io::Result<()> {
-    use std::fs::File;
-    let dir = File::open(path)?;
-    dir.sync_all()
-}
-
-#[cfg(windows)]
-fn fsync_dir(_path: &Path) -> io::Result<()> {
-    // Windows rename() is already metadata-durable.
-    Ok(())
 }
 
 #[test]
