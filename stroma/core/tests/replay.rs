@@ -22,7 +22,7 @@ async fn snapshot_delta_replay_is_deterministic() {
     }
 
     // snapshot logical state BEFORE drop
-    let before = st.debug_dump_queue("t", 0,  None,);
+    let before = st.debug_dump_queue("t", 0,  None,).await;
 
     // force persistence so restart is deterministic
     st.snapshot_partition("t", 0,  None).await.unwrap();
@@ -31,7 +31,7 @@ async fn snapshot_delta_replay_is_deterministic() {
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
-    let after = st2.debug_dump_queue("t", 0,  None);
+    let after = st2.debug_dump_queue("t", 0,  None).await;
 
     assert_eq!(before, after);
 }
@@ -54,7 +54,7 @@ async fn expired_messages_survive_restart() {
     st.mark_inflight_one("t", 0,  None, 0, 10).await.unwrap();
     let offset = rx.await.unwrap().unwrap().base_offset;
 
-    st.list_expired(100, 10).unwrap();
+    st.list_expired(100, 10).await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(
@@ -64,5 +64,5 @@ async fn expired_messages_survive_restart() {
     )
     .await
     .unwrap();
-    assert!(st2.is_ready("t", 0,  None, offset).unwrap());
+    assert!(st2.is_ready("t", 0,  None, offset).await.unwrap());
 }

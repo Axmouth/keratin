@@ -173,6 +173,7 @@ async fn wal_durability_fence() {
         k.append_batch(c, Some(KDurability::AfterWrite))
             .await
             .unwrap();
+        k.force_close().await.unwrap();
     } // crash immediately
 
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())

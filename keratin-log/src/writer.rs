@@ -330,14 +330,22 @@ fn writer_loop(
                 if let Err(e) = respond_to.send(log.truncate_before(before)).map_err(|_| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "could not notify truncate")
                 }) {
-                    tracing::info!("Internal Error in processing truncate command: {e:?}");
+                    tracing::info!("Internal Error in processing truncate command: {e}");
                 } else {
-                    tracing::info!("Truncate successfull");
+                    tracing::info!("Truncate successful");
                 }
             }
-            WriterCmd::Shutdown => {
-                fail_all_pending(&mut pending, "writer shutdown", &notify_tx, false);
+            WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
+                // Sync changes
+                if let Err(e) = log.flush_buffers().and_then(|_| log.flush()).and_then(|_| log.fsync()) {
+                    tracing::error!("Error during writer shutdown fsync: {e}");
+                } else {
+                    tracing::info!("Writer shutdown fsync complete");
+                }
+                if notify_tx.send(()).is_err() {
+                    tracing::info!("Error sending shutdown notification");
+                }
                 return;
             }
         }

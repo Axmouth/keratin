@@ -290,8 +290,8 @@ impl StromaEvent {
             x if x == EventType::Enqueue as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
                 let part = rd_u32(bytes, &mut i)?;
-                let off = rd_u64(bytes, &mut i)?;
                 let group_str = rd_box_str(bytes, &mut i)?;
+                let off = rd_u64(bytes, &mut i)?;
                 let group = if group_str.is_empty() {
                     None
                 } else {

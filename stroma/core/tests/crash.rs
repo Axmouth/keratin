@@ -49,7 +49,7 @@ async fn truncated_delta_does_not_corrupt_state() {
     drop(st);
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
-    st2.validate().unwrap();
+    st2.validate().await.unwrap();
 }
 
 #[tokio::test]
@@ -83,7 +83,7 @@ async fn enqueue_is_durable_and_replayed() {
     .await
     .unwrap();
 
-    assert!(st2.is_ready("t", 0,  None, 0).unwrap());
+    assert!(st2.is_ready("t", 0,  None, 0).await.unwrap());
 }
 
 
@@ -105,7 +105,7 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
-    assert!(st.is_ready("t", 0,  None, 0).unwrap());
+    assert!(st.is_ready("t", 0,  None, 0).await.unwrap());
 
     drop(st);
 
@@ -117,7 +117,7 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
     .await
     .unwrap();
 
-    assert!(st2.is_ready("t", 0,  None, 0).unwrap());
+    assert!(st2.is_ready("t", 0,  None, 0).await.unwrap());
 }
 
 // #[tokio::test]
@@ -169,5 +169,5 @@ async fn expiry_is_durable_across_restart() {
     .await
     .unwrap();
 
-    assert!(st2.is_ready("t", 0, None, off).unwrap());
+    assert!(st2.is_ready("t", 0, None, off).await.unwrap());
 }

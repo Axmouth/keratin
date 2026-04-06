@@ -3,6 +3,8 @@ use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 
 use bitvec::vec::BitVec;
 
+use crate::topic;
+
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -97,7 +99,7 @@ pub enum DLQDiscardPolicy {
 /// - READY is the sole authority for delivery eligibility.
 /// - ACK / REJECT / DLQ are terminal.
 #[derive(Debug, Clone)]
-pub struct QueueState {
+struct QueueInternalState {
     topic: String,
     partition: u32,
 
@@ -129,6 +131,891 @@ pub struct QueueState {
 
     // when to send to DLQ
     dlq_settings: DLQDiscordSettings,
+}
+
+// Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
+pub enum QueueCommand {
+    Enqueue {
+        offset: Offset,
+        retries: u32,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset, retries
+    MarkInflight {
+        offset: Offset,
+        deadline: UnixMillis,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset, deadline
+    MarkInflightBatch {
+        entries: Vec<(Offset, UnixMillis)>,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // entries
+    ClearInflight {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset
+    Ack {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset
+    AckBatch {
+        offsets: Vec<Offset>,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offsets
+    Nack {
+        offset: Offset,
+        requeue: bool,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset, requeue?
+    DeadLetter {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset
+    Reject {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset
+
+    AdvanceFrontier {
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    Reset {
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    },
+    SetAckedUntil {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset
+    SetAckWindow {
+        base: Offset,
+        bits: BitVec,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // base, bits
+    SetAckWindowFromBytes {
+        base: Offset,
+        bits_bytes: Vec<u8>,
+        response: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    }, // base, bits_bytes
+    LoadInflight {
+        entries: Vec<(Offset, UnixMillis)>,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // entries
+    EncodeSnapshot {
+        response: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    },
+    LoadSnapshot {
+        data: Vec<u8>,
+        response: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+    }, // data
+
+    IsAcked {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<bool>>,
+    }, // offset
+    IsInflight {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<bool>>,
+    }, // offset
+    IsInflightOrAcked {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<bool>>,
+    }, // offset
+    IsReady {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<bool>>,
+    }, // offset
+    FilterNotEnqueued {
+        items: Vec<(Offset, Vec<u8>)>,
+        response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, Vec<u8>)>>>,
+    }, // items
+    GetRetries {
+        offset: Offset,
+        response: Option<tokio::sync::oneshot::Sender<Option<u32>>>,
+    }, // offset
+    GetNextOffset {
+        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+    },
+    GetSettledUntil {
+        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+    },
+    GetIterReadyFrom {
+        from: Offset,
+        response: Option<tokio::sync::oneshot::Sender<Vec<Offset>>>,
+    }, // from
+    PollReadyAndMark {
+        max: usize,
+        lease_deadline: UnixMillis,
+        response: Option<tokio::sync::oneshot::Sender<Vec<Offset>>>,
+    }, // max, lease_deadline
+    GetLowestUnacked {
+        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+    },
+    GetLowestNotAcked {
+        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+    },
+    GetNextDeliverable {
+        from: Offset,
+        upper: Offset,
+        response: Option<tokio::sync::oneshot::Sender<Option<Offset>>>,
+    }, // from, upper
+    GetInflightLen {
+        response: Option<tokio::sync::oneshot::Sender<usize>>,
+    },
+    GetNextExpiryHint {
+        response: Option<tokio::sync::oneshot::Sender<Option<UnixMillis>>>,
+    },
+    GetAckWindowBase {
+        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+    },
+    GetAckBitsBytes {
+        response: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+    },
+    GetCanonicalQueueState {
+        response: Option<tokio::sync::oneshot::Sender<CanonicalQueueState>>,
+    },
+    CollectExpired {
+        now: UnixMillis,
+        max: usize,
+        response: Option<tokio::sync::oneshot::Sender<Vec<Offset>>>,
+    }, // now, max
+
+    DumpInflight {
+        response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, UnixMillis)>>>,
+    },
+}
+
+pub struct QueueCommandPackage {
+    pub command: QueueCommand,
+}
+
+impl QueueCommand {
+    pub fn into_package(self) -> QueueCommandPackage {
+        QueueCommandPackage { command: self }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct QueueHandle {
+    command_sender: tokio::sync::mpsc::UnboundedSender<QueueCommandPackage>,
+
+    topic: String,
+    partition: u32,
+}
+
+impl QueueHandle {
+    pub fn init(topic: String, partition: u32) -> Self {
+        let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueueCommandPackage>();
+
+        let topic_clone = topic.clone();
+        tokio::spawn(async move {
+            let mut state = QueueInternalState::new(topic_clone, partition);
+
+            while let Some(pkg) = rx.recv().await {
+                let cmd = pkg.command;
+                Self::process_command(&mut state, cmd);
+            }
+            // If the loop exits, the channel was closed.
+        });
+
+        Self {
+            command_sender: tx,
+            topic,
+            partition,
+        }
+    }
+
+    fn process_command(state: &mut QueueInternalState, cmd: QueueCommand) {
+        match cmd {
+            QueueCommand::Enqueue {
+                offset,
+                retries,
+                response,
+            } => {
+                state.enqueue(offset, retries);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::MarkInflight {
+                offset,
+                deadline,
+                response,
+            } => {
+                state.mark_inflight(offset, deadline);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::MarkInflightBatch { entries, response } => {
+                state.mark_inflight_batch(&entries);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::ClearInflight { offset, response } => {
+                state.clear_inflight(offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::Ack { offset, response } => {
+                state.ack(offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::AckBatch { offsets, response } => {
+                state.ack_batch(&offsets);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::Nack {
+                offset,
+                requeue,
+                response,
+            } => {
+                state.nack(offset, requeue);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::DeadLetter { offset, response } => {
+                state.dead_letter(offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::Reject { offset, response } => {
+                state.reject(offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            QueueCommand::IsAcked { offset, response } => {
+                let result = state.is_acked(offset);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::IsInflight { offset, response } => {
+                let result = state.is_inflight(offset);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::IsReady { offset, response } => {
+                let result = state.is_ready(offset);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::GetRetries { offset, response } => {
+                let result = state.get_retries(offset);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::GetSettledUntil { response } => {
+                let result = state.settled_until();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::GetNextDeliverable {
+                from,
+                upper,
+                response,
+            } => {
+                let result = state.next_deliverable(from, upper);
+                if let Some(r) = response {
+                    let _ = r.send(Some(result));
+                }
+            }
+            QueueCommand::DumpInflight { response } => {
+                let result = state
+                    .dump_inflight();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::CollectExpired { now, max, response } => {
+                let result = state.collect_expired(now, max);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::AdvanceFrontier { response } => {
+                state.advance_frontier();
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::Reset { response } => {
+                state.reset();
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::SetAckedUntil { offset, response } => {
+                state.set_acked_until(offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::SetAckWindow { base, bits, response } => {
+                state.set_ack_window(base, bits);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::SetAckWindowFromBytes { base, bits_bytes, response } => {
+                let result = state.set_ack_window_from_bytes(base, &bits_bytes);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::LoadInflight { entries, response } => {
+                state.load_inflight(&entries);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            },
+            QueueCommand::EncodeSnapshot { response } => {
+                let result = state.encode_snapshot();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::LoadSnapshot { data, response } => {
+                let result = state.load_snapshot(&data);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::IsInflightOrAcked { offset, response } => {
+                let result = state.is_inflight_or_acked(offset);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::FilterNotEnqueued { mut items, response } => {
+                state.filter_not_enqueued(&mut items);
+                if let Some(r) = response {
+                    let _ = r.send(items);
+                }
+            },
+            QueueCommand::PollReadyAndMark { max, lease_deadline, response } => {
+                let result = state.poll_ready_and_mark(max, lease_deadline);
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetNextOffset { response } => {
+                let result = state.next_offset();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetIterReadyFrom { from, response } => {
+                let result = state.iter_ready_from(from).collect();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetLowestUnacked { response } => {
+                let result = state.lowest_unacked_offset();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetLowestNotAcked { response } => {
+                let result = state.lowest_not_acked_offset();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetInflightLen { response } => {
+                let result = state.inflight_len();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetNextExpiryHint { response } => {
+                let result = state.next_expiry_hint();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetAckWindowBase { response } => {
+                let result = state.ack_window_base();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetAckBitsBytes { response } => {
+                let result = state.ack_bits_bytes();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+            QueueCommand::GetCanonicalQueueState { response } => {
+                let result = state.canonical();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            },
+                    }
+    }
+
+    pub async fn enqueue(&self, offset: Offset, retries: u32) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Enqueue {
+                offset,
+                retries,
+                response: Some(tx),
+            },
+        });
+
+        rx.await.unwrap();
+    }
+
+    pub async fn mark_inflight(&self, offset: Offset, deadline: UnixMillis) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::MarkInflight {
+                offset,
+                deadline,
+                response: Some(tx),
+            },
+        });
+        rx.await.unwrap();
+    }
+
+    pub async fn mark_inflight_batch(&self, entries: Vec<(Offset, UnixMillis)>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::MarkInflightBatch {
+                entries,
+                response: Some(tx),
+            },
+        });
+        rx.await.unwrap();
+    }
+
+    pub async fn clear_inflight(&self, offset: Offset) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::ClearInflight {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn ack(&self, offset: Offset) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Ack {
+                offset,
+                response: Some(tx),
+            },
+        });
+        rx.await.unwrap();
+    }
+
+    pub async fn ack_batch(&self, offsets: Vec<Offset>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::AckBatch {
+                offsets,
+                response: Some(tx),
+            },
+        });
+        rx.await.unwrap();
+    }
+
+    pub async fn nack(&self, offset: Offset, requeue: bool) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::Nack {
+                    offset,
+                    requeue,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn dead_letter(&self, offset: Offset) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::DeadLetter {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn reject(&self, offset: Offset) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Reject {
+                offset,
+                response: Some(tx),
+            },
+        });
+        rx.await.unwrap();
+    }
+
+    pub async fn advance_frontier(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::AdvanceFrontier { response: Some(tx) },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn reset(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::Reset { response: Some(tx) },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn set_acked_until(&self, offset: Offset) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::SetAckedUntil {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn set_ack_window(&self, base: Offset, bits: BitVec) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::SetAckWindow {
+                    base,
+                    bits,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn set_ack_window_from_bytes(&self, base: Offset, bits_bytes: Vec<u8>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::SetAckWindowFromBytes {
+                    base,
+                    bits_bytes,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::LoadInflight {
+                    entries,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap();
+    }
+
+    pub async fn encode_snapshot(&self) -> Vec<u8> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::EncodeSnapshot { response: Some(tx) },
+            });
+        rx.await.unwrap()
+    }
+
+    pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<()> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::LoadSnapshot {
+                    data,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))
+    }
+
+    pub async fn is_acked(&self, offset: Offset) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::IsAcked {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(false)
+    }
+    
+    pub async fn is_inflight(&self, offset: Offset) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::IsInflight {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(false)
+    }
+
+    pub async fn is_inflight_or_acked(&self, offset: Offset) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::IsInflightOrAcked {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(false)
+    }
+
+    pub async fn is_ready(&self, offset: Offset) -> bool {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::IsReady {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(false)
+    }
+
+    pub async fn filter_not_enqueued(&self, items: Vec<(Offset, Vec<u8>)>) -> Vec<(Offset, Vec<u8>)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::FilterNotEnqueued {
+                    items: items.clone(),
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn retries(&self, offset: Offset) -> Option<u32> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetRetries {
+                    offset,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(None)
+    }
+
+    pub async fn settled_until(&self) -> Offset {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetSettledUntil { response: Some(tx) },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn next_offset(&self) -> Offset {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetNextOffset {
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn iter_ready_from(&self, from: Offset) -> Vec<Offset> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetIterReadyFrom {
+                    from,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn poll_ready_and_mark(&self, max: usize, lease_deadline: UnixMillis) -> Vec<Offset> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::PollReadyAndMark {
+                    max,
+                    lease_deadline,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn lowest_unacked_offset(&self) -> Offset {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetLowestUnacked { response: Some(tx) },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn lowest_not_acked_offset(&self) -> Offset {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetLowestNotAcked { response: Some(tx) },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn next_deliverable(&self, from: Offset, upper: Offset) -> Option<Offset> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetNextDeliverable {
+                    from,
+                    upper,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or(None)
+    }
+
+    pub async fn inflight_len(&self) -> usize {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetInflightLen { response: Some(tx) },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn next_expiry_hint(&self) -> Option<UnixMillis> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetNextExpiryHint { response: Some(tx) },
+            });
+        rx.await.unwrap_or(None)
+    }
+
+    pub async fn ack_window_base(&self) -> Offset {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetAckWindowBase { response: Some(tx) },
+            });
+        rx.await.unwrap_or(0)
+    }
+
+    pub async fn ack_bits_bytes(&self) -> Vec<u8> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetAckBitsBytes { response: Some(tx) },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn canonical(&self) -> CanonicalQueueState {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::GetCanonicalQueueState { response: Some(tx) },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::CollectExpired {
+                    now,
+                    max,
+                    response: Some(tx),
+                },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage {
+                command: QueueCommand::DumpInflight { response: Some(tx) },
+            });
+        rx.await.unwrap_or_default()
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn partition(&self) -> u32 {
+        self.partition
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -166,7 +1053,7 @@ pub enum AckOutcome {
     Applied, // advanced frontier or set bit
 }
 
-impl QueueState {
+impl QueueInternalState {
     pub fn new(topic: String, partition: u32) -> Self {
         Self {
             topic,
@@ -197,9 +1084,28 @@ impl QueueState {
     }
 
     pub fn iter_ready_from(&self, from: Offset) -> impl Iterator<Item = Offset> + '_ {
-        self.ready
-            .range(from..)
-            .copied()
+        self.ready.range(from..).copied()
+    }
+
+    pub fn poll_ready_and_mark(
+        &mut self,
+        max: usize,
+        lease_deadline: UnixMillis,
+    ) -> Vec<Offset> {
+        tracing::debug!("Polling ready for ({}, {}), settled_until={}", self.topic, self.partition, self.settled_until());
+        let mut offs = Vec::new();
+        for off in self.iter_ready_from(self.settled_until()) {
+            if offs.len() >= max {
+                break;
+            }
+            offs.push(off);
+        }
+
+        let deadline = lease_deadline;
+        let entries: Vec<(Offset, UnixMillis)> = offs.iter().map(|&off| (off, deadline)).collect();
+        self.mark_inflight_batch(&entries);
+
+        offs
     }
 
     /// True if this offset is known ACKed.
@@ -672,7 +1578,7 @@ impl QueueState {
     }
 
     pub fn reset(&mut self) {
-        *self = QueueState::new(self.topic.clone(), self.partition);
+        *self = QueueInternalState::new(self.topic.clone(), self.partition);
     }
 
     // Snapshot/recovery setters (used by recover.rs)
@@ -732,7 +1638,9 @@ impl QueueState {
 
         let mut words = Vec::with_capacity(bytes.len() / word_bytes);
         for chunk in bytes.chunks_exact(word_bytes) {
-            words.push(usize::from_le_bytes(chunk.try_into().unwrap()));
+            words.push(usize::from_le_bytes(chunk.try_into().map_err(|_| {
+                std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to convert chunk to usize")
+            })?));
         }
 
         let mut bits = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::from_vec(words);
@@ -854,13 +1762,24 @@ pub struct CanonicalQueueState {
     pub inflight: Vec<(u64, u64)>,
 }
 
+impl Default for CanonicalQueueState {
+    fn default() -> Self {
+        Self {
+            acked_until: 0,
+            ack_window_base: 0,
+            ack_bits: vec![0; ACK_WINDOW / 8],
+            inflight: Vec::new(),
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::{Offset, QueueState};
+    use super::{Offset, QueueInternalState};
 
     #[test]
     fn next_deliverable_requires_ready() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(5, 10); // ignored
         s.ack(3);
@@ -873,7 +1792,7 @@ mod tests {
 
     #[test]
     fn reject_without_enqueue_is_noop() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.reject(7);
 
@@ -882,7 +1801,7 @@ mod tests {
 
     #[test]
     fn reject_without_enqueue_is_terminal() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.reject(7);
 
@@ -893,7 +1812,7 @@ mod tests {
 
     #[test]
     fn nack_after_ack_is_noop() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
@@ -909,7 +1828,7 @@ mod tests {
 
     #[test]
     fn ack_without_enqueue_is_terminal_but_not_ready() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(3);
 
@@ -921,7 +1840,7 @@ mod tests {
 
     #[test]
     fn has_history_only_after_enqueue_or_delivery() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         // No history initially
         assert!(!s.has_history(5));
@@ -937,7 +1856,7 @@ mod tests {
 
     #[test]
     fn enqueue_creates_history_if_not_acked() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0);
         assert!(s.has_history(5));
@@ -951,7 +1870,7 @@ mod tests {
 
     #[test]
     fn ack_without_enqueue_is_allowed() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(5);
 
@@ -963,7 +1882,7 @@ mod tests {
 
     #[test]
     fn enqueue_after_ack_is_ignored() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(3);
         s.enqueue(3, 0);
@@ -975,7 +1894,7 @@ mod tests {
 
     #[test]
     fn ack_before_enqueue_advances_frontier_normally() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(0);
         s.ack(1);
@@ -992,7 +1911,7 @@ mod tests {
 
     #[test]
     fn nack_without_enqueue_does_not_make_ready() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.nack(5, true);
 
@@ -1003,7 +1922,7 @@ mod tests {
 
     #[test]
     fn inflight_update_does_not_make_offset_ready() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
@@ -1015,7 +1934,7 @@ mod tests {
 
     #[test]
     fn expiry_makes_offset_ready() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(3, 0);
         s.mark_inflight(3, 10);
@@ -1027,7 +1946,7 @@ mod tests {
 
     #[test]
     fn only_ready_offsets_are_delivered() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         assert_eq!(s.next_deliverable(0, 10), 10);
 
@@ -1037,7 +1956,7 @@ mod tests {
 
     #[test]
     fn nack_hits_dlq_at_max_retries() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
@@ -1055,7 +1974,7 @@ mod tests {
 
     #[test]
     fn offset_in_exactly_one_state() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ready.insert(5);
         assert!(s.is_ready(5));
@@ -1077,7 +1996,7 @@ mod tests {
 
     #[test]
     fn retries_persist_across_redelivery() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ready.insert(1);
         s.mark_inflight(1, 100);
@@ -1091,7 +2010,7 @@ mod tests {
 
     #[test]
     fn expired_then_nacked_is_still_not_acked() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(2, 0);
         s.mark_inflight(2, 10);
@@ -1104,7 +2023,7 @@ mod tests {
 
     #[test]
     fn reject_advances_frontier() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(0, 100);
         s.reject(0);
@@ -1115,7 +2034,7 @@ mod tests {
 
     #[test]
     fn nack_requeue_increments_retry() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 100);
@@ -1129,7 +2048,7 @@ mod tests {
 
     #[test]
     fn nack_allows_redelivery() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(0, 0);
         s.mark_inflight(0, 100);
@@ -1140,7 +2059,7 @@ mod tests {
 
     #[test]
     fn nack_never_acks() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(3, 100);
         s.nack(3, true);
@@ -1152,7 +2071,7 @@ mod tests {
 
     #[test]
     fn expiry_never_acks() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0);
         s.mark_inflight(5, 10);
@@ -1176,7 +2095,7 @@ mod tests {
 
     #[test]
     fn expired_offset_delivered_after_frontier_advances() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0);
         s.mark_inflight(5, 10);
@@ -1193,7 +2112,7 @@ mod tests {
 
     #[test]
     fn expired_offsets_do_not_reappear_without_redelivery() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(3, 10);
         s.collect_expired(10, 10);
@@ -1211,7 +2130,7 @@ mod tests {
 
     #[test]
     fn ack_before_expiry_prevents_expiry() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(7, 100);
         s.ack(7);
@@ -1225,7 +2144,7 @@ mod tests {
 
     #[test]
     fn expiry_does_not_interact_with_ack_window() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.ack(1); // out of order
@@ -1243,7 +2162,7 @@ mod tests {
 
     #[test]
     fn expiry_hint_is_none_after_full_drain() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..50 {
             s.mark_inflight(i, i + 10);
@@ -1257,7 +2176,7 @@ mod tests {
 
     #[test]
     fn next_deliverable_progresses_after_expiry() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(10, 0);
         s.mark_inflight(0, 10);
@@ -1274,7 +2193,7 @@ mod tests {
 
     #[test]
     fn random_ops_with_expiry_never_violate_invariants() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for _ in 0..200_000 {
             let o = fastrand::u64(0..1000);
@@ -1297,7 +2216,7 @@ mod tests {
 
     #[test]
     fn expired_offsets_are_removed_exactly_once() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
             s.enqueue(i, 0);
@@ -1314,7 +2233,7 @@ mod tests {
 
     #[test]
     fn updating_inflight_deadline_does_not_expire_early() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
@@ -1329,7 +2248,7 @@ mod tests {
 
     #[test]
     fn acked_offsets_never_expire() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.mark_inflight(5, 10);
         s.ack(5);
@@ -1341,7 +2260,7 @@ mod tests {
 
     #[test]
     fn inflight_below_frontier_is_ignored() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(0);
         s.ack(1);
@@ -1354,7 +2273,7 @@ mod tests {
 
     #[test]
     fn offset_not_in_multiple_states() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0);
         s.mark_inflight(5, 10);
@@ -1370,7 +2289,7 @@ mod tests {
 
     #[test]
     fn frontier_is_monotonic() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for _i in 0..10_000 {
             s.ack(fastrand::u64(0..5000));
@@ -1380,7 +2299,7 @@ mod tests {
 
     #[test]
     fn next_deliverable_never_returns_acked_or_inflight() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..2000 {
             if i % 3 == 0 {
@@ -1405,7 +2324,7 @@ mod tests {
 
     #[test]
     fn snapshot_roundtrip_is_identity() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
             s.mark_inflight(i, 1000 + i);
@@ -1416,7 +2335,7 @@ mod tests {
 
         let snap = s.encode_snapshot();
 
-        let mut s2 = QueueState::new("test".into(), 0);
+        let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
 
         assert_eq!(s.canonical(), s2.canonical());
@@ -1424,7 +2343,7 @@ mod tests {
 
     #[test]
     fn random_ops_never_break_invariants() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for _ in 0..1_000_000 {
             let o = fastrand::u64(0..30000);
@@ -1452,7 +2371,7 @@ mod tests {
 
     #[test]
     fn out_of_order_acks_advance_frontier() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         // ACK 2 and 4 out-of-order; frontier stays at 0
         s.ack(2);
@@ -1482,7 +2401,7 @@ mod tests {
 
     #[test]
     fn ack_removes_inflight() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(10, 0);
         s.mark_inflight(10, 1000);
@@ -1499,7 +2418,7 @@ mod tests {
 
     #[test]
     fn mark_inflight_ignored_if_already_acked() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack_batch(&[0, 1, 2, 3, 4]);
         assert_eq!(s.settled_until(), 5);
@@ -1513,7 +2432,7 @@ mod tests {
 
     #[test]
     fn expiry_hint_tracks_min_deadline_and_handles_updates() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(10, 0);
         s.mark_inflight(10, 500);
@@ -1532,7 +2451,7 @@ mod tests {
 
     #[test]
     fn collect_expired_is_idempotent() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
             s.enqueue(i, 0);
@@ -1549,7 +2468,7 @@ mod tests {
 
     #[test]
     fn clear_inflight_removes_and_hint_updates() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
@@ -1568,7 +2487,7 @@ mod tests {
 
     #[test]
     fn is_inflight_or_acked_behaves() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0);
         s.mark_inflight(5, 100);
@@ -1594,7 +2513,7 @@ mod tests {
 
     #[test]
     fn ack_batch_handles_duplicates() {
-        let mut s = QueueState::new("test".into(), 0);
+        let mut s = QueueInternalState::new("test".into(), 0);
         let v: Vec<Offset> = vec![2, 2, 0, 1, 1, 3];
         s.ack_batch(&v);
         assert_eq!(s.settled_until(), 4);

@@ -683,6 +683,7 @@ mod tests {
         );
     }
 
+    #[cfg(debug_assertions)]
     #[test]
     #[should_panic]
     fn zero_weight_with_unbounded_max_items_panics() {

@@ -47,6 +47,8 @@ impl LogReader {
         }
     }
 
+    // TODO: Memory cache X oldest entries for hot path of reading from the past
+
     pub fn fetch(&self, offset: u64) -> io::Result<Option<OwnedRecord>> {
         let base = match self.find_segment_base(offset)? {
             Some(b) => b,

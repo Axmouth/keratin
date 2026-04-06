@@ -31,7 +31,9 @@ pub enum WriterCmd {
         before: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
     },
-    Shutdown,
+    Shutdown {
+        notify_tx: oneshot::Sender<()>,
+    },
 }
 
 impl Keratin {
@@ -50,9 +52,12 @@ impl Keratin {
 
         println!("Attempting to acquire lock on {}", lock_path.display());
         // Try to acquire exclusive lock (non-blocking)
-        lock_file
-            .try_lock_exclusive()
-            .map_err(|_| io::Error::new(io::ErrorKind::AlreadyExists, format!("Keratin already open for {}", root.display())))?;
+        lock_file.try_lock_exclusive().map_err(|_| {
+            io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                format!("Keratin already open for {}", root.display()),
+            )
+        })?;
         println!("Lock acquired on {}", lock_path.display());
 
         let now = crate::util::unix_millis();
@@ -187,15 +192,69 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
-    pub fn shutdown(&self) -> std::io::Result<()> {
+    pub async fn shutdown(&self) -> std::io::Result<()> {
+        let (notify_tx, notify_rx) = oneshot::channel();
         self.tx
-            .send(WriterCmd::Shutdown)
+            .send(WriterCmd::Shutdown { notify_tx })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        notify_rx
+            .await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?;
         println!("Shutdown command sent to writer");
-        println!("Releasing lock on {}", self.root.join(".keratin.lock").display());
+        println!(
+            "Releasing lock on {}",
+            self.root.join(".keratin.lock").display()
+        );
         self._lock.as_ref().map(|f| f.unlock()).transpose()?;
         self._lock.as_ref().map(|f| f.sync_all()).transpose()?;
-        println!("Lock released on {}", self.root.join(".keratin.lock").display());
+        println!(
+            "Lock released on {}",
+            self.root.join(".keratin.lock").display()
+        );
         Ok(())
+    }
+
+    /// Force to close without waiting for writer to acknowledge shutdown (for testing)
+    /// Do NOT touch in normal operation, as it may cause data loss or corruption if the writer is still processing appends.
+    pub async fn force_close(self) -> std::io::Result<()> {
+        println!("Force closing Keratin instance without waiting for writer acknowledgment");
+        if let Some(lock) = &self._lock {
+            lock.unlock()?;
+            lock.sync_all()?;
+        }
+
+        std::mem::forget(self); // 💀 Drop will NOT run
+        Ok(())
+    }
+}
+
+impl Drop for Keratin {
+    fn drop(&mut self) {
+        let (notify_tx, mut notify_rx) = oneshot::channel();
+        if let Err(e) = self.tx.send(WriterCmd::Shutdown { notify_tx }) {
+            println!("Failed to send shutdown command to writer: {}", e);
+            return;
+        } else {
+            while let Err(e) = notify_rx.try_recv() {
+                tracing::warn!("Failed to receive shutdown notification from writer: {}", e);
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+        }
+
+        println!("Shutdown command sent to writer");
+        println!(
+            "Releasing lock on {}",
+            self.root.join(".keratin.lock").display()
+        );
+        if let Err(e) = self._lock.as_ref().map(|f| f.unlock()).transpose() {
+            println!("Failed to unlock lock file: {}", e);
+        }
+        if let Err(e) = self._lock.as_ref().map(|f| f.sync_all()).transpose() {
+            println!("Failed to sync lock file: {}", e);
+        }
+        println!(
+            "Lock released on {}",
+            self.root.join(".keratin.lock").display()
+        );
     }
 }

@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, QueueState, SnapshotConfig, Stroma};
+use stroma_core::{Offset, QueueHandle, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
@@ -31,19 +31,19 @@ pub async fn append_one(
     rx.await.unwrap().unwrap().base_offset
 }
 
-#[test]
-fn out_of_order_acks_never_skip_frontier() {
-    let mut g = QueueState::new("test".into(), 0);
+#[tokio::test]
+async fn out_of_order_acks_never_skip_frontier() {
+    let q = QueueHandle::init("test".into(), 0);
 
     for i in 0..1000 {
-        g.mark_inflight(i, 0);
+        q.mark_inflight(i, 0).await;
     }
 
     for i in (0..1000).rev() {
-        g.ack(i);
+        q.ack(i).await;
     }
 
-    assert_eq!(g.settled_until(), 1000);
+    assert_eq!(q.settled_until().await, 1000);
 }
 
 #[tokio::test]
@@ -65,8 +65,8 @@ async fn acked_offsets_never_resurrect() {
         }
     }
 
-    assert!(st.is_acked("t", 0,  None, 5).unwrap());
-    assert!(!st.is_ready("t", 0,  None, 5).unwrap());
+    assert!(st.is_acked("t", 0,  None, 5).await.unwrap());
+    assert!(!st.is_ready("t", 0,  None, 5).await.unwrap());
 }
 
 #[tokio::test]
@@ -88,8 +88,8 @@ async fn expiry_never_resurrects_acked_offsets_after_restart() {
     .await
     .unwrap();
 
-    assert!(st2.is_acked("t", 0, None, off).unwrap());
-    assert!(!st2.is_ready("t", 0, None, off).unwrap());
+    assert!(st2.is_acked("t", 0, None, off).await.unwrap());
+    assert!(!st2.is_ready("t", 0, None, off).await.unwrap());
 }
 
 #[tokio::test]
@@ -107,6 +107,6 @@ async fn expiry_respects_max_retries() {
     st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
     st.requeue_expired(10, 10).await.unwrap();
 
-    assert!(st.is_acked("t", 0, None, off).unwrap());
-    assert!(!st.is_ready("t", 0, None, off).unwrap());
+    assert!(st.is_acked("t", 0, None, off).await.unwrap());
+    assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 }
