@@ -13,6 +13,9 @@ use crate::log::{AppendResult, Log, LogState};
 use crate::record::Message;
 use crate::{AppendCompletion, KeratinConfig};
 
+// TODO: Tests showing guaranteed order
+// TODO: Also more tests for failures and edge cases (e.g. batch flush on shutdown, etc.)
+
 #[derive(Debug, Clone)]
 pub struct IoError {
     msg: String,

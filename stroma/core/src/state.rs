@@ -612,6 +612,14 @@ impl QueueHandle {
 
         Some(true) // signal to continue processing
     }
+    
+
+    pub fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: cmd,
+        });
+        Ok(())
+    }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) {
         let (tx, rx) = tokio::sync::oneshot::channel();

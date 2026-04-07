@@ -19,7 +19,7 @@ use tokio::sync::{OnceCell, RwLock};
 use crate::{
     Result, StromaError,
     event::{self, StromaEvent},
-    state::{Offset, QueueHandle, UnixMillis},
+    state::{Offset, QueueCommand, QueueCommandPackage, QueueHandle, UnixMillis},
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -86,6 +86,45 @@ impl GlobalDLQ {
             tp: self.tp.clone(),
             part: self.part,
         }
+    }
+}
+
+pub struct ApplyThenComplete {
+    stroma: Stroma,
+    ev: StromaEvent,
+    inner: Box<dyn AppendCompletion<IoError>>,
+}
+
+impl AppendCompletion<IoError> for ApplyThenComplete {
+    fn complete(self: Box<Self>, res: std::result::Result<AppendResult, IoError>) {
+        match res {
+            Ok(ar) => {
+                let stroma = self.stroma.clone();
+                let ev = self.ev.clone();
+                let inner = self.inner;
+
+                match stroma.enqueue_event_inmem(&ev) {
+                    Ok(()) => {
+                        // let _ = tx.send(Ok(ar));
+                        inner.complete(Ok(ar));
+                    }
+                    Err(e) => inner.complete(Err(IoError::new(e.to_string()))),
+                }
+            }
+            Err(e) => {
+                self.inner.complete(Err(IoError::new(e.to_string())));
+            }
+        }
+    }
+}
+
+impl ApplyThenComplete {
+    pub fn new(
+        stroma: Stroma,
+        ev: StromaEvent,
+        inner: Box<dyn AppendCompletion<IoError>>,
+    ) -> Box<Self> {
+        Box::new(Self { stroma, ev, inner })
     }
 }
 
@@ -244,7 +283,12 @@ impl Stroma {
         Ok(Arc::new(k))
     }
 
-    pub async fn queue_handle(&self, tp: &str, part: u32, group: Option<&str>) -> Result<QueueHandle> {
+    pub async fn queue_handle(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<QueueHandle> {
         let cell = loop {
             let current = self.queue_handles.load();
 
@@ -258,7 +302,9 @@ impl Stroma {
             next.insert(key.clone(), new_cell.clone());
 
             // swap in the new map only if snapshot is still current
-            let prev = self.queue_handles.compare_and_swap(&current, Arc::new(next));
+            let prev = self
+                .queue_handles
+                .compare_and_swap(&current, Arc::new(next));
 
             if Arc::ptr_eq(&prev, &current) {
                 break new_cell;
@@ -271,12 +317,7 @@ impl Stroma {
             .get_or_try_init(|| async {
                 let msg_log = self.msg_log_init(tp, part, group).await?;
                 let event_log = self.event_log_init(tp, part, group).await?;
-                Ok(QueueHandle::init(
-                    tp.into(),
-                    part,
-                    msg_log,
-                    event_log,
-                ))
+                Ok(QueueHandle::init(tp.into(), part, msg_log, event_log))
             })
             .await?;
 
@@ -300,6 +341,139 @@ impl Stroma {
     }
 
     // ---------------- Event apply rules ----------------
+
+    fn queue_handle_sync(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> std::io::Result<QueueHandle> {
+        let current = self.queue_handles.load();
+        let key = (tp.into(), part, group.map(|s| s.into()));
+        let cell = current.get(&key).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::NotFound,
+                format!(
+                    "queue not found for event: tp={} part={} group={:?}",
+                    tp, part, group
+                ),
+            )
+        })?;
+        cell.get()
+            .cloned()
+            .ok_or_else(|| io::Error::other("queue handle not initialized"))
+    }
+
+    fn enqueue_event_inmem(&self, ev: &StromaEvent) -> std::io::Result<()> {
+        match ev {
+            StromaEvent::Enqueue {
+                tp,
+                part,
+                group,
+                off,
+                retries,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::Enqueue {
+                    offset: *off,
+                    retries: *retries,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+            }
+            StromaEvent::MarkInflight {
+                tp,
+                part,
+                group,
+                off,
+                deadline,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::MarkInflight {
+                    offset: *off,
+                    deadline: *deadline,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+            }
+            StromaEvent::Ack {
+                tp,
+                part,
+                group,
+                off,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::Ack {
+                    offset: *off,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+                // - duplicate ACKs
+                // - late ACK after consumer retry
+                // ACK is idempotent and safe.
+            }
+            StromaEvent::Nack {
+                tp,
+                part,
+                group,
+                off,
+                requeue,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::Nack {
+                    offset: *off,
+                    requeue: *requeue,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+                // ✅ Accept NACK even if not inflight:
+                // - race with expiry worker
+                // - duplicate NACKs
+                // - late NACK after consumer retry
+                // NACK is idempotent and safe.
+            }
+            StromaEvent::DeadLetter {
+                tp,
+                part,
+                group,
+                off,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::DeadLetter {
+                    offset: *off,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+            }
+            StromaEvent::ClearInflight {
+                tp,
+                part,
+                group,
+                off,
+            } => {
+                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let command = QueueCommand::ClearInflight {
+                    offset: *off,
+                    response: None,
+                };
+                qh.command_enqueue(command)?;
+            }
+            StromaEvent::ResetQueue { tp, part, group } => {
+                self.remove_queue(tp, *part, group.as_deref());
+                // TODO: More cleanup?
+            }
+            StromaEvent::Snapshot { .. } => {
+                // If you keep Snapshot events inside the event log later, you'd load it here.
+                // With file snapshots, we don't emit Snapshot events, so this is unused.
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "Snapshot event unsupported in v0",
+                ));
+            }
+        }
+        tracing::debug!("Applied event: {ev:?}");
+        Ok(())
+    }
 
     async fn apply_event_inmem(&self, ev: &StromaEvent) -> Result<()> {
         match ev {
@@ -396,7 +570,8 @@ impl Stroma {
     ) -> Result<Offset> {
         if evs.is_empty() {
             return Ok(self
-                .applied_upto_entry(tp, part, group).await?
+                .applied_upto_entry(tp, part, group)
+                .await?
                 .load(Ordering::Acquire));
         }
 
@@ -419,7 +594,8 @@ impl Stroma {
 
         // Update applied watermark:
         let new_upto = ar.base_offset + ar.count as u64;
-        self.applied_upto_entry(tp, part, group).await?
+        self.applied_upto_entry(tp, part, group)
+            .await?
             .store(new_upto, Ordering::Release);
 
         Ok(new_upto)
@@ -1005,7 +1181,8 @@ impl Stroma {
                 }
 
                 self.apply_event_inmem(&ev).await?;
-                self.applied_upto_entry(tp, part, group.as_deref()).await?
+                self.applied_upto_entry(tp, part, group.as_deref())
+                    .await?
                     .store(rec.offset + 1, Ordering::Release);
             }
         }
@@ -1013,7 +1190,12 @@ impl Stroma {
         Ok(())
     }
 
-    fn remove_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Option<Arc<OnceCell<QueueHandle>>> {
+    fn remove_queue(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Option<Arc<OnceCell<QueueHandle>>> {
         let key = (tp.into(), part, group.map(|s| s.into()));
         loop {
             let current = self.queue_handles.load();
@@ -1190,9 +1372,9 @@ impl Stroma {
 
         let log = self.queue_handle(tp, part, group).await?.event_log();
         let msg = event_msg(&ev)?;
-        // TODO: Create a separate completion for the event log, so that I use the original one, once the event is also applied in memory.
-        log.append_enqueue(msg, None, completion).map_err(io_err)?;
-        self.apply_event_inmem(&ev).await?;
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
+        log.append_enqueue(msg, None, outter_completion)
+            .map_err(io_err)?;
         self.maybe_snapshot(tp, part, group, offset).await?;
 
         Ok(())
@@ -1217,8 +1399,9 @@ impl Stroma {
 
         let log = self.queue_handle(tp, part, group).await?.event_log();
         let msg = event_msg(&ev)?;
-        log.append_enqueue(msg, None, completion).map_err(io_err)?;
-        self.apply_event_inmem(&ev).await?;
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
+        log.append_enqueue(msg, None, outter_completion)
+            .map_err(io_err)?;
         self.maybe_snapshot(tp, part, group, offset).await?;
 
         Ok(())
@@ -1447,7 +1630,8 @@ impl Stroma {
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
         let upto = self
-            .applied_upto_entry(tp, part, group).await?
+            .applied_upto_entry(tp, part, group)
+            .await?
             .load(Ordering::Acquire);
         self.write_snapshots_for_partition(tp, part, group, upto)
             .await
