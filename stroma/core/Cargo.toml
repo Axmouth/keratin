@@ -5,6 +5,7 @@ edition = "2024"
 
 [dependencies]
 keratin-log ={ path = "../../keratin-log" }
+arc-swap = "1.9"
 async-trait = "0.1"
 bitvec = "1.0"
 blake3 = "1.8"

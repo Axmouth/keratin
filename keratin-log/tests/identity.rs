@@ -16,6 +16,8 @@ async fn open_fails_when_already_open() {
     // Second open on same directory should fail
     let k2 = Keratin::open(&dir.root, cfg).await;
 
+    dbg!(&k2);
+
     assert!(
         k2.is_err(),
         "second open on same root must fail"

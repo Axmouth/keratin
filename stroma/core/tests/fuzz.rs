@@ -1,10 +1,28 @@
-use stroma_core::QueueHandle;
+use std::sync::Arc;
+
+use keratin_log::KeratinConfig;
+use stroma_core::{SnapshotConfig, Stroma, TempDir, test_dir};
+
+async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
+    let test_dir = test_dir("test_data");
+    let res = Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            KeratinConfig::test_default(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+    (res, test_dir)
+}
 
 #[tokio::test]
 async fn random_operations_never_break_invariants() {
     fastrand::seed(0xC0FFEE);
 
-    let q = QueueHandle::init("test".into(), 0);
+    let (st, _test_dir) = open_test_stroma().await;
+    let q = st.queue_handle("test", 0, None).await.unwrap();
 
     for _ in 0..50_000 {
         let o = fastrand::u64(0..2000);

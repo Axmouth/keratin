@@ -9,7 +9,7 @@ pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, util::{TempDir, test_dir}
 };
-pub use state::QueueHandle;
+pub use state::{QueueHandle, QueueInternalState};
 pub use stroma::{SnapshotConfig, Stroma};
 
 pub type Offset = u64;

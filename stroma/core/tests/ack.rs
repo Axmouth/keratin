@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, QueueHandle, SnapshotConfig, Stroma};
+use stroma_core::{Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
@@ -33,7 +33,8 @@ pub async fn append_one(
 
 #[tokio::test]
 async fn out_of_order_acks_never_skip_frontier() {
-    let q = QueueHandle::init("test".into(), 0);
+    let (st, _test_dir) = open_test_stroma().await;
+    let q = st.queue_handle("test", 0, None).await.unwrap();
 
     for i in 0..1000 {
         q.mark_inflight(i, 0).await;

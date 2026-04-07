@@ -7,8 +7,9 @@ use std::{
     },
 };
 
+use arc_swap::ArcSwap;
 use dashmap::DashMap;
-use hashbrown::HashSet;
+use hashbrown::{HashMap, HashSet};
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
     KeratinAppendCompletion, KeratinConfig, Message,
@@ -17,7 +18,7 @@ use tokio::sync::{OnceCell, RwLock};
 
 use crate::{
     Result, StromaError,
-    event::StromaEvent,
+    event::{self, StromaEvent},
     state::{Offset, QueueHandle, UnixMillis},
 };
 
@@ -88,28 +89,19 @@ impl GlobalDLQ {
     }
 }
 
+type Registry = HashMap<(Box<str>, u32, Option<Box<str>>), Arc<OnceCell<QueueHandle>>>;
+
 #[derive(Debug, Clone)]
 pub struct Stroma {
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg: KeratinConfig,
     pub(crate) snap_cfg: SnapshotConfig,
 
-    // One Keratin per (tp,part) for message payloads.
-    pub(crate) msg_logs_by_tp_part:
-        Arc<DashMap<(Box<str>, u32, Option<Box<str>>), Arc<OnceCell<Arc<Keratin>>>>>,
-
-    // One Keratin per (tp,part), events log
-    pub(crate) event_logs_by_tp_part:
-        Arc<DashMap<(Box<str>, u32, Option<Box<str>>), Arc<OnceCell<Arc<Keratin>>>>>,
-
     // Materialized queue state
-    pub(crate) queues: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), QueueHandle>>,
+    queue_handles: Arc<ArcSwap<Registry>>,
 
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
-
-    // For each (tp,part): highest Keratin offset we have applied into memory
-    pub(crate) applied_upto: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), AtomicU64>>,
 
     pub(crate) msg_count: Arc<AtomicU64>,
 
@@ -132,10 +124,7 @@ impl Stroma {
             root,
             keratin_cfg,
             snap_cfg,
-            msg_logs_by_tp_part: Arc::new(DashMap::new()),
-            event_logs_by_tp_part: Arc::new(DashMap::new()),
-            queues: Arc::new(DashMap::new()),
-            applied_upto: Arc::new(DashMap::new()),
+            queue_handles: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
             global_dlq: Arc::new(RwLock::new(None)),
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
@@ -228,90 +217,86 @@ impl Stroma {
 
     // ---------------- Core accessors ----------------
 
-    async fn event_log(&self, tp: &str, part: u32, group: Option<&str>) -> Result<Arc<Keratin>> {
-        let key = (tp.into(), part, group.map(|s| s.into()));
-
-        let cell = self
-            .event_logs_by_tp_part
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-
-        let k = cell
-            .get_or_try_init(|| async {
-                let dir = self.tp_part_dir(tp, part, group);
-                fs::create_dir_all(&dir).map_err(io_err)?;
-
-                tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
-                let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
-                tracing::info!("Initialized event log: (`{tp}` `{part}` `{group:?}`)");
-
-                Ok(Arc::new(k))
-            })
-            .await?;
-
-        Ok(k.clone())
-    }
-
-    async fn msg_log(&self, tp: &str, part: u32, group: Option<&str>) -> Result<Arc<Keratin>> {
-        let key = (tp.into(), part, group.map(|s| s.into()));
-
-        let cell = self
-            .msg_logs_by_tp_part
-            .entry(key)
-            .or_insert_with(|| Arc::new(OnceCell::new()))
-            .clone();
-
-        let k = cell
-            .get_or_try_init(|| async {
-                let dir = self.msg_tp_part_dir(tp, part, group);
-                fs::create_dir_all(&dir).map_err(io_err)?;
-
-                tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
-                let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
-                tracing::info!("Initialized message log: (`{tp}` `{part}` `{group:?}`)");
-
-                Ok(Arc::new(k))
-            })
-            .await?;
-
-        Ok(k.clone())
-    }
-
-    fn queue_entry(
+    async fn event_log_init(
         &self,
         tp: &str,
         part: u32,
         group: Option<&str>,
-    ) -> dashmap::mapref::one::RefMut<'_, (Box<str>, u32, Option<Box<str>>), QueueHandle> {
-        self.queues
-            .entry((tp.into(), part, group.map(|s| s.into())))
-            .or_insert_with(|| QueueHandle::init(tp.into(), part))
+    ) -> Result<Arc<Keratin>> {
+        let dir = self.tp_part_dir(tp, part, group);
+        fs::create_dir_all(&dir).map_err(io_err)?;
+
+        tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
+        let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
+        tracing::info!("Initialized event log: (`{tp}` `{part}` `{group:?}`)");
+
+        Ok(Arc::new(k))
     }
 
-    fn queue_handle(&self, tp: &str, part: u32, group: Option<&str>) -> QueueHandle {
-        self.queue_entry(tp, part, group).clone()
+    async fn msg_log_init(&self, tp: &str, part: u32, group: Option<&str>) -> Result<Arc<Keratin>> {
+        let dir = self.msg_tp_part_dir(tp, part, group);
+        fs::create_dir_all(&dir).map_err(io_err)?;
+
+        tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
+        let k = Keratin::open(dir, self.keratin_cfg).await.map_err(io_err)?;
+        tracing::info!("Initialized message log: (`{tp}` `{part}` `{group:?}`)");
+
+        Ok(Arc::new(k))
     }
 
-    fn ensure_queue(&self, tp: &str, part: u32, group: Option<&str>) {
-        if !self
-            .queues
-            .contains_key(&(tp.into(), part, group.map(|s| s.into())))
-        {
-            tracing::debug!("Creating new QueueHandle for (`{tp}`, `{part}`, `{group:?}`)");
-            self.queue_entry(tp, part, group);
-        }
+    pub async fn queue_handle(&self, tp: &str, part: u32, group: Option<&str>) -> Result<QueueHandle> {
+        let cell = loop {
+            let current = self.queue_handles.load();
+
+            let key = (tp.into(), part, group.map(|s| s.into()));
+            if let Some(cell) = current.get(&key) {
+                break cell.clone();
+            }
+
+            let new_cell = Arc::new(OnceCell::new());
+            let mut next = (**current).clone();
+            next.insert(key.clone(), new_cell.clone());
+
+            // swap in the new map only if snapshot is still current
+            let prev = self.queue_handles.compare_and_swap(&current, Arc::new(next));
+
+            if Arc::ptr_eq(&prev, &current) {
+                break new_cell;
+            }
+
+            // lost race; retry
+        };
+
+        let q = cell
+            .get_or_try_init(|| async {
+                let msg_log = self.msg_log_init(tp, part, group).await?;
+                let event_log = self.event_log_init(tp, part, group).await?;
+                Ok(QueueHandle::init(
+                    tp.into(),
+                    part,
+                    msg_log,
+                    event_log,
+                ))
+            })
+            .await?;
+
+        Ok(q.clone())
     }
 
-    fn applied_upto_entry(
+    async fn ensure_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
+        self.queue_handle(tp, part, group).await?;
+
+        Ok(())
+    }
+
+    async fn applied_upto_entry(
         &self,
         tp: &str,
         part: u32,
         group: Option<&str>,
-    ) -> dashmap::mapref::one::RefMut<'_, (Box<str>, u32, Option<Box<str>>), AtomicU64> {
-        self.applied_upto
-            .entry((tp.into(), part, group.map(|s| s.into())))
-            .or_insert_with(|| AtomicU64::new(0))
+    ) -> Result<Arc<AtomicU64>> {
+        let queue = self.queue_handle(tp, part, group).await?;
+        Ok(queue.applied_upto())
     }
 
     // ---------------- Event apply rules ----------------
@@ -325,7 +310,7 @@ impl Stroma {
                 off,
                 retries,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 q.enqueue(*off, *retries).await;
             }
             StromaEvent::MarkInflight {
@@ -335,7 +320,7 @@ impl Stroma {
                 off,
                 deadline,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 q.mark_inflight(*off, *deadline).await;
             }
             StromaEvent::Ack {
@@ -344,7 +329,7 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 // ✅ Accept ACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate ACKs
@@ -359,7 +344,7 @@ impl Stroma {
                 off,
                 requeue,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 // ✅ Accept NACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate NACKs
@@ -373,7 +358,7 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 q.dead_letter(*off).await;
             }
             StromaEvent::ClearInflight {
@@ -382,11 +367,12 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref());
+                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
                 q.clear_inflight(*off).await;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
-                self.queues.remove(&(tp.clone(), *part, group.clone()));
+                self.remove_queue(tp, *part, group.as_deref());
+                // TODO: More cleanup?
             }
             StromaEvent::Snapshot { .. } => {
                 // If you keep Snapshot events inside the event log later, you'd load it here.
@@ -410,11 +396,11 @@ impl Stroma {
     ) -> Result<Offset> {
         if evs.is_empty() {
             return Ok(self
-                .applied_upto_entry(tp, part, group)
+                .applied_upto_entry(tp, part, group).await?
                 .load(Ordering::Acquire));
         }
 
-        let log = self.event_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in evs {
             msgs.push(event_msg(ev)?);
@@ -433,7 +419,7 @@ impl Stroma {
 
         // Update applied watermark:
         let new_upto = ar.base_offset + ar.count as u64;
-        self.applied_upto_entry(tp, part, group)
+        self.applied_upto_entry(tp, part, group).await?
             .store(new_upto, Ordering::Release);
 
         Ok(new_upto)
@@ -580,7 +566,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let q = self.queue_handle(tp, part, group);
+        let q = self.queue_handle(tp, part, group).await?;
         Ok(q.lowest_unacked_offset().await)
     }
 
@@ -591,7 +577,7 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<bool> {
-        let q = self.queue_handle(tp, part, group);
+        let q = self.queue_handle(tp, part, group).await?;
         Ok(q.is_inflight_or_acked(off).await)
     }
 
@@ -602,7 +588,7 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<bool> {
-        let q = self.queue_handle(tp, part, group);
+        let q = self.queue_handle(tp, part, group).await?;
         Ok(q.is_ready(off).await)
     }
 
@@ -612,19 +598,21 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         items: Vec<(Offset, Vec<u8>)>,
-    ) -> Vec<(Offset, Vec<u8>)> {
-        let q = self.queue_handle(tp, part, group);
-        q.filter_not_enqueued(items).await
+    ) -> Result<Vec<(Offset, Vec<u8>)>> {
+        let q = self.queue_handle(tp, part, group).await?;
+        Ok(q.filter_not_enqueued(items).await)
+    }
+
+    fn queue_keys_snapshot(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
+        let map = self.queue_handles.load();
+        map.keys().cloned().collect()
     }
 
     pub async fn next_expiry_hint(&self) -> Result<Option<UnixMillis>> {
         let mut min: Option<UnixMillis> = None;
-        let handles = self
-            .queues
-            .iter()
-            .map(|q| q.value().clone())
-            .collect::<Vec<_>>();
-        for qh in handles {
+        let keys = self.queue_keys_snapshot();
+        for (t, p, g) in keys {
+            let qh = self.queue_handle(&t, p, g.as_deref()).await?;
             if let Some(hint) = qh.next_expiry_hint().await {
                 min = Some(match min {
                     Some(m) => m.min(hint),
@@ -643,9 +631,9 @@ impl Stroma {
         group: Option<&str>,
         from: u64,
         upper: u64,
-    ) -> Option<Offset> {
-        let q = self.queue_handle(topic, part, group);
-        q.next_deliverable(from, upper).await
+    ) -> Result<Option<Offset>> {
+        let q = self.queue_handle(topic, part, group).await?;
+        Ok(q.next_deliverable(from, upper).await)
     }
 
     pub async fn list_expired(
@@ -655,21 +643,18 @@ impl Stroma {
     ) -> Result<Vec<(String, u32, Option<String>, Offset)>> {
         let mut out = Vec::new();
 
-        let handles = self
-            .queues
-            .iter()
-            .map(|q| (q.key().clone(), q.value().clone()))
-            .collect::<Vec<_>>();
-        for (ref key, qh) in handles {
+        let keys = self.queue_keys_snapshot();
+        for key in keys {
+            let (tp, part, group) = key;
+            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
             if out.len() >= max {
                 break;
             }
             let want = max - out.len();
             for off in qh.collect_expired(now, want).await {
-                let (tp, part, group) = key;
                 out.push((
                     tp.to_string(),
-                    *part,
+                    part,
                     group.clone().map(|s| s.to_string()),
                     off,
                 ));
@@ -750,10 +735,13 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         // snapshot all queues for this partition (simple v0; later you can do incremental / max-bytes)
-        for e in self.queues.iter() {
-            let (key_tp, key_part, key_group) = e.key();
-            if key_tp.as_ref() == tp && *key_part == part && key_group.as_deref() == group {
-                let blob = e.value().encode_snapshot().await;
+        let keys = self.queue_keys_snapshot();
+        for (key_tp, key_part, key_group) in keys {
+            let qh = self
+                .queue_handle(&key_tp, key_part, key_group.as_deref())
+                .await?;
+            if key_tp.as_ref() == tp && key_part == part && key_group.as_deref() == group {
+                let blob = qh.encode_snapshot().await;
                 self.write_queue_snapshot(tp, part, group, applied_upto, &blob)?;
             }
         }
@@ -923,9 +911,9 @@ impl Stroma {
         // NOTE: tp_dirname is encoded; we don't need the original for recovery of state
         // because events carry real tp strings. We'll just open each partition dir and replay.
         for (group, tp_enc, part) in partitions {
-            let _ = self.msg_log(&tp_enc, part, group.as_deref()).await?;
-            let k = self.event_log(&tp_enc, part, group.as_deref()).await?;
-            self.ensure_queue(&tp_enc, part, group.as_deref());
+            let q = self.queue_handle(&tp_enc, part, group.as_deref()).await?;
+            let event_log = q.event_log();
+            self.ensure_queue(&tp_enc, part, group.as_deref()).await?;
 
             let mut dir = events_root.clone();
             if let Some(ref g) = group {
@@ -937,7 +925,7 @@ impl Stroma {
             // let k = Arc::new(k);
             // We don't know real topic string here; replay will populate from event payload.
             // We'll store this Keratin under the first real tp seen during replay.
-            self.recover_one_log(k, part).await?;
+            self.recover_one_log(event_log, part).await?;
         }
 
         Ok(())
@@ -957,7 +945,7 @@ impl Stroma {
         // - and during replay, when we see tp, we attempt to load its snapshot once.
 
         // We'll cache loaded snapshot offsets here:
-        let snap_applied_for: DashMap<Box<str>, Offset> = DashMap::new();
+        let mut snap_applied_for: HashMap<Box<str>, Offset> = HashMap::new();
         // tp -> last_applied_event_offset
 
         let reader = k.reader();
@@ -1000,7 +988,7 @@ impl Stroma {
                     let sp = self.snap_file(tp, part, group.as_deref());
                     if let Some((snap_upto, blob)) = self.read_queue_snapshot(&sp)? {
                         {
-                            let gs = self.queue_handle(tp, part, group.as_deref());
+                            let gs = self.queue_handle(tp, part, group.as_deref()).await?;
                             gs.load_snapshot(blob).await.map_err(io_err)?;
                         }
                         snap_applied_for.insert(key.into(), snap_upto);
@@ -1009,7 +997,7 @@ impl Stroma {
                     }
                 }
 
-                let snap_upto = *snap_applied_for.get(key).unwrap().value();
+                let snap_upto = *snap_applied_for.get(key).unwrap();
 
                 // Zero with one event causes edge case
                 if rec.offset <= snap_upto && snap_upto > 0 {
@@ -1017,7 +1005,7 @@ impl Stroma {
                 }
 
                 self.apply_event_inmem(&ev).await?;
-                self.applied_upto_entry(tp, part, group.as_deref())
+                self.applied_upto_entry(tp, part, group.as_deref()).await?
                     .store(rec.offset + 1, Ordering::Release);
             }
         }
@@ -1025,34 +1013,39 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn shutdown(&self) -> Result<()> {
-        // Best effort: flush all logs (Keratin flushes on drop, but we can trigger it here).
+    fn remove_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Option<Arc<OnceCell<QueueHandle>>> {
+        let key = (tp.into(), part, group.map(|s| s.into()));
+        loop {
+            let current = self.queue_handles.load();
 
-        let keys: Vec<_> = self
-            .event_logs_by_tp_part
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
-
-        for key in keys {
-            if let Some((_, cell)) = self.event_logs_by_tp_part.remove(&key)
-                && let Some(k) = cell.get()
-            {
-                k.shutdown().await.map_err(io_err)?;
+            if !current.contains_key(&key) {
+                return None;
             }
+
+            let mut next = (**current).clone();
+            let removed = next.remove(&key);
+
+            let new = Arc::new(next);
+            let prev = self.queue_handles.compare_and_swap(&current, new);
+
+            if Arc::ptr_eq(&prev, &current) {
+                return removed;
+            }
+
+            // lost race -> retry
         }
+    }
 
-        let keys: Vec<_> = self
-            .msg_logs_by_tp_part
-            .iter()
-            .map(|entry| entry.key().clone())
-            .collect();
+    pub async fn shutdown(&self) -> Result<()> {
+        // Step 1: atomically take ownership of all queues
+        let old = self.queue_handles.swap(Arc::new(HashMap::new()));
 
-        for key in keys {
-            if let Some((_, cell)) = self.msg_logs_by_tp_part.remove(&key)
-                && let Some(k) = cell.get()
-            {
-                k.shutdown().await.map_err(io_err)?;
+        // Step 2: shutdown everything from the old snapshot
+        for (_key, cell) in old.iter() {
+            if let Some(q) = cell.get() {
+                q.event_log().shutdown().await.map_err(io_err)?;
+                q.msg_log().shutdown().await.map_err(io_err)?;
+                q.shutdown().await;
             }
         }
         Ok(())
@@ -1081,7 +1074,7 @@ impl Stroma {
             return Ok(Vec::new());
         }
 
-        let log = self.msg_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.msg_log();
         let mut msgs = Vec::with_capacity(payloads.len());
         for p in payloads {
             msgs.push(Message {
@@ -1111,8 +1104,8 @@ impl Stroma {
         event_completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
-        let msg_log = self.msg_log(tp, part, group).await?;
-        self.ensure_queue(tp, part, group);
+        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        self.ensure_queue(tp, part, group).await?;
         msg_log
             .append_enqueue(
                 Message {
@@ -1195,8 +1188,9 @@ impl Stroma {
             off: offset,
         };
 
-        let log = self.event_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.event_log();
         let msg = event_msg(&ev)?;
+        // TODO: Create a separate completion for the event log, so that I use the original one, once the event is also applied in memory.
         log.append_enqueue(msg, None, completion).map_err(io_err)?;
         self.apply_event_inmem(&ev).await?;
         self.maybe_snapshot(tp, part, group, offset).await?;
@@ -1221,7 +1215,7 @@ impl Stroma {
             requeue,
         };
 
-        let log = self.event_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.event_log();
         let msg = event_msg(&ev)?;
         log.append_enqueue(msg, None, completion).map_err(io_err)?;
         self.apply_event_inmem(&ev).await?;
@@ -1237,7 +1231,7 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<Option<Message>> {
-        let log = self.msg_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.msg_log();
         let reader = log.reader();
         let rec = reader.fetch(off).map_err(io_err)?.map(|r| r.to_message());
         Ok(rec)
@@ -1251,7 +1245,7 @@ impl Stroma {
         max: usize,
         lease_deadline: UnixMillis,
     ) -> Result<Vec<(Offset, Vec<u8>)>> {
-        let qs = self.queue_handle(tp, part, group);
+        let qs = self.queue_handle(tp, part, group).await?;
 
         // Offsets are now already marked inflight inside queue
         let offs = qs.poll_ready_and_mark(max, lease_deadline).await;
@@ -1311,49 +1305,6 @@ impl Stroma {
         Ok(out)
     }
 
-    pub async fn poll_ready1(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-        max: usize,
-        lease_deadline: UnixMillis,
-    ) -> Result<Vec<(Offset, Vec<u8>)>> {
-        let mut out = Vec::with_capacity(max);
-        let mut inflight = Vec::new();
-
-        let qs = self.queue_handle(tp, part, group);
-
-        tracing::debug!(
-            "Polling ready for ({tp}, {part}, {group:?}), settled_until={}",
-            qs.settled_until().await
-        );
-        let offs = qs.poll_ready_and_mark(max, lease_deadline).await;
-
-        drop(qs); // important before mutation
-
-        for off in offs {
-            // Fetch payload
-            // TODO:  wrap in outter loop as well to keep polling (a few attempts) if due to not found errors it is not filled up to max
-            if let Some(msg) = self.fetch_message_by_offset(tp, part, group, off).await? {
-                out.push((off, msg.payload));
-                inflight.push((off, lease_deadline));
-            }
-        }
-
-        // TODO: Move closer to actual sent time? Or will we need another state to avoid resending before inflight is marked?
-        if !inflight.is_empty() {
-            self.mark_inflight_batch(tp, part, group, &inflight).await?;
-        }
-
-        tracing::debug!(
-            "Polled ready for ({tp}, {part}, {group:?}), got {} messages",
-            out.len()
-        );
-
-        Ok(out)
-    }
-
     pub async fn scan_messages_from(
         &self,
         tp: &str,
@@ -1362,7 +1313,7 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>)>> {
-        let log = self.msg_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.msg_log();
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
         Ok(got.into_iter().map(|r| (r.offset, r.payload)).collect())
@@ -1374,7 +1325,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let log = self.msg_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.msg_log();
         Ok(log.next_offset())
     }
 
@@ -1386,7 +1337,7 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let log = self.msg_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.msg_log();
         log.truncate_before(before).await.map_err(io_err)
     }
 
@@ -1396,7 +1347,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<()> {
-        let cutoff = self.safe_truncate_before(tp, part, group).await;
+        let cutoff = self.safe_truncate_before(tp, part, group).await?;
         tracing::warn!("cleanup cutoff: {}", cutoff);
         if cutoff == 0 {
             return Ok(());
@@ -1408,17 +1359,18 @@ impl Stroma {
     }
 
     /// Only offsets < min(acked_until of every queue) are globally deletable.
-    async fn safe_truncate_before(&self, tp: &str, part: u32, group: Option<&str>) -> Offset {
+    async fn safe_truncate_before(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<Offset> {
         let mut min: Option<UnixMillis> = None;
-        let handles = self
-            .queues
-            .iter()
-            .map(|q| (q.key().clone(), q.value().clone()))
-            .collect::<Vec<_>>();
-        for (ref key, queue) in handles {
-            let (k_tp, k_part, k_group) = key;
-            if k_tp.as_ref() == tp && *k_part == part && k_group.as_deref() == group {
-                let settled_until = queue.settled_until().await;
+        let keys = self.queue_keys_snapshot();
+        for (k_tp, k_part, k_group) in keys {
+            if k_tp.as_ref() == tp && k_part == part && k_group.as_deref() == group {
+                let qh = self.queue_handle(&k_tp, k_part, k_group.as_deref()).await?;
+                let settled_until = qh.settled_until().await;
                 min = Some(match min {
                     Some(m) => m.min(settled_until),
                     None => settled_until,
@@ -1426,14 +1378,14 @@ impl Stroma {
             }
         }
 
-        min.unwrap_or(0)
+        Ok(min.unwrap_or(0))
     }
 
     pub fn list_queues(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
-        self.queues
+        self.queue_keys_snapshot()
             .iter()
-            .map(|e| {
-                let (tp, part, group) = e.key();
+            .map(|k| {
+                let (tp, part, group) = k;
                 (tp.clone(), *part, group.clone())
             })
             .collect()
@@ -1446,21 +1398,21 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<bool> {
-        let q = self.queue_handle(tp, part, group);
+        let q = self.queue_handle(tp, part, group).await?;
         Ok(q.is_acked(off).await)
     }
 
     pub async fn count_inflight(&self, tp: &str, part: u32, group: Option<&str>) -> Result<usize> {
-        let q = self.queue_handle(tp, part, group);
+        let q = self.queue_handle(tp, part, group).await?;
         Ok(q.inflight_len().await)
     }
 
     pub fn list_topics(&self) -> Vec<Box<str>> {
         // TODO: Should return groups too
-        self.queues
+        self.queue_keys_snapshot()
             .iter()
-            .map(|g| {
-                let (tp, _, _) = g.key();
+            .map(|k| {
+                let (tp, _, _) = k;
                 tp.clone()
             })
             .collect::<std::collections::HashSet<_>>()
@@ -1495,7 +1447,7 @@ impl Stroma {
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
         let upto = self
-            .applied_upto_entry(tp, part, group)
+            .applied_upto_entry(tp, part, group).await?
             .load(Ordering::Acquire);
         self.write_snapshots_for_partition(tp, part, group, upto)
             .await
@@ -1508,22 +1460,24 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let log = self.event_log(tp, part, group).await?;
+        let log = self.queue_handle(tp, part, group).await?.event_log();
         log.truncate_before(before).await.map_err(io_err)
     }
 
-    pub async fn debug_dump_queue(&self, tp: &str, part: u32, group: Option<&str>) -> String {
-        let q = self.queue_handle(tp, part, group);
-        format!("{:#?}", q.canonical().await)
+    pub async fn debug_dump_queue(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<String> {
+        let q = self.queue_handle(tp, part, group).await?;
+        Ok(format!("{:#?}", q.canonical().await))
     }
 
     pub async fn validate(&self) -> Result<()> {
-        let handles = self
-            .queues
-            .iter()
-            .map(|q| q.value().clone())
-            .collect::<Vec<_>>();
-        for qh in handles {
+        let keys = self.queue_keys_snapshot();
+        for (k_tp, k_part, k_group) in keys {
+            let qh = self.queue_handle(&k_tp, k_part, k_group.as_deref()).await?;
             for (off, _) in qh.dump_inflight().await {
                 if off < qh.settled_until().await {
                     return Err(StromaError::Decode("inflight < ack frontier".into()));

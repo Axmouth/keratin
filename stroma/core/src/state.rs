@@ -1,7 +1,10 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::sync::Arc;
+use std::sync::atomic::AtomicU64;
 
 use bitvec::vec::BitVec;
+use keratin_log::{Keratin, KeratinConfig};
 
 use crate::topic;
 
@@ -99,7 +102,7 @@ pub enum DLQDiscardPolicy {
 /// - READY is the sole authority for delivery eligibility.
 /// - ACK / REJECT / DLQ are terminal.
 #[derive(Debug, Clone)]
-struct QueueInternalState {
+pub struct QueueInternalState {
     topic: String,
     partition: u32,
 
@@ -135,6 +138,9 @@ struct QueueInternalState {
 
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
 pub enum QueueCommand {
+    Shutdown {
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    },
     Enqueue {
         offset: Offset,
         retries: u32,
@@ -237,10 +243,6 @@ pub enum QueueCommand {
     GetSettledUntil {
         response: Option<tokio::sync::oneshot::Sender<Offset>>,
     },
-    GetIterReadyFrom {
-        from: Offset,
-        response: Option<tokio::sync::oneshot::Sender<Vec<Offset>>>,
-    }, // from
     PollReadyAndMark {
         max: usize,
         lease_deadline: UnixMillis,
@@ -272,6 +274,9 @@ pub enum QueueCommand {
     GetCanonicalQueueState {
         response: Option<tokio::sync::oneshot::Sender<CanonicalQueueState>>,
     },
+    GetStatusReport {
+        response: Option<tokio::sync::oneshot::Sender<QueueStatusReport>>,
+    },
     CollectExpired {
         now: UnixMillis,
         max: usize,
@@ -299,10 +304,20 @@ pub struct QueueHandle {
 
     topic: String,
     partition: u32,
+
+    msg_log: Arc<Keratin>,
+    event_log: Arc<Keratin>,
+
+    applied_upto: Arc<AtomicU64>,
 }
 
 impl QueueHandle {
-    pub fn init(topic: String, partition: u32) -> Self {
+    pub fn init(
+        topic: String,
+        partition: u32,
+        msg_log: Arc<Keratin>,
+        event_log: Arc<Keratin>,
+    ) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueueCommandPackage>();
 
         let topic_clone = topic.clone();
@@ -311,20 +326,35 @@ impl QueueHandle {
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
-                Self::process_command(&mut state, cmd);
+                let processed = Self::process_command(&mut state, cmd);
+                if processed.is_none() {
+                    break;
+                }
             }
             // If the loop exits, the channel was closed.
         });
+
+        let applied_upto = Arc::new(AtomicU64::new(0));
 
         Self {
             command_sender: tx,
             topic,
             partition,
+            msg_log,
+            event_log,
+            applied_upto,
         }
     }
 
-    fn process_command(state: &mut QueueInternalState, cmd: QueueCommand) {
+    fn process_command(state: &mut QueueInternalState, cmd: QueueCommand) -> Option<bool> {
         match cmd {
+            QueueCommand::Shutdown { response } => {
+                // No more commands will be processed after this, so we can ignore the rest of the channel.
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                return None; // signal to break the loop
+            }
             QueueCommand::Enqueue {
                 offset,
                 retries,
@@ -350,7 +380,7 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::ClearInflight { offset, response } => {
                 state.clear_inflight(offset);
                 if let Some(r) = response {
@@ -368,7 +398,7 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::Nack {
                 offset,
                 requeue,
@@ -384,7 +414,7 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::Reject { offset, response } => {
                 state.reject(offset);
                 if let Some(r) = response {
@@ -432,8 +462,7 @@ impl QueueHandle {
                 }
             }
             QueueCommand::DumpInflight { response } => {
-                let result = state
-                    .dump_inflight();
+                let result = state.dump_inflight();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -449,122 +478,139 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::Reset { response } => {
                 state.reset();
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::SetAckedUntil { offset, response } => {
                 state.set_acked_until(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
-            QueueCommand::SetAckWindow { base, bits, response } => {
+            }
+            QueueCommand::SetAckWindow {
+                base,
+                bits,
+                response,
+            } => {
                 state.set_ack_window(base, bits);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
-            QueueCommand::SetAckWindowFromBytes { base, bits_bytes, response } => {
+            }
+            QueueCommand::SetAckWindowFromBytes {
+                base,
+                bits_bytes,
+                response,
+            } => {
                 let result = state.set_ack_window_from_bytes(base, &bits_bytes);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::LoadInflight { entries, response } => {
                 state.load_inflight(&entries);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-            },
+            }
             QueueCommand::EncodeSnapshot { response } => {
                 let result = state.encode_snapshot();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::IsInflightOrAcked { offset, response } => {
                 let result = state.is_inflight_or_acked(offset);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
-            QueueCommand::FilterNotEnqueued { mut items, response } => {
+            }
+            QueueCommand::FilterNotEnqueued {
+                mut items,
+                response,
+            } => {
                 state.filter_not_enqueued(&mut items);
                 if let Some(r) = response {
                     let _ = r.send(items);
                 }
-            },
-            QueueCommand::PollReadyAndMark { max, lease_deadline, response } => {
+            }
+            QueueCommand::PollReadyAndMark {
+                max,
+                lease_deadline,
+                response,
+            } => {
                 let result = state.poll_ready_and_mark(max, lease_deadline);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetNextOffset { response } => {
                 let result = state.next_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
-            QueueCommand::GetIterReadyFrom { from, response } => {
-                let result = state.iter_ready_from(from).collect();
-                if let Some(r) = response {
-                    let _ = r.send(result);
-                }
-            },
+            }
             QueueCommand::GetLowestUnacked { response } => {
                 let result = state.lowest_unacked_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetLowestNotAcked { response } => {
                 let result = state.lowest_not_acked_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetInflightLen { response } => {
                 let result = state.inflight_len();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetNextExpiryHint { response } => {
                 let result = state.next_expiry_hint();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetAckWindowBase { response } => {
                 let result = state.ack_window_base();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetAckBitsBytes { response } => {
                 let result = state.ack_bits_bytes();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
+            }
             QueueCommand::GetCanonicalQueueState { response } => {
                 let result = state.canonical();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
-            },
-                    }
+            }
+            QueueCommand::GetStatusReport { response } => {
+                let result = state.status_report();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+        }
+
+        Some(true) // signal to continue processing
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) {
@@ -606,14 +652,12 @@ impl QueueHandle {
 
     pub async fn clear_inflight(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::ClearInflight {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::ClearInflight {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
@@ -641,28 +685,24 @@ impl QueueHandle {
 
     pub async fn nack(&self, offset: Offset, requeue: bool) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::Nack {
-                    offset,
-                    requeue,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Nack {
+                offset,
+                requeue,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
     pub async fn dead_letter(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::DeadLetter {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::DeadLetter {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
@@ -679,334 +719,285 @@ impl QueueHandle {
 
     pub async fn advance_frontier(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::AdvanceFrontier { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::AdvanceFrontier { response: Some(tx) },
+        });
         rx.await.unwrap();
     }
 
     pub async fn reset(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::Reset { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Reset { response: Some(tx) },
+        });
         rx.await.unwrap();
     }
 
     pub async fn set_acked_until(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::SetAckedUntil {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::SetAckedUntil {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
     pub async fn set_ack_window(&self, base: Offset, bits: BitVec) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::SetAckWindow {
-                    base,
-                    bits,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::SetAckWindow {
+                base,
+                bits,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
     pub async fn set_ack_window_from_bytes(&self, base: Offset, bits_bytes: Vec<u8>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::SetAckWindowFromBytes {
-                    base,
-                    bits_bytes,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::SetAckWindowFromBytes {
+                base,
+                bits_bytes,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
     pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::LoadInflight {
-                    entries,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::LoadInflight {
+                entries,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap();
     }
 
     pub async fn encode_snapshot(&self) -> Vec<u8> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::EncodeSnapshot { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::EncodeSnapshot { response: Some(tx) },
+        });
         rx.await.unwrap()
     }
 
     pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<()> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::LoadSnapshot {
-                    data,
-                    response: Some(tx),
-                },
-            });
-        rx.await.unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::LoadSnapshot {
+                data,
+                response: Some(tx),
+            },
+        });
+        rx.await
+            .unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))
     }
 
     pub async fn is_acked(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::IsAcked {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::IsAcked {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(false)
     }
-    
+
     pub async fn is_inflight(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::IsInflight {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::IsInflight {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(false)
     }
 
     pub async fn is_inflight_or_acked(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::IsInflightOrAcked {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::IsInflightOrAcked {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(false)
     }
 
     pub async fn is_ready(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::IsReady {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::IsReady {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(false)
     }
 
-    pub async fn filter_not_enqueued(&self, items: Vec<(Offset, Vec<u8>)>) -> Vec<(Offset, Vec<u8>)> {
+    pub async fn filter_not_enqueued(
+        &self,
+        items: Vec<(Offset, Vec<u8>)>,
+    ) -> Vec<(Offset, Vec<u8>)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::FilterNotEnqueued {
-                    items: items.clone(),
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::FilterNotEnqueued {
+                items: items.clone(),
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or_default()
     }
 
     pub async fn retries(&self, offset: Offset) -> Option<u32> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetRetries {
-                    offset,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetRetries {
+                offset,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(None)
     }
 
     pub async fn settled_until(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetSettledUntil { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetSettledUntil { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
     }
 
     pub async fn next_offset(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetNextOffset {
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetNextOffset { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
-    }
-
-    pub async fn iter_ready_from(&self, from: Offset) -> Vec<Offset> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetIterReadyFrom {
-                    from,
-                    response: Some(tx),
-                },
-            });
-        rx.await.unwrap_or_default()
     }
 
     pub async fn poll_ready_and_mark(&self, max: usize, lease_deadline: UnixMillis) -> Vec<Offset> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::PollReadyAndMark {
-                    max,
-                    lease_deadline,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::PollReadyAndMark {
+                max,
+                lease_deadline,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or_default()
     }
 
     pub async fn lowest_unacked_offset(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetLowestUnacked { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetLowestUnacked { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
     }
 
     pub async fn lowest_not_acked_offset(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetLowestNotAcked { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetLowestNotAcked { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
     }
 
     pub async fn next_deliverable(&self, from: Offset, upper: Offset) -> Option<Offset> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetNextDeliverable {
-                    from,
-                    upper,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetNextDeliverable {
+                from,
+                upper,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or(None)
     }
 
     pub async fn inflight_len(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetInflightLen { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetInflightLen { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
     }
 
     pub async fn next_expiry_hint(&self) -> Option<UnixMillis> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetNextExpiryHint { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetNextExpiryHint { response: Some(tx) },
+        });
         rx.await.unwrap_or(None)
     }
 
     pub async fn ack_window_base(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetAckWindowBase { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetAckWindowBase { response: Some(tx) },
+        });
         rx.await.unwrap_or(0)
     }
 
     pub async fn ack_bits_bytes(&self) -> Vec<u8> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetAckBitsBytes { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetAckBitsBytes { response: Some(tx) },
+        });
         rx.await.unwrap_or_default()
     }
 
     pub async fn canonical(&self) -> CanonicalQueueState {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::GetCanonicalQueueState { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetCanonicalQueueState { response: Some(tx) },
+        });
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn status_report(&self) -> Result<QueueStatusReport, std::io::Error> {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::GetStatusReport { response: Some(tx) },
+        });
+        rx.await.map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
     }
 
     pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::CollectExpired {
-                    now,
-                    max,
-                    response: Some(tx),
-                },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::CollectExpired {
+                now,
+                max,
+                response: Some(tx),
+            },
+        });
         rx.await.unwrap_or_default()
     }
 
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_sender
-            .send(QueueCommandPackage {
-                command: QueueCommand::DumpInflight { response: Some(tx) },
-            });
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::DumpInflight { response: Some(tx) },
+        });
         rx.await.unwrap_or_default()
+    }
+
+    pub async fn shutdown(&self) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self.command_sender.send(QueueCommandPackage {
+            command: QueueCommand::Shutdown { response: Some(tx) },
+        });
+        let _ = rx.await;
     }
 
     pub fn topic(&self) -> &str {
@@ -1015,6 +1006,18 @@ impl QueueHandle {
 
     pub fn partition(&self) -> u32 {
         self.partition
+    }
+
+    pub fn msg_log(&self) -> Arc<Keratin> {
+        self.msg_log.clone()
+    }
+
+    pub fn event_log(&self) -> Arc<Keratin> {
+        self.event_log.clone()
+    }
+
+    pub fn applied_upto(&self) -> Arc<AtomicU64> {
+        self.applied_upto.clone()
     }
 }
 
@@ -1087,12 +1090,13 @@ impl QueueInternalState {
         self.ready.range(from..).copied()
     }
 
-    pub fn poll_ready_and_mark(
-        &mut self,
-        max: usize,
-        lease_deadline: UnixMillis,
-    ) -> Vec<Offset> {
-        tracing::debug!("Polling ready for ({}, {}), settled_until={}", self.topic, self.partition, self.settled_until());
+    pub fn poll_ready_and_mark(&mut self, max: usize, lease_deadline: UnixMillis) -> Vec<Offset> {
+        tracing::debug!(
+            "Polling ready for ({}, {}), settled_until={}",
+            self.topic,
+            self.partition,
+            self.settled_until()
+        );
         let mut offs = Vec::new();
         for off in self.iter_ready_from(self.settled_until()) {
             if offs.len() >= max {
@@ -1639,7 +1643,10 @@ impl QueueInternalState {
         let mut words = Vec::with_capacity(bytes.len() / word_bytes);
         for chunk in bytes.chunks_exact(word_bytes) {
             words.push(usize::from_le_bytes(chunk.try_into().map_err(|_| {
-                std::io::Error::new(std::io::ErrorKind::InvalidData, "failed to convert chunk to usize")
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "failed to convert chunk to usize",
+                )
             })?));
         }
 
@@ -1752,6 +1759,26 @@ impl QueueInternalState {
             inflight,
         }
     }
+
+    pub fn status_report(&self) -> QueueStatusReport {
+        QueueStatusReport {
+            topic: self.topic.clone(),
+            partition: self.partition,
+            inflight_count: self.inflight.len(),
+            ready_count: self.ready.len(),
+            next_expiry_hint: self.min_deadline_hint,
+            lowest_unacked: self.lowest_unacked_offset(),
+        }
+    }
+}
+
+pub struct QueueStatusReport {
+    pub topic: String,
+    pub partition: u32,
+    pub inflight_count: usize,
+    pub ready_count: usize,
+    pub next_expiry_hint: Option<UnixMillis>,
+    pub lowest_unacked: Offset,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]

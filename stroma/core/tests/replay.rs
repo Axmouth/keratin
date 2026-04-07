@@ -22,7 +22,7 @@ async fn snapshot_delta_replay_is_deterministic() {
     }
 
     // snapshot logical state BEFORE drop
-    let before = st.debug_dump_queue("t", 0,  None,).await;
+    let before = st.debug_dump_queue("t", 0,  None,).await.unwrap();
 
     // force persistence so restart is deterministic
     st.snapshot_partition("t", 0,  None).await.unwrap();
@@ -31,7 +31,7 @@ async fn snapshot_delta_replay_is_deterministic() {
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
-    let after = st2.debug_dump_queue("t", 0,  None).await;
+    let after = st2.debug_dump_queue("t", 0,  None).await.unwrap();
 
     assert_eq!(before, after);
 }

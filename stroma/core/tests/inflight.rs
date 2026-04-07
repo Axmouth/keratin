@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, QueueHandle, SnapshotConfig, Stroma};
+use stroma_core::{Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
@@ -32,7 +32,8 @@ pub async fn append_one(
 
 #[tokio::test]
 async fn expired_messages_are_redelivered_and_never_lost() {
-    let q = QueueHandle::init("test".into(), 0);
+    let (st, _td) = open_test_stroma().await;
+    let q = st.queue_handle("t", 0, None).await.unwrap();
 
     for i in 0..100 {
         q.enqueue(i, 0).await;
@@ -88,7 +89,7 @@ async fn published_messages_become_deliverable_eventually() {
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let d = st.next_deliverable("t", 0,  None,0, 100).await.unwrap();
+            let d = st.next_deliverable("t", 0,  None,0, 100).await.unwrap().unwrap();
             println!("Next deliverable: {:?}", d);
             if d < 100 {
                 break;
