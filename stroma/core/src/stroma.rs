@@ -19,7 +19,7 @@ use tokio::sync::{OnceCell, RwLock};
 use crate::{
     Result, StromaError,
     event::{self, StromaEvent},
-    state::{Offset, QueueCommand, QueueCommandPackage, QueueHandle, UnixMillis},
+    state::{Offset, QueueCommand, QueueCommandPackage, QueueHandle, QueueStatusReport, UnixMillis},
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -1601,6 +1601,29 @@ impl Stroma {
             .collect::<std::collections::HashSet<_>>()
             .into_iter()
             .collect()
+    }
+
+    pub async fn estimate_disk_used(&self) -> Result<u64> {
+        let mut total = 0;
+        let keys = self.queue_keys_snapshot();
+        for (tp, part, group) in keys {
+            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            total += qh.event_log().estimate_disk_used().await.map_err(io_err)?;
+            total += qh.msg_log().estimate_disk_used().await.map_err(io_err)?;
+        }
+        Ok(total)
+    }
+
+    pub async fn get_queues_stats(
+        &self,
+    ) -> Result<HashMap<(Box<str>, Option<Box<str>>), QueueStatusReport>> {
+        let mut stats = HashMap::new();
+        for (tp, part, group) in self.queue_keys_snapshot() {
+            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let status = qh.status_report().await.map_err(io_err)?;
+            stats.insert((tp, group), status);
+        }
+        Ok(stats)
     }
 }
 

@@ -629,6 +629,35 @@ impl Log {
         self.fsync()?;
         Ok(())
     }
+
+    pub fn estimate_disk_used(&self) -> io::Result<u64> {
+        let seg_dir = self.root.join("segments");
+        let mut total = 0u64;
+        for ent in fs::read_dir(&seg_dir)? {
+            let ent = ent?;
+            let meta = ent.metadata()?;
+            if meta.is_file() {
+                total += meta.len();
+            }
+        }
+        let manifest_path = self.root.join("manifest.bin");
+        if let Ok(manifest_meta) = fs::metadata(&manifest_path) {
+            total += manifest_meta.len();
+        }
+        // Also iterate the index files
+        for ent in fs::read_dir(seg_dir)? {
+            let ent = ent?;
+            let name = ent.file_name();
+            let Some(s) = name.to_str() else { continue };
+            if s.ends_with(".idx") {
+                let meta = ent.metadata()?;
+                if meta.is_file() {
+                    total += meta.len();
+                }
+            }
+        }
+        Ok(total)
+    }
 }
 
 // ---- helpers

@@ -1780,6 +1780,7 @@ impl QueueInternalState {
     }
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueStatusReport {
     pub topic: String,
     pub partition: u32,

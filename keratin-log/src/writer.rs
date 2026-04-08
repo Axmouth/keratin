@@ -351,6 +351,14 @@ fn writer_loop(
                 }
                 return;
             }
+            WriterCmd::SizeEstimate { respond_to } => {
+                let res = log.estimate_disk_used().map_err(|e| {
+                    io::Error::other(format!("size estimate error: {e}"))
+                });
+                if let Err(_e) = respond_to.send(res) {
+                    tracing::info!("Error sending size estimate response");
+                }
+            }
         }
     }
 }

@@ -34,6 +34,9 @@ pub enum WriterCmd {
     Shutdown {
         notify_tx: oneshot::Sender<()>,
     },
+    SizeEstimate {
+        respond_to: oneshot::Sender<io::Result<u64>>,
+    },
 }
 
 impl Keratin {
@@ -212,6 +215,15 @@ impl Keratin {
             self.root.join(".keratin.lock").display()
         );
         Ok(())
+    }
+
+    pub async fn estimate_disk_used(&self) -> std::io::Result<u64> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::SizeEstimate { respond_to })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     /// Force to close without waiting for writer to acknowledge shutdown (for testing)
