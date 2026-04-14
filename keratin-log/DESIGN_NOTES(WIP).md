@@ -146,7 +146,7 @@ This enables “seek by time” and time-based TTL/retention without scanning.
 
 # Collagen (or Stroma) v0: state persistence
 
-You’re right that “log shouldn’t grow too far”, but operationally you still want bounded restart time. The best compromise that keeps your philosophy:
+You’re right that “log shouldn’t grow too far”, but operationally you still want bounded restart time. The best compromise that keeps our philosophy:
 
 * **always rebuildable from Keratin**
 * **normally restart from snapshot+delta**
@@ -302,31 +302,31 @@ Loop:
 
 # Trait API: keep it, but add two “log-native” primitives
 
-You can keep your current trait for now, but I’d add these ASAP:
+We can keep the current trait for now, but could add these ASAP:
 
 1. **Append range return**
 
 * `append_batch(...) -> (base_offset, count)`
-  You can always derive the Vec lazily in callers if needed.
+  We can always derive the Vec lazily in callers if needed.
 
 2. **Streaming scan**
 
 * `scan_from(topic, partition, from_offset, max_bytes|max_msgs) -> Stream<Item=RecordRef>`
   This avoids allocating big Vecs and matches log physics.
 
-You can keep your existing `fetch_available` convenience method at the broker layer on top of scan + in-memory group state.
+We can keep our existing `fetch_available` convenience method at the broker layer on top of scan + in-memory group state.
 
 ---
 
 # Raft/replication readiness
 
-Your “durability levels” map cleanly to:
+Our "durability levels" map cleanly to:
 
 * after local write
 * after local fsync
 * after quorum replicated (Raft commit index)
 
-Keratin being append-only makes Raft integration much easier: replication is literally “ship log entries,” apply in order.
+Keratin being append-only makes Raft integration much easier: replication is literally "ship log entries", apply in order.
 
 ┌──────────────────────────┐
 │   Broker / Stream API    │   <-- control records, EOS, headers

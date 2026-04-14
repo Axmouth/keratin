@@ -1,10 +1,8 @@
 use std::{
-    fs, io,
-    path::{Path, PathBuf},
-    sync::{
+    fs, hash::{Hash, Hasher}, io, path::{Path, PathBuf}, sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    },
+    }
 };
 
 use arc_swap::ArcSwap;
@@ -301,16 +299,31 @@ impl Stroma {
             let mut next = (**current).clone();
             next.insert(key.clone(), new_cell.clone());
 
+            println!("Attempting to insert queue handle for ({tp}, {part}, {group:?})...");
             // swap in the new map only if snapshot is still current
             let prev = self
                 .queue_handles
                 .compare_and_swap(&current, Arc::new(next));
+            println!("compare_and_swap result for ({tp}, {part}, {group:?}): {}", if Arc::ptr_eq(&prev, &current) { "success" } else { "failure" });
 
             if Arc::ptr_eq(&prev, &current) {
                 break new_cell;
             }
 
             // lost race; retry
+            println!("Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying...");
+            // make numeric hash of topic/part/group and sleep that long to reduce contention in high concurrency scenarios.
+            let hash = {
+                use std::collections::hash_map::DefaultHasher;
+                let mut hasher = DefaultHasher::new();
+                tp.hash(&mut hasher);
+                part.hash(&mut hasher);
+                group.hash(&mut hasher);
+                hasher.finish()
+            };
+            let sleep_us = hash % 1000;
+            println!("Sleeping for {sleep_us} microseconds before retrying...");
+            tokio::time::sleep(tokio::time::Duration::from_micros(sleep_us)).await;
         };
 
         let q = cell

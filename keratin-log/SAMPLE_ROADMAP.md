@@ -5,13 +5,13 @@ Create a workspace:
 
 * `keratin` (storage substrate: segmented log)
 * `stroma` (derived state materializer: group/inflight/acked)
-* `nexus-storage` (your trait adapter + glue; can keep current trait here)
+* `nexus-storage` (trait adapter + glue; can keep current trait here)
 * optional: `keratin-tools` (inspect/dump/repair CLI)
 
-Keep `keratin` and `stroma` **dependency-light** (no tokio required inside them, unless you want). They can expose:
+Keep `keratin` and `stroma` **dependency-light** (no tokio required inside them, unless we want it). They can expose:
 
 * a **blocking core API**
-* and an **async wrapper** behind a feature flag (tokio) if you want
+* and an **async wrapper** behind a feature flag (tokio) if we want
 
 That keeps them reusable.
 
@@ -112,9 +112,9 @@ Once correctness is nailed:
   * one write per batch
   * fsync only per batch based on config
 * tune index stride (e.g. every 64KB appended)
-* reuse buffers (`BytesMut` or your own pool)
+* reuse buffers (`BytesMut` or our own pool)
 
-At this point you’ll already beat RocksDB on your workload.
+At this point we'll already beat RocksDB on our workload.
 
 ---
 
@@ -122,14 +122,14 @@ At this point you’ll already beat RocksDB on your workload.
 
 ### Goal
 
-Have a derived state engine that supports your broker semantics without touching Keratin internals.
+Have a derived state engine that supports our broker semantics without touching Keratin internals.
 
 ### 3.1 In-memory model first
 
 Implement per `(topic,partition,group)`:
 
 * `acked_until: u64`
-* `inflight: HashMap<u64, Deadline>` (or BTreeMap if you prefer)
+* `inflight: HashMap<u64, Deadline>` (or BTreeMap if we prefer)
 * `heap: BinaryHeap` min-heap (store `(Reverse(deadline), offset, epoch)`)
 
 Expose operations:
@@ -144,10 +144,10 @@ Expose operations:
 
 ### 3.2 The *important* correctness detail: advancing acked_until
 
-Rabbit-like semantics aren’t necessarily “contiguous ack only”. You need:
+Rabbit-like semantics aren’t necessarily "contiguous ack only". We need:
 
-* you can ACK offsets out of order
-* but you still want a fast “lowest unacked”
+* we can ACK offsets out of order
+* but we still want a fast “lowest unacked”
 
 So model:
 
@@ -158,7 +158,7 @@ So model:
   * if `offset == acked_until`: advance frontier while `acked_set` contains next
   * else if `offset > acked_until`: insert into `acked_set`
 
-This makes “lowest unacked” essentially `acked_until` (plus inflight check).
+This makes "lowest unacked" essentially `acked_until` (plus inflight check).
 
 ### 3.3 Persistence: snapshot + delta
 
@@ -174,7 +174,7 @@ Keep encoding fixed-width and CRC’d.
 
 # Phase 4: Connect them (adapter crate)
 
-Create `nexus-storage` that implements your existing `Storage` trait using:
+Create `nexus-storage` that implements our existing `Storage` trait using:
 
 * Keratin for messages
 * Stroma for ack/inflight/group state
@@ -198,13 +198,13 @@ Important: `list_expired` should not scan the whole world anymore.
 
 ---
 
-## A few pushbacks (to keep you from accidental pain)
+## A few pushbacks (to keep us from accidental pain)
 
 1. **“Rebuild from scratch always”**
    Still keep it possible, but don’t rely on it. Snap+delta is the difference between “cool project” and “operationally usable”.
 
 2. **Per-partition writer thread**
-   Works great initially, but long-term you may want *sharded writers* (N partitions per writer) to avoid 10k threads. Start simple.
+   Works great initially, but long-term we may want *sharded writers* (N partitions per writer) to avoid 10k threads. Start simple.
 
 3. **Don’t bake topics/groups into Keratin**
    Keratin should be “log per namespace.” Let the wrapper decide directory layout.
