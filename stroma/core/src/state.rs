@@ -1,17 +1,17 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeSet, BinaryHeap};
 use std::sync::Arc;
 use std::sync::atomic::AtomicU64;
 
 use bitvec::vec::BitVec;
-use keratin_log::{Keratin, KeratinConfig};
-
-use crate::topic;
+use keratin_log::Keratin;
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
 pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
+
+pub const FORMAT_VERSION: u64 = 1;
 
 #[derive(Debug, Clone)]
 pub struct DLQDiscordSettings {
@@ -24,13 +24,13 @@ impl Default for DLQDiscordSettings {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq, PartialOrd, Ord)]
 pub struct CustomDLQ {
     pub tp: String,
     pub part: u32,
 }
 
-#[derive(Debug, Clone, Default)]
+#[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
 pub enum DLQDiscardPolicy {
     #[default]
     Discard,
@@ -106,6 +106,9 @@ pub struct QueueInternalState {
     topic: String,
     partition: u32,
 
+    last_snapshot_timestamp: u64,
+    last_snapshot_event_offset: u64,
+
     // ----- ACK state -----
     // Lowest offset that is NOT ACKed (frontier).
     settled_until: Offset,
@@ -133,7 +136,7 @@ pub struct QueueInternalState {
     dlq_policy: DLQDiscardPolicy,
 
     // when to send to DLQ
-    dlq_settings: DLQDiscordSettings,
+    dlq_discard_max_retries: u32,
 }
 
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
@@ -309,6 +312,10 @@ pub struct QueueHandle {
     event_log: Arc<Keratin>,
 
     applied_upto: Arc<AtomicU64>,
+
+    // TODO: Set on startup and on encode snapshot, then pass them as arguments to the internal state, methods for easy access at stroma level
+            last_snapshot_timestamp: Arc<AtomicU64>,
+            last_snapshot_event_offset: Arc<AtomicU64>,
 }
 
 impl QueueHandle {
@@ -335,6 +342,8 @@ impl QueueHandle {
         });
 
         let applied_upto = Arc::new(AtomicU64::new(0));
+        let last_snapshot_timestamp = Arc::new(AtomicU64::new(0));
+        let last_snapshot_event_offset = Arc::new(AtomicU64::new(0));
 
         Self {
             command_sender: tx,
@@ -343,6 +352,8 @@ impl QueueHandle {
             msg_log,
             event_log,
             applied_upto,
+            last_snapshot_timestamp,
+            last_snapshot_event_offset,
         }
     }
 
@@ -612,12 +623,11 @@ impl QueueHandle {
 
         Some(true) // signal to continue processing
     }
-    
 
     pub fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        let _ = self.command_sender.send(QueueCommandPackage {
-            command: cmd,
-        });
+        let _ = self
+            .command_sender
+            .send(QueueCommandPackage { command: cmd });
         Ok(())
     }
 
@@ -977,7 +987,8 @@ impl QueueHandle {
         let _ = self.command_sender.send(QueueCommandPackage {
             command: QueueCommand::GetStatusReport { response: Some(tx) },
         });
-        rx.await.map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
+        rx.await
+            .map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
     }
 
     pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
@@ -1027,6 +1038,14 @@ impl QueueHandle {
     pub fn applied_upto(&self) -> Arc<AtomicU64> {
         self.applied_upto.clone()
     }
+
+    pub fn last_snapshot_timestamp(&self) -> u64 {
+        self.last_snapshot_timestamp.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn last_snapshot_event_offset(&self) -> u64 {
+        self.last_snapshot_event_offset.load(std::sync::atomic::Ordering::Relaxed)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -1069,6 +1088,8 @@ impl QueueInternalState {
         Self {
             topic,
             partition,
+            last_snapshot_timestamp: 0,
+            last_snapshot_event_offset: 0,
             settled_until: 0,
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
@@ -1078,13 +1099,23 @@ impl QueueInternalState {
             expiry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
-            dlq_settings: DLQDiscordSettings::default(),
+            dlq_discard_max_retries: 5,
         }
     }
 
     #[inline]
     pub fn next_offset(&self) -> Offset {
         self.ready.last().copied().unwrap_or(0)
+    }
+
+    #[inline]
+    pub fn last_snapshot_timestamp(&self) -> Offset {
+        self.last_snapshot_timestamp
+    }
+
+    #[inline]
+    pub fn last_snapshot_event_offset(&self) -> Offset {
+        self.last_snapshot_event_offset
     }
 
     // ---------------- ACK API ----------------
@@ -1211,7 +1242,7 @@ impl QueueInternalState {
         self.inflight.remove(&offset);
 
         let retries = self.retries.entry(offset).or_insert(0);
-        if *retries >= self.dlq_settings.max_retries {
+        if *retries >= self.dlq_discard_max_retries {
             self.ready.remove(&offset);
             self.retries.remove(&offset);
             self.dead_letter(offset);
@@ -1675,8 +1706,18 @@ impl QueueInternalState {
     }
 
     // TODO: Add enqueued state?
-    pub fn encode_snapshot(&self) -> Vec<u8> {
+    pub fn encode_snapshot(&mut self) -> Vec<u8> {
+        self.last_snapshot_event_offset = 0;
+        self.last_snapshot_timestamp = 0;
+
         let mut out = Vec::new();
+
+        // version
+        out.extend_from_slice(&FORMAT_VERSION.to_be_bytes());
+
+        // snapshot meta
+        out.extend_from_slice(&self.last_snapshot_timestamp.to_be_bytes());
+        out.extend_from_slice(&self.last_snapshot_event_offset.to_be_bytes());
 
         // acked_until
         out.extend_from_slice(&self.settled_until.to_be_bytes());
@@ -1703,7 +1744,44 @@ impl QueueInternalState {
             out.extend_from_slice(&off.to_be_bytes());
         }
 
+        // dlq policy
+        match &self.dlq_policy {
+            DLQDiscardPolicy::Discard => {
+                out.push(0);
+            }
+            DLQDiscardPolicy::GlobalDQL => {
+                out.push(1);
+            }
+            DLQDiscardPolicy::CustomDQL(c) => {
+                out.push(2);
+
+                let tp_bytes = c.tp.as_bytes();
+                out.extend_from_slice(&(tp_bytes.len() as u32).to_be_bytes());
+                out.extend_from_slice(tp_bytes);
+
+                out.extend_from_slice(&c.part.to_be_bytes());
+            }
+        }
+
+        // dlq max retries
+        out.extend_from_slice(&self.dlq_discard_max_retries.to_be_bytes());
+
         out
+    }
+
+    fn rebuild_derived(&mut self) {
+        // rebuild expiry heap
+        self.expiry_heap.clear();
+        for (&off, &dl) in &self.inflight {
+            self.expiry_heap.push((Reverse(dl), off));
+        }
+
+        // rebuild min_deadline_hint
+        self.min_deadline_hint = self
+            .inflight
+            .values()
+            .min()
+            .copied();
     }
 
     // TODO: Add enqueued state?
@@ -1719,7 +1797,16 @@ impl QueueInternalState {
             Ok(a.try_into().unwrap())
         }
 
+        const VERSION_SIZE: usize = size_of::<u64>();
+        let version = u64::from_be_bytes(take::<VERSION_SIZE>(&mut bytes)?);
+        if version != FORMAT_VERSION {
+            return Err(Error::new(ErrorKind::InvalidData, "unsupported version"));
+        }
+
         self.reset();
+        
+        self.last_snapshot_timestamp = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.last_snapshot_event_offset = u64::from_be_bytes(take::<8>(&mut bytes)?);
 
         self.settled_until = u64::from_be_bytes(take::<8>(&mut bytes)?);
         let base = u64::from_be_bytes(take::<8>(&mut bytes)?);
@@ -1736,7 +1823,7 @@ impl QueueInternalState {
         for _ in 0..inflight_len {
             let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let dl = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            self.mark_inflight(off, dl);
+            self.inflight.insert(off, dl);
         }
 
         let retries_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
@@ -1751,6 +1838,51 @@ impl QueueInternalState {
             let off: u64 = u64::from_be_bytes(take::<8>(&mut bytes)?);
             self.ready.insert(off);
         }
+
+        let tag = take::<1>(&mut bytes)?[0];
+
+        self.dlq_policy = match tag {
+            0 => DLQDiscardPolicy::Discard,
+            1 => DLQDiscardPolicy::GlobalDQL,
+            2 => {
+                let len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+                if bytes.len() < len {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "dlq tp"));
+                }
+                let tp = String::from_utf8(bytes[..len].to_vec())
+                    .map_err(|_| Error::new(ErrorKind::InvalidData, "utf8"))?;
+                bytes = &bytes[len..];
+
+                let part = u32::from_be_bytes(take::<4>(&mut bytes)?);
+
+                DLQDiscardPolicy::CustomDQL(CustomDLQ { tp, part })
+            }
+            _ => return Err(Error::new(ErrorKind::InvalidData, "dlq tag")),
+        };
+
+        self.dlq_discard_max_retries =
+            u32::from_be_bytes(take::<4>(&mut bytes)?);
+
+        if !bytes.is_empty() {
+            return Err(Error::new(ErrorKind::InvalidData, "trailing bytes"));
+        }
+
+        // --- enforce invariants ---
+        if self.ack_window_base > self.settled_until {
+            return Err(Error::new(ErrorKind::InvalidData, "ack window base > frontier"));
+        }
+
+        if self.inflight.keys().any(|&o| o < self.settled_until) {
+            return Err(Error::new(ErrorKind::InvalidData, "inflight < frontier"));
+        }
+
+        self.ready.retain(|o| self.retries.contains_key(o));
+
+        for off in self.inflight.keys() {
+            self.ready.remove(off);
+        }
+
+        self.rebuild_derived();
 
         Ok(())
     }
@@ -1768,13 +1900,31 @@ impl QueueInternalState {
         }
     }
 
+    pub fn peek_next_expiry_hint(&self) -> Option<UnixMillis> {
+        let heap_iter = self.expiry_heap.iter();
+
+        let mut candidate = None;
+
+        for (Reverse(deadline), offset) in heap_iter {
+            match self.inflight.get(offset) {
+                Some(&d) if d == *deadline => {
+                    candidate = Some(*deadline);
+                    break;
+                }
+                _ => continue, // skip stale
+            }
+        }
+
+        candidate
+    }
+
     pub fn status_report(&self) -> QueueStatusReport {
         QueueStatusReport {
             topic: self.topic.clone(),
             partition: self.partition,
             inflight_count: self.inflight.len(),
             ready_count: self.ready.len(),
-            next_expiry_hint: self.min_deadline_hint,
+            next_expiry_hint: self.peek_next_expiry_hint(),
             lowest_unacked: self.lowest_unacked_offset(),
         }
     }
@@ -1786,6 +1936,7 @@ pub struct QueueStatusReport {
     pub partition: u32,
     pub inflight_count: usize,
     pub ready_count: usize,
+    /// Best-effort next expiry (validated, may be slightly stale but never incorrect)
     pub next_expiry_hint: Option<UnixMillis>,
     pub lowest_unacked: Offset,
 }
@@ -1811,6 +1962,7 @@ impl Default for CanonicalQueueState {
 
 #[cfg(test)]
 mod tests {
+    use crate::state::{CustomDLQ, DLQDiscardPolicy};
     use super::{Offset, QueueInternalState};
 
     #[test]
@@ -1996,7 +2148,7 @@ mod tests {
 
         s.enqueue(1, 0);
         s.mark_inflight(1, 10);
-        for _ in 0..s.dlq_settings.max_retries {
+        for _ in 0..s.dlq_discard_max_retries {
             s.nack(1, true);
             s.mark_inflight(1, 10);
         }
@@ -2378,6 +2530,41 @@ mod tests {
     }
 
     #[test]
+    fn snapshot_preserves_dlq_policy() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+        s.dlq_policy = DLQDiscardPolicy::CustomDQL(CustomDLQ {
+            tp: "dlq-topic".into(),
+            part: 42,
+        });
+        s.dlq_discard_max_retries = 7;
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        assert_eq!(s.dlq_policy, s2.dlq_policy);
+        assert_eq!(s.dlq_discard_max_retries, s2.dlq_discard_max_retries);
+    }
+
+    #[test]
+    fn snapshot_rebuilds_expiry_heap() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 5);
+        s.enqueue(2, 5);
+        s.mark_inflight(1, 100);
+        s.mark_inflight(2, 50);
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        assert_eq!(s2.min_deadline_hint, Some(50));
+    }
+
+    #[test]
     fn random_ops_never_break_invariants() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
@@ -2403,6 +2590,138 @@ mod tests {
                 }
             }
         }
+    }
+
+    #[test]
+    fn snapshot_truncated_fails() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 100);
+
+        let snap = s.encode_snapshot();
+
+        for i in 0..snap.len() {
+            let mut s2 = QueueInternalState::new("test".into(), 0);
+            let res = s2.load_snapshot(&snap[..i]);
+            assert!(res.is_err(), "should fail at truncation {i}");
+        }
+    }
+
+    #[test]
+    fn snapshot_with_trailing_bytes_is_rejected() {
+        let s = QueueInternalState::new("test".into(), 0);
+        let mut snap = s.encode_snapshot();
+
+        snap.extend_from_slice(&[1, 2, 3, 4]);
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        let res = s2.load_snapshot(&snap);
+
+        assert!(res.is_err()); // or assert ok if you *intentionally* allow this
+    }
+
+    #[test]
+    fn snapshot_inconsistent_ready_retries() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.ready.insert(5); // no retries entry
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        // Decide your policy:
+        // either enforce invariant:
+        assert!(s2.get_retries(5).is_some() || !s2.is_ready(5));
+    }
+
+    #[test]
+    fn snapshot_preserves_ack_window_behavior() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        for i in 0..20000 {
+            s.ack(i);
+        }
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        assert_eq!(s.settled_until(), s2.settled_until());
+
+        for i in 0..20000 {
+            assert_eq!(s.is_acked(i), s2.is_acked(i));
+        }
+    }
+
+    #[test]
+    fn snapshot_handles_stale_heap_entries() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        for i in 0..1000 {
+            s.enqueue(i, 0);
+            s.mark_inflight(i, i + 100);
+            s.mark_inflight(i, i + 200); // create stale heap entries
+        }
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        for _ in 0..1000 {
+            let _ = s2.next_expiry_hint();
+        }
+
+        assert_eq!(s.inflight_len(), s2.inflight_len());
+    }
+
+    #[test]
+    fn snapshot_all_dlq_variants() {
+        let cases = vec![
+            DLQDiscardPolicy::Discard,
+            DLQDiscardPolicy::GlobalDQL,
+            DLQDiscardPolicy::CustomDQL(CustomDLQ {
+                tp: "x".into(),
+                part: 1,
+            }),
+        ];
+
+        for policy in cases {
+            let mut s = QueueInternalState::new("test".into(), 0);
+            s.dlq_policy = policy.clone();
+
+            let snap = s.encode_snapshot();
+
+            let mut s2 = QueueInternalState::new("test".into(), 0);
+            s2.load_snapshot(&snap).unwrap();
+
+            assert_eq!(s2.dlq_policy, policy);
+        }
+    }
+
+    #[test]
+    fn snapshot_load_is_idempotent() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        for i in 0..100 {
+            s.enqueue(i, i as u32);
+            s.mark_inflight(i, i + 100);
+        }
+
+        let snap = s.encode_snapshot();
+
+        let mut s2 = QueueInternalState::new("test".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+        let snap2 = s2.encode_snapshot();
+
+        let mut s3 = QueueInternalState::new("test".into(), 0);
+        s3.load_snapshot(&snap2).unwrap();
+
+        assert_eq!(s2.canonical(), s3.canonical());
     }
 
     #[test]

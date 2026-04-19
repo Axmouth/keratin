@@ -1,12 +1,15 @@
 use std::{
-    fs, hash::{Hash, Hasher}, io, path::{Path, PathBuf}, sync::{
+    fs,
+    hash::{Hash, Hasher},
+    io,
+    path::{Path, PathBuf},
+    sync::{
         Arc,
         atomic::{AtomicU64, Ordering},
-    }
+    },
 };
 
 use arc_swap::ArcSwap;
-use dashmap::DashMap;
 use hashbrown::{HashMap, HashSet};
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
@@ -16,8 +19,8 @@ use tokio::sync::{OnceCell, RwLock};
 
 use crate::{
     Result, StromaError,
-    event::{self, StromaEvent},
-    state::{Offset, QueueCommand, QueueCommandPackage, QueueHandle, QueueStatusReport, UnixMillis},
+    event::StromaEvent,
+    state::{Offset, QueueCommand, QueueHandle, QueueStatusReport, UnixMillis},
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -206,6 +209,31 @@ impl Stroma {
         out
     }
 
+    fn dec_component(s: &str) -> Result<String> {
+        let bytes = s.as_bytes();
+        let mut out = Vec::with_capacity(bytes.len());
+        let mut i = 0;
+
+        while i < bytes.len() {
+            match bytes[i] {
+                b'%' if i + 2 < bytes.len() => {
+                    let hex = std::str::from_utf8(&bytes[i + 1..i + 3])
+                        .map_err(|e| StromaError::Decode(e.to_string()))?;
+                    let b = u8::from_str_radix(hex, 16)
+                        .map_err(|e| StromaError::Decode(e.to_string()))?;
+                    out.push(b);
+                    i += 3;
+                }
+                b => {
+                    out.push(b);
+                    i += 1;
+                }
+            }
+        }
+
+        String::from_utf8(out).map_err(|e| StromaError::Decode(e.to_string()))
+    }
+
     fn msg_tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
         let mut p = self.messages_root();
         if let Some(g) = group {
@@ -299,19 +327,28 @@ impl Stroma {
             let mut next = (**current).clone();
             next.insert(key.clone(), new_cell.clone());
 
-            println!("Attempting to insert queue handle for ({tp}, {part}, {group:?})...");
+            tracing::debug!("Attempting to insert queue handle for ({tp}, {part}, {group:?})...");
             // swap in the new map only if snapshot is still current
             let prev = self
                 .queue_handles
                 .compare_and_swap(&current, Arc::new(next));
-            println!("compare_and_swap result for ({tp}, {part}, {group:?}): {}", if Arc::ptr_eq(&prev, &current) { "success" } else { "failure" });
+            tracing::debug!(
+                "compare_and_swap result for ({tp}, {part}, {group:?}): {}",
+                if Arc::ptr_eq(&prev, &current) {
+                    "success"
+                } else {
+                    "failure"
+                }
+            );
 
             if Arc::ptr_eq(&prev, &current) {
                 break new_cell;
             }
 
             // lost race; retry
-            println!("Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying...");
+            tracing::debug!(
+                "Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying..."
+            );
             // make numeric hash of topic/part/group and sleep that long to reduce contention in high concurrency scenarios.
             let hash = {
                 use std::collections::hash_map::DefaultHasher;
@@ -322,7 +359,7 @@ impl Stroma {
                 hasher.finish()
             };
             let sleep_us = hash % 1000;
-            println!("Sleeping for {sleep_us} microseconds before retrying...");
+            tracing::debug!("Sleeping for {sleep_us} microseconds before retrying...");
             tokio::time::sleep(tokio::time::Duration::from_micros(sleep_us)).await;
         };
 
@@ -910,7 +947,9 @@ impl Stroma {
             return Ok(());
         }
         self.write_snapshots_for_partition(tp, part, group, applied_upto)
-            .await
+            .await?;
+        self.truncate_partition_log(tp, part, group, applied_upto.saturating_sub(1)).await?;
+        Ok(())
     }
 
     async fn write_snapshots_for_partition(
@@ -923,17 +962,9 @@ impl Stroma {
         let dir = self.snap_dir(tp, part, group);
         fs::create_dir_all(&dir).map_err(io_err)?;
 
-        // snapshot all queues for this partition (simple v0; later you can do incremental / max-bytes)
-        let keys = self.queue_keys_snapshot();
-        for (key_tp, key_part, key_group) in keys {
-            let qh = self
-                .queue_handle(&key_tp, key_part, key_group.as_deref())
-                .await?;
-            if key_tp.as_ref() == tp && key_part == part && key_group.as_deref() == group {
-                let blob = qh.encode_snapshot().await;
-                self.write_queue_snapshot(tp, part, group, applied_upto, &blob)?;
-            }
-        }
+        let qh = self.queue_handle(tp, part, group).await?;
+        let blob = qh.encode_snapshot().await;
+        self.write_queue_snapshot(tp, part, group, applied_upto, &blob)?;
 
         // Future: after snapshotting, you can truncate events log safely (once Keratin supports it).
         // self.maybe_truncate_partition(tp, part).await?;
@@ -1047,6 +1078,19 @@ impl Stroma {
     // ---------------- Recovery ----------------
 
     async fn recover_all(&self) -> Result<()> {
+        let partitions = self.discover_partitions()?; // decoded names
+
+        for (group, tp, part) in partitions {
+            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let event_log = qh.event_log();
+            self.recover_one_log(&tp, part, group.as_deref(), event_log)
+                .await?;
+        }
+
+        Ok(())
+    }
+
+    async fn recover_all1(&self) -> Result<()> {
         // discover existing partitions by walking root/events
         let events_root = self.events_root();
         if !events_root.exists() {
@@ -1114,13 +1158,53 @@ impl Stroma {
             // let k = Arc::new(k);
             // We don't know real topic string here; replay will populate from event payload.
             // We'll store this Keratin under the first real tp seen during replay.
-            self.recover_one_log(event_log, part).await?;
+            self.recover_one_log1(event_log, part).await?;
         }
 
         Ok(())
     }
 
-    async fn recover_one_log(&self, k: Arc<Keratin>, part: u32) -> Result<()> {
+    async fn recover_one_log(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        k: Arc<Keratin>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(tp, part, group).await?;
+
+        let mut cur = 0u64;
+
+        if let Some((applied_upto, blob)) =
+            self.read_queue_snapshot(&self.snap_file(tp, part, group))?
+        {
+            qh.load_snapshot(blob).await.map_err(io_err)?;
+            qh.applied_upto().store(applied_upto, Ordering::Release);
+            cur = applied_upto;
+        }
+
+        let k = qh.event_log();
+        let reader = k.reader();
+        let tail = k.next_offset();
+
+        while cur < tail {
+            let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
+            if batch.is_empty() {
+                break;
+            }
+
+            for rec in batch {
+                cur = rec.offset + 1;
+                let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
+                self.apply_event_inmem(&ev).await?;
+                qh.applied_upto().store(cur, Ordering::Release);
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn recover_one_log1(&self, k: Arc<Keratin>, part: u32) -> Result<()> {
         // 1) Load all snapshot files for this partition into queues map + remember per-queue snapshot offsets
         //    We cannot pre-know tp; snapshot directory is keyed by encoded tp, but the snapshot file
         //    itself does not embed tp. So: in v0, we load snapshots only when we know tp.
@@ -1157,17 +1241,6 @@ impl Stroma {
                 // Ensure the Keratin instance is registered under the real topic string.
                 let tp = ev.tp();
                 let group = ev.group();
-                // let cell = self.log(tp, part, group.as_deref()).await?;
-                // let cell = self
-                //     .logs_by_tp_part
-                //     .entry((tp.into(), part, group.clone()))
-                //     .or_insert_with(|| Arc::new(OnceCell::new()))
-                //     .clone();
-
-                // Best-effort: initialize if empty
-                // if let Err(err) = cell.set(k.clone()) {
-                //     tracing::error!("Error initializing log: {err}");
-                // }
 
                 // Best-effort: load snapshot for (tp) once, and if snapshot's last_applied >= rec.offset, skip.
                 let key = tp;
@@ -1177,8 +1250,8 @@ impl Stroma {
                     let sp = self.snap_file(tp, part, group.as_deref());
                     if let Some((snap_upto, blob)) = self.read_queue_snapshot(&sp)? {
                         {
-                            let gs = self.queue_handle(tp, part, group.as_deref()).await?;
-                            gs.load_snapshot(blob).await.map_err(io_err)?;
+                            let qh = self.queue_handle(tp, part, group.as_deref()).await?;
+                            qh.load_snapshot(blob).await.map_err(io_err)?;
                         }
                         snap_applied_for.insert(key.into(), snap_upto);
                     } else {
@@ -1201,6 +1274,62 @@ impl Stroma {
         }
 
         Ok(())
+    }
+
+    pub fn discover_partitions(&self) -> Result<Vec<(Option<String>, String, u32)>> {
+        let root = self.events_root();
+
+        if !root.exists() {
+            return Ok(Vec::new());
+        }
+
+        let mut out = Vec::new();
+
+        for lvl1 in fs::read_dir(&root).map_err(io_err)? {
+            let lvl1 = lvl1.map_err(io_err)?;
+            if !lvl1.file_type().map_err(io_err)?.is_dir() {
+                continue;
+            }
+
+            let lvl1_name_enc = lvl1.file_name().to_string_lossy().to_string();
+            let lvl1_path = lvl1.path();
+
+            // --- detect layout ---
+            let mut has_partition_dirs = false;
+
+            for e in fs::read_dir(&lvl1_path).map_err(io_err)? {
+                let e = e.map_err(io_err)?;
+                if e.file_type().map_err(io_err)?.is_dir()
+                    && e.file_name().to_string_lossy().parse::<u32>().is_ok()
+                {
+                    has_partition_dirs = true;
+                    break;
+                }
+            }
+
+            if has_partition_dirs {
+                // ---- legacy: lvl1 = topic ----
+                let tp = Self::dec_component(&lvl1_name_enc)?;
+                collect_parts_decoded(None, tp, &lvl1_path, &mut out)?;
+            } else {
+                // ---- grouped: lvl1 = group ----
+                let group = Self::dec_component(&lvl1_name_enc)?;
+
+                for tp_ent in fs::read_dir(&lvl1_path).map_err(io_err)? {
+                    let tp_ent = tp_ent.map_err(io_err)?;
+                    if !tp_ent.file_type().map_err(io_err)?.is_dir() {
+                        continue;
+                    }
+
+                    let tp_enc = tp_ent.file_name().to_string_lossy().to_string();
+                    let tp = Self::dec_component(&tp_enc)?;
+
+                    collect_parts_decoded(Some(group.clone()), tp, &tp_ent.path(), &mut out)?;
+                }
+            }
+        }
+
+        Ok(out)
     }
 
     fn remove_queue(
@@ -1257,7 +1386,7 @@ impl Stroma {
 }
 
 impl Stroma {
-    /// Append a batch of message payloads and return assigned offsets (like Rocks).
+    /// Append a batch of message payloads and return assigned offsets.
     pub async fn append_messages_batch(
         &self,
         tp: &str,
@@ -1388,6 +1517,7 @@ impl Stroma {
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
         log.append_enqueue(msg, None, outter_completion)
             .map_err(io_err)?;
+
         self.maybe_snapshot(tp, part, group, offset).await?;
 
         Ok(())
@@ -1678,10 +1808,16 @@ impl Stroma {
         tp: &str,
         part: u32,
         group: Option<&str>,
-        before: Offset,
+        before_event: Offset,
     ) -> Result<u64> {
-        let log = self.queue_handle(tp, part, group).await?.event_log();
-        log.truncate_before(before).await.map_err(io_err)
+        let qh = self.queue_handle(tp, part, group).await?;
+        let event_log = qh.event_log();
+        let res = event_log.truncate_before(before_event).await.map_err(io_err)?;
+        let msg_log = qh.msg_log();
+        let safe_msg_truncate = qh.lowest_not_acked_offset().await.saturating_sub(1);
+        msg_log.truncate_before(safe_msg_truncate).await.map_err(io_err)?;
+
+        Ok(res)
     }
 
     pub async fn debug_dump_queue(
@@ -1771,11 +1907,37 @@ fn collect_parts(
         if !part_ent.file_type().map_err(io_err)?.is_dir() {
             continue;
         }
+
         let part_str = part_ent.file_name().to_string_lossy().to_string();
         let part = part_str
             .parse::<u32>()
             .map_err(|_| StromaError::Decode(format!("bad partition dir: {part_str}")))?;
+
         out.push((group.clone(), tp_enc.clone(), part));
     }
+
+    Ok(())
+}
+
+fn collect_parts_decoded(
+    group: Option<String>,
+    tp_enc: String,
+    tp_dir: &Path,
+    out: &mut Vec<(Option<String>, String, u32)>,
+) -> Result<()> {
+    for part_ent in fs::read_dir(tp_dir).map_err(io_err)? {
+        let part_ent = part_ent.map_err(io_err)?;
+        if !part_ent.file_type().map_err(io_err)?.is_dir() {
+            continue;
+        }
+
+        let part_str = part_ent.file_name().to_string_lossy().to_string();
+        let part = part_str
+            .parse::<u32>()
+            .map_err(|_| StromaError::Decode(format!("bad partition dir: {part_str}")))?;
+
+        out.push((group.clone(), tp_enc.clone(), part));
+    }
+
     Ok(())
 }
