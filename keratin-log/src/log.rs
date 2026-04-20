@@ -563,7 +563,7 @@ impl Log {
 
         // If nothing deletable, we can still advance head only up to the first base >= before? No.
         // In v0 we keep head truthful to "first readable". That is:
-        // - if we didn't delete any segment, head doesn't change.
+        // if we didn't delete any segment, head doesn't change.
         if deletable.is_empty() {
             return Ok(cur_head);
         }

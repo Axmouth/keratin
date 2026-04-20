@@ -45,7 +45,8 @@ async fn truncated_delta_does_not_corrupt_state() {
         }
     }
 
-    st.truncate_partition_log("t", 0,  None, 123).await.unwrap();
+    let qh = st.queue_handle("t", 0,  None).await.unwrap();
+    st.truncate_partition_log(qh, 123).await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();

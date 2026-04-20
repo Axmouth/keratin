@@ -1,10 +1,11 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
 use std::sync::Arc;
-use std::sync::atomic::AtomicU64;
+use std::sync::atomic::{AtomicBool, AtomicU64};
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
+use keratin_log::util::unix_millis;
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
@@ -119,7 +120,7 @@ pub struct QueueInternalState {
 
     // ----- inflight -----
     // offset -> deadline_ts
-    inflight: hashbrown::HashMap<Offset, UnixMillis>,
+    inflight: BTreeMap<Offset, UnixMillis>,
 
     // ----- Ready -----
     // offset -> retries
@@ -140,6 +141,7 @@ pub struct QueueInternalState {
 }
 
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
+#[derive(Debug)]
 pub enum QueueCommand {
     Shutdown {
         response: Option<tokio::sync::oneshot::Sender<()>>,
@@ -209,11 +211,12 @@ pub enum QueueCommand {
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // entries
     EncodeSnapshot {
+        last_snapshot_event_offset: u64,
         response: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
     },
     LoadSnapshot {
         data: Vec<u8>,
-        response: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+        response: Option<tokio::sync::oneshot::Sender<std::io::Result<SnapshotMeta>>>,
     }, // data
 
     IsAcked {
@@ -301,12 +304,19 @@ impl QueueCommand {
     }
 }
 
+#[derive(Debug)]
+pub struct SnapshotMeta {
+    pub last_snapshot_timestamp: u64,
+    pub last_snapshot_event_offset: u64,
+}
+
 #[derive(Debug, Clone)]
 pub struct QueueHandle {
     command_sender: tokio::sync::mpsc::UnboundedSender<QueueCommandPackage>,
 
     topic: String,
     partition: u32,
+    group: Option<String>,
 
     msg_log: Arc<Keratin>,
     event_log: Arc<Keratin>,
@@ -314,26 +324,33 @@ pub struct QueueHandle {
     applied_upto: Arc<AtomicU64>,
 
     // TODO: Set on startup and on encode snapshot, then pass them as arguments to the internal state, methods for easy access at stroma level
-            last_snapshot_timestamp: Arc<AtomicU64>,
-            last_snapshot_event_offset: Arc<AtomicU64>,
+    last_snapshot_timestamp: Arc<AtomicU64>,
+    last_snapshot_event_offset: Arc<AtomicU64>,
+    creating_snapshot: Arc<AtomicBool>,
+    dirty_since_snapshot: Arc<AtomicBool>,
 }
 
 impl QueueHandle {
     pub fn init(
         topic: String,
         partition: u32,
+        group: Option<String>,
         msg_log: Arc<Keratin>,
         event_log: Arc<Keratin>,
     ) -> Self {
         let (tx, mut rx) = tokio::sync::mpsc::unbounded_channel::<QueueCommandPackage>();
+        let dirty_since_snapshot = Arc::new(AtomicBool::new(false));
 
         let topic_clone = topic.clone();
+        let dirty_since_snapshot_loop = dirty_since_snapshot.clone();
         tokio::spawn(async move {
             let mut state = QueueInternalState::new(topic_clone, partition);
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
-                let processed = Self::process_command(&mut state, cmd);
+                let (processed, dirty) = Self::process_command(&mut state, cmd);
+                let _old_val = dirty_since_snapshot_loop.fetch_or(dirty, std::sync::atomic::Ordering::Relaxed);
+
                 if processed.is_none() {
                     break;
                 }
@@ -344,27 +361,33 @@ impl QueueHandle {
         let applied_upto = Arc::new(AtomicU64::new(0));
         let last_snapshot_timestamp = Arc::new(AtomicU64::new(0));
         let last_snapshot_event_offset = Arc::new(AtomicU64::new(0));
+        let creating_snapshot = Arc::new(AtomicBool::new(false));
 
         Self {
             command_sender: tx,
             topic,
             partition,
+            group,
             msg_log,
             event_log,
             applied_upto,
             last_snapshot_timestamp,
             last_snapshot_event_offset,
+            creating_snapshot,
+            dirty_since_snapshot,
         }
     }
 
-    fn process_command(state: &mut QueueInternalState, cmd: QueueCommand) -> Option<bool> {
+    fn process_command(state: &mut QueueInternalState, cmd: QueueCommand) -> (Option<bool>, bool) {
+        let mut dirty = false;
+
         match cmd {
             QueueCommand::Shutdown { response } => {
                 // No more commands will be processed after this, so we can ignore the rest of the channel.
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-                return None; // signal to break the loop
+                return (None, false); // signal to break the loop
             }
             QueueCommand::Enqueue {
                 offset,
@@ -375,6 +398,7 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::MarkInflight {
                 offset,
@@ -385,30 +409,35 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::MarkInflightBatch { entries, response } => {
                 state.mark_inflight_batch(&entries);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = !entries.is_empty();
             }
             QueueCommand::ClearInflight { offset, response } => {
                 state.clear_inflight(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::Ack { offset, response } => {
                 state.ack(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::AckBatch { offsets, response } => {
                 state.ack_batch(&offsets);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = !offsets.is_empty();
             }
             QueueCommand::Nack {
                 offset,
@@ -419,18 +448,21 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::DeadLetter { offset, response } => {
                 state.dead_letter(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::Reject { offset, response } => {
                 state.reject(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::IsAcked { offset, response } => {
                 let result = state.is_acked(offset);
@@ -480,6 +512,7 @@ impl QueueHandle {
             }
             QueueCommand::CollectExpired { now, max, response } => {
                 let result = state.collect_expired(now, max);
+                dirty = !result.is_empty();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -489,18 +522,21 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::Reset { response } => {
                 state.reset();
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::SetAckedUntil { offset, response } => {
                 state.set_acked_until(offset);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::SetAckWindow {
                 base,
@@ -511,6 +547,7 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = true;
             }
             QueueCommand::SetAckWindowFromBytes {
                 base,
@@ -521,15 +558,17 @@ impl QueueHandle {
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
+                dirty = true;
             }
             QueueCommand::LoadInflight { entries, response } => {
                 state.load_inflight(&entries);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
+                dirty = !entries.is_empty();
             }
-            QueueCommand::EncodeSnapshot { response } => {
-                let result = state.encode_snapshot();
+            QueueCommand::EncodeSnapshot { last_snapshot_event_offset, response } => {
+                let result = state.encode_snapshot(last_snapshot_event_offset);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -561,6 +600,7 @@ impl QueueHandle {
                 response,
             } => {
                 let result = state.poll_ready_and_mark(max, lease_deadline);
+                dirty = !result.is_empty();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -621,7 +661,7 @@ impl QueueHandle {
             }
         }
 
-        Some(true) // signal to continue processing
+        (Some(true), dirty) // signal to continue processing
     }
 
     pub fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
@@ -783,7 +823,7 @@ impl QueueHandle {
                 response: Some(tx),
             },
         });
-        rx.await.unwrap();
+        rx.await.unwrap().unwrap();
     }
 
     pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
@@ -797,15 +837,20 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
-    pub async fn encode_snapshot(&self) -> Vec<u8> {
+    pub async fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Vec<u8> {
+        self.creating_snapshot.store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.command_sender.send(QueueCommandPackage {
-            command: QueueCommand::EncodeSnapshot { response: Some(tx) },
+            command: QueueCommand::EncodeSnapshot { last_snapshot_event_offset, response: Some(tx) },
         });
-        rx.await.unwrap()
+        let res = rx.await;
+        self.last_snapshot_event_offset.store(last_snapshot_event_offset, std::sync::atomic::Ordering::Relaxed);
+        self.last_snapshot_timestamp.store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.creating_snapshot.store(false, std::sync::atomic::Ordering::SeqCst);
+        res.unwrap()
     }
 
-    pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<()> {
+    pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<SnapshotMeta> {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self.command_sender.send(QueueCommandPackage {
             command: QueueCommand::LoadSnapshot {
@@ -813,8 +858,13 @@ impl QueueHandle {
                 response: Some(tx),
             },
         });
-        rx.await
-            .unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))
+        let snapmeta = rx.await
+            .unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))?;
+
+        self.last_snapshot_event_offset.store(snapmeta.last_snapshot_event_offset, std::sync::atomic::Ordering::Relaxed);
+        self.last_snapshot_timestamp.store(snapmeta.last_snapshot_timestamp, std::sync::atomic::Ordering::Relaxed);
+
+        Ok(snapmeta)
     }
 
     pub async fn is_acked(&self, offset: Offset) -> bool {
@@ -1027,6 +1077,10 @@ impl QueueHandle {
         self.partition
     }
 
+    pub fn group(&self) -> Option<&str> {
+        self.group.as_deref()
+    }
+
     pub fn msg_log(&self) -> Arc<Keratin> {
         self.msg_log.clone()
     }
@@ -1045,6 +1099,18 @@ impl QueueHandle {
 
     pub fn last_snapshot_event_offset(&self) -> u64 {
         self.last_snapshot_event_offset.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn creating_snapshot(&self) -> bool {
+        self.creating_snapshot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn dirty_snapshot(&self) -> bool {
+        self.dirty_since_snapshot.load(std::sync::atomic::Ordering::Relaxed)
+    }
+
+    pub fn set_dirty_snapshot(&self, dirty: bool) {
+        self.dirty_since_snapshot.store(dirty, std::sync::atomic::Ordering::Relaxed);
     }
 }
 
@@ -1093,7 +1159,7 @@ impl QueueInternalState {
             settled_until: 0,
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
-            inflight: hashbrown::HashMap::new(),
+            inflight: BTreeMap::new(),
             ready: BTreeSet::new(),
             retries: hashbrown::HashMap::new(),
             expiry_heap: BinaryHeap::new(),
@@ -1116,6 +1182,30 @@ impl QueueInternalState {
     #[inline]
     pub fn last_snapshot_event_offset(&self) -> Offset {
         self.last_snapshot_event_offset
+    }
+
+    #[inline]
+    pub fn min_ready_offset(&self) -> Option<Offset> {
+        self.ready.first().copied()
+    }
+
+    #[inline]
+    pub fn min_inflight_offset(&self) -> Option<Offset> {
+        self.inflight.keys().copied().min()
+    }
+
+    #[inline]
+    pub fn safe_message_truncate_before(&self) -> Offset {
+        let min_ready = self.ready.first().copied().unwrap_or(u64::MAX);
+        let min_inflight = self.inflight.keys().copied().min().unwrap_or(u64::MAX);
+
+        let result = min_ready.min(min_inflight);
+
+        if result == 0 {
+            return self.settled_until;
+        }
+
+        result
     }
 
     // ---------------- ACK API ----------------
@@ -1397,7 +1487,7 @@ impl QueueInternalState {
 
     #[inline]
     pub fn lowest_not_acked_offset(&self) -> Offset {
-        self.settled_until
+        self.safe_message_truncate_before()
     }
 
     pub fn get_retries(&self, offset: Offset) -> Option<u32> {
@@ -1706,9 +1796,9 @@ impl QueueInternalState {
     }
 
     // TODO: Add enqueued state?
-    pub fn encode_snapshot(&mut self) -> Vec<u8> {
-        self.last_snapshot_event_offset = 0;
-        self.last_snapshot_timestamp = 0;
+    pub fn encode_snapshot(&mut self, last_snapshot_event_offset: u64) -> Vec<u8> {
+        self.last_snapshot_event_offset = last_snapshot_event_offset;
+        self.last_snapshot_timestamp = unix_millis();
 
         let mut out = Vec::new();
 
@@ -1785,7 +1875,7 @@ impl QueueInternalState {
     }
 
     // TODO: Add enqueued state?
-    pub fn load_snapshot(&mut self, mut bytes: &[u8]) -> std::io::Result<()> {
+    pub fn load_snapshot(&mut self, mut bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
         use std::io::{Error, ErrorKind};
 
         fn take<const N: usize>(b: &mut &[u8]) -> std::io::Result<[u8; N]> {
@@ -1884,7 +1974,10 @@ impl QueueInternalState {
 
         self.rebuild_derived();
 
-        Ok(())
+        Ok(SnapshotMeta {
+            last_snapshot_event_offset: self.last_snapshot_event_offset,
+            last_snapshot_timestamp: self.last_snapshot_timestamp,
+        })
     }
 
     // TODO: Add enqueued state?
@@ -2521,7 +2614,7 @@ mod tests {
             }
         }
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2538,7 +2631,7 @@ mod tests {
         });
         s.dlq_discard_max_retries = 7;
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2556,7 +2649,7 @@ mod tests {
         s.mark_inflight(1, 100);
         s.mark_inflight(2, 50);
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2599,7 +2692,7 @@ mod tests {
         s.enqueue(1, 0);
         s.mark_inflight(1, 100);
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         for i in 0..snap.len() {
             let mut s2 = QueueInternalState::new("test".into(), 0);
@@ -2610,8 +2703,8 @@ mod tests {
 
     #[test]
     fn snapshot_with_trailing_bytes_is_rejected() {
-        let s = QueueInternalState::new("test".into(), 0);
-        let mut snap = s.encode_snapshot();
+        let mut q = QueueInternalState::new("test".into(), 0);
+        let mut snap = q.encode_snapshot(0);
 
         snap.extend_from_slice(&[1, 2, 3, 4]);
 
@@ -2627,7 +2720,7 @@ mod tests {
 
         s.ready.insert(5); // no retries entry
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2645,7 +2738,7 @@ mod tests {
             s.ack(i);
         }
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2667,7 +2760,7 @@ mod tests {
             s.mark_inflight(i, i + 200); // create stale heap entries
         }
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
@@ -2694,7 +2787,7 @@ mod tests {
             let mut s = QueueInternalState::new("test".into(), 0);
             s.dlq_policy = policy.clone();
 
-            let snap = s.encode_snapshot();
+            let snap = s.encode_snapshot(0);
 
             let mut s2 = QueueInternalState::new("test".into(), 0);
             s2.load_snapshot(&snap).unwrap();
@@ -2712,11 +2805,11 @@ mod tests {
             s.mark_inflight(i, i + 100);
         }
 
-        let snap = s.encode_snapshot();
+        let snap = s.encode_snapshot(0);
 
         let mut s2 = QueueInternalState::new("test".into(), 0);
         s2.load_snapshot(&snap).unwrap();
-        let snap2 = s2.encode_snapshot();
+        let snap2 = s2.encode_snapshot(0);
 
         let mut s3 = QueueInternalState::new("test".into(), 0);
         s3.load_snapshot(&snap2).unwrap();

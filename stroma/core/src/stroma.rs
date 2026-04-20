@@ -5,8 +5,9 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
+    time::Instant,
 };
 
 use arc_swap::ArcSwap;
@@ -61,7 +62,7 @@ pub struct SnapshotConfig {
 impl Default for SnapshotConfig {
     fn default() -> Self {
         Self {
-            every_events: 5_000_000,
+            every_events: 500_000,
         }
     }
 }
@@ -363,15 +364,21 @@ impl Stroma {
             tokio::time::sleep(tokio::time::Duration::from_micros(sleep_us)).await;
         };
 
-        let q = cell
+        let qh = cell
             .get_or_try_init(|| async {
                 let msg_log = self.msg_log_init(tp, part, group).await?;
                 let event_log = self.event_log_init(tp, part, group).await?;
-                Ok(QueueHandle::init(tp.into(), part, msg_log, event_log))
+                Ok(QueueHandle::init(
+                    tp.into(),
+                    part,
+                    group.map(|s| s.into()),
+                    msg_log,
+                    event_log,
+                ))
             })
             .await?;
 
-        Ok(q.clone())
+        Ok(qh.clone())
     }
 
     async fn ensure_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
@@ -935,6 +942,82 @@ impl Stroma {
     // Recovery loads snapshots, then replays events AFTER the minimum snapshot offset,
     // skipping events already covered by each queue's snapshot.
 
+    async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
+        if qh.creating_snapshot() {
+            tracing::info!("Snapshot already in progress, skipping..");
+            return Ok::<(), StromaError>(());
+        }
+        if !qh.dirty_snapshot() {
+            tracing::info!("Snapshot is not dirty, skipping..");
+            return Ok::<(), StromaError>(());
+        }
+        let msg_log = qh.msg_log();
+        let safe_msg_truncate = qh.lowest_not_acked_offset().await;
+        let applied_upto = qh.applied_upto().load(Ordering::Relaxed);
+        let every = stroma.snap_cfg.every_events.max(1);
+        let last = qh.last_snapshot_event_offset();
+        // if applied_upto - last < every {
+        //     return Ok(());
+        // }
+        let tp = qh.topic();
+        let part = qh.partition();
+        let group = qh.group();
+        tracing::info!("Writing log snapshot until {applied_upto}..");
+        stroma
+            .write_snapshots_for_partition(qh.clone(), applied_upto)
+            .await?;
+        let event_log = qh.event_log();
+        let event_head = event_log
+            .truncate_before(applied_upto)
+            .await
+            .map_err(io_err)?;
+        tracing::info!(
+            "event truncate tp={} part={} group={:?} before={} -> new_head={}",
+            tp,
+            part,
+            group,
+            applied_upto,
+            event_head
+        );
+        let msg_head = msg_log
+            .truncate_before(safe_msg_truncate)
+            .await
+            .map_err(io_err)?;
+        tracing::info!(
+            "message truncate tp={} part={} group={:?} before={} -> new_head={}",
+            tp,
+            part,
+            group,
+            safe_msg_truncate,
+            msg_head
+        );
+        qh.set_dirty_snapshot(false);
+        Ok(())
+    }
+
+    fn periodic_snapshot(&self, qh: QueueHandle) -> Result<()> {
+        let stroma = self.clone();
+        tokio::spawn(async move {
+            tracing::info!("Starting periodic snapshot service for tp={} part={} group={}", qh.topic(), qh.partition(), qh.group().unwrap_or("Default"));
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(2));
+            // avoid immediate tick
+            ticker.tick().await;
+            let stroma = stroma.clone();
+            let qh = qh.clone();
+
+            loop {
+                ticker.tick().await;
+
+                let res = Self::periodic_snapshot_step(&stroma, &qh).await;
+                if let Err(err) = res {
+                    tracing::error!("Error during periodic snapshot: {err}");
+                }
+            }
+        });
+
+        Ok(())
+    }
+
     async fn maybe_snapshot(
         &self,
         tp: &str,
@@ -942,31 +1025,46 @@ impl Stroma {
         group: Option<&str>,
         applied_upto: Offset,
     ) -> Result<()> {
+        return Ok(());
         let every = self.snap_cfg.every_events.max(1);
-        if !applied_upto.is_multiple_of(every) {
+        let qh = self.queue_handle(tp, part, group).await?;
+        if qh.creating_snapshot() {
             return Ok(());
         }
-        self.write_snapshots_for_partition(tp, part, group, applied_upto)
-            .await?;
-        self.truncate_partition_log(tp, part, group, applied_upto.saturating_sub(1)).await?;
+        let last = qh.last_snapshot_event_offset();
+        if applied_upto - last < every {
+            return Ok(());
+        }
+        tracing::info!("Writing log snapshot until {applied_upto}..");
+        // if !applied_upto.is_multiple_of(every) {
+        //     return Ok(());
+        // }
+        self.write_snapshots_for_partition(qh, applied_upto).await?;
+        self.truncate_partition_log(qh, applied_upto).await?;
         Ok(())
     }
 
     async fn write_snapshots_for_partition(
         &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
+        qh: QueueHandle,
         applied_upto: Offset,
     ) -> Result<()> {
+        let tp = qh.topic();
+        let part = qh.partition();
+        let group = qh.group();
+        let qh: QueueHandle = self.queue_handle(tp, part, group).await?;
+        let blob = qh.encode_snapshot(applied_upto).await;
+
         let dir = self.snap_dir(tp, part, group);
-        fs::create_dir_all(&dir).map_err(io_err)?;
+        let (tp, group) = (tp.to_string(), group.map(|s| s.to_string()));
+        let stroma = self.clone();
+        tokio::task::spawn_blocking(move || {
+            fs::create_dir_all(&dir).map_err(io_err)?;
+            stroma.write_queue_snapshot(&tp, part, group.as_deref(), applied_upto, &blob)
+        })
+        .await
+        .map_err(|e| StromaError::Io(e.to_string()))??;
 
-        let qh = self.queue_handle(tp, part, group).await?;
-        let blob = qh.encode_snapshot().await;
-        self.write_queue_snapshot(tp, part, group, applied_upto, &blob)?;
-
-        // Future: after snapshotting, you can truncate events log safely (once Keratin supports it).
         // self.maybe_truncate_partition(tp, part).await?;
 
         Ok(())
@@ -1083,6 +1181,7 @@ impl Stroma {
         for (group, tp, part) in partitions {
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
             let event_log = qh.event_log();
+            // TODO: Split to threads/tasks for faster work on many queues?
             self.recover_one_log(&tp, part, group.as_deref(), event_log)
                 .await?;
         }
@@ -1169,8 +1268,13 @@ impl Stroma {
         tp: &str,
         part: u32,
         group: Option<&str>,
-        k: Arc<Keratin>,
+        event_log: Arc<Keratin>,
     ) -> Result<()> {
+        tracing::info!(
+            "Recovering log tp: {tp}, partition: {part}, group: {}",
+            group.unwrap_or("Default")
+        );
+        let start = Instant::now();
         let qh = self.queue_handle(tp, part, group).await?;
 
         let mut cur = 0u64;
@@ -1183,9 +1287,8 @@ impl Stroma {
             cur = applied_upto;
         }
 
-        let k = qh.event_log();
-        let reader = k.reader();
-        let tail = k.next_offset();
+        let reader = event_log.reader();
+        let tail = event_log.next_offset();
 
         while cur < tail {
             let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
@@ -1200,6 +1303,15 @@ impl Stroma {
                 qh.applied_upto().store(cur, Ordering::Release);
             }
         }
+
+        let elapsed = start.elapsed().as_secs_f64();
+        tracing::info!(
+            "Recovered log tp: {tp}, partition: {part}, group: {} after {:.3} seconds",
+            group.unwrap_or("Default"),
+            elapsed
+        );
+
+        self.periodic_snapshot(qh)?;
 
         Ok(())
     }
@@ -1481,7 +1593,10 @@ impl Stroma {
                 .await
                 .map_err(io_err)
             {
-                Ok(_event_offset) => {
+                Ok(event_offset) => {
+                    let _ = stroma
+                        .maybe_snapshot(&tp, part, group.as_deref(), event_offset)
+                        .await;
                     event_completion.complete(Ok(AppendResult {
                         base_offset: msg_offset,
                         count: 1,
@@ -1512,13 +1627,15 @@ impl Stroma {
             off: offset,
         };
 
-        let log = self.queue_handle(tp, part, group).await?.event_log();
+        let qh = self.queue_handle(tp, part, group).await?;
+        let log = qh.event_log();
         let msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
         log.append_enqueue(msg, None, outter_completion)
             .map_err(io_err)?;
 
-        self.maybe_snapshot(tp, part, group, offset).await?;
+        let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        self.maybe_snapshot(tp, part, group, applied_up_to).await?;
 
         Ok(())
     }
@@ -1540,12 +1657,15 @@ impl Stroma {
             requeue,
         };
 
-        let log = self.queue_handle(tp, part, group).await?.event_log();
+        let qh = self.queue_handle(tp, part, group).await?;
+        let log = qh.event_log();
         let msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
         log.append_enqueue(msg, None, outter_completion)
             .map_err(io_err)?;
-        self.maybe_snapshot(tp, part, group, offset).await?;
+
+        let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        self.maybe_snapshot(tp, part, group, applied_up_to).await?;
 
         Ok(())
     }
@@ -1663,8 +1783,8 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let log = self.queue_handle(tp, part, group).await?.msg_log();
-        log.truncate_before(before).await.map_err(io_err)
+        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        msg_log.truncate_before(before).await.map_err(io_err)
     }
 
     pub async fn cleanup_topic_partition(
@@ -1680,7 +1800,8 @@ impl Stroma {
         }
 
         self.snapshot_partition(tp, part, group).await?;
-        self.truncate_partition_log(tp, part, group, cutoff).await?;
+        let qh = self.queue_handle(tp, part, group).await?;
+        self.truncate_partition_log(qh, cutoff).await?;
         Ok(())
     }
 
@@ -1691,20 +1812,11 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let mut min: Option<UnixMillis> = None;
-        let keys = self.queue_keys_snapshot();
-        for (k_tp, k_part, k_group) in keys {
-            if k_tp.as_ref() == tp && k_part == part && k_group.as_deref() == group {
-                let qh = self.queue_handle(&k_tp, k_part, k_group.as_deref()).await?;
-                let settled_until = qh.settled_until().await;
-                min = Some(match min {
-                    Some(m) => m.min(settled_until),
-                    None => settled_until,
-                });
-            }
-        }
+        let qh = self.queue_handle(tp, part, group).await?;
+        let settled_until = qh.settled_until().await;
+        let min = settled_until.min(qh.lowest_not_acked_offset().await);
 
-        Ok(min.unwrap_or(0))
+        Ok(min)
     }
 
     pub fn list_queues(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
@@ -1799,25 +1911,48 @@ impl Stroma {
             .applied_upto_entry(tp, part, group)
             .await?
             .load(Ordering::Acquire);
-        self.write_snapshots_for_partition(tp, part, group, upto)
-            .await
+        let qh = self.queue_handle(tp, part, group).await?;
+        self.write_snapshots_for_partition(qh, upto).await
     }
 
     pub async fn truncate_partition_log(
         &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
+        qh: QueueHandle,
         before_event: Offset,
     ) -> Result<u64> {
-        let qh = self.queue_handle(tp, part, group).await?;
+        let tp = qh.topic();
+        let part = qh.partition();
+        let group = qh.group();
         let event_log = qh.event_log();
-        let res = event_log.truncate_before(before_event).await.map_err(io_err)?;
+        let event_head = event_log
+            .truncate_before(before_event)
+            .await
+            .map_err(io_err)?;
+        tracing::info!(
+            "event truncate tp={} part={} group={:?} before={} -> new_head={}",
+            tp,
+            part,
+            group,
+            before_event,
+            event_head
+        );
         let msg_log = qh.msg_log();
-        let safe_msg_truncate = qh.lowest_not_acked_offset().await.saturating_sub(1);
-        msg_log.truncate_before(safe_msg_truncate).await.map_err(io_err)?;
+        // let safe_msg_truncate = self.safe_truncate_before(tp, part, group).await?;
+        let safe_msg_truncate = qh.lowest_not_acked_offset().await;
+        let msg_head = msg_log
+            .truncate_before(safe_msg_truncate)
+            .await
+            .map_err(io_err)?;
+        tracing::info!(
+            "message truncate tp={} part={} group={:?} before={} -> new_head={}",
+            tp,
+            part,
+            group,
+            safe_msg_truncate,
+            msg_head
+        );
 
-        Ok(res)
+        Ok(event_head)
     }
 
     pub async fn debug_dump_queue(
@@ -1941,3 +2076,5 @@ fn collect_parts_decoded(
 
     Ok(())
 }
+
+fn is_send<T: Send>(_: T) {}
