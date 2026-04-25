@@ -11,16 +11,19 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
-use hashbrown::{HashMap, HashSet};
+use crossbeam::queue::SegQueue;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
     KeratinAppendCompletion, KeratinConfig, Message,
 };
+use serde::{Deserialize, Serialize};
+use std::collections::{HashMap, HashSet};
 use tokio::sync::{OnceCell, RwLock};
 
 use crate::{
     Result, StromaError,
     event::StromaEvent,
+    partition::Partition,
     state::{Offset, QueueCommand, QueueHandle, QueueStatusReport, UnixMillis},
 };
 
@@ -94,6 +97,7 @@ impl GlobalDLQ {
 pub struct ApplyThenComplete {
     stroma: Stroma,
     ev: StromaEvent,
+    qh: QueueHandle,
     inner: Box<dyn AppendCompletion<IoError>>,
 }
 
@@ -108,6 +112,9 @@ impl AppendCompletion<IoError> for ApplyThenComplete {
                 match stroma.enqueue_event_inmem(&ev) {
                     Ok(()) => {
                         // let _ = tx.send(Ok(ar));
+                        self.qh
+                            .applied_upto()
+                            .fetch_max(ar.base_offset + ar.count as u64, Ordering::Relaxed);
                         inner.complete(Ok(ar));
                     }
                     Err(e) => inner.complete(Err(IoError::new(e.to_string()))),
@@ -124,9 +131,90 @@ impl ApplyThenComplete {
     pub fn new(
         stroma: Stroma,
         ev: StromaEvent,
+        qh: QueueHandle,
         inner: Box<dyn AppendCompletion<IoError>>,
     ) -> Box<Self> {
-        Box::new(Self { stroma, ev, inner })
+        Box::new(Self {
+            stroma,
+            ev,
+            qh,
+            inner,
+        })
+    }
+}
+
+#[derive(Debug)]
+pub struct TaskGroup {
+    handles: SegQueue<tokio::task::JoinHandle<()>>,
+    shutdown: AtomicBool,
+}
+
+impl TaskGroup {
+    pub fn new() -> Self {
+        Self {
+            handles: SegQueue::new(),
+            shutdown: AtomicBool::new(false),
+        }
+    }
+
+    pub fn spawn<F>(&self, _name: &'static str, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
+        // Hard gate: no tasks after shutdown
+        if self.shutdown.load(Ordering::Acquire) {
+            return;
+        }
+
+        #[cfg(tokio_unstable)]
+        let handle = tokio::task::Builder::new().name(_name).spawn(fut).unwrap();
+
+        #[cfg(not(tokio_unstable))]
+        let handle = tokio::spawn(fut);
+
+        // Push only if still open
+        if self.shutdown.load(Ordering::Acquire) {
+            handle.abort(); // defensive, extremely rare
+        } else {
+            self.handles.push(handle);
+        }
+    }
+
+    pub fn shutdown(&self) {
+        // Close the gate
+        self.shutdown.store(true, Ordering::Release);
+
+        // Drain deterministically
+        while let Some(h) = self.handles.pop() {
+            h.abort();
+        }
+    }
+}
+
+impl Drop for TaskGroup {
+    fn drop(&mut self) {
+        self.shutdown.store(true, Ordering::Release);
+
+        while let Some(h) = self.handles.pop() {
+            h.abort();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
+pub struct MessageHeaders {
+    pub published: Option<u64>,
+    pub publish_received: Option<u64>,
+    pub extra: HashMap<String, String>,
+}
+
+impl MessageHeaders {
+    pub fn encode(&self) -> Result<Vec<u8>> {
+        rmp_serde::to_vec_named(self).map_err(|err| StromaError::Decode(err.to_string()))
+    }
+
+    pub fn decode(bytes: &[u8]) -> Result<Self> {
+        rmp_serde::from_slice(bytes).map_err(|err| StromaError::Decode(err.to_string()))
     }
 }
 
@@ -137,6 +225,8 @@ pub struct Stroma {
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg: KeratinConfig,
     pub(crate) snap_cfg: SnapshotConfig,
+
+    pub(crate) task_group: Arc<TaskGroup>,
 
     // Materialized queue state
     queue_handles: Arc<ArcSwap<Registry>>,
@@ -165,6 +255,7 @@ impl Stroma {
             root,
             keratin_cfg,
             snap_cfg,
+            task_group: Arc::new(TaskGroup::new()),
             queue_handles: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
             global_dlq: Arc::new(RwLock::new(None)),
             msg_count: Arc::new(AtomicU64::new(0)),
@@ -374,6 +465,7 @@ impl Stroma {
                     group.map(|s| s.into()),
                     msg_log,
                     event_log,
+                    self.task_group.clone(),
                 ))
             })
             .await?;
@@ -436,7 +528,7 @@ impl Stroma {
                     retries: *retries,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
             }
             StromaEvent::MarkInflight {
                 tp,
@@ -451,7 +543,7 @@ impl Stroma {
                     deadline: *deadline,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
             }
             StromaEvent::Ack {
                 tp,
@@ -464,7 +556,7 @@ impl Stroma {
                     offset: *off,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
@@ -482,7 +574,7 @@ impl Stroma {
                     requeue: *requeue,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
                 // ✅ Accept NACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate NACKs
@@ -500,7 +592,7 @@ impl Stroma {
                     offset: *off,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
             }
             StromaEvent::ClearInflight {
                 tp,
@@ -513,7 +605,7 @@ impl Stroma {
                     offset: *off,
                     response: None,
                 };
-                qh.command_enqueue(command)?;
+                qh.blocking_command_enqueue(command)?;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
                 self.remove_queue(tp, *part, group.as_deref());
@@ -632,17 +724,21 @@ impl Stroma {
                 .load(Ordering::Acquire));
         }
 
-        let log = self.queue_handle(tp, part, group).await?.event_log();
+        let qh = self.queue_handle(tp, part, group).await?;
+        let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in evs {
             msgs.push(event_msg(ev)?);
         }
 
         // Durable append first.
-        let ar = log
+        let ar = event_log
             .append_batch(msgs, Some(durability))
             .await
             .map_err(io_err)?;
+        qh.applied_upto()
+            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        qh.set_dirty_snapshot(true);
 
         // Apply in memory after durable accept.
         for ev in evs {
@@ -650,7 +746,7 @@ impl Stroma {
         }
 
         // Update applied watermark:
-        let new_upto = ar.base_offset + ar.count as u64;
+        let new_upto = event_log.head_offset();
         self.applied_upto_entry(tp, part, group)
             .await?
             .store(new_upto, Ordering::Release);
@@ -752,13 +848,13 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<()> {
-        let ev1 = StromaEvent::ClearInflight {
-            tp: tp.into(),
-            part,
-            group: group.map(|s| s.into()),
-            off,
-        };
-        let ev2 = StromaEvent::Nack {
+        // let ev1 = StromaEvent::ClearInflight {
+        //     tp: tp.into(),
+        //     part,
+        //     group: group.map(|s| s.into()),
+        //     off,
+        // };
+        let ev1 = StromaEvent::Nack {
             tp: tp.into(),
             part,
             group: group.map(|s| s.into()),
@@ -766,7 +862,7 @@ impl Stroma {
             requeue: true,
         };
         let upto = self
-            .append_events_durable(tp, part, group, &[ev1, ev2], KDurability::AfterFsync)
+            .append_events_durable(tp, part, group, &[ev1], KDurability::AfterFsync)
             .await?;
         self.maybe_snapshot(tp, part, group, upto).await?;
         Ok(())
@@ -909,25 +1005,31 @@ impl Stroma {
         let expired_set: HashSet<(String, u32, Option<String>, u64)> =
             HashSet::from_iter(expired.clone().into_iter());
 
-        for (tp, part, group, off) in expired {
-            let evs = [
-                StromaEvent::ClearInflight {
-                    tp: tp.clone().into(),
-                    part,
-                    group: group.clone().map(|s| s.into()),
-                    off,
-                },
-                StromaEvent::Nack {
-                    tp: tp.clone().into(),
-                    part,
-                    group: group.clone().map(|s| s.into()),
-                    off,
-                    requeue: true,
-                },
-            ];
+        let mut events_per_queue =
+            HashMap::<(String, u32, Option<String>), Vec<StromaEvent>>::new();
 
-            self.append_events_durable(&tp, part, group.as_deref(), &evs, KDurability::AfterFsync)
-                .await?;
+        for (tp, part, group, off) in expired {
+            let ev = StromaEvent::Nack {
+                tp: tp.clone().into(),
+                part,
+                group: group.clone().map(|s| s.into()),
+                off,
+                requeue: true,
+            };
+
+            let entry = events_per_queue.entry((tp, part, group)).or_default();
+            entry.push(ev);
+        }
+
+        for ((tp, part, group), events) in events_per_queue {
+            self.append_events_durable(
+                &tp,
+                part,
+                group.as_deref(),
+                &events,
+                KDurability::AfterFsync,
+            )
+            .await?;
         }
 
         Ok(expired_set)
@@ -948,14 +1050,19 @@ impl Stroma {
             return Ok::<(), StromaError>(());
         }
         if !qh.dirty_snapshot() {
-            tracing::info!("Snapshot is not dirty, skipping..");
+            tracing::info!(
+                "Snapshot for {}: {} {} is not dirty, skipping..",
+                qh.topic(),
+                qh.group().unwrap_or("Default"),
+                qh.partition()
+            );
             return Ok::<(), StromaError>(());
         }
         let msg_log = qh.msg_log();
         let safe_msg_truncate = qh.lowest_not_acked_offset().await;
         let applied_upto = qh.applied_upto().load(Ordering::Relaxed);
-        let every = stroma.snap_cfg.every_events.max(1);
-        let last = qh.last_snapshot_event_offset();
+        // let every = stroma.snap_cfg.every_events.max(1);
+        // let last = qh.last_snapshot_event_offset();
         // if applied_upto - last < every {
         //     return Ok(());
         // }
@@ -997,9 +1104,15 @@ impl Stroma {
 
     fn periodic_snapshot(&self, qh: QueueHandle) -> Result<()> {
         let stroma = self.clone();
-        tokio::spawn(async move {
-            tracing::info!("Starting periodic snapshot service for tp={} part={} group={}", qh.topic(), qh.partition(), qh.group().unwrap_or("Default"));
-            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(2));
+        self.task_group.spawn("snapshotting", async move {
+            tracing::info!(
+                "Starting periodic snapshot service for tp={} part={} group={}",
+                qh.topic(),
+                qh.partition(),
+                qh.group().unwrap_or("Default")
+            );
+            // TODO: Make configurable
+            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(10));
             // avoid immediate tick
             ticker.tick().await;
             let stroma = stroma.clone();
@@ -1053,7 +1166,11 @@ impl Stroma {
         let part = qh.partition();
         let group = qh.group();
         let qh: QueueHandle = self.queue_handle(tp, part, group).await?;
-        let blob = qh.encode_snapshot(applied_upto).await;
+        let blob = if let Some(blob) = qh.encode_snapshot(applied_upto).await {
+            blob
+        } else {
+            return Ok(());
+        };
 
         let dir = self.snap_dir(tp, part, group);
         let (tp, group) = (tp.to_string(), group.map(|s| s.to_string()));
@@ -1479,11 +1596,12 @@ impl Stroma {
         // Step 2: shutdown everything from the old snapshot
         for (_key, cell) in old.iter() {
             if let Some(q) = cell.get() {
+                q.shutdown().await;
                 q.event_log().shutdown().await.map_err(io_err)?;
                 q.msg_log().shutdown().await.map_err(io_err)?;
-                q.shutdown().await;
             }
         }
+        self.task_group.shutdown();
         Ok(())
     }
 
@@ -1510,7 +1628,7 @@ impl Stroma {
             return Ok(Vec::new());
         }
 
-        let log = self.queue_handle(tp, part, group).await?.msg_log();
+        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
         let mut msgs = Vec::with_capacity(payloads.len());
         for p in payloads {
             msgs.push(Message {
@@ -1520,7 +1638,7 @@ impl Stroma {
             });
         }
 
-        let ar = log.append_batch(msgs, None).await.map_err(io_err)?;
+        let ar = msg_log.append_batch(msgs, None).await.map_err(io_err)?;
 
         let mut out = Vec::with_capacity(ar.count as usize);
         let mut o = ar.base_offset;
@@ -1536,6 +1654,7 @@ impl Stroma {
         tp: &str,
         part: u32,
         group: Option<&str>,
+        headers: &MessageHeaders,
         payload: &[u8],
         event_completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
@@ -1546,7 +1665,7 @@ impl Stroma {
             .append_enqueue(
                 Message {
                     flags: 0,
-                    headers: vec![],
+                    headers: headers.encode()?,
                     payload: payload.to_vec(),
                 },
                 None,
@@ -1630,12 +1749,12 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, group).await?;
         let log = qh.event_log();
         let msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
         log.append_enqueue(msg, None, outter_completion)
             .map_err(io_err)?;
 
-        let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
-        self.maybe_snapshot(tp, part, group, applied_up_to).await?;
+        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
 
         Ok(())
     }
@@ -1658,14 +1777,15 @@ impl Stroma {
         };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let log = qh.event_log();
+        let event_log = qh.event_log();
         let msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, completion);
-        log.append_enqueue(msg, None, outter_completion)
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
+        event_log
+            .append_enqueue(msg, None, outter_completion)
             .map_err(io_err)?;
 
-        let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
-        self.maybe_snapshot(tp, part, group, applied_up_to).await?;
+        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
 
         Ok(())
     }
@@ -1690,7 +1810,7 @@ impl Stroma {
         group: Option<&str>,
         max: usize,
         lease_deadline: UnixMillis,
-    ) -> Result<Vec<(Offset, Vec<u8>)>> {
+    ) -> Result<Vec<(Offset, MessageHeaders, Vec<u8>, u32)>> {
         let qs = self.queue_handle(tp, part, group).await?;
 
         // Offsets are now already marked inflight inside queue
@@ -1703,12 +1823,13 @@ impl Stroma {
         let mut out = Vec::with_capacity(offs.len());
 
         let mut i = 0;
+        let retries_map: HashMap<u64, u32> = HashMap::from_iter(offs.clone().into_iter());
         while i < offs.len() {
-            let start = offs[i];
+            let (start, _retries) = offs[i];
             let mut len = 1;
 
             // ---- group contiguous offsets ----
-            while i + len < offs.len() && offs[i + len] == start + len as u64 {
+            while i + len < offs.len() && offs[i + len].0 == start + len as u64 {
                 len += 1;
             }
 
@@ -1717,21 +1838,21 @@ impl Stroma {
 
             // ---- fast path: perfect match ----
             if batch.len() == len {
-                for (off, payload) in batch {
-                    out.push((off, payload));
+                for (off, payload, headers) in batch {
+                    out.push((off, headers, payload, retries_map[&off]));
                 }
             } else {
                 // ---- slow path: handle holes (rare but important) ----
                 // build small lookup map
                 let mut map = hashbrown::HashMap::with_capacity(batch.len());
-                for (off, payload) in batch {
-                    map.insert(off, payload);
+                for (off, payload, headers) in batch {
+                    map.insert(off, (headers, payload));
                 }
 
                 for j in 0..len {
                     let off = start + j as u64;
-                    if let Some(payload) = map.remove(&off) {
-                        out.push((off, payload));
+                    if let Some((headers, payload)) = map.remove(&off) {
+                        out.push((off, headers, payload, retries_map[&off]));
                     } else {
                         // extremely rare: log inconsistency or race
                         tracing::warn!(
@@ -1758,11 +1879,13 @@ impl Stroma {
         group: Option<&str>,
         from: Offset,
         max: usize,
-    ) -> Result<Vec<(Offset, Vec<u8>)>> {
+    ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
         let log = self.queue_handle(tp, part, group).await?.msg_log();
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
-        Ok(got.into_iter().map(|r| (r.offset, r.payload)).collect())
+        got.into_iter()
+            .map(|r| MessageHeaders::decode(&r.headers).map(|h| (r.offset, r.payload, h)))
+            .collect::<Result<Vec<(Offset, Vec<u8>, MessageHeaders)>>>()
     }
 
     pub async fn current_next_offset(

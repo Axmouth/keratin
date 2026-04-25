@@ -1,7 +1,7 @@
 use std::sync::Arc;
 
 use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, SnapshotConfig, Stroma};
+use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
@@ -25,7 +25,12 @@ pub async fn append_one(
     payload: &[u8],
 ) -> Offset {
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message(tp, part, group, payload, c)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message(tp, part, group, &headers, payload, c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -53,11 +58,16 @@ async fn acked_offsets_never_resurrect() {
 
     // ACK offset 5 before it exists
     st.ack_one("t", 0,  None, 5).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
 
     // Append messages until offsets advance past 5
     loop {
         let (c, rx) = KeratinAppendCompletion::pair();
-        st.append_message("t", 0,  None, b"x", c).await.unwrap();
+        st.append_message("t", 0,  None, &headers, b"x", c).await.unwrap();
         let offset = rx.await.unwrap().unwrap().base_offset;
 
         if offset >= 5 {
@@ -79,6 +89,7 @@ async fn expiry_never_resurrects_acked_offsets_after_restart() {
     st.ack_one("t", 0, None, off).await.unwrap();
 
     st.requeue_expired(20, 10).await.unwrap();
+    st.shutdown().await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(

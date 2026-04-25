@@ -1,19 +1,25 @@
 use std::sync::Arc;
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, SnapshotConfig, Stroma};
+use keratin_log::{
+    CompletionPair, KeratinAppendCompletion, KeratinConfig,
+    util::{TempDir, test_dir},
+};
+use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
-    (Arc::new(
-        Stroma::open(
-            &test_dir.root,
-            KeratinConfig::test_default(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .unwrap(),
-    ), test_dir)
+    (
+        Arc::new(
+            Stroma::open(
+                &test_dir.root,
+                KeratinConfig::test_default(),
+                SnapshotConfig::default(),
+            )
+            .await
+            .unwrap(),
+        ),
+        test_dir,
+    )
 }
 
 pub async fn append_one(
@@ -24,7 +30,12 @@ pub async fn append_one(
     payload: &[u8],
 ) -> Offset {
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message(tp, part, group, payload, c)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message(tp, part, group, &headers, payload, c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -55,7 +66,14 @@ async fn mark_inflight_after_enqueue_is_applied() {
     let (st, _td) = open_test_stroma().await;
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, None, b"x", completion).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, b"x", completion)
+        .await
+        .unwrap();
 
     // Wait until enqueue event is durable + applied
     let ar = rx.await.unwrap().unwrap();
@@ -76,9 +94,21 @@ async fn published_messages_become_deliverable_eventually() {
     for i in 0..100 {
         let (completion, rx) = KeratinAppendCompletion::pair();
         rxlist.push(rx);
-        st.append_message("t", 0, None, format!("m{i}").as_bytes(), completion)
-            .await
-            .unwrap();
+        let headers = MessageHeaders {
+            published: Default::default(),
+            publish_received: Default::default(),
+            extra: Default::default(),
+        };
+        st.append_message(
+            "t",
+            0,
+            None,
+            &headers,
+            format!("m{i}").as_bytes(),
+            completion,
+        )
+        .await
+        .unwrap();
         println!("Appended m{i}");
     }
 
@@ -89,7 +119,11 @@ async fn published_messages_become_deliverable_eventually() {
 
     tokio::time::timeout(std::time::Duration::from_secs(5), async {
         loop {
-            let d = st.next_deliverable("t", 0,  None,0, 100).await.unwrap().unwrap();
+            let d = st
+                .next_deliverable("t", 0, None, 0, 100)
+                .await
+                .unwrap()
+                .unwrap();
             println!("Next deliverable: {:?}", d);
             if d < 100 {
                 break;
@@ -106,13 +140,20 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
     let (st, _td) = open_test_stroma().await;
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0,  None,b"x", completion).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, b"x", completion)
+        .await
+        .unwrap();
 
     // Wait until enqueue is DURABLE
     rx.await.unwrap().unwrap();
 
     // Now mark inflight must work
-    st.mark_inflight_one("t", 0,  None,0, 100).await.unwrap();
+    st.mark_inflight_one("t", 0, None, 0, 100).await.unwrap();
 
     assert!(st.is_inflight_or_acked("t", 0, None, 0).await.unwrap());
 }
@@ -121,11 +162,16 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
 async fn inflight_before_enqueue_is_ignored() {
     let (st, _td) = open_test_stroma().await;
 
-    st.mark_inflight_one("t", 0,  None,0, 100).await.unwrap();
+    st.mark_inflight_one("t", 0, None, 0, 100).await.unwrap();
     assert!(!st.is_inflight_or_acked("t", 0, None, 0).await.unwrap());
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0,  None,"s".as_bytes(), completion)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, "s".as_bytes(), completion)
         .await
         .unwrap();
     let ar = rx.await.unwrap().unwrap();
@@ -140,7 +186,14 @@ async fn append_completion_implies_enqueued() {
     let (st, _td) = open_test_stroma().await;
 
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0,  None,b"x", c).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, b"x", c)
+        .await
+        .unwrap();
 
     let ar = rx.await.unwrap().unwrap();
 
@@ -154,7 +207,14 @@ async fn append_completions_may_arrive_out_of_order() {
     let mut rxs = vec![];
     for _ in 0..50 {
         let (c, rx) = KeratinAppendCompletion::pair();
-        st.append_message("t", 0, None, b"x", c).await.unwrap();
+        let headers = MessageHeaders {
+            published: Default::default(),
+            publish_received: Default::default(),
+            extra: Default::default(),
+        };
+        st.append_message("t", 0, None, &headers, b"x", c)
+            .await
+            .unwrap();
         rxs.push(rx);
         println!("Appended message, total completions: {}", rxs.len());
     }
@@ -174,7 +234,14 @@ async fn poll_ready_delivers_and_marks_inflight() {
     // append 3 messages
     for _ in 0..3 {
         let (c, rx) = KeratinAppendCompletion::pair();
-        st.append_message("t", 0, None, b"x", c).await.unwrap();
+        let headers = MessageHeaders {
+            published: Default::default(),
+            publish_received: Default::default(),
+            extra: Default::default(),
+        };
+        st.append_message("t", 0, None, &headers, b"x", c)
+            .await
+            .unwrap();
         rx.await.unwrap().unwrap();
     }
 
@@ -183,7 +250,7 @@ async fn poll_ready_delivers_and_marks_inflight() {
 
     assert_eq!(msgs.len(), 3);
 
-    for (off, _) in msgs {
+    for (off, _, _, _) in msgs {
         assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
     }
 }
@@ -193,7 +260,14 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
     let (st, _td) = open_test_stroma().await;
 
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, None, b"x", c).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, b"x", c)
+        .await
+        .unwrap();
     let off = rx.await.unwrap().unwrap().base_offset;
 
     let now = 1000;
@@ -269,7 +343,9 @@ async fn expiry_respects_batch_limit() {
 
     for i in 0..10 {
         let off = append_one(&st, "t", 0, None, b"x").await;
-        st.mark_inflight_one("t", 0, None, off, i + 10).await.unwrap();
+        st.mark_inflight_one("t", 0, None, off, i + 10)
+            .await
+            .unwrap();
     }
 
     let n = st.requeue_expired(100, 3).await.unwrap().len();

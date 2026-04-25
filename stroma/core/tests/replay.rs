@@ -26,6 +26,7 @@ async fn snapshot_delta_replay_is_deterministic() {
 
     // force persistence so restart is deterministic
     st.snapshot_partition("t", 0, None).await.unwrap();
+    st.shutdown().await.unwrap();
 
     drop(st);
 
@@ -50,11 +51,17 @@ async fn expired_messages_survive_restart() {
     );
 
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0, None, b"x", c).await.unwrap();
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0, None, &headers, b"x", c).await.unwrap();
     st.mark_inflight_one("t", 0, None, 0, 10).await.unwrap();
     let offset = rx.await.unwrap().unwrap().base_offset;
 
     st.list_expired(100, 10).await.unwrap();
+    st.shutdown().await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(

@@ -102,14 +102,14 @@ struct NotifyItem {
 }
 
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
-    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(1024);
+    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(8192);
 
     std::thread::spawn(move || {
         notifier_loop(notify_rx);
         tracing::info!("Notifier loop exited");
     });
 
-    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(1024);
+    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(8192);
 
     std::thread::spawn(move || {
         writer_loop(&mut log, cfg, rx, state, notify_tx);
@@ -237,7 +237,12 @@ fn writer_loop(
             match writes_rx.recv() {
                 Ok(c) => c,
                 Err(_) => {
-                    shutdown_fail_unstaged(&mut batcher, "writer shutdown", FlushReason::Shutdown);
+                    shutdown_fail_unstaged(
+                        &mut batcher,
+                        "writer shutdown",
+                        FlushReason::Shutdown,
+                        &notify_tx,
+                    );
                     // fail_all_pending(&mut pending, "writer shutdown");
                     return;
                 }
@@ -254,6 +259,7 @@ fn writer_loop(
                         &mut batcher,
                         "writer disconnected",
                         FlushReason::Shutdown,
+                        &notify_tx,
                     );
                     // fail_all_pending(&mut pending, "writer disconnected");
                     return;
@@ -342,7 +348,11 @@ fn writer_loop(
             WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
                 // Sync changes
-                if let Err(e) = log.flush_buffers().and_then(|_| log.flush()).and_then(|_| log.fsync()) {
+                if let Err(e) = log
+                    .flush_buffers()
+                    .and_then(|_| log.flush())
+                    .and_then(|_| log.fsync())
+                {
                     tracing::error!("Error during writer shutdown fsync: {e}");
                 } else {
                     tracing::info!("Writer shutdown fsync complete");
@@ -353,9 +363,9 @@ fn writer_loop(
                 return;
             }
             WriterCmd::SizeEstimate { respond_to } => {
-                let res = log.estimate_disk_used().map_err(|e| {
-                    io::Error::other(format!("size estimate error: {e}"))
-                });
+                let res = log
+                    .estimate_disk_used()
+                    .map_err(|e| io::Error::other(format!("size estimate error: {e}")));
                 if let Err(_e) = respond_to.send(res) {
                     tracing::info!("Error sending size estimate response");
                 }
@@ -405,7 +415,12 @@ fn stage_reqs(
                     }
                 }
                 Err(e) => {
-                    r.completion.complete(Err(e.into()));
+                    let _ = notify_tx.send(NotifyMsg::One {
+                        item: NotifyItem {
+                            completion: r.completion,
+                            result: Err(e.into()),
+                        },
+                    });
                 }
             },
             AppendPayload::Many(messages) => match log.stage_append_batch(&messages, now_ms) {
@@ -430,7 +445,12 @@ fn stage_reqs(
                     }
                 }
                 Err(e) => {
-                    r.completion.complete(Err(e.into()));
+                    let _ = notify_tx.send(NotifyMsg::One {
+                        item: NotifyItem {
+                            completion: r.completion,
+                            result: Err(e.into()),
+                        },
+                    });
                 }
             },
         }
@@ -536,13 +556,19 @@ fn shutdown_fail_unstaged(
     batcher: &mut BatcherCore<AppendReq, impl FnMut(&AppendReq) -> (usize, usize)>,
     msg: &str,
     _why: FlushReason,
+    notify_tx: &Sender<NotifyMsg>,
 ) {
     let reqs = batcher.flush();
+    let mut items = Vec::new();
     for r in reqs {
-        r.completion.complete(Err(IoError {
-            msg: msg.to_string(),
-        }));
+        items.push(NotifyItem {
+            completion: r.completion,
+            result: Err(IoError {
+                msg: msg.to_string(),
+            }),
+        });
     }
+    let _ = notify_tx.send(NotifyMsg::Batch(items));
 }
 
 fn commit(

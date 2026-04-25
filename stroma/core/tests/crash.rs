@@ -1,7 +1,7 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
-use stroma_core::{Offset, SnapshotConfig, Stroma};
+use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir("test_data");
@@ -24,7 +24,12 @@ pub async fn append_one(
     payload: &[u8],
 ) -> Offset {
     let (c, rx) = KeratinAppendCompletion::pair();
-    st.append_message(tp, part, group, payload, c)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message(tp, part, group, &headers, payload, c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -47,6 +52,7 @@ async fn truncated_delta_does_not_corrupt_state() {
 
     let qh = st.queue_handle("t", 0,  None).await.unwrap();
     st.truncate_partition_log(qh, 123).await.unwrap();
+    st.shutdown().await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
@@ -67,13 +73,19 @@ async fn enqueue_is_durable_and_replayed() {
     );
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0,  None, b"hello", completion)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0,  None, &headers, b"hello", completion)
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
 
     // Force snapshot & restart
     st.snapshot_partition("t", 0,  None).await.unwrap();
+    st.shutdown().await.unwrap();
     drop(st);
 
     let st2 = Stroma::open(
@@ -102,11 +114,17 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
     );
 
     let (completion, rx) = KeratinAppendCompletion::pair();
-    st.append_message("t", 0,  None, b"hello", completion)
+    let headers = MessageHeaders {
+        published: Default::default(),
+        publish_received: Default::default(),
+        extra: Default::default(),
+    };
+    st.append_message("t", 0,  None, &headers, b"hello", completion)
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
     assert!(st.is_ready("t", 0,  None, 0).await.unwrap());
+    st.shutdown().await.unwrap();
 
     drop(st);
 
@@ -157,8 +175,15 @@ async fn expiry_is_durable_across_restart() {
     let (st, dir) = open_test_stroma().await;
 
     let off = append_one(&st, "t", 0, None, b"x").await;
+    dbg!(off);
     st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
+    assert!(!st.is_ready("t", 0, None, off).await.unwrap());
     st.requeue_expired(10, 10).await.unwrap();
+    assert!(st.is_ready("t", 0, None, off).await.unwrap());
+
+    st.shutdown().await.unwrap();
+
+    tokio::time::sleep(Duration::from_millis(1500)).await;
 
     drop(st);
 

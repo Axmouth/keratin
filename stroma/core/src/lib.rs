@@ -1,4 +1,5 @@
 mod event;
+mod metrics;
 mod state;
 mod stroma;
 
@@ -7,10 +8,11 @@ use thiserror::Error;
 
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage, util::{TempDir, test_dir}
+    KeratinConfig, Message, ReceivedMessage,
+    util::{TempDir, test_dir},
 };
 pub use state::{QueueHandle, QueueInternalState};
-pub use stroma::{SnapshotConfig, Stroma};
+pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
