@@ -5,7 +5,7 @@ use keratin_log::KeratinConfig;
 use stroma_core::{SnapshotConfig, Stroma, TempDir, test_dir};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
-    let test_dir = test_dir("test_data");
+    let test_dir = test_dir!("test_data");
     let res = Arc::new(
         Stroma::open(
             &test_dir.root,

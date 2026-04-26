@@ -3,7 +3,7 @@ use std::fs::OpenOptions;
 
 #[tokio::test]
 async fn wal_crash_recovery_truncated_tail() {
-    let dir = util::test_dir("wal_recovery");
+    let dir = test_dir!("wal_recovery");
     let cfg = KeratinConfig::test_default();
 
     {
@@ -36,7 +36,7 @@ async fn wal_crash_recovery_truncated_tail() {
 
 #[tokio::test]
 async fn wal_truncates_partial_tail() {
-    let dir = util::test_dir("wal_truncate");
+    let dir = test_dir!("wal_truncate");
 
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
@@ -73,7 +73,7 @@ async fn wal_truncates_partial_tail() {
 
 #[tokio::test]
 async fn wal_recovery_continuity() {
-    let dir = util::test_dir("wal_recovery_continuity");
+    let dir = test_dir!("wal_recovery_continuity");
 
     {
         let k = Keratin::open(&dir.root, KeratinConfig::test_default())
@@ -128,7 +128,7 @@ async fn wal_recovery_continuity() {
 
 #[tokio::test]
 async fn wal_durability_fence() {
-    let dir = util::test_dir("wal_durability_fence");
+    let dir = test_dir!("wal_durability_fence");
 
     {
         let k = Keratin::open(&dir.root, KeratinConfig::test_default())

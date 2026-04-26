@@ -1,10 +1,10 @@
 use std::sync::Arc;
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
+use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir}, test_dir};
 use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
-    let test_dir = test_dir("test_data");
+    let test_dir = test_dir!("test_data");
     let res = Arc::new(
         Stroma::open(
             &test_dir.root,

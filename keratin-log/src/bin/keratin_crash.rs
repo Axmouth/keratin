@@ -3,7 +3,7 @@ use std::{path::PathBuf, process::Command};
 
 // TODO
 fn main() {
-    let temp_dir = util::test_dir("keratin-crash");
+    let temp_dir = test_dir!("keratin-crash");
 
     // child writer
     let exe = std::env::current_exe().unwrap();

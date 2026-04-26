@@ -45,7 +45,7 @@ fn decode_record(v: &[u8]) -> (u32, u64) {
 
 #[tokio::main]
 async fn main() {
-    let root = util::test_dir("keratin-stream");
+    let root = test_dir!("keratin-stream");
     let cfg = KeratinConfig {
         segment_max_bytes: 256 * 1024 * 1024,
         index_stride_bytes: 64 * 1024,

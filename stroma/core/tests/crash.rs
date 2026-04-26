@@ -1,10 +1,10 @@
 use std::{sync::Arc, time::Duration};
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir, test_dir}};
+use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir}, test_dir};
 use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
-    let test_dir = test_dir("test_data");
+    let test_dir = test_dir!("test_data");
     (Arc::new(
         Stroma::open(
             &test_dir.root,
@@ -37,7 +37,7 @@ pub async fn append_one(
 
 #[tokio::test]
 async fn truncated_delta_does_not_corrupt_state() {
-    let dir = test_dir("test_data");
+    let dir = test_dir!("test_data");
     let kcfg = KeratinConfig::test_default();
     let scfg = SnapshotConfig::default();
 
@@ -61,7 +61,7 @@ async fn truncated_delta_does_not_corrupt_state() {
 
 #[tokio::test]
 async fn enqueue_is_durable_and_replayed() {
-    let dir = test_dir("enqueue_replay");
+    let dir = test_dir!("enqueue_replay");
     let st = Arc::new(
         Stroma::open(
             &dir.root,
@@ -102,7 +102,7 @@ async fn enqueue_is_durable_and_replayed() {
 
 #[tokio::test]
 async fn enqueue_is_durable_and_replayed_no_snap() {
-    let dir = test_dir("enqueue_replay");
+    let dir = test_dir!("enqueue_replay");
     let st = Arc::new(
         Stroma::open(
             &dir.root,
@@ -141,7 +141,7 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
 
 // #[tokio::test]
 // async fn crash_between_message_and_enqueue_event_is_safe() {
-//     let test_dir = test_dir("test_data");
+//     let test_dir = test_dir!("test_data");
 //     let st = Arc::new(
 //         Stroma::open(
 //             &test_dir.root,

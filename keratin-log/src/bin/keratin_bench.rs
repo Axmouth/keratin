@@ -8,7 +8,7 @@ use std::{
 };
 
 fn main() {
-    let temp_dir = util::test_dir("keratin-bench");
+    let temp_dir = test_dir!("keratin-bench");
 
     let cfg = KeratinConfig {
         segment_max_bytes: 256 * 1024 * 1024,

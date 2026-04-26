@@ -8,8 +8,7 @@ use thiserror::Error;
 
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage,
-    util::{TempDir, test_dir},
+    KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
 };
 pub use state::{QueueHandle, QueueInternalState};
 pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};

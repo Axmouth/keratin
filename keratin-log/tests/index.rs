@@ -2,7 +2,7 @@ use keratin_log::*;
 
 #[tokio::test]
 async fn wal_index_fetch_correctness() {
-    let dir = util::test_dir("wal_index");
+    let dir = test_dir!("wal_index");
     let cfg = KeratinConfig::test_default();
     let k = Keratin::open(&dir.root, cfg).await.unwrap();
 

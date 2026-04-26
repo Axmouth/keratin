@@ -2,7 +2,7 @@ use keratin_log::*;
 use std::path::PathBuf;
 
 fn main() {
-    let temp_dir = util::test_dir("keratin-test");
+    let temp_dir = test_dir!("keratin-test");
 
     let cfg = KeratinConfig {
         segment_max_bytes: 8 * 1024 * 1024,

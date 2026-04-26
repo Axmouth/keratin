@@ -1,12 +1,12 @@
 use std::sync::Arc;
 
-use keratin_log::{KeratinConfig, util::test_dir};
+use keratin_log::{KeratinConfig, test_dir};
 use similar_asserts::assert_eq;
 use stroma_core::*;
 
 #[tokio::test]
 async fn snapshot_delta_replay_is_deterministic() {
-    let dir = test_dir("stroma_replay");
+    let dir = test_dir!("stroma_replay");
     let kcfg = KeratinConfig::test_default();
     let scfg = SnapshotConfig::default();
 
@@ -39,7 +39,7 @@ async fn snapshot_delta_replay_is_deterministic() {
 
 #[tokio::test]
 async fn expired_messages_survive_restart() {
-    let dir = test_dir("expiry_restart");
+    let dir = test_dir!("expiry_restart");
     let st = Arc::new(
         Stroma::open(
             &dir.root,
@@ -78,7 +78,7 @@ async fn expired_messages_survive_restart() {
 async fn discover_partitions_handles_encoded_names() {
     // create dirs like:
     // events/group%2Fa/topic%2Fb/0000000001
-    let dir = test_dir("discover_partitions_handles_encoded_names");
+    let dir = test_dir!("discover_partitions_handles_encoded_names");
     let st = Arc::new(
         Stroma::open(
             &dir.root,

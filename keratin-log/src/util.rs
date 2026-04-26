@@ -1,7 +1,7 @@
 #[cfg(windows)]
 use std::io;
 use std::{
-    path::{Path, PathBuf}, thread::sleep, time::{Duration, SystemTime, UNIX_EPOCH}
+    path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}
 };
 
 use anyhow::Context;
@@ -17,14 +17,32 @@ pub fn unix_millis() -> UnixMillis {
     }
 }
 
-pub fn test_dir(prefix: &str) -> TempDir {
-    let root: PathBuf = format!("test_data/{prefix}-{}", fastrand::u64(..)).into();
-    // let p = std::env::temp_dir()
-    //     .join(format!("{}-{}", prefix, fastrand::u64(..)));
-    println!("Temp path: {}", root.display());
-    std::fs::create_dir_all(&root).unwrap();
-    TempDir { root }
+#[macro_export]
+macro_rules! test_dir {
+    ($prefix:expr) => {{
+        use std::path::PathBuf;
+        // This env! now resolves to the caller's Cargo.toml directory
+        let root: PathBuf = format!(
+            "{}/test_data/{}-{}", 
+            env!("CARGO_WORKSPACE_DIR"), 
+            $prefix, 
+            fastrand::u64(..)
+        ).into();
+        
+        std::fs::create_dir_all(&root).unwrap();
+        // Ensure TempDir is accessible from the library's path
+        $crate::util::TempDir { root }
+    }};
 }
+
+// pub fn test_dir(prefix: &str) -> TempDir {
+//     let root: PathBuf = format!("{}/test_data/{prefix}-{}", env!("CARGO_MANIFEST_DIR"), fastrand::u64(..)).into();
+//     // let p = std::env::temp_dir()
+//     //     .join(format!("{}-{}", prefix, fastrand::u64(..)));
+//     println!("Temp path: {}", root.display());
+//     std::fs::create_dir_all(&root).unwrap();
+//     TempDir { root }
+// }
 
 pub struct TempDir {
     pub root: PathBuf,

@@ -177,7 +177,9 @@ impl Manifest {
 
 #[test]
 fn manifest_roundtrip() {
-    let dir = crate::util::test_dir("test_data/manifest_roundtrip");
+    use crate::test_dir;
+
+    let dir = test_dir!("test_data/manifest_roundtrip");
     let m1 = Manifest::default_new(123, 4096, 128);
     m1.store_atomic(&dir.root).unwrap();
     let m2 = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();

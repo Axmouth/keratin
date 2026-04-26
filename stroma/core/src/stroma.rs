@@ -203,8 +203,8 @@ impl Drop for TaskGroup {
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageHeaders {
-    pub published: Option<u64>,
-    pub publish_received: Option<u64>,
+    pub published: u64,
+    pub publish_received: u64,
     pub extra: HashMap<String, String>,
 }
 

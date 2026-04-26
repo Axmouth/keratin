@@ -4,7 +4,7 @@ use keratin_log::*;
 
 #[tokio::test]
 async fn open_fails_when_already_open() {
-    let dir = util::test_dir("keratin_lock");
+    let dir = test_dir!("keratin_lock");
 
     let cfg = KeratinConfig::test_default();
 
@@ -36,7 +36,7 @@ async fn open_fails_when_already_open() {
 
 #[tokio::test]
 async fn wal_append_scan_identity() {
-    let dir = util::test_dir("wal_identity");
+    let dir = test_dir!("wal_identity");
 
     let cfg = KeratinConfig::test_default();
     let k = Keratin::open(&dir.root, cfg).await.unwrap();
@@ -71,7 +71,7 @@ async fn wal_append_scan_identity() {
 
 #[tokio::test]
 async fn wal_recovery_identity() {
-    let dir = util::test_dir("wal_recovery");
+    let dir = test_dir!("wal_recovery");
 
     {
         let k = Keratin::open(&dir.root, KeratinConfig::test_default())
@@ -104,7 +104,7 @@ async fn wal_recovery_identity() {
 
 #[tokio::test]
 async fn scan_past_end_must_not_hang() {
-    let dir = util::test_dir("scan_past_end");
+    let dir = test_dir!("scan_past_end");
 
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
@@ -127,7 +127,7 @@ async fn scan_past_end_must_not_hang() {
 
 #[tokio::test]
 async fn wal_multi_producer_ordering() {
-    let dir = util::test_dir("wal_multi");
+    let dir = test_dir!("wal_multi");
 
     let k = Arc::new(
         Keratin::open(&dir.root, KeratinConfig::test_default())
@@ -165,7 +165,7 @@ async fn wal_multi_producer_ordering() {
 
 #[tokio::test]
 async fn wal_segment_roll_continuity() {
-    let dir = util::test_dir("wal_roll");
+    let dir = test_dir!("wal_roll");
 
     let mut cfg = KeratinConfig::test_default();
     cfg.segment_max_bytes = 64 * 1024; // force many segments
@@ -192,7 +192,7 @@ async fn wal_segment_roll_continuity() {
 
 #[tokio::test]
 async fn wal_high_contention_storm() {
-    let dir = util::test_dir("wal_storm");
+    let dir = test_dir!("wal_storm");
 
     let k = Arc::new(
         Keratin::open(&dir.root, KeratinConfig::test_default())
