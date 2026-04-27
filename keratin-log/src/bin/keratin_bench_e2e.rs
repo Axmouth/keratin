@@ -8,8 +8,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-const PAYLOAD_SIZE: usize = 256;
-const BATCH: usize = 4096;
+const PAYLOAD_SIZE: usize = 256 * 4 * 512;
+const BATCH: usize = 256;
 const PRODUCERS: u32 = 8;
 const CONSUMERS: u32 = PRODUCERS;
 const RUN_SECS: u64 = 10;
@@ -49,12 +49,12 @@ async fn main() {
     let cfg = KeratinConfig {
         segment_max_bytes: 256 * 1024 * 1024,
         index_stride_bytes: 64 * 1024,
-        max_batch_bytes: 4 * 1024 * 1024,
-        max_batch_records: 2048,
+        max_batch_bytes: 32 * 1024 * 1024,
+        max_batch_records: 2048 * 4,
         batch_linger_ms: 5,
         default_durability: KDurability::AfterFsync,
-        fsync_interval_ms: 2,
-        flush_target_bytes: 32 * 1024 * 1024,
+        fsync_interval_ms: 5,
+        flush_target_bytes: 128 * 1024 * 1024,
     };
 
     let k = Arc::new(Keratin::open(&root.root, cfg).await.unwrap());

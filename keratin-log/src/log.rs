@@ -413,8 +413,17 @@ impl Log {
 
         // periodic stat print (keep it here so it measures real IO)
         if self.last_stats_dump.elapsed() > Duration::from_secs(1) {
+            let now = std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .expect("Time went backwards");
+
+            let total_secs = now.as_secs();
+            let millis = now.subsec_millis();
+
             println!(
-                "KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms bytes={} kbytes/batch={} rec/batch={}",
+                "{}.{:03} : KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms bytes={} kbytes/batch={} rec/batch={}",
+                total_secs,
+                millis,
                 self.stats.batches,
                 self.stats.records,
                 self.stats.encode.as_millis(),

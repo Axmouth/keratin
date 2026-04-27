@@ -7,7 +7,7 @@ use std::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
-    time::Instant,
+    time::{Duration, Instant},
 };
 
 use arc_swap::ArcSwap;
@@ -19,12 +19,17 @@ use keratin_log::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::sync::{OnceCell, RwLock};
+use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, StromaError,
     event::StromaEvent,
+    metrics::StromaMetrics,
     partition::Partition,
-    state::{Offset, QueueCommand, QueueHandle, QueueStatusReport, UnixMillis},
+    state::{
+        Offset, QueueCommand, QueueDebugInfo, QueueHandle, QueueStatusReport, StromaDebugSnapshot,
+        UnixMillis,
+    },
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -145,59 +150,74 @@ impl ApplyThenComplete {
 
 #[derive(Debug)]
 pub struct TaskGroup {
-    handles: SegQueue<tokio::task::JoinHandle<()>>,
-    shutdown: AtomicBool,
+    token: CancellationToken,
+    tracker: tokio_util::task::TaskTracker,
 }
 
 impl TaskGroup {
     pub fn new() -> Self {
         Self {
-            handles: SegQueue::new(),
-            shutdown: AtomicBool::new(false),
+            token: CancellationToken::new(),
+            tracker: tokio_util::task::TaskTracker::new(),
         }
     }
 
-    pub fn spawn<F>(&self, _name: &'static str, fut: F)
+    /// Spawn with automatic cancellation on shutdown.
+    /// Future is dropped at its current await point when shutdown fires.
+    pub fn spawn<F>(&self, name: &'static str, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        // Hard gate: no tasks after shutdown
-        if self.shutdown.load(Ordering::Acquire) {
+        if self.token.is_cancelled() {
             return;
         }
+        let cancel = self.token.child_token();
+        self.spawn_raw(name, async move {
+            tokio::select! {
+                _ = cancel.cancelled() => {}
+                _ = fut => {}
+            }
+        });
+    }
 
+    /// Spawn with the cancellation token exposed.
+    /// Use when the task needs to clean up at a safe point on shutdown.
+    pub fn spawn_with_cancel<F, Fut>(&self, name: &'static str, make_fut: F)
+    where
+        F: FnOnce(CancellationToken) -> Fut,
+        Fut: Future<Output = ()> + Send + 'static,
+    {
+        if self.token.is_cancelled() {
+            return;
+        }
+        let cancel = self.token.child_token();
+        self.spawn_raw(name, make_fut(cancel));
+    }
+
+    fn spawn_raw<F>(&self, _name: &'static str, fut: F)
+    where
+        F: Future<Output = ()> + Send + 'static,
+    {
         #[cfg(tokio_unstable)]
-        let handle = tokio::task::Builder::new().name(_name).spawn(fut).unwrap();
-
+        let _ = self.tracker.build_task().name(_name).spawn(fut);
         #[cfg(not(tokio_unstable))]
-        let handle = tokio::spawn(fut);
-
-        // Push only if still open
-        if self.shutdown.load(Ordering::Acquire) {
-            handle.abort(); // defensive, extremely rare
-        } else {
-            self.handles.push(handle);
+        {
+            let _ = _name;
+            self.tracker.spawn(fut);
         }
     }
 
-    pub fn shutdown(&self) {
-        // Close the gate
-        self.shutdown.store(true, Ordering::Release);
-
-        // Drain deterministically
-        while let Some(h) = self.handles.pop() {
-            h.abort();
-        }
+    pub async fn shutdown(&self) {
+        self.token.cancel();
+        self.tracker.close();
+        self.tracker.wait().await;
     }
 }
 
 impl Drop for TaskGroup {
     fn drop(&mut self) {
-        self.shutdown.store(true, Ordering::Release);
-
-        while let Some(h) = self.handles.pop() {
-            h.abort();
-        }
+        self.token.cancel();
+        self.tracker.close();
     }
 }
 
@@ -222,6 +242,7 @@ type Registry = HashMap<(Box<str>, u32, Option<Box<str>>), Arc<OnceCell<QueueHan
 
 #[derive(Debug, Clone)]
 pub struct Stroma {
+    pub(crate) start_time: Instant,
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg: KeratinConfig,
     pub(crate) snap_cfg: SnapshotConfig,
@@ -237,6 +258,8 @@ pub struct Stroma {
     pub(crate) msg_count: Arc<AtomicU64>,
 
     pub(crate) event_count: Arc<AtomicU64>,
+
+    pub(crate) metrics: Arc<StromaMetrics>,
 }
 
 impl Stroma {
@@ -245,13 +268,17 @@ impl Stroma {
         keratin_cfg: KeratinConfig,
         snap_cfg: SnapshotConfig,
     ) -> Result<Self> {
+        let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("events")).map_err(io_err)?;
         fs::create_dir_all(root.join("messages")).map_err(io_err)?;
         fs::create_dir_all(root.join("snapshots")).map_err(io_err)?;
         fs::create_dir_all(root.join("tmp")).map_err(io_err)?;
 
+        let metrics = Arc::new(StromaMetrics::new(60));
+
         let st = Self {
+            start_time,
             root,
             keratin_cfg,
             snap_cfg,
@@ -260,10 +287,25 @@ impl Stroma {
             global_dlq: Arc::new(RwLock::new(None)),
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
+            metrics: metrics.clone(),
         };
 
         // Recover from existing snapshot files + replay events.
         st.recover_all().await?;
+
+        let st_metrics = st.clone();
+        st.task_group.spawn("debug report", async move {
+            loop {
+                tokio::time::sleep(Duration::from_secs(10)).await;
+
+                let res = st_metrics.debug_report().await;
+                if let Ok(report) = res {
+                    println!("{report}");
+                } else if let Err(err) = res {
+                    eprintln!("{err}");
+                }
+            }
+        });
 
         Ok(st)
     }
@@ -284,6 +326,10 @@ impl Stroma {
 
     fn snapshots_root(&self) -> PathBuf {
         self.root.join("snapshots")
+    }
+
+    pub fn metrics(&self) -> Arc<StromaMetrics> {
+        self.metrics.clone()
     }
 
     /// Encode a string into a path-safe component (stable & reversible-ish).
@@ -466,6 +512,7 @@ impl Stroma {
                     msg_log,
                     event_log,
                     self.task_group.clone(),
+                    self.metrics.clone(),
                 ))
             })
             .await?;
@@ -724,18 +771,26 @@ impl Stroma {
                 .load(Ordering::Acquire));
         }
 
+        // let _timer = Timer::new(&self.metrics.event_log_appends.batches.latency);
+        let start = Instant::now();
+
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in evs {
             msgs.push(event_msg(ev)?);
         }
+        let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
 
         // Durable append first.
         let ar = event_log
             .append_batch(msgs, Some(durability))
             .await
             .map_err(io_err)?;
+
+        self.metrics
+            .event_log_appends
+            .observe(evs.len(), bytes_count);
         qh.applied_upto()
             .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
         qh.set_dirty_snapshot(true);
@@ -750,6 +805,12 @@ impl Stroma {
         self.applied_upto_entry(tp, part, group)
             .await?
             .store(new_upto, Ordering::Release);
+
+        self.metrics
+            .event_log_appends
+            .batches
+            .latency
+            .observe(start.elapsed());
 
         Ok(new_upto)
     }
@@ -1104,7 +1165,7 @@ impl Stroma {
 
     fn periodic_snapshot(&self, qh: QueueHandle) -> Result<()> {
         let stroma = self.clone();
-        self.task_group.spawn("snapshotting", async move {
+        tokio::spawn(async move {
             tracing::info!(
                 "Starting periodic snapshot service for tp={} part={} group={}",
                 qh.topic(),
@@ -1387,12 +1448,16 @@ impl Stroma {
         group: Option<&str>,
         event_log: Arc<Keratin>,
     ) -> Result<()> {
+        let start = Instant::now();
+
         tracing::info!(
             "Recovering log tp: {tp}, partition: {part}, group: {}",
             group.unwrap_or("Default")
         );
-        let start = Instant::now();
         let qh = self.queue_handle(tp, part, group).await?;
+
+        let snap_load_start = Instant::now();
+        // load snapshot...
 
         let mut cur = 0u64;
 
@@ -1407,6 +1472,14 @@ impl Stroma {
         let reader = event_log.reader();
         let tail = event_log.next_offset();
 
+        self.metrics
+            .recovery
+            .snapshot_load_latency
+            .observe(snap_load_start.elapsed());
+
+        let replay_start = Instant::now();
+        let mut events_count = 0;
+
         while cur < tail {
             let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
             if batch.is_empty() {
@@ -1418,15 +1491,26 @@ impl Stroma {
                 let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
                 self.apply_event_inmem(&ev).await?;
                 qh.applied_upto().store(cur, Ordering::Release);
+                events_count += 1;
             }
         }
 
-        let elapsed = start.elapsed().as_secs_f64();
+        let elapsed = start.elapsed();
         tracing::info!(
             "Recovered log tp: {tp}, partition: {part}, group: {} after {:.3} seconds",
             group.unwrap_or("Default"),
-            elapsed
+            elapsed.as_secs_f64(),
         );
+        self.metrics
+            .recovery
+            .events_replayed
+            .fetch_add(events_count as u64, Ordering::Relaxed);
+        self.metrics
+            .recovery
+            .replay_duration
+            .observe(replay_start.elapsed());
+
+        self.metrics.recovery.startup_duration.observe(elapsed);
 
         self.periodic_snapshot(qh)?;
 
@@ -1613,6 +1697,89 @@ impl Stroma {
     // and call log.truncate_before(cutoff).
     //
     // Until then, snapshots give fast startup even if the event log grows.
+
+    pub async fn debug_snapshot(&self) -> Result<StromaDebugSnapshot> {
+        let keys = self.queue_keys_snapshot();
+
+        use futures::stream::{FuturesUnordered, StreamExt};
+
+        let mut futs = FuturesUnordered::new();
+        for (tp, part, group) in keys {
+            let stroma = self.clone();
+            futs.push(async move {
+                let qh = stroma.queue_handle(&tp, part, group.as_deref()).await?;
+                Ok::<_, StromaError>(qh.full_debug_info().await)
+            });
+        }
+
+        let mut queues = Vec::with_capacity(futs.len());
+        while let Some(result) = futs.next().await {
+            queues.push(result?);
+        }
+
+        Ok(StromaDebugSnapshot {
+            queue_count: queues.len(),
+            queues,
+            cmd_queue_depths: self.metrics.cmd_queue_depths_snapshot(),
+            snapshot_metrics: self.metrics.snapshot.snapshot(),
+            recovery_metrics: self.metrics.recovery.snapshot(),
+            log_metrics: self.metrics.log_snapshot(),
+            command_metrics: self.metrics.command_snapshot(),
+            uptime_seconds: self.start_time.elapsed().as_secs(),
+        })
+    }
+
+    pub async fn debug_report(&self) -> Result<String> {
+        let snap = self.debug_snapshot().await?;
+        let mut out = String::new();
+        use std::fmt::Write;
+
+        writeln!(out, "=== Stroma debug report ===").unwrap();
+        writeln!(out, "Uptime: {}s", snap.uptime_seconds).unwrap();
+        writeln!(out, "Active queues: {}", snap.queue_count).unwrap();
+        writeln!(out).unwrap();
+
+        writeln!(out, "Command queue depths:").unwrap();
+        for (lane, depth) in &snap.cmd_queue_depths {
+            writeln!(out, "  {}: {}", lane, depth).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        writeln!(out, "Snapshots:").unwrap();
+        writeln!(out, "  attempts: {}", snap.snapshot_metrics.attempts_total).unwrap();
+        writeln!(
+            out,
+            "  skipped (not dirty): {}",
+            snap.snapshot_metrics.skipped_not_dirty
+        )
+        .unwrap();
+        if let Some(avg) = snap.snapshot_metrics.avg_clone_ms {
+            writeln!(out, "  avg clone: {:.1}ms", avg).unwrap();
+        }
+        if let Some(avg) = snap.snapshot_metrics.avg_total_ms {
+            writeln!(out, "  avg total: {:.1}ms", avg).unwrap();
+        }
+        writeln!(out).unwrap();
+
+        writeln!(out, "Queues:").unwrap();
+        for q in &snap.queues {
+            let g = q.group.as_deref().unwrap_or("Default");
+            writeln!(
+                out,
+                "  {}/{}/{}: ready={} inflight={} settled={} dirty={}",
+                q.topic,
+                q.partition,
+                g,
+                q.state.ready_count,
+                q.state.inflight_count,
+                q.state.settled_until,
+                q.dirty_since_snapshot
+            )
+            .unwrap();
+        }
+
+        Ok(out)
+    }
 }
 
 impl Stroma {

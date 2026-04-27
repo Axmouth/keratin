@@ -15,6 +15,7 @@ use crate::{AppendCompletion, KeratinConfig};
 
 // TODO: Tests showing guaranteed order
 // TODO: Also more tests for failures and edge cases (e.g. batch flush on shutdown, etc.)
+// TODO: More pipelining: Batch -> encode and stage buffer -> write file -> fsync -> notify awaiters (estimated possible 40%-60% gain in throughput from not waiting encoding and fsync for large payloads)
 
 #[derive(Debug, Clone)]
 pub struct IoError {

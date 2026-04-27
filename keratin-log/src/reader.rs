@@ -158,7 +158,7 @@ impl LogReader {
         out: &mut Vec<OwnedRecord>,
         max: usize,
     ) -> io::Result<()> {
-        const SLAB: usize = 4096; // SSD page aligned
+        const SLAB: usize = 4096 * 8; // SSD page aligned
 
         let mut buf = vec![0u8; SLAB];
         let mut window: Vec<u8> = Vec::with_capacity(SLAB * 2);

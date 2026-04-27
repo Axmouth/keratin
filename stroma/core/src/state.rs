@@ -1,15 +1,21 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap};
+use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::thread;
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
 use keratin_log::util::unix_millis;
+use rangemap::RangeSet;
+use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::metrics::{
+    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
+    StromaMetrics,
+};
 use crate::stroma::TaskGroup;
 
 pub type Offset = u64;
@@ -129,7 +135,7 @@ pub struct QueueInternalState {
 
     // ----- Ready -----
     // offset -> retries
-    ready: BTreeSet<Offset>,                  // readiness only
+    ready: RangeSet<Offset>,                  // readiness only
     retries: hashbrown::HashMap<Offset, u32>, // retry metadata only
 
     // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
@@ -244,13 +250,13 @@ pub enum QueueCommand {
         items: Vec<(Offset, Vec<u8>)>,
         response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, Vec<u8>)>>>,
     }, // items
+    GetDebugInfo {
+        response: Option<tokio::sync::oneshot::Sender<QueueInternalDebugInfo>>,
+    }, // debug info
     GetRetries {
         offset: Offset,
         response: Option<tokio::sync::oneshot::Sender<u32>>,
     }, // offset
-    GetNextOffset {
-        response: Option<tokio::sync::oneshot::Sender<Offset>>,
-    },
     GetSettledUntil {
         response: Option<tokio::sync::oneshot::Sender<Offset>>,
     },
@@ -315,12 +321,12 @@ impl QueueCommand {
             QueueCommand::Reset { .. } => CommandPrio::Express,
 
             // === Observability / admin queries — fast, cheap, must stay responsive ===
+            QueueCommand::GetDebugInfo { .. } => CommandPrio::Express,
             QueueCommand::GetStatusReport { .. } => CommandPrio::Express,
             QueueCommand::GetInflightLen { .. } => CommandPrio::Express,
             QueueCommand::GetSettledUntil { .. } => CommandPrio::Express,
             QueueCommand::GetLowestUnacked { .. } => CommandPrio::Express,
             QueueCommand::GetLowestNotAcked { .. } => CommandPrio::Express,
-            QueueCommand::GetNextOffset { .. } => CommandPrio::Express,
             QueueCommand::GetAckWindowBase { .. } => CommandPrio::Express,
             QueueCommand::GetAckBitsBytes { .. } => CommandPrio::Express,
             QueueCommand::GetCanonicalQueueState { .. } => CommandPrio::Express,
@@ -366,8 +372,52 @@ impl QueueCommand {
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
         }
     }
+
+    pub fn variant_name(&self) -> &str {
+        match self {
+            QueueCommand::Shutdown { .. } => "Shutdown",
+            QueueCommand::Enqueue { .. } => "Enqueue",
+            QueueCommand::MarkInflight { .. } => "MarkInflight",
+            QueueCommand::MarkInflightBatch { .. } => "MarkInflightBatch",
+            QueueCommand::ClearInflight { .. } => "ClearInflight",
+            QueueCommand::Ack { .. } => "Ack",
+            QueueCommand::AckBatch { .. } => "AckBatch",
+            QueueCommand::Nack { .. } => "Nack",
+            QueueCommand::DeadLetter { .. } => "DeadLetter",
+            QueueCommand::Reject { .. } => "Reject",
+            QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
+            QueueCommand::Reset { .. } => "Reset",
+            QueueCommand::SetAckedUntil { .. } => "SetAckedUntil",
+            QueueCommand::SetAckWindow { .. } => "SetAckWindow",
+            QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
+            QueueCommand::LoadInflight { .. } => "LoadInflight",
+            QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
+            QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
+            QueueCommand::IsAcked { .. } => "IsAcked",
+            QueueCommand::IsInflight { .. } => "IsInflight",
+            QueueCommand::IsInflightOrAcked { .. } => "IsInflightOrAcked",
+            QueueCommand::IsReady { .. } => "IsReady",
+            QueueCommand::FilterNotEnqueued { .. } => "FilterNotEnqueued",
+            QueueCommand::GetRetries { .. } => "GetRetries",
+            QueueCommand::GetSettledUntil { .. } => "GetSettledUntil",
+            QueueCommand::PollReadyAndMark { .. } => "PollReadyAndMark",
+            QueueCommand::GetLowestUnacked { .. } => "GetLowestUnacked",
+            QueueCommand::GetLowestNotAcked { .. } => "GetLowestNotAcked",
+            QueueCommand::GetNextDeliverable { .. } => "GetNextDeliverable",
+            QueueCommand::GetInflightLen { .. } => "GetInflightLen",
+            QueueCommand::GetNextExpiryHint { .. } => "GetNextExpiryHint",
+            QueueCommand::GetAckWindowBase { .. } => "GetAckWindowBase",
+            QueueCommand::GetAckBitsBytes { .. } => "GetAckBitsBytes",
+            QueueCommand::GetCanonicalQueueState { .. } => "GetCanonicalQueueState",
+            QueueCommand::GetStatusReport { .. } => "GetStatusReport",
+            QueueCommand::CollectExpired { .. } => "CollectExpired",
+            QueueCommand::DumpInflight { .. } => "DumpInflight",
+            QueueCommand::GetDebugInfo { response } => "GetDebugInfo",
+        }
+    }
 }
 
+#[derive(Debug, Eq, PartialEq, PartialOrd, Ord, Hash, Copy, Clone)]
 pub enum CommandPrio {
     Express,
     High,
@@ -376,14 +426,37 @@ pub enum CommandPrio {
     SuperLow,
 }
 
-pub struct QueueCommandPackage {
-    pub command: QueueCommand,
+impl CommandPrio {
+    pub fn all() -> [Self; 5] {
+        use CommandPrio::*;
+        [SuperLow, Low, Medium, High, Express]
+    }
+
+    pub fn name(&self) -> &'static str {
+        match self {
+            CommandPrio::Express => "express",
+            CommandPrio::High => "high",
+            CommandPrio::Medium => "medium",
+            CommandPrio::Low => "low",
+            CommandPrio::SuperLow => "super_low",
+        }
+    }
+
+    pub fn idx(&self) -> usize {
+        match self {
+            CommandPrio::Express => 0,
+            CommandPrio::High => 1,
+            CommandPrio::Medium => 2,
+            CommandPrio::Low => 3,
+            CommandPrio::SuperLow => 4,
+        }
+    }
 }
 
-impl QueueCommand {
-    pub fn into_package(self) -> QueueCommandPackage {
-        QueueCommandPackage { command: self }
-    }
+#[derive(Debug)]
+pub struct QueueCommandPackage {
+    pub command: QueueCommand,
+    pub enqueued_at: Instant,
 }
 
 #[derive(Debug)]
@@ -394,6 +467,7 @@ pub struct SnapshotMeta {
 
 #[derive(Debug)]
 pub struct CommandReceiver {
+    metrics: Arc<StromaMetrics>,
     express: mpsc::Receiver<QueueCommandPackage>,
     high_prio: mpsc::Receiver<QueueCommandPackage>,
     medium_prio: mpsc::Receiver<QueueCommandPackage>,
@@ -410,7 +484,7 @@ impl CommandReceiver {
     ///
     /// Returns `None` only when all senders have been dropped AND all queues
     /// are empty (i.e. the actor should shut down).
-    pub async fn recv(&mut self) -> Option<QueueCommandPackage> {
+    async fn recv_inner(&mut self) -> Option<QueueCommandPackage> {
         loop {
             // Fast path: drain anything already queued, highest-prio first.
             // This avoids waking up the scheduler when work is already available.
@@ -436,34 +510,19 @@ impl CommandReceiver {
             tokio::select! {
                 biased;
                 pkg = self.express.recv() => {
-                    match pkg {
-                        Some(p) => return Some(p),
-                        None => {} // closed, try others
-                    }
+                    if let Some(p) = pkg { return Some(p) }
                 }
                 pkg = self.high_prio.recv() => {
-                    match pkg {
-                        Some(p) => return Some(p),
-                        None => {}
-                    }
+                    if let Some(p) = pkg { return Some(p) }
                 }
                 pkg = self.medium_prio.recv() => {
-                    match pkg {
-                        Some(p) => return Some(p),
-                        None => {}
-                    }
+                    if let Some(p) = pkg { return Some(p) }
                 }
                 pkg = self.low_prio.recv() => {
-                    match pkg {
-                        Some(p) => return Some(p),
-                        None => {}
-                    }
+                    if let Some(p) = pkg { return Some(p) }
                 }
                 pkg = self.super_low_prio.recv() => {
-                    match pkg {
-                        Some(p) => return Some(p),
-                        None => {}
-                    }
+                    if let Some(p) = pkg { return Some(p) }
                 }
             }
 
@@ -480,10 +539,24 @@ impl CommandReceiver {
             // Otherwise loop: some senders still alive, keep waiting.
         }
     }
+
+    pub async fn recv(&mut self) -> Option<QueueCommandPackage> {
+        let result = self.recv_inner().await;
+
+        // When returning a command, record wait time and update depth gauge
+        if let Some(ref pkg) = result {
+            let prio = pkg.command.prio();
+            // depth was already decremented implicitly by the recv; we track by counting
+            self.metrics.cmd_wait_latency[prio.idx()].observe(pkg.enqueued_at.elapsed());
+            self.metrics.cmd_queue_depth[prio.idx()].fetch_sub(1, Ordering::Relaxed);
+        }
+        result
+    }
 }
 
 #[derive(Debug, Clone)]
 pub struct CommandSender {
+    metrics: Arc<StromaMetrics>,
     express: mpsc::Sender<QueueCommandPackage>,
     high_prio: mpsc::Sender<QueueCommandPackage>,
     medium_prio: mpsc::Sender<QueueCommandPackage>,
@@ -492,7 +565,7 @@ pub struct CommandSender {
 }
 
 impl CommandSender {
-    pub fn channel_pair() -> (CommandSender, CommandReceiver) {
+    pub fn channel_pair(metrics: Arc<StromaMetrics>) -> (CommandSender, CommandReceiver) {
         let (express_tx, express_rx) = mpsc::channel(2048);
         let (high_tx, high_rx) = mpsc::channel(16384);
         let (medium_tx, medium_rx) = mpsc::channel(8192);
@@ -500,6 +573,7 @@ impl CommandSender {
         let (super_low_tx, super_low_rx) = mpsc::channel(512);
 
         let sender = CommandSender {
+            metrics: metrics.clone(),
             express: express_tx,
             high_prio: high_tx,
             medium_prio: medium_tx,
@@ -508,6 +582,7 @@ impl CommandSender {
         };
 
         let receiver = CommandReceiver {
+            metrics,
             express: express_rx,
             high_prio: high_rx,
             medium_prio: medium_rx,
@@ -516,27 +591,54 @@ impl CommandSender {
         };
 
         (sender, receiver)
-
     }
 
-    pub async fn send(&self, pkg: QueueCommandPackage) -> Result<(), mpsc::error::SendError<QueueCommandPackage>> {
-        match pkg.command.prio() {
+    pub async fn send(
+        &self,
+        mut pkg: QueueCommandPackage,
+    ) -> Result<(), mpsc::error::SendError<QueueCommandPackage>> {
+        pkg.enqueued_at = Instant::now();
+
+        let prio = pkg.command.prio();
+        // increment depth gauge for this lane
+        self.metrics.cmd_queue_depth[prio.idx()].fetch_add(1, Ordering::Relaxed);
+        let res = match prio {
             CommandPrio::Express => self.express.send(pkg).await,
             CommandPrio::High => self.high_prio.send(pkg).await,
             CommandPrio::Medium => self.medium_prio.send(pkg).await,
             CommandPrio::Low => self.low_prio.send(pkg).await,
             CommandPrio::SuperLow => self.super_low_prio.send(pkg).await,
+        };
+        // if send failed, decrement; if succeeded, will be decremented on recv
+        if res.is_err() {
+            self.metrics.cmd_queue_depth[prio.idx()].fetch_sub(1, Ordering::Relaxed);
         }
+
+        res
     }
 
-    pub fn blocking_send(&self, pkg: QueueCommandPackage) -> Result<(), mpsc::error::SendError<QueueCommandPackage>> {
-        match pkg.command.prio() {
+    pub fn blocking_send(
+        &self,
+        mut pkg: QueueCommandPackage,
+    ) -> Result<(), mpsc::error::SendError<QueueCommandPackage>> {
+        pkg.enqueued_at = Instant::now();
+
+        let prio = pkg.command.prio();
+        // increment depth gauge for this lane
+        self.metrics.cmd_queue_depth[prio.idx()].fetch_add(1, Ordering::Relaxed);
+        let res = match pkg.command.prio() {
             CommandPrio::Express => self.express.blocking_send(pkg),
             CommandPrio::High => self.high_prio.blocking_send(pkg),
             CommandPrio::Medium => self.medium_prio.blocking_send(pkg),
             CommandPrio::Low => self.low_prio.blocking_send(pkg),
             CommandPrio::SuperLow => self.super_low_prio.blocking_send(pkg),
+        };
+        // if send failed, decrement; if succeeded, will be decremented on recv
+        if res.is_err() {
+            self.metrics.cmd_queue_depth[prio.idx()].fetch_sub(1, Ordering::Relaxed);
         }
+
+        res
     }
 }
 
@@ -560,6 +662,8 @@ pub struct QueueHandle {
     last_snapshot_event_offset: Arc<AtomicU64>,
     creating_snapshot: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
+
+    metrics: Arc<StromaMetrics>,
 }
 
 impl QueueHandle {
@@ -570,8 +674,9 @@ impl QueueHandle {
         msg_log: Arc<Keratin>,
         event_log: Arc<Keratin>,
         task_group: Arc<TaskGroup>,
+        metrics: Arc<StromaMetrics>,
     ) -> Self {
-        let (tx, mut rx) = CommandSender::channel_pair();
+        let (tx, mut rx) = CommandSender::channel_pair(metrics.clone());
         let dirty_since_snapshot = Arc::new(AtomicBool::new(false));
 
         let topic_clone = topic.clone();
@@ -597,6 +702,7 @@ impl QueueHandle {
             creating_snapshot,
             dirty_since_snapshot,
             task_group,
+            metrics,
         };
 
         let handle = result.clone();
@@ -620,12 +726,35 @@ impl QueueHandle {
         result
     }
 
+    pub async fn full_debug_info(&self) -> QueueDebugInfo {
+        let state = self.debug_info().await;
+
+        QueueDebugInfo {
+            topic: self.topic.clone(),
+            partition: self.partition,
+            group: self.group.clone(),
+            applied_upto: self.applied_upto.load(Ordering::Relaxed),
+            last_snapshot_timestamp: self.last_snapshot_timestamp(),
+            last_snapshot_event_offset: self.last_snapshot_event_offset(),
+            dirty_since_snapshot: self.dirty_snapshot(),
+            creating_snapshot: self.creating_snapshot(),
+            state,
+        }
+    }
+
+    #[tracing::instrument(skip(state, handle), fields(
+        queue = %handle.topic(),
+        part = handle.partition(),
+        cmd = cmd.variant_name(),
+    ))]
     fn process_command(
         state: &mut QueueInternalState,
         cmd: QueueCommand,
         handle: &QueueHandle,
     ) -> (Option<bool>, bool) {
         let mut dirty = false;
+        let start = Instant::now();
+        let prio = cmd.prio();
 
         match cmd {
             QueueCommand::Shutdown { response } => {
@@ -728,6 +857,12 @@ impl QueueHandle {
                     let _ = r.send(result);
                 }
             }
+            QueueCommand::GetDebugInfo { response } => {
+                let result = state.debug_info();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
             QueueCommand::GetRetries { offset, response } => {
                 let result = state.get_retries(offset);
                 if let Some(r) = response {
@@ -817,34 +952,55 @@ impl QueueHandle {
                 last_snapshot_event_offset,
                 response,
             } => {
-                let start = Instant::now();
-                // state.expiry_heap.shrink_to_fit();
-                // state.retries.shrink_to_fit();
-                // state.ready = state.ready.clone().into_iter().collect();
-                // state.inflight = state.inflight.clone().into_iter().collect();
+                let trigger_time = Instant::now();
+                handle.metrics.snapshot.attempts.incr();
+
+                if !handle.dirty_snapshot() {
+                    handle
+                        .metrics
+                        .snapshot
+                        .skipped_not_dirty
+                        .fetch_add(1, Ordering::Relaxed);
+                    if let Some(r) = response {
+                        let _ = r.send(None);
+                    }
+                    return (Some(true), false);
+                }
+
                 state.last_snapshot_event_offset = last_snapshot_event_offset;
                 state.last_snapshot_timestamp = unix_millis();
-                let start2 = Instant::now();
-                let state = state.clone();
-                let handle = handle.clone();
-                tracing::info!(
-                    "ms taken cloning on encode snapshot command: {}",
-                    start2.elapsed().as_millis()
-                );
+
+                let clone_start = Instant::now();
+                let state_clone = state.clone();
+                let clone_duration = clone_start.elapsed();
+                handle
+                    .metrics
+                    .snapshot
+                    .clone_latency
+                    .observe(clone_duration);
+
+                let metrics_bg = handle.metrics.clone(); // Arc clone
                 tokio::task::spawn_blocking(move || {
+                    let encode_start = Instant::now();
+                    let blob = state_clone.encode_snapshot(last_snapshot_event_offset);
+                    let encode_duration = encode_start.elapsed();
+                    metrics_bg.snapshot.encode_latency.observe(encode_duration);
+                    metrics_bg
+                        .snapshot
+                        .bytes_written
+                        .fetch_add(blob.len() as u64, Ordering::Relaxed);
+                    metrics_bg
+                        .snapshot
+                        .last_snapshot_size_bytes
+                        .store(blob.len() as u64, Ordering::Relaxed);
+
+                    let total = trigger_time.elapsed();
+                    metrics_bg.snapshot.total_latency.observe(total);
+
                     if let Some(r) = response {
-                        if handle.dirty_snapshot() {
-                            let result = state.encode_snapshot(last_snapshot_event_offset);
-                            let _ = r.send(Some(result));
-                        } else {
-                            let _ = r.send(None);
-                        }
+                        let _ = r.send(Some(blob));
                     }
                 });
-                tracing::info!(
-                    "ms taken on encode snapshot command: {}",
-                    start.elapsed().as_millis()
-                );
             }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
@@ -874,12 +1030,6 @@ impl QueueHandle {
             } => {
                 let result = state.poll_ready_and_mark(max, lease_deadline);
                 dirty = !result.is_empty();
-                if let Some(r) = response {
-                    let _ = r.send(result);
-                }
-            }
-            QueueCommand::GetNextOffset { response } => {
-                let result = state.next_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -935,156 +1085,203 @@ impl QueueHandle {
             }
         }
 
+        let elapsed = start.elapsed();
+        handle.metrics.cmd_process_latency[prio.idx()].observe(elapsed);
+
         (Some(true), dirty) // signal to continue processing
     }
 
     pub async fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
         let _ = self
             .command_sender
-            .send(QueueCommandPackage { command: cmd }).await;
+            .send(QueueCommandPackage {
+                command: cmd,
+                enqueued_at: Instant::now(),
+            })
+            .await;
         Ok(())
     }
 
     pub fn blocking_command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        let _ = self
-            .command_sender
-            .blocking_send(QueueCommandPackage { command: cmd });
+        let _ = self.command_sender.blocking_send(QueueCommandPackage {
+            command: cmd,
+            enqueued_at: Instant::now(),
+        });
         Ok(())
+    }
+
+    pub async fn debug_info(&self) -> QueueInternalDebugInfo {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::GetDebugInfo { response: Some(tx) })
+            .await;
+        rx.await
+            .unwrap_or_else(|_| QueueInternalDebugInfo::default())
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) {
         let (tx, rx) = tokio::sync::oneshot::channel();
 
-        let _ = self.command_enqueue(QueueCommand::Enqueue {
-            offset,
-            retries,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Enqueue {
+                offset,
+                retries,
+                response: Some(tx),
+            })
+            .await;
 
         rx.await.unwrap();
     }
 
     pub async fn mark_inflight(&self, offset: Offset, deadline: UnixMillis) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::MarkInflight {
-            offset,
-            deadline,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::MarkInflight {
+                offset,
+                deadline,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn mark_inflight_batch(&self, entries: Vec<(Offset, UnixMillis)>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::MarkInflightBatch {
-            entries,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::MarkInflightBatch {
+                entries,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn clear_inflight(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::ClearInflight {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::ClearInflight {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn ack(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::Ack {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Ack {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn ack_batch(&self, offsets: Vec<Offset>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::AckBatch {
-            offsets,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::AckBatch {
+                offsets,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn nack(&self, offset: Offset, requeue: bool) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::Nack {
-            offset,
-            requeue,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Nack {
+                offset,
+                requeue,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn dead_letter(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::DeadLetter {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::DeadLetter {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn reject(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::Reject {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Reject {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn advance_frontier(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn reset(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::Reset { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Reset { response: Some(tx) })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn set_acked_until(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::SetAckedUntil {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::SetAckedUntil {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn set_ack_window(&self, base: Offset, bits: BitVec) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::SetAckWindow {
-            base,
-            bits,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::SetAckWindow {
+                base,
+                bits,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
     pub async fn set_ack_window_from_bytes(&self, base: Offset, bits_bytes: Vec<u8>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::SetAckWindowFromBytes {
-            base,
-            bits_bytes,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::SetAckWindowFromBytes {
+                base,
+                bits_bytes,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap().unwrap();
     }
 
     pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::LoadInflight {
-            entries,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::LoadInflight {
+                entries,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap();
     }
 
@@ -1092,10 +1289,12 @@ impl QueueHandle {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::EncodeSnapshot {
-            last_snapshot_event_offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::EncodeSnapshot {
+                last_snapshot_event_offset,
+                response: Some(tx),
+            })
+            .await;
         let res = rx.await;
         self.last_snapshot_event_offset.store(
             last_snapshot_event_offset,
@@ -1110,10 +1309,12 @@ impl QueueHandle {
 
     pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<SnapshotMeta> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::LoadSnapshot {
-            data,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::LoadSnapshot {
+                data,
+                response: Some(tx),
+            })
+            .await;
         let snapmeta = rx
             .await
             .unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))?;
@@ -1132,37 +1333,45 @@ impl QueueHandle {
 
     pub async fn is_acked(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::IsAcked {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::IsAcked {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(false)
     }
 
     pub async fn is_inflight(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::IsInflight {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::IsInflight {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(false)
     }
 
     pub async fn is_inflight_or_acked(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::IsInflightOrAcked {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::IsInflightOrAcked {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(false)
     }
 
     pub async fn is_ready(&self, offset: Offset) -> bool {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::IsReady {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::IsReady {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(false)
     }
 
@@ -1171,31 +1380,31 @@ impl QueueHandle {
         items: Vec<(Offset, Vec<u8>)>,
     ) -> Vec<(Offset, Vec<u8>)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::FilterNotEnqueued {
-            items: items.clone(),
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::FilterNotEnqueued {
+                items: items.clone(),
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn retries(&self, offset: Offset) -> u32 {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetRetries {
-            offset,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetRetries {
+                offset,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(0)
     }
 
     pub async fn settled_until(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetSettledUntil { response: Some(tx) }).await;
-        rx.await.unwrap_or(0)
-    }
-
-    pub async fn next_offset(&self) -> Offset {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetNextOffset { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetSettledUntil { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(0)
     }
 
@@ -1205,92 +1414,118 @@ impl QueueHandle {
         lease_deadline: UnixMillis,
     ) -> Vec<(Offset, u32)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::PollReadyAndMark {
-            max,
-            lease_deadline,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::PollReadyAndMark {
+                max,
+                lease_deadline,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn lowest_unacked_offset(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetLowestUnacked { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetLowestUnacked { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(0)
     }
 
     pub async fn lowest_not_acked_offset(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetLowestNotAcked { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetLowestNotAcked { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(0)
     }
 
     pub async fn next_deliverable(&self, from: Offset, upper: Offset) -> Option<Offset> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetNextDeliverable {
-            from,
-            upper,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetNextDeliverable {
+                from,
+                upper,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or(None)
     }
 
     pub async fn inflight_len(&self) -> usize {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetInflightLen { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetInflightLen { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(0)
     }
 
     pub async fn next_expiry_hint(&self) -> Option<UnixMillis> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetNextExpiryHint { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetNextExpiryHint { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(None)
     }
 
     pub async fn ack_window_base(&self) -> Offset {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetAckWindowBase { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetAckWindowBase { response: Some(tx) })
+            .await;
         rx.await.unwrap_or(0)
     }
 
     pub async fn ack_bits_bytes(&self) -> Vec<u8> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetAckBitsBytes { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetAckBitsBytes { response: Some(tx) })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn canonical(&self) -> CanonicalQueueState {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetCanonicalQueueState { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetCanonicalQueueState { response: Some(tx) })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn status_report(&self) -> Result<QueueStatusReport, std::io::Error> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::GetStatusReport { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::GetStatusReport { response: Some(tx) })
+            .await;
         rx.await
             .map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
     }
 
     pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::CollectExpired {
-            now,
-            max,
-            response: Some(tx),
-        }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::CollectExpired {
+                now,
+                max,
+                response: Some(tx),
+            })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::DumpInflight { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::DumpInflight { response: Some(tx) })
+            .await;
         rx.await.unwrap_or_default()
     }
 
     pub async fn shutdown(&self) {
         let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self.command_enqueue(QueueCommand::Shutdown { response: Some(tx) }).await;
+        let _ = self
+            .command_enqueue(QueueCommand::Shutdown { response: Some(tx) })
+            .await;
         let _ = rx.await;
     }
 
@@ -1390,7 +1625,7 @@ impl QueueInternalState {
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
             inflight: BTreeMap::new(),
-            ready: BTreeSet::new(),
+            ready: RangeSet::new(),
             retries: hashbrown::HashMap::new(),
             expiry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
@@ -1399,9 +1634,27 @@ impl QueueInternalState {
         }
     }
 
+    pub fn debug_info(&self) -> QueueInternalDebugInfo {
+        QueueInternalDebugInfo {
+            settled_until: self.settled_until,
+            ack_window_base: self.ack_window_base,
+            ready_count: self.ready.len(),
+            inflight_count: self.inflight.len(),
+            retries_count: self.retries.len(),
+            min_ready: self.ready.first().map(|r| r.start),
+            max_ready: self.ready.last().map(|r| r.end),
+            min_inflight: self.inflight.keys().next().copied(),
+            max_inflight: self.inflight.keys().next_back().copied(),
+            expiry_heap_size: self.expiry_heap.len(),
+            next_expiry_hint: self.peek_next_expiry_hint(),
+            dlq_policy: format!("{:?}", self.dlq_policy),
+            dlq_max_retries: self.dlq_discard_max_retries,
+        }
+    }
+
     #[inline]
     pub fn next_offset(&self) -> Offset {
-        self.ready.last().copied().unwrap_or(0)
+        self.ready.last().map(|r| r.end).unwrap_or(0)
     }
 
     #[inline]
@@ -1416,7 +1669,7 @@ impl QueueInternalState {
 
     #[inline]
     pub fn min_ready_offset(&self) -> Option<Offset> {
-        self.ready.first().copied()
+        self.ready.first().map(|r| r.start)
     }
 
     #[inline]
@@ -1426,7 +1679,7 @@ impl QueueInternalState {
 
     #[inline]
     pub fn safe_message_truncate_before(&self) -> Offset {
-        let min_ready = self.ready.first().copied().unwrap_or(u64::MAX);
+        let min_ready = self.ready.first().map(|r| r.start).unwrap_or(u64::MAX);
         let min_inflight = self.inflight.keys().copied().min().unwrap_or(u64::MAX);
 
         let result = min_ready.min(min_inflight);
@@ -1445,9 +1698,13 @@ impl QueueInternalState {
         self.settled_until
     }
 
-    pub fn iter_ready_from(&self, from: Offset) -> impl Iterator<Item = Offset> + '_ {
-        self.ready.range(from..).copied()
-    }
+    // pub fn iter_ready_from(&self, from: Offset) -> impl Iterator<Item = Offset> + '_ {
+    //     // Iterate overlapping ranges from `from` onwards, flatten to individual offsets
+    //     let range  = from..u64::MAX ;
+    //     self.ready
+    //         .overlapping(&range)
+    //         .flat_map(|range| range.start.max(from)..range.end)
+    // }
 
     pub fn poll_ready_and_mark(
         &mut self,
@@ -1460,8 +1717,14 @@ impl QueueInternalState {
             self.partition,
             self.settled_until()
         );
-        let mut offs = Vec::new();
-        for off in self.iter_ready_from(self.settled_until()) {
+        let mut offs = Vec::with_capacity(max);
+        let from = self.settled_until();
+        let range  = from..u64::MAX ;
+        // Iterate overlapping ranges from `from` onwards, flatten to individual offsets
+        let iter = self.ready
+            .overlapping(&range)
+            .flat_map(|range| range.start.max(from)..range.end);
+        for off in iter {
             if offs.len() >= max {
                 break;
             }
@@ -1518,7 +1781,7 @@ impl QueueInternalState {
 
         // SETTLE beats inflight: always remove inflight if present
         let removed = self.inflight.remove(&offset);
-        self.ready.remove(&offset);
+        self.ready.remove(offset..offset+1);
         self.retries.remove(&offset);
         if removed.is_some() {
             // heap can have stale entries now
@@ -1549,14 +1812,14 @@ impl QueueInternalState {
         }
 
         if !requeue {
-            self.ready.remove(&offset);
+            self.ready.remove(offset..offset + 1);
+
             self.retries.remove(&offset);
             self.dead_letter(offset);
             return;
         }
 
-        let exists = self.inflight.contains_key(&offset)
-            || self.ready.contains(&offset);
+        let exists = self.inflight.contains_key(&offset) || self.ready.contains(&offset);
         if !exists {
             return;
         }
@@ -1565,14 +1828,15 @@ impl QueueInternalState {
 
         let retries = self.retries.entry(offset).or_insert(0);
         if *retries >= self.dlq_discard_max_retries {
-            self.ready.remove(&offset);
+            self.ready.remove(offset..offset + 1);
+
             self.retries.remove(&offset);
             self.dead_letter(offset);
             return;
         }
 
         *retries += 1;
-        self.ready.insert(offset);
+        self.ready.insert(offset..offset + 1);
         self.recompute_hint_if_needed();
     }
 
@@ -1732,7 +1996,7 @@ impl QueueInternalState {
             return;
         }
 
-        self.ready.insert(offset);
+        self.ready.insert(offset..offset + 1);
         if retries > 0 {
             self.retries.insert(offset, retries);
         }
@@ -1758,10 +2022,11 @@ impl QueueInternalState {
             return;
         }
 
-        // Case 2: initial delivery — must be READY
-        if !self.ready.remove(&offset) {
+        // Case 2: initial delivery, must be READY
+        if !self.ready.contains(&offset) {
             return;
         }
+        self.ready.remove(offset..offset + 1);
 
         self.inflight.insert(offset, deadline);
         self.expiry_heap.push((Reverse(deadline), offset));
@@ -1783,7 +2048,11 @@ impl QueueInternalState {
         }
     }
 
-    pub fn mark_inflight_uniform_deadline_with_retries(&mut self, offsets: &[(Offset, u32)], deadline: UnixMillis) {
+    pub fn mark_inflight_uniform_deadline_with_retries(
+        &mut self,
+        offsets: &[(Offset, u32)],
+        deadline: UnixMillis,
+    ) {
         for &(o, _) in offsets {
             self.mark_inflight(o, deadline);
         }
@@ -1839,7 +2108,7 @@ impl QueueInternalState {
             match self.inflight.get(&off).copied() {
                 Some(cur_deadline) if cur_deadline == deadline => {
                     self.inflight.remove(&off);
-                    self.ready.insert(off);
+                    self.ready.insert(off..off + 1);
                     out.push(off);
                 }
                 _ => continue,
@@ -1924,27 +2193,20 @@ impl QueueInternalState {
     /// Find next deliverable offset in [from, upper).
     /// Skips inflight and (bounded) acked entries.
     pub fn next_deliverable(&self, from: Offset, upper: Offset) -> Offset {
-        let mut off = from.max(self.settled_until);
-
-        while off < upper {
-            if !self.ready.contains(&off) {
-                off += 1;
-                continue;
+        let start = from.max(self.settled_until);
+        
+        for range in self.ready.overlapping(&(start..upper)) {
+            let range_start = range.start.max(start);
+            for off in range_start..range.end.min(upper) {
+                if self.inflight.contains_key(&off) {
+                    continue;
+                }
+                if self.is_acked(off) {
+                    continue;
+                }
+                return off;
             }
-
-            if self.inflight.contains_key(&off) {
-                off += 1;
-                continue;
-            }
-
-            if self.is_acked(off) {
-                off += 1;
-                continue;
-            }
-
-            return off;
         }
-
         upper
     }
 
@@ -2082,9 +2344,11 @@ impl QueueInternalState {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
-        out.extend_from_slice(&(self.ready.len() as u32).to_be_bytes());
-        for off in self.ready.iter() {
-            out.extend_from_slice(&off.to_be_bytes());
+        let ranges: Vec<_> = self.ready.iter().collect();
+        out.extend_from_slice(&(ranges.len() as u32).to_be_bytes());
+        for range in ranges {
+            out.extend_from_slice(&range.start.to_be_bytes());
+            out.extend_from_slice(&range.end.to_be_bytes());
         }
 
         // dlq policy
@@ -2177,10 +2441,11 @@ impl QueueInternalState {
             self.retries.insert(off, retries);
         }
 
-        let ready_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
-        for _ in 0..ready_len {
-            let off: u64 = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            self.ready.insert(off);
+        let ranges_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        for _ in 0..ranges_len {
+            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.ready.insert(start..end);
         }
 
         let tag = take::<1>(&mut bytes)?[0];
@@ -2222,8 +2487,8 @@ impl QueueInternalState {
             return Err(Error::new(ErrorKind::InvalidData, "inflight < frontier"));
         }
 
-        for off in self.inflight.keys() {
-            self.ready.remove(off);
+        for off in self.inflight.keys().copied() {
+            self.ready.remove(off..off+1);
         }
 
         self.rebuild_derived();
@@ -2286,6 +2551,49 @@ pub struct QueueStatusReport {
     /// Best-effort next expiry (validated, may be slightly stale but never incorrect)
     pub next_expiry_hint: Option<UnixMillis>,
     pub lowest_unacked: Offset,
+}
+
+#[derive(Debug, Serialize)]
+pub struct StromaDebugSnapshot {
+    pub queues: Vec<QueueDebugInfo>,
+    pub queue_count: usize,
+    pub cmd_queue_depths: HashMap<String, usize>, // lane name -> depth
+    pub snapshot_metrics: SnapshotMetricsSnapshot,
+    pub recovery_metrics: RecoveryMetricsSnapshot,
+    pub log_metrics: LogMetricsSnapshot,
+    pub command_metrics: CommandMetricsSnapshot,
+    pub uptime_seconds: u64,
+}
+#[derive(Debug, Serialize)]
+pub struct QueueDebugInfo {
+    pub topic: String,
+    pub partition: u32,
+    pub group: Option<String>,
+
+    pub applied_upto: u64,
+    pub last_snapshot_timestamp: u64,
+    pub last_snapshot_event_offset: u64,
+    pub dirty_since_snapshot: bool,
+    pub creating_snapshot: bool,
+
+    pub state: QueueInternalDebugInfo,
+}
+
+#[derive(Debug, Clone, Default, Serialize)]
+pub struct QueueInternalDebugInfo {
+    pub settled_until: Offset,
+    pub ack_window_base: Offset,
+    pub ready_count: usize,
+    pub inflight_count: usize,
+    pub retries_count: usize,
+    pub min_ready: Option<Offset>,
+    pub max_ready: Option<Offset>,
+    pub min_inflight: Option<Offset>,
+    pub max_inflight: Option<Offset>,
+    pub expiry_heap_size: usize,
+    pub next_expiry_hint: Option<UnixMillis>,
+    pub dlq_policy: String,
+    pub dlq_max_retries: u32,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -2511,7 +2819,7 @@ mod tests {
     fn offset_in_exactly_one_state() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(5);
+        s.ready.insert(5..5+1);
         assert!(s.is_ready(5));
         assert!(!s.is_inflight(5));
 
@@ -2533,7 +2841,7 @@ mod tests {
     fn retries_persist_across_redelivery() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(1);
+        s.ready.insert(1..1+1);
         s.mark_inflight(1, 100);
         s.nack(1, true);
 
@@ -2972,7 +3280,7 @@ mod tests {
     fn snapshot_inconsistent_ready_retries() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(5); // no retries entry
+        s.ready.insert(5..5+1); // no retries entry
 
         let snap = s.encode_snapshot(0);
 

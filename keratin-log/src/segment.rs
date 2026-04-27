@@ -69,6 +69,7 @@ impl Segment {
 
     pub fn append_bytes(&mut self, data: &[u8]) -> io::Result<u64> {
         // returns start position where this append begins
+        // TODO: Seek to last successful write end? To overwrite corrupted
         let start = self.file.seek(SeekFrom::End(0))?;
         self.file.write_all(data)?;
         self.bytes_written += data.len() as u64;
