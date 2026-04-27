@@ -23,7 +23,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     Result, StromaError,
-    event::StromaEvent,
+    event::{AckEventMeta, EnqueueEventMeta, NackEventMeta, StromaEvent},
     metrics::StromaMetrics,
     partition::Partition,
     state::{
@@ -145,6 +145,117 @@ impl ApplyThenComplete {
             qh,
             inner,
         })
+    }
+}
+
+/// Completion for the msg_log batch in append_message_batch.
+/// Once msg-log durability is reached, emits one EnqueueMany event_log entry,
+/// then fans out per client completions with assigned offsets.
+struct MsgBatchCompletion {
+    stroma: Stroma,
+    tp: Box<str>,
+    part: u32,
+    group: Option<Box<str>>,
+    completions: Vec<Box<dyn AppendCompletion<IoError>>>,
+    durability: KDurability,
+    runtime: tokio::runtime::Handle,
+}
+
+impl MsgBatchCompletion {
+    fn new(
+        stroma: Stroma,
+        tp: Box<str>,
+        part: u32,
+        group: Option<Box<str>>,
+        completions: Vec<Box<dyn AppendCompletion<IoError>>>,
+        durability: KDurability,
+    ) -> Box<Self> {
+        Box::new(Self {
+            stroma,
+            tp,
+            part,
+            group,
+            completions,
+            durability,
+            runtime: tokio::runtime::Handle::current(),
+        })
+    }
+}
+
+impl AppendCompletion<IoError> for MsgBatchCompletion {
+    fn complete(self: Box<Self>, res: std::result::Result<AppendResult, IoError>) {
+        let Self {
+            stroma,
+            tp,
+            part,
+            group,
+            completions,
+            durability,
+            runtime,
+        } = *self;
+
+        let ar = match res {
+            Ok(ar) => ar,
+            Err(err) => {
+                let err_msg = err.to_string();
+                for c in completions {
+                    c.complete(Err(IoError::new(err_msg.clone())));
+                }
+                return;
+            }
+        };
+
+        let base = ar.base_offset;
+        let count = ar.count as u64;
+
+        if count != completions.len() as u64 {
+            tracing::error!(
+                "msg-log batch returned count={} but we had {} completions",
+                count,
+                completions.len()
+            );
+            // Continue anyway with whichever is smaller, fan out will not go past either
+        }
+
+        // Build EnqueueMany event for the event log
+        let metas: Vec<EnqueueEventMeta> = (0..count)
+            .map(|i| EnqueueEventMeta {
+                off: base + i,
+                retries: 0,
+            })
+            .collect();
+
+        let event = StromaEvent::EnqueueMany {
+            tp: tp.clone(),
+            part,
+            group: group.clone(),
+            reqs: metas,
+        };
+
+        // Spawn the event_log append + fan-out. We are inside a sync completion
+        // callback (called from the writer thread), so we cannot await directly.
+        // The completion thread should not block, we hand off to the runtime
+        runtime.spawn(async move {
+            match stroma
+                .append_events_durable(&tp, part, group.as_deref(), vec![event], durability)
+                .await
+            {
+                Ok(_) => {
+                    for (i, c) in completions.into_iter().enumerate() {
+                        c.complete(Ok(AppendResult {
+                            base_offset: base + i as u64,
+                            count: 1,
+                        }));
+                    }
+                }
+                Err(err) => {
+                    let err_msg = err.to_string();
+                    for c in completions {
+                        c.complete(Err(IoError::new(err_msg.clone())));
+                    }
+                }
+            }
+        });
     }
 }
 
@@ -582,7 +693,7 @@ impl Stroma {
                 tp,
                 part,
                 group,
-                reqs
+                reqs,
             } => {
                 let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::EnqueueMany {
@@ -708,7 +819,7 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let qh = self.queue_handle_sync(&tp,part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::ClearInflight {
                     offset: off,
                     response: None,
@@ -1860,37 +1971,70 @@ impl Stroma {
 }
 
 impl Stroma {
-    /// Append a batch of message payloads and return assigned offsets.
-    pub async fn append_messages_batch(
+    /// Append a batch of messages with one msg-log batch and one event-log batch.
+    /// Each client gets its own completion that fires with its assigned offset
+    /// after both the msg-log AND event-log batches complete durably.
+    pub async fn append_message_batch(
         &self,
         tp: &str,
         part: u32,
         group: Option<&str>,
-        payloads: &[Vec<u8>],
-    ) -> Result<Vec<Offset>> {
-        if payloads.is_empty() {
-            return Ok(Vec::new());
+        items: Vec<(MessageHeaders, Vec<u8>, Box<dyn AppendCompletion<IoError>>)>,
+    ) -> Result<()> {
+        if items.is_empty() {
+            return Ok(());
         }
 
-        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
-        let mut msgs = Vec::with_capacity(payloads.len());
-        for p in payloads {
-            msgs.push(Message {
+        self.ensure_queue(tp, part, group).await?;
+        let qh = self.queue_handle(tp, part, group).await?;
+        let msg_log = qh.msg_log();
+
+        // Build msg_log batch and extract per client completions.
+        // Per message header encode failures fail just that one completion.
+        let mut messages = Vec::with_capacity(items.len());
+        let mut completions = Vec::with_capacity(items.len());
+        for (headers, payload, completion) in items {
+            let header_bytes = match headers.encode() {
+                Ok(b) => b,
+                Err(err) => {
+                    completion.complete(Err(IoError::new(err.to_string())));
+                    continue;
+                }
+            };
+            messages.push(Message {
                 flags: 0,
-                headers: vec![],
-                payload: p.clone(),
+                headers: header_bytes,
+                payload,
             });
+            completions.push(completion);
         }
 
-        let ar = msg_log.append_batch(msgs, None).await.map_err(io_err)?;
-
-        let mut out = Vec::with_capacity(ar.count as usize);
-        let mut o = ar.base_offset;
-        for _ in 0..ar.count {
-            out.push(o);
-            o += 1;
+        if messages.is_empty() {
+            return Ok(());
         }
-        Ok(out)
+
+        // Custom completion that:
+        //   1. fires when the msg_log batch is durably accepted
+        //   2. emits ONE event_log batch with EnqueueMany
+        //   3. fans out per client completions with their assigned offsets
+        let stroma = self.clone();
+        let tp_box: Box<str> = tp.into();
+        let group_box: Option<Box<str>> = group.map(|s| s.into());
+
+        let msg_completion = MsgBatchCompletion::new(
+            stroma,
+            tp_box,
+            part,
+            group_box,
+            completions,
+            self.keratin_cfg.default_durability,
+        );
+
+        msg_log
+            .append_batch_enqueue(messages, None, msg_completion)
+            .map_err(io_err)?;
+
+        Ok(())
     }
 
     pub async fn append_message(
@@ -1991,10 +2135,38 @@ impl Stroma {
         };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let log = qh.event_log();
-        let msg = event_msg(&ev)?;
+        let event_log = qh.event_log();
+        let event_msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
-        log.append_enqueue(msg, None, outter_completion)
+        event_log.append_enqueue(event_msg, None, outter_completion)
+            .map_err(io_err)?;
+
+        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
+
+        Ok(())
+    }
+
+    pub async fn ack_enqueue_many(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<AckEventMeta>,
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<()> {
+        let ev = StromaEvent::AckMany {
+            tp: tp.into(),
+            part,
+            group: group.map(|s| s.into()),
+            reqs,
+        };
+
+        let qh = self.queue_handle(tp, part, group).await?;
+        let event_log = qh.event_log();
+        let event_msg = event_msg(&ev)?;
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
+        event_log.append_enqueue(event_msg, None, outter_completion)
             .map_err(io_err)?;
 
         // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
@@ -2022,10 +2194,38 @@ impl Stroma {
 
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
-        let msg = event_msg(&ev)?;
+        let event_msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
         event_log
-            .append_enqueue(msg, None, outter_completion)
+            .append_enqueue(event_msg, None, outter_completion)
+            .map_err(io_err)?;
+
+        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
+        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
+
+        Ok(())
+    }
+
+    pub async fn nack_enqueue_many(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<NackEventMeta>,
+        completion: Box<dyn AppendCompletion<IoError>>,
+    ) -> Result<()> {
+        let ev = StromaEvent::NackMany {
+            tp: tp.into(),
+            part,
+            group: group.map(|s| s.into()),
+            reqs,
+        };
+
+        let qh = self.queue_handle(tp, part, group).await?;
+        let event_log = qh.event_log();
+        let event_msg = event_msg(&ev)?;
+        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
+        event_log.append_enqueue(event_msg, None, outter_completion)
             .map_err(io_err)?;
 
         // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);

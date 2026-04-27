@@ -13,6 +13,7 @@ pub use keratin_log::{
 pub use state::{QueueHandle, QueueInternalState};
 pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};
 pub use metrics::StromaMetrics;
+pub use event::{EnqueueEventMeta, AckEventMeta, NackEventMeta, MarkInflightEventMeta};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
