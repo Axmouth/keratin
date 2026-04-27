@@ -114,7 +114,7 @@ impl AppendCompletion<IoError> for ApplyThenComplete {
                 let ev = self.ev.clone();
                 let inner = self.inner;
 
-                match stroma.enqueue_event_inmem(&ev) {
+                match stroma.enqueue_event_inmem(ev) {
                     Ok(()) => {
                         // let _ = tx.send(Ok(ar));
                         self.qh
@@ -560,7 +560,8 @@ impl Stroma {
             .ok_or_else(|| io::Error::other("queue handle not initialized"))
     }
 
-    fn enqueue_event_inmem(&self, ev: &StromaEvent) -> std::io::Result<()> {
+    fn enqueue_event_inmem(&self, ev: StromaEvent) -> std::io::Result<()> {
+        tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue {
                 tp,
@@ -569,10 +570,23 @@ impl Stroma {
                 off,
                 retries,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::Enqueue {
-                    offset: *off,
-                    retries: *retries,
+                    offset: off,
+                    retries,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+            }
+            StromaEvent::EnqueueMany {
+                tp,
+                part,
+                group,
+                reqs
+            } => {
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
+                let command = QueueCommand::EnqueueMany {
+                    reqs,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -584,10 +598,23 @@ impl Stroma {
                 off,
                 deadline,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::MarkInflight {
-                    offset: *off,
-                    deadline: *deadline,
+                    offset: off,
+                    deadline,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+            }
+            StromaEvent::MarkInflightMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
+                let command = QueueCommand::MarkInflightMany {
+                    reqs,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -598,9 +625,25 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::Ack {
-                    offset: *off,
+                    offset: off,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+                // - duplicate ACKs
+                // - late ACK after consumer retry
+                // ACK is idempotent and safe.
+            }
+            StromaEvent::AckMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
+                let command = QueueCommand::AckMany {
+                    reqs,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -615,14 +658,32 @@ impl Stroma {
                 off,
                 requeue,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::Nack {
-                    offset: *off,
-                    requeue: *requeue,
+                    offset: off,
+                    requeue,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
-                // ✅ Accept NACK even if not inflight:
+                // Accept NACK even if not inflight:
+                // - race with expiry worker
+                // - duplicate NACKs
+                // - late NACK after consumer retry
+                // NACK is idempotent and safe.
+            }
+            StromaEvent::NackMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
+                let command = QueueCommand::NackMany {
+                    reqs,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+                // Accept NACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate NACKs
                 // - late NACK after consumer retry
@@ -634,9 +695,9 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp, part, group.as_deref())?;
                 let command = QueueCommand::DeadLetter {
-                    offset: *off,
+                    offset: off,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -647,15 +708,15 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let qh = self.queue_handle_sync(tp, *part, group.as_deref())?;
+                let qh = self.queue_handle_sync(&tp,part, group.as_deref())?;
                 let command = QueueCommand::ClearInflight {
-                    offset: *off,
+                    offset: off,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
-                self.remove_queue(tp, *part, group.as_deref());
+                self.remove_queue(&tp, part, group.as_deref());
                 // TODO: More cleanup?
             }
             StromaEvent::Snapshot { .. } => {
@@ -667,11 +728,11 @@ impl Stroma {
                 ));
             }
         }
-        tracing::debug!("Applied event: {ev:?}");
         Ok(())
     }
 
-    async fn apply_event_inmem(&self, ev: &StromaEvent) -> Result<()> {
+    async fn apply_event_inmem(&self, ev: StromaEvent) -> Result<()> {
+        tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue {
                 tp,
@@ -680,8 +741,17 @@ impl Stroma {
                 off,
                 retries,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                q.enqueue(*off, *retries).await;
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.enqueue(off, retries).await;
+            }
+            StromaEvent::EnqueueMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.enqueue_many(reqs).await;
             }
             StromaEvent::MarkInflight {
                 tp,
@@ -690,8 +760,17 @@ impl Stroma {
                 off,
                 deadline,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                q.mark_inflight(*off, *deadline).await;
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.mark_inflight(off, deadline).await;
+            }
+            StromaEvent::MarkInflightMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.mark_inflight_batch(reqs).await;
             }
             StromaEvent::Ack {
                 tp,
@@ -699,13 +778,27 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                // ✅ Accept ACK even if not inflight:
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                // Accept ACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
-                q.ack(*off).await;
+                q.ack(off).await;
+            }
+            StromaEvent::AckMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                // Accept ACK even if not inflight:
+                // - race with expiry worker
+                // - duplicate ACKs
+                // - late ACK after consumer retry
+                // ACK is idempotent and safe.
+                q.ack_many(reqs).await;
             }
             StromaEvent::Nack {
                 tp,
@@ -714,13 +807,27 @@ impl Stroma {
                 off,
                 requeue,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                // ✅ Accept NACK even if not inflight:
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                // Accept NACK even if not inflight:
                 // - race with expiry worker
                 // - duplicate NACKs
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
-                q.nack(*off, *requeue).await;
+                q.nack(off, requeue).await;
+            }
+            StromaEvent::NackMany {
+                tp,
+                part,
+                group,
+                reqs,
+            } => {
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                // Accept NACK even if not inflight:
+                // - race with expiry worker
+                // - duplicate NACKs
+                // - late NACK after consumer retry
+                // NACK is idempotent and safe.
+                q.nack_many(reqs).await;
             }
             StromaEvent::DeadLetter {
                 tp,
@@ -728,8 +835,8 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                q.dead_letter(*off).await;
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.dead_letter(off).await;
             }
             StromaEvent::ClearInflight {
                 tp,
@@ -737,11 +844,11 @@ impl Stroma {
                 group,
                 off,
             } => {
-                let q = self.queue_handle(tp, *part, group.as_deref()).await?;
-                q.clear_inflight(*off).await;
+                let q = self.queue_handle(&tp, part, group.as_deref()).await?;
+                q.clear_inflight(off).await;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
-                self.remove_queue(tp, *part, group.as_deref());
+                self.remove_queue(&tp, part, group.as_deref());
                 // TODO: More cleanup?
             }
             StromaEvent::Snapshot { .. } => {
@@ -752,7 +859,6 @@ impl Stroma {
                 ));
             }
         }
-        tracing::debug!("Applied event: {ev:?}");
         Ok(())
     }
 
@@ -761,7 +867,7 @@ impl Stroma {
         tp: &str,
         part: u32,
         group: Option<&str>,
-        evs: &[StromaEvent],
+        evs: Vec<StromaEvent>,
         durability: KDurability,
     ) -> Result<Offset> {
         if evs.is_empty() {
@@ -777,7 +883,8 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
-        for ev in evs {
+        let msgs_count = msgs.len();
+        for ev in &evs {
             msgs.push(event_msg(ev)?);
         }
         let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
@@ -790,13 +897,13 @@ impl Stroma {
 
         self.metrics
             .event_log_appends
-            .observe(evs.len(), bytes_count);
+            .observe(msgs_count, bytes_count);
         qh.applied_upto()
             .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
         qh.set_dirty_snapshot(true);
 
         // Apply in memory after durable accept.
-        for ev in evs {
+        for ev in evs.into_iter() {
             self.apply_event_inmem(ev).await?;
         }
 
@@ -840,7 +947,7 @@ impl Stroma {
         }
 
         let upto = self
-            .append_events_durable(tp, part, group, &evs, KDurability::AfterFsync)
+            .append_events_durable(tp, part, group, evs, KDurability::AfterFsync)
             .await?;
         self.maybe_snapshot(tp, part, group, upto).await?;
 
@@ -869,36 +976,10 @@ impl Stroma {
         }
 
         let upto = self
-            .append_events_durable(&tp, part, group, &evs, KDurability::AfterFsync)
+            .append_events_durable(&tp, part, group, evs, KDurability::AfterFsync)
             .await?;
         self.maybe_snapshot(&tp, part, group, upto).await?;
 
-        Ok(())
-    }
-
-    pub async fn clear_inflight(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-        off: Offset,
-    ) -> Result<()> {
-        let ev = StromaEvent::ClearInflight {
-            tp: tp.into(),
-            part,
-            group: group.map(|s| s.into()),
-            off,
-        };
-        let upto = self
-            .append_events_durable(
-                tp,
-                part,
-                group,
-                std::slice::from_ref(&ev),
-                KDurability::AfterFsync,
-            )
-            .await?;
-        self.maybe_snapshot(tp, part, group, upto).await?;
         Ok(())
     }
 
@@ -909,12 +990,6 @@ impl Stroma {
         group: Option<&str>,
         off: Offset,
     ) -> Result<()> {
-        // let ev1 = StromaEvent::ClearInflight {
-        //     tp: tp.into(),
-        //     part,
-        //     group: group.map(|s| s.into()),
-        //     off,
-        // };
         let ev1 = StromaEvent::Nack {
             tp: tp.into(),
             part,
@@ -923,7 +998,7 @@ impl Stroma {
             requeue: true,
         };
         let upto = self
-            .append_events_durable(tp, part, group, &[ev1], KDurability::AfterFsync)
+            .append_events_durable(tp, part, group, vec![ev1], KDurability::AfterFsync)
             .await?;
         self.maybe_snapshot(tp, part, group, upto).await?;
         Ok(())
@@ -944,7 +1019,7 @@ impl Stroma {
             requeue: true,
         };
         let upto = self
-            .append_events_durable(tp, part, group, &[ev], KDurability::AfterFsync)
+            .append_events_durable(tp, part, group, vec![ev], KDurability::AfterFsync)
             .await?;
         self.maybe_snapshot(tp, part, group, upto).await?;
         Ok(())
@@ -1087,7 +1162,7 @@ impl Stroma {
                 &tp,
                 part,
                 group.as_deref(),
-                &events,
+                events,
                 KDurability::AfterFsync,
             )
             .await?;
@@ -1489,7 +1564,7 @@ impl Stroma {
             for rec in batch {
                 cur = rec.offset + 1;
                 let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
-                self.apply_event_inmem(&ev).await?;
+                self.apply_event_inmem(ev).await?;
                 qh.applied_upto().store(cur, Ordering::Release);
                 events_count += 1;
             }
@@ -1579,8 +1654,10 @@ impl Stroma {
                     continue; // covered by snapshot
                 }
 
-                self.apply_event_inmem(&ev).await?;
-                self.applied_upto_entry(tp, part, group.as_deref())
+                let tp = tp.to_string();
+                let group = group.clone();
+                self.apply_event_inmem(ev).await?;
+                self.applied_upto_entry(&tp, part, group.as_deref())
                     .await?
                     .store(rec.offset + 1, Ordering::Release);
             }
@@ -1873,7 +1950,7 @@ impl Stroma {
                     &tp,
                     part,
                     group.as_deref(),
-                    &[ev],
+                    vec![ev],
                     stroma.keratin_cfg.default_durability,
                 )
                 .await
@@ -2286,9 +2363,13 @@ impl EventView for StromaEvent {
     fn tp(&self) -> &str {
         match self {
             StromaEvent::Enqueue { tp, .. } => tp,
+            StromaEvent::EnqueueMany { tp, .. } => tp,
             StromaEvent::MarkInflight { tp, .. } => tp,
+            StromaEvent::MarkInflightMany { tp, .. } => tp,
             StromaEvent::Ack { tp, .. } => tp,
+            StromaEvent::AckMany { tp, .. } => tp,
             StromaEvent::Nack { tp, .. } => tp,
+            StromaEvent::NackMany { tp, .. } => tp,
             StromaEvent::DeadLetter { tp, .. } => tp,
             StromaEvent::ClearInflight { tp, .. } => tp,
             StromaEvent::ResetQueue { tp, .. } => tp,
@@ -2298,9 +2379,13 @@ impl EventView for StromaEvent {
     fn part(&self) -> u32 {
         match self {
             StromaEvent::Enqueue { part, .. } => *part,
+            StromaEvent::EnqueueMany { part, .. } => *part,
             StromaEvent::MarkInflight { part, .. } => *part,
+            StromaEvent::MarkInflightMany { part, .. } => *part,
             StromaEvent::Ack { part, .. } => *part,
+            StromaEvent::AckMany { part, .. } => *part,
             StromaEvent::Nack { part, .. } => *part,
+            StromaEvent::NackMany { part, .. } => *part,
             StromaEvent::DeadLetter { part, .. } => *part,
             StromaEvent::ClearInflight { part, .. } => *part,
             StromaEvent::ResetQueue { part, .. } => *part,
@@ -2310,9 +2395,13 @@ impl EventView for StromaEvent {
     fn group(&self) -> &Option<Box<str>> {
         match self {
             StromaEvent::Enqueue { group, .. } => group,
+            StromaEvent::EnqueueMany { group, .. } => group,
             StromaEvent::MarkInflight { group, .. } => group,
+            StromaEvent::MarkInflightMany { group, .. } => group,
             StromaEvent::Ack { group, .. } => group,
+            StromaEvent::AckMany { group, .. } => group,
             StromaEvent::Nack { group, .. } => group,
+            StromaEvent::NackMany { group, .. } => group,
             StromaEvent::DeadLetter { group, .. } => group,
             StromaEvent::ClearInflight { group, .. } => group,
             StromaEvent::ResetQueue { group, .. } => group,

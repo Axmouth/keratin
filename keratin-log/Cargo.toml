@@ -15,7 +15,7 @@ fs2 = "0.4"
 parking_lot = "0.12"
 thiserror = "2.0"
 tokio = { version = "1", features = ["full"] }
-tracing = "0.1"
+tracing = { version = "0.1", features = ["release_max_level_info"] }
 tracing-subscriber = { version = "0.3", features = [
     "fmt",
     "env-filter",

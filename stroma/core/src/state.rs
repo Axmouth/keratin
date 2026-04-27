@@ -12,6 +12,7 @@ use serde::Serialize;
 use tokio::sync::mpsc;
 use tokio::time::Instant;
 
+use crate::event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta};
 use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
     StromaMetrics,
@@ -162,13 +163,17 @@ pub enum QueueCommand {
         retries: u32,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // offset, retries
+    EnqueueMany {
+        reqs: Vec<EnqueueEventMeta>,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // list[offset, retries]
     MarkInflight {
         offset: Offset,
         deadline: UnixMillis,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // offset, deadline
-    MarkInflightBatch {
-        entries: Vec<(Offset, UnixMillis)>,
+    MarkInflightMany {
+        reqs: Vec<MarkInflightEventMeta>,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // entries
     ClearInflight {
@@ -179,13 +184,17 @@ pub enum QueueCommand {
         offset: Offset,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // offset
-    AckBatch {
-        offsets: Vec<Offset>,
+    AckMany {
+        reqs: Vec<AckEventMeta>,
         response: Option<tokio::sync::oneshot::Sender<()>>,
-    }, // offsets
+    }, // list[offset]
     Nack {
         offset: Offset,
         requeue: bool,
+        response: Option<tokio::sync::oneshot::Sender<()>>,
+    }, // offset, requeue
+    NackMany {
+        reqs: Vec<NackEventMeta>,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // offset, requeue?
     DeadLetter {
@@ -346,20 +355,22 @@ impl QueueCommand {
             // Higher than publish so consumers drain the queue under load
             QueueCommand::PollReadyAndMark { .. } => CommandPrio::High,
             QueueCommand::MarkInflight { .. } => CommandPrio::High,
-            QueueCommand::MarkInflightBatch { .. } => CommandPrio::High,
+            QueueCommand::MarkInflightMany { .. } => CommandPrio::High,
 
             // === Settlement — finishes in-progress work, matches delivery priority ===
             // Ack/nack completing work frees up consumer prefetch slots; if this is
             // low priority, consumers stall waiting for acks to register
             QueueCommand::Ack { .. } => CommandPrio::High,
-            QueueCommand::AckBatch { .. } => CommandPrio::High,
+            QueueCommand::AckMany { .. } => CommandPrio::High,
             QueueCommand::Nack { .. } => CommandPrio::High,
+            QueueCommand::NackMany { .. } => CommandPrio::High,
             QueueCommand::Reject { .. } => CommandPrio::High,
             QueueCommand::DeadLetter { .. } => CommandPrio::High,
 
             // === Producer path — must accept writes but yield to delivery/settlement ===
             // Under overload, throttling publish is correct. Natural backpressure upstream.
             QueueCommand::Enqueue { .. } => CommandPrio::Medium,
+            QueueCommand::EnqueueMany { .. } => CommandPrio::Medium,
 
             // === Background maintenance — wait for quiet periods ===
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
@@ -377,12 +388,14 @@ impl QueueCommand {
         match self {
             QueueCommand::Shutdown { .. } => "Shutdown",
             QueueCommand::Enqueue { .. } => "Enqueue",
+            QueueCommand::EnqueueMany { .. } => "EnqueueMany",
             QueueCommand::MarkInflight { .. } => "MarkInflight",
-            QueueCommand::MarkInflightBatch { .. } => "MarkInflightBatch",
+            QueueCommand::MarkInflightMany { .. } => "MarkInflightMany",
             QueueCommand::ClearInflight { .. } => "ClearInflight",
             QueueCommand::Ack { .. } => "Ack",
-            QueueCommand::AckBatch { .. } => "AckBatch",
+            QueueCommand::AckMany { .. } => "AckMany",
             QueueCommand::Nack { .. } => "Nack",
+            QueueCommand::NackMany { .. } => "NackMany",
             QueueCommand::DeadLetter { .. } => "DeadLetter",
             QueueCommand::Reject { .. } => "Reject",
             QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
@@ -412,7 +425,7 @@ impl QueueCommand {
             QueueCommand::GetStatusReport { .. } => "GetStatusReport",
             QueueCommand::CollectExpired { .. } => "CollectExpired",
             QueueCommand::DumpInflight { .. } => "DumpInflight",
-            QueueCommand::GetDebugInfo { response } => "GetDebugInfo",
+            QueueCommand::GetDebugInfo { .. } => "GetDebugInfo",
         }
     }
 }
@@ -775,6 +788,16 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
+            QueueCommand::EnqueueMany {
+                reqs,
+                response,
+            } => {
+                state.enqueue_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !reqs.is_empty();
+            }
             QueueCommand::MarkInflight {
                 offset,
                 deadline,
@@ -786,12 +809,12 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
-            QueueCommand::MarkInflightBatch { entries, response } => {
-                state.mark_inflight_batch(&entries);
+            QueueCommand::MarkInflightMany { reqs, response } => {
+                state.mark_inflight_many(&reqs);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-                dirty = !entries.is_empty();
+                dirty = !reqs.is_empty();
             }
             QueueCommand::ClearInflight { offset, response } => {
                 state.clear_inflight(offset);
@@ -807,12 +830,12 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
-            QueueCommand::AckBatch { offsets, response } => {
-                state.ack_batch(&offsets);
+            QueueCommand::AckMany { reqs, response } => {
+                state.ack_many(&reqs);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-                dirty = !offsets.is_empty();
+                dirty = !reqs.is_empty();
             }
             QueueCommand::Nack {
                 offset,
@@ -824,6 +847,16 @@ impl QueueHandle {
                     let _ = r.send(());
                 }
                 dirty = true;
+            }
+            QueueCommand::NackMany {
+                reqs,
+                response,
+            } => {
+                state.nack_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !reqs.is_empty();
             }
             QueueCommand::DeadLetter { offset, response } => {
                 state.dead_letter(offset);
@@ -1133,6 +1166,19 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
+    pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+
+        let _ = self
+            .command_enqueue(QueueCommand::EnqueueMany {
+                reqs,
+                response: Some(tx),
+            })
+            .await;
+
+        rx.await.unwrap();
+    }
+
     pub async fn mark_inflight(&self, offset: Offset, deadline: UnixMillis) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
@@ -1145,11 +1191,11 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
-    pub async fn mark_inflight_batch(&self, entries: Vec<(Offset, UnixMillis)>) {
+    pub async fn mark_inflight_batch(&self, reqs: Vec<MarkInflightEventMeta>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::MarkInflightBatch {
-                entries,
+            .command_enqueue(QueueCommand::MarkInflightMany {
+                reqs,
                 response: Some(tx),
             })
             .await;
@@ -1178,11 +1224,11 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
-    pub async fn ack_batch(&self, offsets: Vec<Offset>) {
+    pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::AckBatch {
-                offsets,
+            .command_enqueue(QueueCommand::AckMany {
+                reqs,
                 response: Some(tx),
             })
             .await;
@@ -1195,6 +1241,17 @@ impl QueueHandle {
             .command_enqueue(QueueCommand::Nack {
                 offset,
                 requeue,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap();
+    }
+
+    pub async fn nack_many(&self, reqs: Vec<NackEventMeta>) {
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::NackMany {
+                reqs,
                 response: Some(tx),
             })
             .await;
@@ -1804,7 +1861,6 @@ impl QueueInternalState {
         }
     }
 
-    // TODO: move non storage related logic elsewhere?
     pub fn nack(&mut self, offset: u64, requeue: bool) {
         if offset < self.settled_until {
             self.inflight.remove(&offset);
@@ -1840,7 +1896,13 @@ impl QueueInternalState {
         self.recompute_hint_if_needed();
     }
 
-    // TODO: move non storage related logic elsewhere?
+    pub fn nack_many(&mut self, reqs: &[NackEventMeta]) {
+        for req in reqs {
+            self.nack(req.off, req.requeue);
+        }
+    }
+
+    // TODO: todo
     pub fn dead_letter(&mut self, offset: u64) {
         // let global_dlq = &stroma.global_dlq;
 
@@ -1933,9 +1995,9 @@ impl QueueInternalState {
         }
     }
 
-    pub fn ack_batch(&mut self, offsets: &[Offset]) {
-        for &o in offsets {
-            self.ack(o);
+    pub fn ack_many(&mut self, reqs: &[AckEventMeta]) {
+        for e in reqs {
+            self.ack(e.off);
         }
     }
 
@@ -2002,6 +2064,12 @@ impl QueueInternalState {
         }
     }
 
+    pub fn enqueue_many(&mut self, reqs: &[EnqueueEventMeta]) {
+        for req in reqs {
+            self.enqueue(req.off, req.retries);
+        }
+    }
+
     // ---------------- Inflight API ----------------
 
     /// Mark inflight for an offset. If offset is already ACKed, no-op.
@@ -2036,9 +2104,9 @@ impl QueueInternalState {
         });
     }
 
-    pub fn mark_inflight_batch(&mut self, entries: &[(Offset, UnixMillis)]) {
-        for &(o, d) in entries {
-            self.mark_inflight(o, d);
+    pub fn mark_inflight_many(&mut self, reqs: &[MarkInflightEventMeta]) {
+        for e in reqs {
+            self.mark_inflight(e.off, e.deadline);
         }
     }
 
@@ -2618,7 +2686,7 @@ impl Default for CanonicalQueueState {
 #[cfg(test)]
 mod tests {
     use super::{Offset, QueueInternalState};
-    use crate::state::{CustomDLQ, DLQDiscardPolicy};
+    use crate::{event::AckEventMeta, state::{CustomDLQ, DLQDiscardPolicy}};
 
     #[test]
     fn next_deliverable_requires_ready() {
@@ -3428,7 +3496,7 @@ mod tests {
     fn mark_inflight_ignored_if_already_acked() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ack_batch(&[0, 1, 2, 3, 4]);
+        s.ack_many(&[0, 1, 2, 3, 4].map(|off| AckEventMeta {off}));
         assert_eq!(s.settled_until(), 5);
 
         s.enqueue(2, 0);
@@ -3522,8 +3590,8 @@ mod tests {
     #[test]
     fn ack_batch_handles_duplicates() {
         let mut s = QueueInternalState::new("test".into(), 0);
-        let v: Vec<Offset> = vec![2, 2, 0, 1, 1, 3];
-        s.ack_batch(&v);
+        let v: Vec<AckEventMeta> = [2, 2, 0, 1, 1, 3].into_iter().map(|off| AckEventMeta {off}).collect();
+        s.ack_many(&v);
         assert_eq!(s.settled_until(), 4);
     }
 }
