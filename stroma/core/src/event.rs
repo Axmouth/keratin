@@ -17,8 +17,6 @@ pub enum EventType {
     AckMany = 21,
     Nack = 30,
     NackMany = 31,
-    DeadLetter = 40,
-    ClearInflight = 50,
     ResetQueue = 60,
     Snapshot = 70,
 }
@@ -50,67 +48,31 @@ pub struct MarkInflightEventMeta {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StromaEvent {
     Enqueue {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         off: Offset,
         retries: u32,
     },
     EnqueueMany {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         reqs: Vec<EnqueueEventMeta>,
     },
     MarkInflight {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         off: Offset,
         deadline: UnixMillis,
     },
     MarkInflightMany {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         reqs: Vec<MarkInflightEventMeta>,
     },
     Ack {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         off: Offset,
     },
     AckMany {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         reqs: Vec<AckEventMeta>,
     },
     Nack {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         off: Offset,
         requeue: bool,
     },
     NackMany {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         reqs: Vec<NackEventMeta>,
-    },
-    DeadLetter {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
-        off: Offset,
-    },
-    ClearInflight {
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
-        off: Offset,
     },
     ResetQueue {
         tp: Box<str>,
@@ -231,82 +193,34 @@ impl StromaEvent {
 
         match self {
             StromaEvent::Enqueue {
-                tp,
-                part,
-                group,
                 off,
                 retries,
             } => {
                 put_u16(&mut out, EventType::Enqueue as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_u32(&mut out, *retries);
             }
             StromaEvent::MarkInflight {
-                tp,
-                part,
-                group,
                 off,
                 deadline,
             } => {
                 put_u16(&mut out, EventType::MarkInflight as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_u64(&mut out, *deadline);
             }
             StromaEvent::Ack {
-                tp,
-                part,
-                group,
                 off,
             } => {
                 put_u16(&mut out, EventType::Ack as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
             }
             StromaEvent::Nack {
-                tp,
-                part,
-                group,
                 off,
                 requeue,
             } => {
                 put_u16(&mut out, EventType::Nack as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u64(&mut out, *off);
                 put_bool(&mut out, *requeue);
-            }
-            StromaEvent::DeadLetter {
-                tp,
-                part,
-                group,
-                off,
-            } => {
-                put_u16(&mut out, EventType::DeadLetter as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
-                put_u64(&mut out, *off);
-            }
-            StromaEvent::ClearInflight {
-                tp,
-                part,
-                group,
-                off,
-            } => {
-                put_u16(&mut out, EventType::ClearInflight as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
-                put_u64(&mut out, *off);
             }
             StromaEvent::ResetQueue { tp, part, group } => {
                 put_u16(&mut out, EventType::ResetQueue as u16);
@@ -334,43 +248,31 @@ impl StromaEvent {
                 put_u32(&mut out, blob.len() as u32);
                 out.extend_from_slice(blob);
             }
-            StromaEvent::EnqueueMany { tp, part, group, reqs } => {
+            StromaEvent::EnqueueMany { reqs } => {
                 put_u16(&mut out, EventType::EnqueueMany as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u32(&mut out, reqs.len() as u32);
                 for req in reqs {
                     put_u64(&mut out, req.off);
                     put_u32(&mut out, req.retries);
                 }
             }
-            StromaEvent::MarkInflightMany { tp, part, group, reqs } => {
+            StromaEvent::MarkInflightMany { reqs } => {
                 put_u16(&mut out, EventType::MarkInflightMany as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u32(&mut out, reqs.len() as u32);
                 for req in reqs {
                     put_u64(&mut out, req.off);
                     put_u64(&mut out, req.deadline);
                 }
             }
-            StromaEvent::AckMany { tp, part, group, reqs } => {
+            StromaEvent::AckMany { reqs } => {
                 put_u16(&mut out, EventType::AckMany as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u32(&mut out, reqs.len() as u32);
                 for req in reqs {
                     put_u64(&mut out, req.off);
                 }
             }
-            StromaEvent::NackMany { tp, part, group, reqs } => {
+            StromaEvent::NackMany { reqs } => {
                 put_u16(&mut out, EventType::NackMany as u16);
-                put_str(&mut out, tp)?;
-                put_u32(&mut out, *part);
-                put_str(&mut out, &group.clone().unwrap_or("".into()))?;
                 put_u32(&mut out, reqs.len() as u32);
                 for req in reqs {
                     put_u64(&mut out, req.off);
@@ -402,111 +304,33 @@ impl StromaEvent {
         let ty = rd_u16(bytes, &mut i)?;
         match ty {
             x if x == EventType::Enqueue as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
                 let off = rd_u64(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let retries = rd_u32(bytes, &mut i)?;
                 Ok(StromaEvent::Enqueue {
-                    tp,
-                    part,
-                    group,
                     off,
                     retries,
                 })
             }
             x if x == EventType::MarkInflight as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let off = rd_u64(bytes, &mut i)?;
                 let deadline = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::MarkInflight {
-                    tp,
-                    part,
-                    group,
                     off,
                     deadline,
                 })
             }
             x if x == EventType::Ack as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let off = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::Ack {
-                    tp,
-                    part,
-                    group,
                     off,
                 })
             }
             x if x == EventType::Nack as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let off = rd_u64(bytes, &mut i)?;
                 let requeue = rd_bool(bytes, &mut i)?;
                 Ok(StromaEvent::Nack {
-                    tp,
-                    part,
-                    group,
                     off,
                     requeue,
-                })
-            }
-            x if x == EventType::DeadLetter as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
-                let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::DeadLetter {
-                    tp,
-                    part,
-                    group,
-                    off,
-                })
-            }
-            x if x == EventType::ClearInflight as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
-                let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::ClearInflight {
-                    tp,
-                    part,
-                    group,
-                    off,
                 })
             }
             x if x == EventType::ResetQueue as u16 => {
@@ -545,14 +369,6 @@ impl StromaEvent {
                 })
             }
             x if x == EventType::EnqueueMany as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -561,21 +377,10 @@ impl StromaEvent {
                     reqs.push(EnqueueEventMeta { off, retries });
                 }
                 Ok(StromaEvent::EnqueueMany {
-                    tp,
-                    part,
-                    group,
                     reqs,
                 })
             }
             x if x == EventType::MarkInflightMany as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -584,21 +389,10 @@ impl StromaEvent {
                     reqs.push(MarkInflightEventMeta { off, deadline });
                 }
                 Ok(StromaEvent::MarkInflightMany {
-                    tp,
-                    part,
-                    group,
                     reqs,
                 })
             }
             x if x == EventType::AckMany as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -606,21 +400,10 @@ impl StromaEvent {
                     reqs.push(AckEventMeta { off });
                 }
                 Ok(StromaEvent::AckMany {
-                    tp,
-                    part,
-                    group,
                     reqs,
                 })
             }
             x if x == EventType::NackMany as u16 => {
-                let tp = rd_box_str(bytes, &mut i)?;
-                let part = rd_u32(bytes, &mut i)?;
-                let group_str = rd_box_str(bytes, &mut i)?;
-                let group = if group_str.is_empty() {
-                    None
-                } else {
-                    Some(group_str)
-                };
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {
@@ -629,9 +412,6 @@ impl StromaEvent {
                     reqs.push(NackEventMeta { off, requeue });
                 }
                 Ok(StromaEvent::NackMany {
-                    tp,
-                    part,
-                    group,
                     reqs,
                 })
             }
@@ -650,9 +430,6 @@ mod tests {
     #[test]
     fn test_enqueue_encode_decode() {
         let event = StromaEvent::Enqueue {
-            tp: "topic".into(),
-            part: 1,
-            group: Some("group".into()),
             off: 100,
             retries: 5,
         };
@@ -664,9 +441,6 @@ mod tests {
     #[test]
     fn test_enqueue_without_group() {
         let event = StromaEvent::Enqueue {
-            tp: "topic".into(),
-            part: 0,
-            group: None,
             off: 0,
             retries: 0,
         };
@@ -678,9 +452,6 @@ mod tests {
     #[test]
     fn test_mark_inflight_encode_decode() {
         let event = StromaEvent::MarkInflight {
-            tp: "topic".into(),
-            part: 2,
-            group: Some("group".into()),
             off: 200,
             deadline: 1234567890,
         };
@@ -692,9 +463,6 @@ mod tests {
     #[test]
     fn test_ack_encode_decode() {
         let event = StromaEvent::Ack {
-            tp: "topic".into(),
-            part: 3,
-            group: None,
             off: 300,
         };
         let encoded = event.encode().unwrap();
@@ -705,9 +473,6 @@ mod tests {
     #[test]
     fn test_nack_encode_decode() {
         let event = StromaEvent::Nack {
-            tp: "topic".into(),
-            part: 1,
-            group: Some("group".into()),
             off: 150,
             requeue: true,
         };
@@ -719,37 +484,8 @@ mod tests {
     #[test]
     fn test_nack_no_requeue() {
         let event = StromaEvent::Nack {
-            tp: "topic".into(),
-            part: 1,
-            group: None,
             off: 150,
             requeue: false,
-        };
-        let encoded = event.encode().unwrap();
-        let decoded = StromaEvent::decode(&encoded).unwrap();
-        assert_eq!(event, decoded);
-    }
-
-    #[test]
-    fn test_dead_letter_encode_decode() {
-        let event = StromaEvent::DeadLetter {
-            tp: "topic".into(),
-            part: 2,
-            group: Some("group".into()),
-            off: 250,
-        };
-        let encoded = event.encode().unwrap();
-        let decoded = StromaEvent::decode(&encoded).unwrap();
-        assert_eq!(event, decoded);
-    }
-
-    #[test]
-    fn test_clear_inflight_encode_decode() {
-        let event = StromaEvent::ClearInflight {
-            tp: "topic".into(),
-            part: 0,
-            group: None,
-            off: 50,
         };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -784,9 +520,6 @@ mod tests {
     #[test]
     fn test_enqueue_many_encode_decode() {
         let event = StromaEvent::EnqueueMany {
-            tp: "topic".into(),
-            part: 2,
-            group: Some("group".into()),
             reqs: vec![
                 EnqueueEventMeta { off: 100, retries: 1 },
                 EnqueueEventMeta { off: 101, retries: 2 },
@@ -800,9 +533,6 @@ mod tests {
     #[test]
     fn test_mark_inflight_many_encode_decode() {
         let event = StromaEvent::MarkInflightMany {
-            tp: "topic".into(),
-            part: 1,
-            group: None,
             reqs: vec![
                 MarkInflightEventMeta { off: 200, deadline: 1000 },
                 MarkInflightEventMeta { off: 201, deadline: 2000 },
@@ -816,9 +546,6 @@ mod tests {
     #[test]
     fn test_ack_many_encode_decode() {
         let event = StromaEvent::AckMany {
-            tp: "topic".into(),
-            part: 3,
-            group: Some("group".into()),
             reqs: vec![AckEventMeta { off: 300 }, AckEventMeta { off: 301 }],
         };
         let encoded = event.encode().unwrap();
@@ -829,9 +556,6 @@ mod tests {
     #[test]
     fn test_nack_many_encode_decode() {
         let event = StromaEvent::NackMany {
-            tp: "topic".into(),
-            part: 0,
-            group: None,
             reqs: vec![
                 NackEventMeta { off: 400, requeue: true },
                 NackEventMeta { off: 401, requeue: false },
@@ -844,9 +568,13 @@ mod tests {
 
     #[test]
     fn test_invalid_magic() {
-        let mut bytes = vec![0u8; 20];
+        let bytes = vec![0u8; 20];
         let decoded = StromaEvent::decode(&bytes);
         assert!(decoded.is_err());
+        assert_eq!(decoded.map_err(|e| e.to_string()), Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "not stroma event",
+            ).to_string()))
     }
 
     #[test]

@@ -27,10 +27,10 @@ async fn random_operations_never_break_invariants() {
 
     for _ in 0..50_000 {
         let o = fastrand::u64(0..2000);
-        match fastrand::u8(0..3) {
-            0 => q.mark_inflight(o, fastrand::u64(0..100_000)).await,
-            1 => q.ack(o).await,
-            _ => q.clear_inflight(o).await,
+        match fastrand::u8(0..10) {
+            0 | 4 | 8 => q.mark_inflight(o, fastrand::u64(0..100_000)).await,
+            1 | 5 | 7 => q.ack(o).await,
+            i => q.nack(o, i.is_multiple_of(3)).await,
         }
 
         // Since we never mention offsets >= 2000, frontier must never exceed 2000.

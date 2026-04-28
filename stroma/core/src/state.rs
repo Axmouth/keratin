@@ -176,10 +176,6 @@ pub enum QueueCommand {
         reqs: Vec<MarkInflightEventMeta>,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // entries
-    ClearInflight {
-        offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
-    }, // offset
     Ack {
         offset: Offset,
         response: Option<tokio::sync::oneshot::Sender<()>>,
@@ -197,15 +193,6 @@ pub enum QueueCommand {
         reqs: Vec<NackEventMeta>,
         response: Option<tokio::sync::oneshot::Sender<()>>,
     }, // offset, requeue?
-    DeadLetter {
-        offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
-    }, // offset
-    Reject {
-        offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
-    }, // offset
-
     AdvanceFrontier {
         response: Option<tokio::sync::oneshot::Sender<()>>,
     },
@@ -364,8 +351,6 @@ impl QueueCommand {
             QueueCommand::AckMany { .. } => CommandPrio::High,
             QueueCommand::Nack { .. } => CommandPrio::High,
             QueueCommand::NackMany { .. } => CommandPrio::High,
-            QueueCommand::Reject { .. } => CommandPrio::High,
-            QueueCommand::DeadLetter { .. } => CommandPrio::High,
 
             // === Producer path — must accept writes but yield to delivery/settlement ===
             // Under overload, throttling publish is correct. Natural backpressure upstream.
@@ -374,7 +359,6 @@ impl QueueCommand {
 
             // === Background maintenance — wait for quiet periods ===
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
-            QueueCommand::ClearInflight { .. } => CommandPrio::Low,
             QueueCommand::AdvanceFrontier { .. } => CommandPrio::Low,
 
             // === Snapshots — lowest priority, run only when other work is drained ===
@@ -391,13 +375,10 @@ impl QueueCommand {
             QueueCommand::EnqueueMany { .. } => "EnqueueMany",
             QueueCommand::MarkInflight { .. } => "MarkInflight",
             QueueCommand::MarkInflightMany { .. } => "MarkInflightMany",
-            QueueCommand::ClearInflight { .. } => "ClearInflight",
             QueueCommand::Ack { .. } => "Ack",
             QueueCommand::AckMany { .. } => "AckMany",
             QueueCommand::Nack { .. } => "Nack",
             QueueCommand::NackMany { .. } => "NackMany",
-            QueueCommand::DeadLetter { .. } => "DeadLetter",
-            QueueCommand::Reject { .. } => "Reject",
             QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
             QueueCommand::Reset { .. } => "Reset",
             QueueCommand::SetAckedUntil { .. } => "SetAckedUntil",
@@ -816,13 +797,6 @@ impl QueueHandle {
                 }
                 dirty = !reqs.is_empty();
             }
-            QueueCommand::ClearInflight { offset, response } => {
-                state.clear_inflight(offset);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
-            }
             QueueCommand::Ack { offset, response } => {
                 state.ack(offset);
                 if let Some(r) = response {
@@ -857,20 +831,6 @@ impl QueueHandle {
                     let _ = r.send(());
                 }
                 dirty = !reqs.is_empty();
-            }
-            QueueCommand::DeadLetter { offset, response } => {
-                state.dead_letter(offset);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
-            }
-            QueueCommand::Reject { offset, response } => {
-                state.reject(offset);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
             }
             QueueCommand::IsAcked { offset, response } => {
                 let result = state.is_acked(offset);
@@ -1202,17 +1162,6 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
-    pub async fn clear_inflight(&self, offset: Offset) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::ClearInflight {
-                offset,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.unwrap();
-    }
-
     pub async fn ack(&self, offset: Offset) {
         let (tx, rx) = tokio::sync::oneshot::channel();
         let _ = self
@@ -1252,28 +1201,6 @@ impl QueueHandle {
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
                 reqs,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.unwrap();
-    }
-
-    pub async fn dead_letter(&self, offset: Offset) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::DeadLetter {
-                offset,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.unwrap();
-    }
-
-    pub async fn reject(&self, offset: Offset) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::Reject {
-                offset,
                 response: Some(tx),
             })
             .await;

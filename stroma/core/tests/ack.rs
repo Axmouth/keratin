@@ -69,6 +69,7 @@ async fn acked_offsets_never_resurrect() {
         let (c, rx) = KeratinAppendCompletion::pair();
         st.append_message("t", 0,  None, &headers, b"x", c).await.unwrap();
         let offset = rx.await.unwrap().unwrap().base_offset;
+        println!("{offset} appended");
 
         if offset >= 5 {
             assert_eq!(offset, 5, "offsets must be contiguous in this test");
