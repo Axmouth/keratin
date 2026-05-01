@@ -56,7 +56,9 @@ async fn expired_messages_survive_restart() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, b"x", c).await.unwrap();
+    st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
+        .await
+        .unwrap();
     st.mark_inflight_one("t", 0, None, 0, 10).await.unwrap();
     let offset = rx.await.unwrap().unwrap().base_offset;
 
@@ -91,9 +93,15 @@ async fn discover_partitions_handles_encoded_names() {
 
     st.queue_handle("a", 1, Some("b")).await.unwrap();
     st.queue_handle("c", 2, Some("d")).await.unwrap();
-    st.queue_handle("topic+\\/i", 3, Some("group+\\/j")).await.unwrap();
-    st.queue_handle("topic/e", 4, Some("group/f")).await.unwrap();
-    st.queue_handle("topic g", 5, Some("group h")).await.unwrap();
+    st.queue_handle("topic+\\/i", 3, Some("group+\\/j"))
+        .await
+        .unwrap();
+    st.queue_handle("topic/e", 4, Some("group/f"))
+        .await
+        .unwrap();
+    st.queue_handle("topic g", 5, Some("group h"))
+        .await
+        .unwrap();
 
     let mut parts = st.discover_partitions().unwrap();
     parts.sort();

@@ -1,6 +1,8 @@
 use std::sync::Arc;
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir}, test_dir};
+use keratin_log::{
+    CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
+};
 use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
@@ -30,7 +32,7 @@ pub async fn append_one(
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message(tp, part, group, &headers, payload, c)
+    st.append_message(tp, part, group, &headers, payload.to_vec(), c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -57,7 +59,7 @@ async fn acked_offsets_never_resurrect() {
     let (st, _test_dir) = open_test_stroma().await;
 
     // ACK offset 5 before it exists
-    st.ack_one("t", 0,  None, 5).await.unwrap();
+    st.ack_one("t", 0, None, 5).await.unwrap();
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
@@ -67,7 +69,9 @@ async fn acked_offsets_never_resurrect() {
     // Append messages until offsets advance past 5
     loop {
         let (c, rx) = KeratinAppendCompletion::pair();
-        st.append_message("t", 0,  None, &headers, b"x", c).await.unwrap();
+        st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
+            .await
+            .unwrap();
         let offset = rx.await.unwrap().unwrap().base_offset;
         println!("{offset} appended");
 
@@ -77,8 +81,8 @@ async fn acked_offsets_never_resurrect() {
         }
     }
 
-    assert!(st.is_acked("t", 0,  None, 5).await.unwrap());
-    assert!(!st.is_ready("t", 0,  None, 5).await.unwrap());
+    assert!(st.is_acked("t", 0, None, 5).await.unwrap());
+    assert!(!st.is_ready("t", 0, None, 5).await.unwrap());
 }
 
 #[tokio::test]

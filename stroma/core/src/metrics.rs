@@ -1,5 +1,7 @@
 use std::{
-    collections::HashMap, sync::atomic::{AtomicU64, AtomicUsize, Ordering}, time::Duration
+    collections::HashMap,
+    sync::atomic::{AtomicU64, AtomicUsize, Ordering},
+    time::Duration,
 };
 
 use serde::Serialize;
@@ -68,8 +70,8 @@ impl RollingCounter {
         let mut sum = 0;
 
         for i in 0..seconds.min(self.buckets.len()) {
-            let idx =
-                ((now as isize - i as isize).rem_euclid(self.buckets.len().max(1) as isize)) as usize;
+            let idx = ((now as isize - i as isize).rem_euclid(self.buckets.len().max(1) as isize))
+                as usize;
             sum += self.buckets[idx].load(Ordering::Relaxed);
         }
 
@@ -147,7 +149,8 @@ impl LatencyStats {
         self.count.fetch_add(1, Ordering::Relaxed);
         self.total_micros
             .fetch_add(d.as_micros() as u64, Ordering::Relaxed);
-        self.max_micros.fetch_max(d.as_micros() as u64, Ordering::Relaxed);
+        self.max_micros
+            .fetch_max(d.as_micros() as u64, Ordering::Relaxed);
     }
 
     pub fn avg_micros(&self) -> Option<f64> {
@@ -158,7 +161,7 @@ impl LatencyStats {
             Some(self.total_micros.load(Ordering::Relaxed) as f64 / count as f64)
         }
     }
-    
+
     pub fn max_micros(&self) -> Option<u64> {
         let v = self.max_micros.load(Ordering::Relaxed);
         if v == 0 && self.count.load(Ordering::Relaxed) == 0 {
@@ -236,23 +239,23 @@ impl StromaMetrics {
             cmd_dispatched: std::array::from_fn(|_| OpStats::new(bucket_count)),
             cmd_wait_latency: std::array::from_fn(|_| LatencyStats::default()),
             cmd_process_latency: std::array::from_fn(|_| LatencyStats::default()),
-            
+
             enqueue: OpStats::new(bucket_count),
             poll_ready: OpStats::new(bucket_count),
             ack: OpStats::new(bucket_count),
             nack: OpStats::new(bucket_count),
             mark_inflight: OpStats::new(bucket_count),
             collect_expired: OpStats::new(bucket_count),
-            
+
             snapshot: SnapshotMetrics::default(),
             recovery: RecoveryMetrics::default(),
-            
+
             event_log_appends: BatchStats::new(bucket_count),
             msg_log_appends: BatchStats::new(bucket_count),
             event_log_reads: OpStats::new(bucket_count),
             msg_log_reads: OpStats::new(bucket_count),
             log_truncations: OpStats::new(bucket_count),
-            
+
             queues_active: AtomicUsize::new(0),
         }
     }
@@ -272,18 +275,21 @@ impl StromaMetrics {
             let dispatched = &self.cmd_dispatched[prio.idx()];
             let wait = &self.cmd_wait_latency[prio.idx()];
             let proc_lat = &self.cmd_process_latency[prio.idx()];
-            
-            per_lane.insert(key, LaneSnapshot {
-                current_depth: depth,
-                dispatched_per_sec_1m: dispatched.ops.rate_per_sec(60),
-                avg_wait_ms: wait.avg_micros().map(|v| v / 1000.0),
-                max_wait_ms: wait.max_micros().map(|v| v as f64 / 1000.0),
-                avg_process_ms: proc_lat.avg_micros().map(|v| v / 1000.0),
-                max_process_ms: proc_lat.max_micros().map(|v| v as f64 / 1000.0),
-                total_dispatched: dispatched.total.load(Ordering::Relaxed),
-            });
+
+            per_lane.insert(
+                key,
+                LaneSnapshot {
+                    current_depth: depth,
+                    dispatched_per_sec_1m: dispatched.ops.rate_per_sec(60),
+                    avg_wait_ms: wait.avg_micros().map(|v| v / 1000.0),
+                    max_wait_ms: wait.max_micros().map(|v| v as f64 / 1000.0),
+                    avg_process_ms: proc_lat.avg_micros().map(|v| v / 1000.0),
+                    max_process_ms: proc_lat.max_micros().map(|v| v as f64 / 1000.0),
+                    total_dispatched: dispatched.total.load(Ordering::Relaxed),
+                },
+            );
         }
-        
+
         let mut per_kind = HashMap::new();
         let kinds = [
             ("enqueue", &self.enqueue),
@@ -294,16 +300,19 @@ impl StromaMetrics {
             ("collect_expired", &self.collect_expired),
         ];
         for (name, ops) in kinds {
-            per_kind.insert(name.to_string(), CmdKindSnapshot {
-                total: ops.total.load(Ordering::Relaxed),
-                per_sec_1m: ops.ops.rate_per_sec(60),
-                avg_latency_ms: ops.latency.avg_micros().map(|v| v / 1000.0),
-            });
+            per_kind.insert(
+                name.to_string(),
+                CmdKindSnapshot {
+                    total: ops.total.load(Ordering::Relaxed),
+                    per_sec_1m: ops.ops.rate_per_sec(60),
+                    avg_latency_ms: ops.latency.avg_micros().map(|v| v / 1000.0),
+                },
+            );
         }
-        
+
         CommandMetricsSnapshot { per_lane, per_kind }
     }
-    
+
     /// Standalone helper for just queue depths, used in `debug_snapshot()`.
     pub fn cmd_queue_depths_snapshot(&self) -> HashMap<String, usize> {
         let mut out = HashMap::new();
@@ -320,11 +329,15 @@ impl StromaMetrics {
 fn log_kind_snapshot(appends: &BatchStats, reads: &OpStats) -> LogKindSnapshot {
     let total_batches = appends.batches.total.load(Ordering::Relaxed);
     let total_items = appends.items_total.load(Ordering::Relaxed);
-    
+
     LogKindSnapshot {
         appends_per_sec_1m: appends.batches.ops.rate_per_sec(60),
         avg_append_latency_ms: appends.batches.latency.avg_micros().map(|v| v / 1000.0),
-        max_append_latency_ms: appends.batches.latency.max_micros().map(|v| v as f64 / 1000.0),
+        max_append_latency_ms: appends
+            .batches
+            .latency
+            .max_micros()
+            .map(|v| v as f64 / 1000.0),
         avg_batch_size: if total_batches == 0 {
             None
         } else {
@@ -439,7 +452,10 @@ impl RecoveryMetrics {
     pub fn snapshot(&self) -> RecoveryMetricsSnapshot {
         RecoveryMetricsSnapshot {
             avg_startup_ms: self.startup_duration.avg_micros().map(|v| v / 1000.0),
-            max_startup_ms: self.startup_duration.max_micros().map(|v| v as f64 / 1000.0),
+            max_startup_ms: self
+                .startup_duration
+                .max_micros()
+                .map(|v| v as f64 / 1000.0),
             avg_snapshot_load_ms: self.snapshot_load_latency.avg_micros().map(|v| v / 1000.0),
             avg_replay_ms: self.replay_duration.avg_micros().map(|v| v / 1000.0),
             max_replay_ms: self.replay_duration.max_micros().map(|v| v as f64 / 1000.0),
@@ -456,17 +472,17 @@ pub struct SnapshotMetricsSnapshot {
     pub attempts_total: u64,
     pub skipped_not_dirty: u64,
     pub skipped_in_progress: u64,
-    
+
     pub avg_clone_ms: Option<f64>,
     pub avg_encode_ms: Option<f64>,
     pub avg_write_ms: Option<f64>,
     pub avg_total_ms: Option<f64>,
-    
+
     // Useful for understanding outliers
-    pub max_clone_ms: Option<f64>,    // see note below
+    pub max_clone_ms: Option<f64>, // see note below
     pub max_encode_ms: Option<f64>,
     pub max_total_ms: Option<f64>,
-    
+
     pub last_snapshot_size_bytes: u64,
     pub total_bytes_written: u64,
 }
@@ -477,18 +493,18 @@ impl SnapshotMetrics {
             attempts_total: self.attempts.total.load(Ordering::Relaxed),
             skipped_not_dirty: self.skipped_not_dirty.load(Ordering::Relaxed),
             skipped_in_progress: self.skipped_in_progress.load(Ordering::Relaxed),
-            
+
             avg_clone_ms: self.clone_latency.avg_micros().map(|v| v / 1000.0),
             avg_encode_ms: self.encode_latency.avg_micros().map(|v| v / 1000.0),
             avg_write_ms: self.write_latency.avg_micros().map(|v| v / 1000.0),
             avg_total_ms: self.total_latency.avg_micros().map(|v| v / 1000.0),
-            
+
             // Your LatencyStats currently doesn't track max — see note below.
             // For now, leaving these as None or removing them.
             max_clone_ms: None,
             max_encode_ms: None,
             max_total_ms: None,
-            
+
             last_snapshot_size_bytes: self.last_snapshot_size_bytes.load(Ordering::Relaxed),
             total_bytes_written: self.bytes_written.load(Ordering::Relaxed),
         }

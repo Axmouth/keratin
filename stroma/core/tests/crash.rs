@@ -1,19 +1,24 @@
 use std::{sync::Arc, time::Duration};
 
-use keratin_log::{CompletionPair, KeratinAppendCompletion, KeratinConfig, util::{TempDir}, test_dir};
+use keratin_log::{
+    CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
+};
 use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir!("test_data");
-    (Arc::new(
-        Stroma::open(
-            &test_dir.root,
-            KeratinConfig::test_default(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .unwrap(),
-    ), test_dir)
+    (
+        Arc::new(
+            Stroma::open(
+                &test_dir.root,
+                KeratinConfig::test_default(),
+                SnapshotConfig::default(),
+            )
+            .await
+            .unwrap(),
+        ),
+        test_dir,
+    )
 }
 
 pub async fn append_one(
@@ -29,7 +34,7 @@ pub async fn append_one(
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message(tp, part, group, &headers, payload, c)
+    st.append_message(tp, part, group, &headers, payload.to_vec(), c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -44,13 +49,13 @@ async fn truncated_delta_does_not_corrupt_state() {
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
     for i in 0..1000 {
-        st.mark_inflight_one("t", 0,  None, i, 1000).await.unwrap();
+        st.mark_inflight_one("t", 0, None, i, 1000).await.unwrap();
         if i % 4 == 0 {
-            st.ack_one("t", 0,  None, i).await.unwrap();
+            st.ack_one("t", 0, None, i).await.unwrap();
         }
     }
 
-    let qh = st.queue_handle("t", 0,  None).await.unwrap();
+    let qh = st.queue_handle("t", 0, None).await.unwrap();
     st.truncate_partition_log(qh, 123).await.unwrap();
     st.shutdown().await.unwrap();
     drop(st);
@@ -78,13 +83,13 @@ async fn enqueue_is_durable_and_replayed() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0,  None, &headers, b"hello", completion)
+    st.append_message("t", 0, None, &headers, b"hello".to_vec(), completion)
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
 
     // Force snapshot & restart
-    st.snapshot_partition("t", 0,  None).await.unwrap();
+    st.snapshot_partition("t", 0, None).await.unwrap();
     st.shutdown().await.unwrap();
     drop(st);
 
@@ -96,9 +101,8 @@ async fn enqueue_is_durable_and_replayed() {
     .await
     .unwrap();
 
-    assert!(st2.is_ready("t", 0,  None, 0).await.unwrap());
+    assert!(st2.is_ready("t", 0, None, 0).await.unwrap());
 }
-
 
 #[tokio::test]
 async fn enqueue_is_durable_and_replayed_no_snap() {
@@ -119,11 +123,11 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0,  None, &headers, b"hello", completion)
+    st.append_message("t", 0, None, &headers, b"hello".to_vec(), completion)
         .await
         .unwrap();
     let _append_result = rx.await.unwrap().unwrap();
-    assert!(st.is_ready("t", 0,  None, 0).await.unwrap());
+    assert!(st.is_ready("t", 0, None, 0).await.unwrap());
     st.shutdown().await.unwrap();
 
     drop(st);
@@ -136,7 +140,7 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
     .await
     .unwrap();
 
-    assert!(st2.is_ready("t", 0,  None, 0).await.unwrap());
+    assert!(st2.is_ready("t", 0, None, 0).await.unwrap());
 }
 
 // #[tokio::test]

@@ -769,10 +769,7 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
-            QueueCommand::EnqueueMany {
-                reqs,
-                response,
-            } => {
+            QueueCommand::EnqueueMany { reqs, response } => {
                 state.enqueue_many(&reqs);
                 if let Some(r) = response {
                     let _ = r.send(());
@@ -822,10 +819,7 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
-            QueueCommand::NackMany {
-                reqs,
-                response,
-            } => {
+            QueueCommand::NackMany { reqs, response } => {
                 state.nack_many(&reqs);
                 if let Some(r) = response {
                     let _ = r.send(());
@@ -1703,9 +1697,10 @@ impl QueueInternalState {
         );
         let mut offs = Vec::with_capacity(max);
         let from = self.settled_until();
-        let range  = from..u64::MAX ;
+        let range = from..u64::MAX;
         // Iterate overlapping ranges from `from` onwards, flatten to individual offsets
-        let iter = self.ready
+        let iter = self
+            .ready
             .overlapping(&range)
             .flat_map(|range| range.start.max(from)..range.end);
         for off in iter {
@@ -1765,7 +1760,7 @@ impl QueueInternalState {
 
         // SETTLE beats inflight: always remove inflight if present
         let removed = self.inflight.remove(&offset);
-        self.ready.remove(offset..offset+1);
+        self.ready.remove(offset..offset + 1);
         self.retries.remove(&offset);
         if removed.is_some() {
             // heap can have stale entries now
@@ -2189,7 +2184,7 @@ impl QueueInternalState {
     /// Skips inflight and (bounded) acked entries.
     pub fn next_deliverable(&self, from: Offset, upper: Offset) -> Offset {
         let start = from.max(self.settled_until);
-        
+
         for range in self.ready.overlapping(&(start..upper)) {
             let range_start = range.start.max(start);
             for off in range_start..range.end.min(upper) {
@@ -2483,7 +2478,7 @@ impl QueueInternalState {
         }
 
         for off in self.inflight.keys().copied() {
-            self.ready.remove(off..off+1);
+            self.ready.remove(off..off + 1);
         }
 
         self.rebuild_derived();
@@ -2613,7 +2608,10 @@ impl Default for CanonicalQueueState {
 #[cfg(test)]
 mod tests {
     use super::{Offset, QueueInternalState};
-    use crate::{event::AckEventMeta, state::{CustomDLQ, DLQDiscardPolicy}};
+    use crate::{
+        event::AckEventMeta,
+        state::{CustomDLQ, DLQDiscardPolicy},
+    };
 
     #[test]
     fn next_deliverable_requires_ready() {
@@ -2814,7 +2812,7 @@ mod tests {
     fn offset_in_exactly_one_state() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(5..5+1);
+        s.ready.insert(5..5 + 1);
         assert!(s.is_ready(5));
         assert!(!s.is_inflight(5));
 
@@ -2836,7 +2834,7 @@ mod tests {
     fn retries_persist_across_redelivery() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(1..1+1);
+        s.ready.insert(1..1 + 1);
         s.mark_inflight(1, 100);
         s.nack(1, true);
 
@@ -3275,7 +3273,7 @@ mod tests {
     fn snapshot_inconsistent_ready_retries() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ready.insert(5..5+1); // no retries entry
+        s.ready.insert(5..5 + 1); // no retries entry
 
         let snap = s.encode_snapshot(0);
 
@@ -3423,7 +3421,7 @@ mod tests {
     fn mark_inflight_ignored_if_already_acked() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.ack_many(&[0, 1, 2, 3, 4].map(|off| AckEventMeta {off}));
+        s.ack_many(&[0, 1, 2, 3, 4].map(|off| AckEventMeta { off }));
         assert_eq!(s.settled_until(), 5);
 
         s.enqueue(2, 0);
@@ -3517,7 +3515,10 @@ mod tests {
     #[test]
     fn ack_batch_handles_duplicates() {
         let mut s = QueueInternalState::new("test".into(), 0);
-        let v: Vec<AckEventMeta> = [2, 2, 0, 1, 1, 3].into_iter().map(|off| AckEventMeta {off}).collect();
+        let v: Vec<AckEventMeta> = [2, 2, 0, 1, 1, 3]
+            .into_iter()
+            .map(|off| AckEventMeta { off })
+            .collect();
         s.ack_many(&v);
         assert_eq!(s.settled_until(), 4);
     }

@@ -1,9 +1,7 @@
 use std::sync::Arc;
 
 use keratin_log::{
-    CompletionPair, KeratinAppendCompletion, KeratinConfig,
-    util::{TempDir},
-    test_dir
+    CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
 };
 use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
 
@@ -36,7 +34,7 @@ pub async fn append_one(
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message(tp, part, group, &headers, payload, c)
+    st.append_message(tp, part, group, &headers, payload.to_vec(), c)
         .await
         .unwrap();
     rx.await.unwrap().unwrap().base_offset
@@ -72,7 +70,7 @@ async fn mark_inflight_after_enqueue_is_applied() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, b"x", completion)
+    st.append_message("t", 0, None, &headers, b"x".to_vec(), completion)
         .await
         .unwrap();
 
@@ -105,7 +103,7 @@ async fn published_messages_become_deliverable_eventually() {
             0,
             None,
             &headers,
-            format!("m{i}").as_bytes(),
+            format!("m{i}").as_bytes().to_vec(),
             completion,
         )
         .await
@@ -146,7 +144,7 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, b"x", completion)
+    st.append_message("t", 0, None, &headers, b"x".to_vec(), completion)
         .await
         .unwrap();
 
@@ -172,7 +170,7 @@ async fn inflight_before_enqueue_is_ignored() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, "s".as_bytes(), completion)
+    st.append_message("t", 0, None, &headers, "s".as_bytes().to_vec(), completion)
         .await
         .unwrap();
     let ar = rx.await.unwrap().unwrap();
@@ -192,7 +190,7 @@ async fn append_completion_implies_enqueued() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, b"x", c)
+    st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
         .await
         .unwrap();
 
@@ -213,7 +211,7 @@ async fn append_completions_may_arrive_out_of_order() {
             publish_received: Default::default(),
             extra: Default::default(),
         };
-        st.append_message("t", 0, None, &headers, b"x", c)
+        st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
             .await
             .unwrap();
         rxs.push(rx);
@@ -240,7 +238,7 @@ async fn poll_ready_delivers_and_marks_inflight() {
             publish_received: Default::default(),
             extra: Default::default(),
         };
-        st.append_message("t", 0, None, &headers, b"x", c)
+        st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
             .await
             .unwrap();
         rx.await.unwrap().unwrap();
@@ -266,7 +264,7 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
         publish_received: Default::default(),
         extra: Default::default(),
     };
-    st.append_message("t", 0, None, &headers, b"x", c)
+    st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
         .await
         .unwrap();
     let off = rx.await.unwrap().unwrap().base_offset;

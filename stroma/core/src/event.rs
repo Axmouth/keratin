@@ -192,32 +192,21 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
-            StromaEvent::Enqueue {
-                off,
-                retries,
-            } => {
+            StromaEvent::Enqueue { off, retries } => {
                 put_u16(&mut out, EventType::Enqueue as u16);
                 put_u64(&mut out, *off);
                 put_u32(&mut out, *retries);
             }
-            StromaEvent::MarkInflight {
-                off,
-                deadline,
-            } => {
+            StromaEvent::MarkInflight { off, deadline } => {
                 put_u16(&mut out, EventType::MarkInflight as u16);
                 put_u64(&mut out, *off);
                 put_u64(&mut out, *deadline);
             }
-            StromaEvent::Ack {
-                off,
-            } => {
+            StromaEvent::Ack { off } => {
                 put_u16(&mut out, EventType::Ack as u16);
                 put_u64(&mut out, *off);
             }
-            StromaEvent::Nack {
-                off,
-                requeue,
-            } => {
+            StromaEvent::Nack { off, requeue } => {
                 put_u16(&mut out, EventType::Nack as u16);
                 put_u64(&mut out, *off);
                 put_bool(&mut out, *requeue);
@@ -306,32 +295,21 @@ impl StromaEvent {
             x if x == EventType::Enqueue as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let retries = rd_u32(bytes, &mut i)?;
-                Ok(StromaEvent::Enqueue {
-                    off,
-                    retries,
-                })
+                Ok(StromaEvent::Enqueue { off, retries })
             }
             x if x == EventType::MarkInflight as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let deadline = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::MarkInflight {
-                    off,
-                    deadline,
-                })
+                Ok(StromaEvent::MarkInflight { off, deadline })
             }
             x if x == EventType::Ack as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
-                Ok(StromaEvent::Ack {
-                    off,
-                })
+                Ok(StromaEvent::Ack { off })
             }
             x if x == EventType::Nack as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let requeue = rd_bool(bytes, &mut i)?;
-                Ok(StromaEvent::Nack {
-                    off,
-                    requeue,
-                })
+                Ok(StromaEvent::Nack { off, requeue })
             }
             x if x == EventType::ResetQueue as u16 => {
                 let tp = rd_box_str(bytes, &mut i)?;
@@ -376,9 +354,7 @@ impl StromaEvent {
                     let retries = rd_u32(bytes, &mut i)?;
                     reqs.push(EnqueueEventMeta { off, retries });
                 }
-                Ok(StromaEvent::EnqueueMany {
-                    reqs,
-                })
+                Ok(StromaEvent::EnqueueMany { reqs })
             }
             x if x == EventType::MarkInflightMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
@@ -388,9 +364,7 @@ impl StromaEvent {
                     let deadline = rd_u64(bytes, &mut i)?;
                     reqs.push(MarkInflightEventMeta { off, deadline });
                 }
-                Ok(StromaEvent::MarkInflightMany {
-                    reqs,
-                })
+                Ok(StromaEvent::MarkInflightMany { reqs })
             }
             x if x == EventType::AckMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
@@ -399,9 +373,7 @@ impl StromaEvent {
                     let off = rd_u64(bytes, &mut i)?;
                     reqs.push(AckEventMeta { off });
                 }
-                Ok(StromaEvent::AckMany {
-                    reqs,
-                })
+                Ok(StromaEvent::AckMany { reqs })
             }
             x if x == EventType::NackMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
@@ -411,9 +383,7 @@ impl StromaEvent {
                     let requeue = rd_bool(bytes, &mut i)?;
                     reqs.push(NackEventMeta { off, requeue });
                 }
-                Ok(StromaEvent::NackMany {
-                    reqs,
-                })
+                Ok(StromaEvent::NackMany { reqs })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -440,10 +410,7 @@ mod tests {
 
     #[test]
     fn test_enqueue_without_group() {
-        let event = StromaEvent::Enqueue {
-            off: 0,
-            retries: 0,
-        };
+        let event = StromaEvent::Enqueue { off: 0, retries: 0 };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);
@@ -462,9 +429,7 @@ mod tests {
 
     #[test]
     fn test_ack_encode_decode() {
-        let event = StromaEvent::Ack {
-            off: 300,
-        };
+        let event = StromaEvent::Ack { off: 300 };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);
@@ -521,8 +486,14 @@ mod tests {
     fn test_enqueue_many_encode_decode() {
         let event = StromaEvent::EnqueueMany {
             reqs: vec![
-                EnqueueEventMeta { off: 100, retries: 1 },
-                EnqueueEventMeta { off: 101, retries: 2 },
+                EnqueueEventMeta {
+                    off: 100,
+                    retries: 1,
+                },
+                EnqueueEventMeta {
+                    off: 101,
+                    retries: 2,
+                },
             ],
         };
         let encoded = event.encode().unwrap();
@@ -534,8 +505,14 @@ mod tests {
     fn test_mark_inflight_many_encode_decode() {
         let event = StromaEvent::MarkInflightMany {
             reqs: vec![
-                MarkInflightEventMeta { off: 200, deadline: 1000 },
-                MarkInflightEventMeta { off: 201, deadline: 2000 },
+                MarkInflightEventMeta {
+                    off: 200,
+                    deadline: 1000,
+                },
+                MarkInflightEventMeta {
+                    off: 201,
+                    deadline: 2000,
+                },
             ],
         };
         let encoded = event.encode().unwrap();
@@ -557,8 +534,14 @@ mod tests {
     fn test_nack_many_encode_decode() {
         let event = StromaEvent::NackMany {
             reqs: vec![
-                NackEventMeta { off: 400, requeue: true },
-                NackEventMeta { off: 401, requeue: false },
+                NackEventMeta {
+                    off: 400,
+                    requeue: true,
+                },
+                NackEventMeta {
+                    off: 401,
+                    requeue: false,
+                },
             ],
         };
         let encoded = event.encode().unwrap();
@@ -571,10 +554,10 @@ mod tests {
         let bytes = vec![0u8; 20];
         let decoded = StromaEvent::decode(&bytes);
         assert!(decoded.is_err());
-        assert_eq!(decoded.map_err(|e| e.to_string()), Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "not stroma event",
-            ).to_string()))
+        assert_eq!(
+            decoded.map_err(|e| e.to_string()),
+            Err(io::Error::new(io::ErrorKind::InvalidData, "not stroma event",).to_string())
+        )
     }
 
     #[test]

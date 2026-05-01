@@ -6,14 +6,14 @@ mod stroma;
 use keratin_log::KDurability;
 use thiserror::Error;
 
+pub use event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta};
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
 };
-pub use state::{QueueHandle, QueueInternalState};
-pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};
 pub use metrics::StromaMetrics;
-pub use event::{EnqueueEventMeta, AckEventMeta, NackEventMeta, MarkInflightEventMeta};
+pub use state::{QueueHandle, QueueInternalState, StromaDebugSnapshot};
+pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;

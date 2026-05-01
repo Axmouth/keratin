@@ -18,10 +18,7 @@ async fn open_fails_when_already_open() {
 
     dbg!(&k2);
 
-    assert!(
-        k2.is_err(),
-        "second open on same root must fail"
-    );
+    assert!(k2.is_err(), "second open on same root must fail");
 
     // Drop first instance
     drop(k1);

@@ -1,7 +1,8 @@
 #[cfg(windows)]
 use std::io;
 use std::{
-    path::{Path, PathBuf}, time::{SystemTime, UNIX_EPOCH}
+    path::{Path, PathBuf},
+    time::{SystemTime, UNIX_EPOCH},
 };
 
 use anyhow::Context;
@@ -23,12 +24,13 @@ macro_rules! test_dir {
         use std::path::PathBuf;
         // This env! now resolves to the caller's Cargo.toml directory
         let root: PathBuf = format!(
-            "{}/test_data/{}-{}", 
-            env!("CARGO_WORKSPACE_DIR"), 
-            $prefix, 
+            "{}/test_data/{}-{}",
+            env!("CARGO_WORKSPACE_DIR"),
+            $prefix,
             fastrand::u64(..)
-        ).into();
-        
+        )
+        .into();
+
         std::fs::create_dir_all(&root).unwrap();
         // Ensure TempDir is accessible from the library's path
         $crate::util::TempDir { root }

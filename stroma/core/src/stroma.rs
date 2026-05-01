@@ -392,6 +392,7 @@ impl Stroma {
         };
 
         // Recover from existing snapshot files + replay events.
+        // TODO: do it lazily
         st.recover_all().await?;
 
         let st_metrics = st.clone();
@@ -531,7 +532,7 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
-        let k = Keratin::open(dir, self.keratin_cfg_msg)
+        let k = Keratin::open(dir, self.keratin_cfg_event)
             .await
             .map_err(io_err)?;
         tracing::info!("Initialized event log: (`{tp}` `{part}` `{group:?}`)");
@@ -1383,19 +1384,38 @@ impl Stroma {
         let replay_start = Instant::now();
         let mut events_count = 0;
 
-        while cur < tail {
-            let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
-            if batch.is_empty() {
-                break;
-            }
+        let qh_clone = qh.clone();
+        let events = tokio::task::spawn_blocking(move || {
+            let mut events = Vec::new();
+            let _: Result<()> = {
+                while cur < tail {
+                    let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
+                    if batch.is_empty() {
+                        break;
+                    }
 
-            for rec in batch {
-                cur = rec.offset + 1;
-                let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
-                self.apply_event_inmem(ev, &qh).await?;
-                qh.applied_upto().store(cur, Ordering::Release);
-                events_count += 1;
-            }
+                    for rec in batch {
+                        cur = rec.offset + 1;
+                        let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
+                        events.push(ev);
+                        // self.apply_event_inmem(ev, &qh).await?;
+                        // stroma
+                        //     .enqueue_event_inmem(ev, &qh_clone)
+                        //     .map_err(|err| StromaError::Io(err.to_string()))?;
+                        qh_clone.applied_upto().store(cur, Ordering::Release);
+                        events_count += 1;
+                    }
+                }
+
+                Ok(())
+            };
+            Ok(events)
+        })
+        .await
+        .map_err(|err| StromaError::Io(err.to_string()))??;
+
+        for ev in events {
+            self.apply_event_inmem(ev, &qh).await?;
         }
 
         let elapsed = start.elapsed();
@@ -1686,7 +1706,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         headers: &MessageHeaders,
-        payload: &[u8],
+        payload: Vec<u8>,
         event_completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
@@ -1697,7 +1717,7 @@ impl Stroma {
                 Message {
                     flags: 0,
                     headers: headers.encode()?,
-                    payload: payload.to_vec(),
+                    payload,
                 },
                 None,
                 msg_completion,
@@ -1886,67 +1906,81 @@ impl Stroma {
             return Ok(Vec::new());
         }
 
-        let mut out = Vec::with_capacity(offs.len());
-
         let mut i = 0;
-        let retries_map: HashMap<u64, u32> = HashMap::from_iter(offs.clone().into_iter());
-        while i < offs.len() {
-            let (start, _retries) = offs[i];
-            let mut len = 1;
 
-            // ---- group contiguous offsets ----
-            while i + len < offs.len() && offs[i + len].0 == start + len as u64 {
-                len += 1;
-            }
+        let qh = self.queue_handle(tp, part, group).await?;
 
-            // ---- batch fetch ----
-            let batch = self.scan_messages_from(tp, part, group, start, len).await?;
+        let stroma = self.clone();
+        let closure = move || {
+            let res: Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> = {
+                let mut out: Vec<(u64, MessageHeaders, Vec<u8>, u32)> =
+                    Vec::with_capacity(offs.len());
+                let retries_map: HashMap<u64, u32> = HashMap::from_iter(offs.clone().into_iter());
+                while i < offs.len() {
+                    let (start, _retries) = offs[i];
+                    let mut len = 1;
 
-            // ---- fast path: perfect match ----
-            if batch.len() == len {
-                for (off, payload, headers) in batch {
-                    out.push((off, headers, payload, retries_map[&off]));
-                }
-            } else {
-                // ---- slow path: handle holes (rare but important) ----
-                // build small lookup map
-                let mut map = hashbrown::HashMap::with_capacity(batch.len());
-                for (off, payload, headers) in batch {
-                    map.insert(off, (headers, payload));
-                }
-
-                for j in 0..len {
-                    let off = start + j as u64;
-                    if let Some((headers, payload)) = map.remove(&off) {
-                        out.push((off, headers, payload, retries_map[&off]));
-                    } else {
-                        // extremely rare: log inconsistency or race
-                        tracing::warn!(
-                            "Missing payload for offset {} in batch fetch (tp={}, part={}, group={:?})",
-                            off,
-                            tp,
-                            part,
-                            group
-                        );
+                    // ---- group contiguous offsets ----
+                    // TODO: we might be able to skip since we now save ranges?
+                    while i + len < offs.len() && offs[i + len].0 == start + len as u64 {
+                        len += 1;
                     }
-                }
-            }
 
-            i += len;
-        }
+                    // ---- batch fetch ----
+                    let batch: Vec<(u64, Vec<u8>, MessageHeaders)> =
+                        stroma.scan_messages_from(&qh, start, len)?;
+
+                    // ---- fast path: perfect match ----
+                    if batch.len() == len {
+                        for (off, payload, headers) in batch {
+                            out.push((off, headers, payload, retries_map[&off]));
+                        }
+                    } else {
+                        // ---- slow path: handle holes (rare but important) ----
+                        // build small lookup map
+                        let mut map = HashMap::with_capacity(batch.len());
+                        for (off, payload, headers) in batch {
+                            map.insert(off, (headers, payload));
+                        }
+
+                        for j in 0..len {
+                            let off = start + j as u64;
+                            if let Some((headers, payload)) = map.remove(&off) {
+                                out.push((off, headers, payload, retries_map[&off]));
+                            } else {
+                                // extremely rare: log inconsistency or race
+                                tracing::warn!(
+                                    "Missing payload for offset {} in batch fetch (tp={}, part={}, group={:?})",
+                                    off,
+                                    qh.topic(),
+                                    qh.partition(),
+                                    qh.group(),
+                                );
+                            }
+                        }
+                    }
+
+                    i += len;
+                }
+                Ok(out)
+            };
+            res
+        };
+
+        let out = tokio::task::spawn_blocking(closure)
+            .await
+            .map_err(|err| StromaError::Io(err.to_string()))??;
 
         Ok(out)
     }
 
-    pub async fn scan_messages_from(
+    pub fn scan_messages_from(
         &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
+        qh: &QueueHandle,
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
-        let log = self.queue_handle(tp, part, group).await?.msg_log();
+        let log = qh.msg_log();
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
         got.into_iter()
