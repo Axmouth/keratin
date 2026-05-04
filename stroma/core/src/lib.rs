@@ -6,14 +6,17 @@ mod stroma;
 use keratin_log::KDurability;
 use thiserror::Error;
 
-pub use event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta};
+pub use event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta, DeclareMeta, DeadLetterMeta, DLQDiscardPolicyWire};
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
-pub use state::{QueueHandle, QueueInternalState, StromaDebugSnapshot};
-pub use stroma::{MessageHeaders, SnapshotConfig, Stroma};
+pub use state::{
+    AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, NackBatchOutcome, NackOutcome,
+    QueueHandle, QueueInternalState, StromaDebugSnapshot,
+};
+pub use stroma::{GlobalDLQ, MessageHeaders, SnapshotConfig, Stroma};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;

@@ -2,23 +2,28 @@ use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
-use std::thread;
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
 use keratin_log::util::unix_millis;
 use rangemap::RangeSet;
 use serde::Serialize;
-use tokio::sync::mpsc;
+use tokio::sync::{RwLock, mpsc, oneshot};
 use tokio::time::Instant;
+use uuid::Uuid;
 
-use crate::event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta};
+use crate::event::{
+    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueEventMeta, MarkInflightEventMeta,
+    NackEventMeta,
+};
 use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
     StromaMetrics,
 };
-use crate::stroma::TaskGroup;
+use crate::stroma::{GlobalDLQ, TaskGroup};
 
+pub type ClientId = Uuid;
+pub type ConsumerId = u64;
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -26,12 +31,27 @@ pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
 pub const FORMAT_VERSION: u64 = 1;
 
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
+pub enum NackOutcome {
+    /// already settled / not in lifecycle
+    NoOp,
+    /// back to ready, retries++
+    Requeued,
+    /// retries exhausted OR requeue=false
+    DeadLetterRequested,
+}
+
 #[derive(Debug, Clone)]
-pub struct DLQDiscordSettings {
+pub struct NackBatchOutcome {
+    pub dead_letter_offsets: Vec<Offset>,
+}
+
+#[derive(Debug, Clone)]
+pub struct DLQDiscardSettings {
     pub max_retries: u32,
 }
 
-impl Default for DLQDiscordSettings {
+impl Default for DLQDiscardSettings {
     fn default() -> Self {
         Self { max_retries: 5 }
     }
@@ -41,6 +61,7 @@ impl Default for DLQDiscordSettings {
 pub struct CustomDLQ {
     pub tp: String,
     pub part: u32,
+    pub group: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, PartialOrd, Ord)]
@@ -49,6 +70,13 @@ pub enum DLQDiscardPolicy {
     Discard,
     GlobalDQL,
     CustomDQL(CustomDLQ), // tp, part
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ResolvedDlqTarget {
+    pub tp: String,
+    pub part: u32,
+    pub group: Option<String>,
 }
 
 /// QueueState invariants and transitions:
@@ -134,10 +162,13 @@ pub struct QueueInternalState {
     // offset -> deadline_ts
     inflight: BTreeMap<Offset, UnixMillis>,
 
+    // awaiting DLQ-copy + commit
+    pending_dlq: BTreeMap<Offset, Option<ResolvedDlqTarget>>,
+
     // ----- Ready -----
     // offset -> retries
-    ready: RangeSet<Offset>,                  // readiness only
-    retries: hashbrown::HashMap<Offset, u32>, // retry metadata only
+    ready: RangeSet<Offset>,       // readiness only
+    retries: HashMap<Offset, u32>, // retry metadata only
 
     // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
     expiry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
@@ -156,148 +187,171 @@ pub struct QueueInternalState {
 #[derive(Debug)]
 pub enum QueueCommand {
     Shutdown {
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     },
     Enqueue {
         offset: Offset,
         retries: u32,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // offset, retries
     EnqueueMany {
         reqs: Vec<EnqueueEventMeta>,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // list[offset, retries]
     MarkInflight {
         offset: Offset,
         deadline: UnixMillis,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // offset, deadline
     MarkInflightMany {
         reqs: Vec<MarkInflightEventMeta>,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // entries
     Ack {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // offset
     AckMany {
         reqs: Vec<AckEventMeta>,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // list[offset]
     Nack {
         offset: Offset,
         requeue: bool,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<NackOutcome>>,
     }, // offset, requeue
     NackMany {
         reqs: Vec<NackEventMeta>,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<Vec<(Offset, NackOutcome)>>>,
     }, // offset, requeue?
+    DeadLetterCommit {
+        offsets: Vec<Offset>,
+        response: Option<oneshot::Sender<()>>,
+    },
+    MarkPendingDlq {
+        offsets: Vec<Offset>,
+        response: Option<oneshot::Sender<()>>,
+    },
+    DiscardPendingDlq {
+        offsets: Vec<Offset>,
+        response: Option<oneshot::Sender<()>>,
+    },
+    Declare {
+        meta: DeclareMeta,
+        response: Option<oneshot::Sender<()>>,
+    },
+    GetPendingDlq {
+        response: Option<oneshot::Sender<Vec<(Offset, Option<ResolvedDlqTarget>)>>>,
+    },
+    GetDlqTarget {
+        global: Option<GlobalDLQ>,
+        response: Option<oneshot::Sender<Option<(String, u32, Option<String>)>>>,
+    },
     AdvanceFrontier {
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     },
     Reset {
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     },
     SetAckedUntil {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // offset
     SetAckWindow {
         base: Offset,
         bits: BitVec,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // base, bits
     SetAckWindowFromBytes {
         base: Offset,
         bits_bytes: Vec<u8>,
-        response: Option<tokio::sync::oneshot::Sender<std::io::Result<()>>>,
+        response: Option<oneshot::Sender<std::io::Result<()>>>,
     }, // base, bits_bytes
     LoadInflight {
         entries: Vec<(Offset, UnixMillis)>,
-        response: Option<tokio::sync::oneshot::Sender<()>>,
+        response: Option<oneshot::Sender<()>>,
     }, // entries
     EncodeSnapshot {
         last_snapshot_event_offset: u64,
-        response: Option<tokio::sync::oneshot::Sender<Option<Vec<u8>>>>,
+        response: Option<oneshot::Sender<Option<Vec<u8>>>>,
     },
     LoadSnapshot {
         data: Vec<u8>,
-        response: Option<tokio::sync::oneshot::Sender<std::io::Result<SnapshotMeta>>>,
+        response: Option<oneshot::Sender<std::io::Result<SnapshotMeta>>>,
     }, // data
 
     IsAcked {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<bool>>,
+        response: Option<oneshot::Sender<bool>>,
     }, // offset
     IsInflight {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<bool>>,
+        response: Option<oneshot::Sender<bool>>,
     }, // offset
     IsInflightOrAcked {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<bool>>,
+        response: Option<oneshot::Sender<bool>>,
     }, // offset
     IsReady {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<bool>>,
+        response: Option<oneshot::Sender<bool>>,
     }, // offset
     FilterNotEnqueued {
         items: Vec<(Offset, Vec<u8>)>,
-        response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, Vec<u8>)>>>,
+        response: Option<oneshot::Sender<Vec<(Offset, Vec<u8>)>>>,
     }, // items
     GetDebugInfo {
-        response: Option<tokio::sync::oneshot::Sender<QueueInternalDebugInfo>>,
+        response: Option<oneshot::Sender<QueueInternalDebugInfo>>,
     }, // debug info
     GetRetries {
         offset: Offset,
-        response: Option<tokio::sync::oneshot::Sender<u32>>,
+        response: Option<oneshot::Sender<u32>>,
     }, // offset
     GetSettledUntil {
-        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+        response: Option<oneshot::Sender<Offset>>,
     },
     PollReadyAndMark {
         max: usize,
         lease_deadline: UnixMillis,
-        response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, u32)>>>,
+        response: Option<oneshot::Sender<Vec<(Offset, u32)>>>,
     }, // max, lease_deadline
     GetLowestUnacked {
-        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+        response: Option<oneshot::Sender<Offset>>,
     },
     GetLowestNotAcked {
-        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+        response: Option<oneshot::Sender<Offset>>,
     },
     GetNextDeliverable {
         from: Offset,
         upper: Offset,
-        response: Option<tokio::sync::oneshot::Sender<Option<Offset>>>,
+        response: Option<oneshot::Sender<Option<Offset>>>,
     }, // from, upper
     GetInflightLen {
-        response: Option<tokio::sync::oneshot::Sender<usize>>,
+        response: Option<oneshot::Sender<usize>>,
     },
     GetNextExpiryHint {
-        response: Option<tokio::sync::oneshot::Sender<Option<UnixMillis>>>,
+        response: Option<oneshot::Sender<Option<UnixMillis>>>,
     },
     GetAckWindowBase {
-        response: Option<tokio::sync::oneshot::Sender<Offset>>,
+        response: Option<oneshot::Sender<Offset>>,
     },
     GetAckBitsBytes {
-        response: Option<tokio::sync::oneshot::Sender<Vec<u8>>>,
+        response: Option<oneshot::Sender<Vec<u8>>>,
     },
     GetCanonicalQueueState {
-        response: Option<tokio::sync::oneshot::Sender<CanonicalQueueState>>,
+        response: Option<oneshot::Sender<CanonicalQueueState>>,
     },
     GetStatusReport {
-        response: Option<tokio::sync::oneshot::Sender<QueueStatusReport>>,
+        response: Option<oneshot::Sender<QueueStatusReport>>,
     },
     CollectExpired {
         now: UnixMillis,
         max: usize,
-        response: Option<tokio::sync::oneshot::Sender<Vec<Offset>>>,
+        response: Option<oneshot::Sender<Vec<Offset>>>,
     }, // now, max
 
     DumpInflight {
-        response: Option<tokio::sync::oneshot::Sender<Vec<(Offset, UnixMillis)>>>,
+        response: Option<oneshot::Sender<Vec<(Offset, UnixMillis)>>>,
     },
 }
 
@@ -315,6 +369,7 @@ impl QueueCommand {
             QueueCommand::SetAckWindowFromBytes { .. } => CommandPrio::Express,
             QueueCommand::LoadInflight { .. } => CommandPrio::Express,
             QueueCommand::Reset { .. } => CommandPrio::Express,
+            QueueCommand::GetDlqTarget { .. } => CommandPrio::Express,
 
             // === Observability / admin queries — fast, cheap, must stay responsive ===
             QueueCommand::GetDebugInfo { .. } => CommandPrio::Express,
@@ -351,6 +406,11 @@ impl QueueCommand {
             QueueCommand::AckMany { .. } => CommandPrio::High,
             QueueCommand::Nack { .. } => CommandPrio::High,
             QueueCommand::NackMany { .. } => CommandPrio::High,
+            QueueCommand::DeadLetterCommit { .. } => CommandPrio::High,
+            QueueCommand::MarkPendingDlq { .. } => CommandPrio::High,
+            QueueCommand::DiscardPendingDlq { .. } => CommandPrio::High,
+            QueueCommand::Declare { .. } => CommandPrio::High,
+            QueueCommand::GetPendingDlq { .. } => CommandPrio::High,
 
             // === Producer path — must accept writes but yield to delivery/settlement ===
             // Under overload, throttling publish is correct. Natural backpressure upstream.
@@ -407,6 +467,12 @@ impl QueueCommand {
             QueueCommand::CollectExpired { .. } => "CollectExpired",
             QueueCommand::DumpInflight { .. } => "DumpInflight",
             QueueCommand::GetDebugInfo { .. } => "GetDebugInfo",
+            QueueCommand::DeadLetterCommit { .. } => "DeadLetterCommit",
+            QueueCommand::MarkPendingDlq { .. } => "MarkPendingDlq",
+            QueueCommand::DiscardPendingDlq { .. } => "DiscardPendingDlq",
+            QueueCommand::Declare { .. } => "Declare",
+            QueueCommand::GetPendingDlq { .. } => "GetPendingDlq",
+            QueueCommand::GetDlqTarget { .. } => "GetDlqTarget",
         }
     }
 }
@@ -637,6 +703,15 @@ impl CommandSender {
 }
 
 #[derive(Debug, Clone)]
+pub struct QueueSharedBundle {
+    pub msg_log: Arc<Keratin>,
+    pub event_log: Arc<Keratin>,
+    pub task_group: Arc<TaskGroup>,
+    pub metrics: Arc<StromaMetrics>,
+    pub global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
+}
+
+#[derive(Debug, Clone)]
 pub struct QueueHandle {
     command_sender: CommandSender,
 
@@ -657,6 +732,7 @@ pub struct QueueHandle {
     creating_snapshot: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
 
+    global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
 }
 
@@ -665,11 +741,16 @@ impl QueueHandle {
         topic: String,
         partition: u32,
         group: Option<String>,
-        msg_log: Arc<Keratin>,
-        event_log: Arc<Keratin>,
-        task_group: Arc<TaskGroup>,
-        metrics: Arc<StromaMetrics>,
+        bundle: QueueSharedBundle,
     ) -> Self {
+        let bundle_clone = bundle.clone();
+        let QueueSharedBundle {
+            msg_log,
+            event_log,
+            task_group,
+            metrics,
+            global_dlq,
+        } = bundle;
         let (tx, mut rx) = CommandSender::channel_pair(metrics.clone());
         let dirty_since_snapshot = Arc::new(AtomicBool::new(false));
 
@@ -696,13 +777,14 @@ impl QueueHandle {
             creating_snapshot,
             dirty_since_snapshot,
             task_group,
+            global_dlq,
             metrics,
         };
 
         let handle = result.clone();
 
         task_group_clone.spawn("queue control", async move {
-            let mut state = QueueInternalState::new(topic_clone, partition);
+            let mut state: QueueInternalState = QueueInternalState::new(topic_clone, partition);
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
@@ -813,18 +895,62 @@ impl QueueHandle {
                 requeue,
                 response,
             } => {
-                state.nack(offset, requeue);
+                let outcome = state.nack(offset, requeue);
+                if let Some(r) = response {
+                    let _ = r.send(outcome);
+                }
+                dirty = true;
+            }
+            QueueCommand::NackMany { reqs, response } => {
+                let outcomes = state.nack_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(outcomes);
+                }
+                dirty = !reqs.is_empty();
+            }
+            QueueCommand::DeadLetterCommit { offsets, response } => {
+                for o in &offsets {
+                    state.commit_dlq(*o);
+                }
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !offsets.is_empty();
+            }
+            QueueCommand::DiscardPendingDlq { offsets, response } => {
+                for o in &offsets {
+                    state.discard_pending_dlq(*o);
+                }
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !offsets.is_empty();
+            }
+            QueueCommand::Declare { meta, response } => {
+                state.apply_declare(&meta);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
                 dirty = true;
             }
-            QueueCommand::NackMany { reqs, response } => {
-                state.nack_many(&reqs);
+            QueueCommand::MarkPendingDlq { offsets, response } => {
+                state.mark_pending_dlq_many(&offsets);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
-                dirty = !reqs.is_empty();
+                dirty = !offsets.is_empty();
+            }
+            QueueCommand::GetDlqTarget { global, response } => {
+                let v = state.resolve_dlq_target(global.as_ref());
+                if let Some(r) = response {
+                    let _ = r.send(v);
+                }
+            }
+            QueueCommand::GetPendingDlq { response } => {
+                let v = state.pending_dlq_iter().collect();
+                if let Some(r) = response {
+                    let _ = r.send(v);
+                }
             }
             QueueCommand::IsAcked { offset, response } => {
                 let result = state.is_acked(offset);
@@ -1098,7 +1224,7 @@ impl QueueHandle {
     }
 
     pub async fn debug_info(&self) -> QueueInternalDebugInfo {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetDebugInfo { response: Some(tx) })
             .await;
@@ -1107,7 +1233,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
         let _ = self
             .command_enqueue(QueueCommand::Enqueue {
@@ -1121,7 +1247,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
 
         let _ = self
             .command_enqueue(QueueCommand::EnqueueMany {
@@ -1134,7 +1260,7 @@ impl QueueHandle {
     }
 
     pub async fn mark_inflight(&self, offset: Offset, deadline: UnixMillis) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
                 offset,
@@ -1146,7 +1272,7 @@ impl QueueHandle {
     }
 
     pub async fn mark_inflight_batch(&self, reqs: Vec<MarkInflightEventMeta>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
                 reqs,
@@ -1157,7 +1283,7 @@ impl QueueHandle {
     }
 
     pub async fn ack(&self, offset: Offset) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
                 offset,
@@ -1168,7 +1294,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
                 reqs,
@@ -1178,8 +1304,8 @@ impl QueueHandle {
         rx.await.unwrap();
     }
 
-    pub async fn nack(&self, offset: Offset, requeue: bool) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    pub async fn nack(&self, offset: Offset, requeue: bool) -> NackOutcome {
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
                 offset,
@@ -1187,14 +1313,77 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.unwrap()
     }
 
-    pub async fn nack_many(&self, reqs: Vec<NackEventMeta>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+    pub async fn nack_many(&self, reqs: Vec<NackEventMeta>) -> Vec<(Offset, NackOutcome)> {
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
                 reqs,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap()
+    }
+
+    pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::DeadLetterCommit {
+                offsets,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap();
+    }
+
+    pub async fn get_dlq_target(&self) -> Option<(String, u32, Option<String>)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::GetDlqTarget {
+                global: self.global_dlq.read().await.clone(),
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap()
+    }
+
+    pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::DiscardPendingDlq {
+                offsets,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap();
+    }
+
+    pub async fn declare(&self, meta: DeclareMeta) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::Declare {
+                meta,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap();
+    }
+
+    pub async fn pending_dlq(&self) -> Vec<(Offset, Option<ResolvedDlqTarget>)> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::GetPendingDlq { response: Some(tx) })
+            .await;
+        rx.await.unwrap()
+    }
+
+    pub async fn mark_pending_dlq_many(&self, offsets: Vec<Offset>) {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::MarkPendingDlq {
+                offsets,
                 response: Some(tx),
             })
             .await;
@@ -1202,7 +1391,7 @@ impl QueueHandle {
     }
 
     pub async fn advance_frontier(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
             .await;
@@ -1210,7 +1399,7 @@ impl QueueHandle {
     }
 
     pub async fn reset(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
             .await;
@@ -1218,7 +1407,7 @@ impl QueueHandle {
     }
 
     pub async fn set_acked_until(&self, offset: Offset) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckedUntil {
                 offset,
@@ -1229,7 +1418,7 @@ impl QueueHandle {
     }
 
     pub async fn set_ack_window(&self, base: Offset, bits: BitVec) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckWindow {
                 base,
@@ -1241,7 +1430,7 @@ impl QueueHandle {
     }
 
     pub async fn set_ack_window_from_bytes(&self, base: Offset, bits_bytes: Vec<u8>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckWindowFromBytes {
                 base,
@@ -1253,7 +1442,7 @@ impl QueueHandle {
     }
 
     pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::LoadInflight {
                 entries,
@@ -1266,7 +1455,7 @@ impl QueueHandle {
     pub async fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Option<Vec<u8>> {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
@@ -1286,7 +1475,7 @@ impl QueueHandle {
     }
 
     pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<SnapshotMeta> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::LoadSnapshot {
                 data,
@@ -1310,7 +1499,7 @@ impl QueueHandle {
     }
 
     pub async fn is_acked(&self, offset: Offset) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::IsAcked {
                 offset,
@@ -1321,7 +1510,7 @@ impl QueueHandle {
     }
 
     pub async fn is_inflight(&self, offset: Offset) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::IsInflight {
                 offset,
@@ -1332,7 +1521,7 @@ impl QueueHandle {
     }
 
     pub async fn is_inflight_or_acked(&self, offset: Offset) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::IsInflightOrAcked {
                 offset,
@@ -1343,7 +1532,7 @@ impl QueueHandle {
     }
 
     pub async fn is_ready(&self, offset: Offset) -> bool {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::IsReady {
                 offset,
@@ -1357,7 +1546,7 @@ impl QueueHandle {
         &self,
         items: Vec<(Offset, Vec<u8>)>,
     ) -> Vec<(Offset, Vec<u8>)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::FilterNotEnqueued {
                 items: items.clone(),
@@ -1368,7 +1557,7 @@ impl QueueHandle {
     }
 
     pub async fn retries(&self, offset: Offset) -> u32 {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetRetries {
                 offset,
@@ -1379,7 +1568,7 @@ impl QueueHandle {
     }
 
     pub async fn settled_until(&self) -> Offset {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetSettledUntil { response: Some(tx) })
             .await;
@@ -1391,7 +1580,7 @@ impl QueueHandle {
         max: usize,
         lease_deadline: UnixMillis,
     ) -> Vec<(Offset, u32)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::PollReadyAndMark {
                 max,
@@ -1403,7 +1592,7 @@ impl QueueHandle {
     }
 
     pub async fn lowest_unacked_offset(&self) -> Offset {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetLowestUnacked { response: Some(tx) })
             .await;
@@ -1411,7 +1600,7 @@ impl QueueHandle {
     }
 
     pub async fn lowest_not_acked_offset(&self) -> Offset {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetLowestNotAcked { response: Some(tx) })
             .await;
@@ -1419,7 +1608,7 @@ impl QueueHandle {
     }
 
     pub async fn next_deliverable(&self, from: Offset, upper: Offset) -> Option<Offset> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetNextDeliverable {
                 from,
@@ -1431,7 +1620,7 @@ impl QueueHandle {
     }
 
     pub async fn inflight_len(&self) -> usize {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetInflightLen { response: Some(tx) })
             .await;
@@ -1439,7 +1628,7 @@ impl QueueHandle {
     }
 
     pub async fn next_expiry_hint(&self) -> Option<UnixMillis> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetNextExpiryHint { response: Some(tx) })
             .await;
@@ -1447,7 +1636,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_window_base(&self) -> Offset {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetAckWindowBase { response: Some(tx) })
             .await;
@@ -1455,7 +1644,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_bits_bytes(&self) -> Vec<u8> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetAckBitsBytes { response: Some(tx) })
             .await;
@@ -1463,7 +1652,7 @@ impl QueueHandle {
     }
 
     pub async fn canonical(&self) -> CanonicalQueueState {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetCanonicalQueueState { response: Some(tx) })
             .await;
@@ -1471,7 +1660,7 @@ impl QueueHandle {
     }
 
     pub async fn status_report(&self) -> Result<QueueStatusReport, std::io::Error> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetStatusReport { response: Some(tx) })
             .await;
@@ -1480,7 +1669,7 @@ impl QueueHandle {
     }
 
     pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::CollectExpired {
                 now,
@@ -1492,7 +1681,7 @@ impl QueueHandle {
     }
 
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DumpInflight { response: Some(tx) })
             .await;
@@ -1500,7 +1689,7 @@ impl QueueHandle {
     }
 
     pub async fn shutdown(&self) {
-        let (tx, rx) = tokio::sync::oneshot::channel();
+        let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Shutdown { response: Some(tx) })
             .await;
@@ -1603,8 +1792,9 @@ impl QueueInternalState {
             ack_window_base: 0,
             ack_bits: BitVec::repeat(false, ACK_WINDOW),
             inflight: BTreeMap::new(),
+            pending_dlq: BTreeMap::new(),
             ready: RangeSet::new(),
-            retries: hashbrown::HashMap::new(),
+            retries: HashMap::new(),
             expiry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
@@ -1659,13 +1849,18 @@ impl QueueInternalState {
     pub fn safe_message_truncate_before(&self) -> Offset {
         let min_ready = self.ready.first().map(|r| r.start).unwrap_or(u64::MAX);
         let min_inflight = self.inflight.keys().copied().min().unwrap_or(u64::MAX);
+        let min_pending = self
+            .pending_dlq
+            .iter()
+            .map(|(off, _)| off)
+            .copied()
+            .next()
+            .unwrap_or(u64::MAX);
 
-        let result = min_ready.min(min_inflight);
-
+        let result = min_ready.min(min_inflight).min(min_pending);
         if result == 0 {
             return self.settled_until;
         }
-
         result
     }
 
@@ -1739,7 +1934,7 @@ impl QueueInternalState {
 
     #[inline]
     pub fn is_inflight_or_acked(&self, offset: Offset) -> bool {
-        self.is_acked(offset) || self.is_inflight(offset)
+        self.is_acked(offset) || self.is_inflight(offset) || self.pending_dlq.contains_key(&offset)
     }
 
     #[inline]
@@ -1783,137 +1978,125 @@ impl QueueInternalState {
         }
     }
 
-    pub fn nack(&mut self, offset: u64, requeue: bool) {
+    pub fn nack(&mut self, offset: u64, requeue: bool) -> NackOutcome {
         if offset < self.settled_until {
             self.inflight.remove(&offset);
-            return;
+            return NackOutcome::NoOp;
         }
 
-        if !requeue {
-            self.ready.remove(offset..offset + 1);
-
-            self.retries.remove(&offset);
-            self.dead_letter(offset);
-            return;
-        }
-
-        let exists = self.inflight.contains_key(&offset) || self.ready.contains(&offset);
+        let exists = self.inflight.contains_key(&offset)
+            || self.ready.contains(&offset)
+            || self.retries.contains_key(&offset);
         if !exists {
-            return;
+            return NackOutcome::NoOp;
         }
 
         self.inflight.remove(&offset);
 
+        if !requeue {
+            // Policy-driven: caller (Stroma) decides DLQ vs discard based on dlq_policy.
+            // We only mark pending; the local ack happens later via commit_dlq or
+            // discard_pending_dlq depending on policy.
+            self.ready.remove(offset..offset + 1);
+            self.retries.remove(&offset);
+            self.pending_dlq.insert(offset, None);
+            self.recompute_hint_if_needed();
+            // if let DLQDiscardPolicy::Discard = self.dlq_policy {
+            //     return NackOutcome::NoOp;
+            // }
+            return NackOutcome::DeadLetterRequested;
+        }
+
         let retries = self.retries.entry(offset).or_insert(0);
         if *retries >= self.dlq_discard_max_retries {
             self.ready.remove(offset..offset + 1);
-
             self.retries.remove(&offset);
-            self.dead_letter(offset);
-            return;
+            self.pending_dlq.insert(offset, None);
+            self.recompute_hint_if_needed();
+            return NackOutcome::DeadLetterRequested;
         }
 
         *retries += 1;
         self.ready.insert(offset..offset + 1);
         self.recompute_hint_if_needed();
+        NackOutcome::Requeued
     }
 
-    pub fn nack_many(&mut self, reqs: &[NackEventMeta]) {
-        for req in reqs {
-            self.nack(req.off, req.requeue);
-        }
+    pub fn nack_many(&mut self, reqs: &[NackEventMeta]) -> Vec<(Offset, NackOutcome)> {
+        reqs.iter()
+            .map(|r| (r.off, self.nack(r.off, r.requeue)))
+            .collect()
     }
 
-    // TODO: todo
-    pub fn dead_letter(&mut self, offset: u64) {
-        // let global_dlq = &stroma.global_dlq;
+    pub fn mark_pending_dlq_many(&mut self, offsets: &[Offset]) {
+        for &o in offsets {
+            if o < self.settled_until {
+                continue;
+            }
+            self.inflight.remove(&o);
+            self.ready.remove(o..o + 1);
+            self.retries.remove(&o);
+            self.pending_dlq.entry(o).or_insert(None);
+        }
+        self.recompute_hint_if_needed();
+    }
 
-        // // Do fallible parts first
-        // let dlq = match &self.dlq_policy {
-        //     DLQDiscardPolicy::Discard => {
-        //         // no DLQ; just discard
-        //     return Ok(());
-        //     }
-        //     DLQDiscardPolicy::GlobalDQL => match global_dlq.blocking_read().as_ref().map(|d| d.to_custom_dlq()) {
-        //         Some(c) => c,
-        //         None => {
-        //             // no global DLQ configured; discard
-        //             return Ok(());
-        //         }
-        //     },
-        //     DLQDiscardPolicy::CustomDQL(c) => c.clone(),
-        // };
+    /// DLQ copy succeeded -> finalize as ack.
+    pub fn commit_dlq(&mut self, offset: Offset) {
+        if !self.pending_dlq.remove(&offset).is_some() {
+            return; // not pending; idempotent no-op
+        }
+        self.ack(offset); // reuse existing frontier-advance logic
+    }
 
-        // // We enqueue the message to the DLQ topic/partition.
-        // let msg = match stroma.fetch_message_by_offset(&self.topic, self.partition, offset).await? {
-        //     Some(msg) => msg,
-        //     None => {
-        //         // message not found; cannot DLQ
-        //         return Ok(());
-        //     }
-        // };
-        // let (completion, _) = KeratinAppendCompletion::pair();
-        // let bytes = Message::encode_msg(&msg, offset).map_err(|e| StromaError::Corruption(e.to_string()))?;
-        // stroma.append_message(&dlq.tp, dlq.part, &bytes, completion).await?;
-
-        // TODO: WIP
-        if offset < self.settled_until {
-            // already acked
-            self.inflight.remove(&offset); // best-effort cleanup
+    /// Policy says discard, OR DLQ copy permanently failed -> ack locally without DLQ.
+    /// Identical mechanics to commit_dlq right now, but kept separate for clarity
+    /// and future divergence (e.g. metrics, logging, poison set).
+    pub fn discard_pending_dlq(&mut self, offset: Offset) {
+        if !self.pending_dlq.remove(&offset).is_some() {
             return;
         }
+        self.ack(offset);
+    }
 
-        // beats inflight: always remove inflight if present
-        let removed = self.inflight.remove(&offset);
-        if removed.is_some() {
-            // heap can have stale entries now
-            self.recompute_hint_if_needed();
-        }
+    /// Returns (offset, target). target == None means "needs re-resolution".
+    pub fn pending_dlq_iter(
+        &self,
+    ) -> impl Iterator<Item = (Offset, Option<ResolvedDlqTarget>)> + '_ {
+        self.pending_dlq.iter().map(|(&o, t)| (o, t.clone()))
+    }
 
-        if offset == self.settled_until {
-            self.settled_until += 1;
-            self.advance_frontier();
-            return;
-        }
+    pub fn is_pending_dlq(&self, offset: Offset) -> bool {
+        self.pending_dlq.contains_key(&offset)
+    }
 
-        let end = self.ack_window_base + ACK_WINDOW as u64;
-        if offset < end {
-            let idx = (offset - self.ack_window_base) as usize;
-            self.ack_bits.set(idx, true);
-        } else {
-            // leave for persistence/event log (still applied logically by replay later)
-            // (Materialized model can ignore or store it.)
+    pub fn resolve_dlq_target(
+        &self,
+        global: Option<&GlobalDLQ>,
+    ) -> Option<(String, u32, Option<String>)> {
+        match &self.dlq_policy {
+            DLQDiscardPolicy::Discard => None,
+            DLQDiscardPolicy::CustomDQL(c) => Some((c.tp.clone(), c.part, c.group.clone())),
+            DLQDiscardPolicy::GlobalDQL => global.map(|g| (g.tp.clone(), g.part, g.group.clone())),
         }
     }
 
-    pub fn reject(&mut self, offset: u64) {
-        // TODO: WIP - currently same as nack, must reque into dql which must be implemented
-        if offset < self.settled_until {
-            // already acked
-            self.inflight.remove(&offset); // best-effort cleanup
-            return;
+    pub fn apply_declare(&mut self, meta: &DeclareMeta) {
+        if let Some(p) = &meta.dlq_policy {
+            self.dlq_policy = match p {
+                DLQDiscardPolicyWire::Discard => DLQDiscardPolicy::Discard,
+                DLQDiscardPolicyWire::GlobalDQL => DLQDiscardPolicy::GlobalDQL,
+                DLQDiscardPolicyWire::CustomDQL { tp, part, group } => {
+                    DLQDiscardPolicy::CustomDQL(CustomDLQ {
+                        tp: tp.to_string(),
+                        part: *part,
+                        group: group.as_deref().map(|s| s.into()),
+                    })
+                }
+            };
         }
-
-        // NACK beats inflight: always remove inflight if present
-        let removed = self.inflight.remove(&offset);
-        if removed.is_some() {
-            // heap can have stale entries now
-            self.recompute_hint_if_needed();
-        }
-
-        if offset == self.settled_until {
-            self.settled_until += 1;
-            self.advance_frontier();
-            return;
-        }
-
-        let end = self.ack_window_base + ACK_WINDOW as u64;
-        if offset < end {
-            let idx = (offset - self.ack_window_base) as usize;
-            self.ack_bits.set(idx, true);
-        } else {
-            // far nack: leave for persistence/event log (still applied logically by replay later)
-            // (Materialized model can ignore or store it.)
+        if let Some(n) = meta.dlq_max_retries {
+            self.dlq_discard_max_retries = n;
         }
     }
 
@@ -1976,6 +2159,7 @@ impl QueueInternalState {
 
     pub fn enqueue(&mut self, offset: Offset, retries: u32) {
         // We assume it is only used on messages that have been properly stored earlier
+        // TODO: possibly use different checks as ack window has limited trust
         if self.is_acked(offset) {
             return;
         }
@@ -2324,21 +2508,43 @@ impl QueueInternalState {
         out.extend_from_slice(&bits);
 
         // inflight
-        out.extend_from_slice(&(self.inflight.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(self.inflight.len() as u64).to_be_bytes());
         for (&off, e) in self.inflight.iter() {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
-        out.extend_from_slice(&(self.retries.len() as u32).to_be_bytes());
+        // retries
+        out.extend_from_slice(&(self.retries.len() as u64).to_be_bytes());
         for (&off, e) in self.retries.iter() {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
+        // ready ranges
         let ranges: Vec<_> = self.ready.iter().collect();
-        out.extend_from_slice(&(ranges.len() as u32).to_be_bytes());
+        out.extend_from_slice(&(ranges.len() as u64).to_be_bytes());
         for range in ranges {
             out.extend_from_slice(&range.start.to_be_bytes());
             out.extend_from_slice(&range.end.to_be_bytes());
+        }
+
+        // pending dlq
+        out.extend_from_slice(&(self.pending_dlq.len() as u64).to_be_bytes());
+        for (off, target) in &self.pending_dlq {
+            out.extend_from_slice(&off.to_be_bytes());
+            match target {
+                None => out.push(0),
+                Some(t) => {
+                    out.push(1);
+                    let tp_bytes = t.tp.as_bytes();
+                    out.extend_from_slice(&(tp_bytes.len() as u32).to_be_bytes());
+                    out.extend_from_slice(tp_bytes);
+                    out.extend_from_slice(&t.part.to_be_bytes());
+                    let grp = t.group.as_deref().unwrap_or_default();
+                    let grp_bytes = grp.as_bytes();
+                    out.extend_from_slice(&(grp_bytes.len() as u32).to_be_bytes());
+                    out.extend_from_slice(grp_bytes);
+                }
+            }
         }
 
         // dlq policy
@@ -2357,6 +2563,11 @@ impl QueueInternalState {
                 out.extend_from_slice(tp_bytes);
 
                 out.extend_from_slice(&c.part.to_be_bytes());
+
+                let group_tmp = c.group.as_deref().unwrap_or_default();
+                let group_bytes = group_tmp.as_bytes();
+                out.extend_from_slice(&(group_bytes.len() as u32).to_be_bytes());
+                out.extend_from_slice(group_bytes);
             }
         }
 
@@ -2395,6 +2606,7 @@ impl QueueInternalState {
             Ok(a.try_into().unwrap())
         }
 
+        // Version
         const VERSION_SIZE: usize = size_of::<u64>();
         let version = u64::from_be_bytes(take::<VERSION_SIZE>(&mut bytes)?);
         if version != FORMAT_VERSION {
@@ -2409,6 +2621,7 @@ impl QueueInternalState {
         self.settled_until = u64::from_be_bytes(take::<8>(&mut bytes)?);
         let base = u64::from_be_bytes(take::<8>(&mut bytes)?);
 
+        // ack window
         let win_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
         if bytes.len() < win_len {
             return Err(Error::new(ErrorKind::UnexpectedEof, "ack window"));
@@ -2417,25 +2630,64 @@ impl QueueInternalState {
         bytes = &bytes[win_len..];
         self.set_ack_window_from_bytes(base, win)?;
 
-        let inflight_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        // inflight
+        let inflight_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
         for _ in 0..inflight_len {
             let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let dl = u64::from_be_bytes(take::<8>(&mut bytes)?);
             self.inflight.insert(off, dl);
         }
 
-        let retries_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        // retries
+        let retries_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
         for _ in 0..retries_len {
             let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
             self.retries.insert(off, retries);
         }
 
-        let ranges_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+        // ready ranges
+        let ranges_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
         for _ in 0..ranges_len {
             let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
             self.ready.insert(start..end);
+        }
+
+        // pending dlq
+        let n = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        for _ in 0..n {
+            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let target = {
+                let tag = take::<1>(&mut bytes)?[0];
+                match tag {
+                    0 => None,
+                    1 => {
+                        let tp_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+                        if bytes.len() < tp_len {
+                            return Err(Error::new(ErrorKind::UnexpectedEof, "pending tp"));
+                        }
+                        let tp = String::from_utf8(bytes[..tp_len].to_vec())
+                            .map_err(|_| Error::new(ErrorKind::InvalidData, "utf8"))?;
+                        bytes = &bytes[tp_len..];
+                        let part = u32::from_be_bytes(take::<4>(&mut bytes)?);
+                        let g_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+                        if bytes.len() < g_len {
+                            return Err(Error::new(ErrorKind::UnexpectedEof, "pending group"));
+                        }
+                        let g = String::from_utf8(bytes[..g_len].to_vec())
+                            .map_err(|_| Error::new(ErrorKind::InvalidData, "utf8"))?;
+                        bytes = &bytes[g_len..];
+                        Some(ResolvedDlqTarget {
+                            tp,
+                            part,
+                            group: if g.is_empty() { None } else { Some(g) },
+                        })
+                    }
+                    _ => return Err(Error::new(ErrorKind::InvalidData, "pending tag")),
+                }
+            };
+            self.pending_dlq.insert(off, target);
         }
 
         let tag = take::<1>(&mut bytes)?[0];
@@ -2454,7 +2706,17 @@ impl QueueInternalState {
 
                 let part = u32::from_be_bytes(take::<4>(&mut bytes)?);
 
-                DLQDiscardPolicy::CustomDQL(CustomDLQ { tp, part })
+                let len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+                let group_tmp = String::from_utf8(bytes[..len].to_vec())
+                    .map_err(|_| Error::new(ErrorKind::InvalidData, "utf8"))?;
+                let group = if group_tmp.is_empty() {
+                    None
+                } else {
+                    Some(group_tmp)
+                };
+                bytes = &bytes[len..];
+
+                DLQDiscardPolicy::CustomDQL(CustomDLQ { tp, part, group })
             }
             _ => return Err(Error::new(ErrorKind::InvalidData, "dlq tag")),
         };
@@ -2462,7 +2724,10 @@ impl QueueInternalState {
         self.dlq_discard_max_retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
 
         if !bytes.is_empty() {
-            return Err(Error::new(ErrorKind::InvalidData, "trailing bytes"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("{} trailing bytes", bytes.len()),
+            ));
         }
 
         // --- enforce invariants ---
@@ -2609,8 +2874,9 @@ impl Default for CanonicalQueueState {
 mod tests {
     use super::{Offset, QueueInternalState};
     use crate::{
-        event::AckEventMeta,
-        state::{CustomDLQ, DLQDiscardPolicy},
+        event::{AckEventMeta, DLQDiscardPolicyWire, DeclareMeta},
+        state::{CustomDLQ, DLQDiscardPolicy, NackOutcome},
+        stroma::GlobalDLQ,
     };
 
     #[test]
@@ -2624,26 +2890,6 @@ mod tests {
 
         s.enqueue(5, 0);
         assert_eq!(s.next_deliverable(0, 10), 5);
-    }
-
-    #[test]
-    fn reject_without_enqueue_is_noop() {
-        let mut s = QueueInternalState::new("test".into(), 0);
-
-        s.reject(7);
-
-        assert!(!s.has_history(7));
-    }
-
-    #[test]
-    fn reject_without_enqueue_is_terminal() {
-        let mut s = QueueInternalState::new("test".into(), 0);
-
-        s.reject(7);
-
-        assert!(s.is_acked(7));
-        assert!(!s.is_ready(7));
-        assert!(!s.is_inflight(7));
     }
 
     #[test]
@@ -2805,6 +3051,12 @@ mod tests {
 
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
+        assert!(!s.is_acked(1));
+
+        s.commit_dlq(1);
+
+        assert!(!s.is_ready(1));
+        assert!(!s.is_inflight(1));
         assert!(s.is_acked(1));
     }
 
@@ -2855,17 +3107,6 @@ mod tests {
 
         assert!(!s.is_acked(2));
         assert_eq!(s.next_deliverable(0, 10), 2);
-    }
-
-    #[test]
-    fn reject_advances_frontier() {
-        let mut s = QueueInternalState::new("test".into(), 0);
-
-        s.mark_inflight(0, 100);
-        s.reject(0);
-
-        assert!(s.is_acked(0));
-        assert_eq!(s.settled_until(), 1);
     }
 
     #[test]
@@ -3183,6 +3424,7 @@ mod tests {
         s.dlq_policy = DLQDiscardPolicy::CustomDQL(CustomDLQ {
             tp: "dlq-topic".into(),
             part: 42,
+            group: Some("dlq-group".into()),
         });
         s.dlq_discard_max_retries = 7;
 
@@ -3333,6 +3575,7 @@ mod tests {
             DLQDiscardPolicy::CustomDQL(CustomDLQ {
                 tp: "x".into(),
                 part: 1,
+                group: Some("y".into()),
             }),
         ];
 
@@ -3521,5 +3764,312 @@ mod tests {
             .collect();
         s.ack_many(&v);
         assert_eq!(s.settled_until(), 4);
+    }
+
+    #[test]
+    fn nack_requeue_under_max_returns_requeued() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 100);
+
+        let out = s.nack(1, true);
+
+        assert_eq!(out, NackOutcome::Requeued);
+        assert!(s.is_ready(1));
+        assert!(!s.is_pending_dlq(1));
+        assert_eq!(s.get_retries(1), 1);
+    }
+
+    #[test]
+    fn nack_requeue_at_max_returns_dead_letter() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.dlq_discard_max_retries = 2;
+        s.enqueue(1, 0);
+
+        s.mark_inflight(1, 100);
+        assert_eq!(s.nack(1, true), NackOutcome::Requeued); // retries=1
+        s.mark_inflight(1, 100);
+        assert_eq!(s.nack(1, true), NackOutcome::Requeued); // retries=2
+        s.mark_inflight(1, 100);
+        let out = s.nack(1, true); // retries==max -> DLQ
+
+        assert_eq!(out, NackOutcome::DeadLetterRequested);
+        assert!(s.is_pending_dlq(1));
+        assert!(!s.is_ready(1));
+        assert!(!s.is_inflight(1));
+        assert!(!s.is_acked(1)); // NOT acked yet — phase 2 hasn't happened
+    }
+
+    #[test]
+    fn nack_no_requeue_goes_to_pending_dlq() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 100);
+
+        let out = s.nack(1, false);
+
+        assert_eq!(out, NackOutcome::DeadLetterRequested);
+        assert!(s.is_pending_dlq(1));
+        assert!(!s.is_acked(1));
+    }
+
+    #[test]
+    fn nack_unknown_offset_is_noop() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        let out = s.nack(42, true);
+        assert_eq!(out, NackOutcome::NoOp);
+        assert!(!s.is_pending_dlq(42));
+        assert!(!s.is_acked(42));
+    }
+
+    #[test]
+    fn nack_below_frontier_is_noop() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.ack(0);
+        s.ack(1);
+        s.ack(2);
+        assert_eq!(s.settled_until(), 3);
+
+        let out = s.nack(1, true);
+        assert_eq!(out, NackOutcome::NoOp);
+        assert!(!s.is_pending_dlq(1));
+    }
+
+    #[test]
+    fn commit_dlq_acks_locally_and_advances_frontier() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 100);
+        assert_eq!(s.nack(0, false), NackOutcome::DeadLetterRequested);
+
+        s.commit_dlq(0);
+
+        assert!(!s.is_pending_dlq(0));
+        assert!(s.is_acked(0));
+        assert_eq!(s.settled_until(), 1);
+    }
+
+    #[test]
+    fn commit_dlq_unknown_offset_is_idempotent() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.commit_dlq(99); // never been pending
+        assert!(!s.is_acked(99));
+        assert_eq!(s.settled_until(), 0);
+    }
+
+    #[test]
+    fn commit_dlq_twice_is_idempotent() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 100);
+        s.nack(0, false);
+
+        s.commit_dlq(0);
+        s.commit_dlq(0); // second call: pending_dlq no longer contains, no-op
+
+        assert!(s.is_acked(0));
+        assert_eq!(s.settled_until(), 1);
+    }
+
+    #[test]
+    fn discard_pending_dlq_acks_locally() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 100);
+        s.nack(0, false);
+
+        s.discard_pending_dlq(0);
+
+        assert!(!s.is_pending_dlq(0));
+        assert!(s.is_acked(0));
+    }
+
+    #[test]
+    fn pending_dlq_blocks_msg_truncation() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(5, 0);
+        s.mark_inflight(5, 100);
+        s.nack(5, false); // pending_dlq = {5}
+
+        // Frontier is 0, but pending_dlq holds 5, so safe truncation must not pass 5.
+        assert!(s.safe_message_truncate_before() <= 5);
+        assert!(s.is_inflight_or_acked(5)); // delivery must skip it
+    }
+
+    #[test]
+    fn pending_dlq_does_not_count_as_ready() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(3, 0);
+        s.mark_inflight(3, 100);
+        s.nack(3, false);
+
+        assert!(!s.is_ready(3));
+        assert_eq!(s.next_deliverable(0, 100), 100); // nothing deliverable
+    }
+
+    #[test]
+    fn poll_ready_skips_pending_dlq() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0);
+        s.enqueue(1, 0);
+        s.enqueue(2, 0);
+        s.mark_inflight(1, 100);
+        s.nack(1, false); // 1 -> pending_dlq
+
+        let polled = s.poll_ready_and_mark(10, 200);
+        let offsets: Vec<_> = polled.iter().map(|(o, _)| *o).collect();
+
+        assert!(!offsets.contains(&1));
+        assert_eq!(offsets, vec![0, 2]);
+    }
+
+    #[test]
+    fn mark_pending_dlq_many_clears_other_states() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(1, 0);
+        s.enqueue(2, 0);
+        s.mark_inflight(1, 100); // 1 inflight, 2 ready
+
+        s.mark_pending_dlq_many(&[1, 2]);
+
+        assert!(s.is_pending_dlq(1));
+        assert!(s.is_pending_dlq(2));
+        assert!(!s.is_inflight(1));
+        assert!(!s.is_ready(2));
+        assert!(!s.is_acked(1));
+        assert!(!s.is_acked(2));
+    }
+
+    #[test]
+    fn apply_declare_updates_only_provided_fields() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        let original_max = s.dlq_discard_max_retries;
+
+        s.apply_declare(&DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
+            dlq_max_retries: None,
+        });
+
+        assert_eq!(s.dlq_policy, DLQDiscardPolicy::GlobalDQL);
+        assert_eq!(s.dlq_discard_max_retries, original_max); // untouched
+    }
+
+    #[test]
+    fn apply_declare_custom_dlq_roundtrips_through_wire() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.apply_declare(&DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::CustomDQL {
+                tp: "dlq-x".into(),
+                part: 7,
+                group: Some("g1".into()), // assumes you added the group field
+            }),
+            dlq_max_retries: Some(99),
+        });
+
+        assert_eq!(
+            s.dlq_policy,
+            DLQDiscardPolicy::CustomDQL(CustomDLQ {
+                tp: "dlq-x".into(),
+                part: 7,
+                group: Some("g1".into()),
+            })
+        );
+        assert_eq!(s.dlq_discard_max_retries, 99);
+    }
+
+    #[test]
+    fn resolve_dlq_target_discard_returns_none() {
+        let s = QueueInternalState::new("t".into(), 0);
+        assert!(matches!(s.dlq_policy, DLQDiscardPolicy::Discard));
+        assert!(s.resolve_dlq_target(None).is_none());
+        // Even with a global, discard means discard.
+        let global = GlobalDLQ {
+            tp: "g".into(),
+            part: 0,
+            group: None,
+        };
+        assert!(s.resolve_dlq_target(Some(&global)).is_none());
+    }
+
+    #[test]
+    fn resolve_dlq_target_global_falls_back_to_global() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.dlq_policy = DLQDiscardPolicy::GlobalDQL;
+
+        assert!(s.resolve_dlq_target(None).is_none());
+
+        let g = GlobalDLQ {
+            tp: "global-dlq".into(),
+            part: 3,
+            group: None,
+        };
+        let r = s.resolve_dlq_target(Some(&g)).unwrap();
+        assert_eq!(r, ("global-dlq".into(), 3, None));
+    }
+
+    #[test]
+    fn resolve_dlq_target_custom_ignores_global() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.dlq_policy = DLQDiscardPolicy::CustomDQL(CustomDLQ {
+            tp: "custom".into(),
+            part: 1,
+            group: None,
+        });
+        let g = GlobalDLQ {
+            tp: "global".into(),
+            part: 9,
+            group: None,
+        };
+
+        let r = s.resolve_dlq_target(Some(&g)).unwrap();
+        assert_eq!(r, ("custom".into(), 1, None));
+    }
+
+    #[test]
+    fn snapshot_roundtrips_pending_dlq() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(1, 0);
+        s.enqueue(2, 0);
+        s.mark_inflight(1, 100);
+        s.nack(1, false);
+        s.nack(2, false);
+
+        let snap = s.encode_snapshot(0);
+        let mut s2 = QueueInternalState::new("t".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        assert!(s2.is_pending_dlq(1));
+        assert!(s2.is_pending_dlq(2));
+        assert_eq!(s.canonical(), s2.canonical());
+    }
+
+    #[test]
+    fn snapshot_roundtrips_declare_settings() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.dlq_discard_max_retries = 17;
+        s.dlq_policy = DLQDiscardPolicy::CustomDQL(CustomDLQ {
+            tp: "x".into(),
+            part: 2,
+            group: Some("g".into()),
+        });
+
+        let snap = s.encode_snapshot(0);
+        let mut s2 = QueueInternalState::new("t".into(), 0);
+        s2.load_snapshot(&snap).unwrap();
+
+        assert_eq!(s2.dlq_discard_max_retries, 17);
+        assert_eq!(s2.dlq_policy, s.dlq_policy);
+    }
+
+    #[test]
+    fn nack_after_dead_letter_requested_is_noop() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0);
+        s.mark_inflight(0, 100);
+        s.nack(0, false); // -> pending_dlq
+
+        let out = s.nack(0, true); // already pending, not in lifecycle
+        assert_eq!(out, NackOutcome::NoOp);
+        assert!(s.is_pending_dlq(0));
     }
 }

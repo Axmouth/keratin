@@ -124,6 +124,14 @@ async fn expiry_respects_max_retries() {
     st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
     st.requeue_expired(10, 10).await.unwrap();
 
+    
+    assert!(st.is_acked("t", 0, None, off).await.unwrap());
+    assert!(!st.is_ready("t", 0, None, off).await.unwrap());
+
+    let qh = st.queue_handle("t", 0, None).await.unwrap();
+
+    qh.dead_letter_commit(vec![off]).await;
+
     assert!(st.is_acked("t", 0, None, off).await.unwrap());
     assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 }

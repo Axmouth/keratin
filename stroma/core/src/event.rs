@@ -1,5 +1,9 @@
 use std::io;
 
+use serde::{Deserialize, Serialize};
+
+use crate::state::ConsumerId;
+
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -17,6 +21,9 @@ pub enum EventType {
     AckMany = 21,
     Nack = 30,
     NackMany = 31,
+    DeadLetter = 40,
+    DeadLetterCommit = 41,
+    Declare = 50,
     ResetQueue = 60,
     Snapshot = 70,
 }
@@ -32,16 +39,86 @@ pub struct AckEventMeta {
     pub off: Offset,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
+pub enum NackType {
+    Reject,
+    RequeueNow,
+    RequeueAt { available_at: UnixMillis },
+}
+
+impl NackType {
+    pub fn write_bytes(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
+        match self {
+            NackType::Reject => {
+                put_u8(out, 0);
+            }
+            NackType::RequeueNow => {
+                put_u8(out, 1);
+            }
+            NackType::RequeueAt { available_at: ts } => {
+                put_u8(out, 2);
+                put_u64(out, *ts);
+            }
+        }
+        Ok(())
+    }
+
+    pub fn read_from_bytes(&self, input: &[u8]) -> Result<Self, io::Error> {
+        let mut i = 0;
+
+        let tag = rd_u8(input, &mut i)?;
+
+        match tag {
+            0 => Ok(NackType::Reject),
+            1 => Ok(NackType::RequeueNow),
+            2 => {
+                let ts = rd_u64(input, &mut i)?;
+                Ok(NackType::RequeueAt { available_at: ts })
+            }
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid NackType tag",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct NackEventMeta {
     pub off: Offset,
     pub requeue: bool,
 }
 
+// TODO: Add delivery tag?
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct MarkInflightEventMeta {
     pub off: Offset,
     pub deadline: UnixMillis,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DeadLetterMeta {
+    pub off: Offset,
+    pub target_tp: Box<str>,
+    pub target_part: u32,
+    pub target_group: Option<Box<str>>,
+}
+
+/// Settings update; None = leave unchanged.
+/// Add fields here as new settings are introduced.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct DeclareMeta {
+    pub dlq_policy: Option<DLQDiscardPolicyWire>,
+    pub dlq_max_retries: Option<u32>,
+}
+
+/// Wire form of DLQDiscardPolicy. Mirrors state::DLQDiscardPolicy
+/// but lives in event.rs so this module stays free of state imports.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DLQDiscardPolicyWire {
+    Discard,
+    GlobalDQL,
+    CustomDQL { tp: Box<str>, part: u32, group: Option<Box<str>> },
 }
 
 // TODO: Add events for setting DLQ target and policy, timeouts, retry limits, etc.
@@ -74,6 +151,13 @@ pub enum StromaEvent {
     NackMany {
         reqs: Vec<NackEventMeta>,
     },
+    DeadLetter {
+        reqs: Vec<DeadLetterMeta>,
+    },
+    DeadLetterCommit {
+        offs: Vec<Offset>,
+    },
+    Declare(DeclareMeta),
     ResetQueue {
         tp: Box<str>,
         part: u32,
@@ -268,6 +352,50 @@ impl StromaEvent {
                     put_bool(&mut out, req.requeue);
                 }
             }
+            StromaEvent::DeadLetter { reqs } => {
+                put_u16(&mut out, EventType::DeadLetter as u16);
+                put_u32(&mut out, reqs.len() as u32);
+                for r in reqs {
+                    put_u64(&mut out, r.off);
+                    put_str(&mut out, &r.target_tp)?;
+                    put_u32(&mut out, r.target_part);
+                    put_str(&mut out, r.target_group.as_deref().unwrap_or(""))?;
+                }
+            }
+            StromaEvent::DeadLetterCommit { offs } => {
+                put_u16(&mut out, EventType::DeadLetterCommit as u16);
+                put_u32(&mut out, offs.len() as u32);
+                for o in offs {
+                    put_u64(&mut out, *o);
+                }
+            }
+            StromaEvent::Declare(m) => {
+                put_u16(&mut out, EventType::Declare as u16);
+                // bitmap of which Option fields are present, then values in order
+                let mut flags: u16 = 0;
+                if m.dlq_policy.is_some() {
+                    flags |= 1 << 0;
+                }
+                if m.dlq_max_retries.is_some() {
+                    flags |= 1 << 1;
+                }
+                put_u16(&mut out, flags);
+                if let Some(p) = &m.dlq_policy {
+                    match p {
+                        DLQDiscardPolicyWire::Discard => put_u8(&mut out, 0),
+                        DLQDiscardPolicyWire::GlobalDQL => put_u8(&mut out, 1),
+                        DLQDiscardPolicyWire::CustomDQL { tp, part, group } => {
+                            put_u8(&mut out, 2);
+                            put_str(&mut out, tp)?;
+                            put_u32(&mut out, *part);
+                            put_str(&mut out, &group.as_deref().unwrap_or_default());
+                        }
+                    }
+                }
+                if let Some(n) = m.dlq_max_retries {
+                    put_u32(&mut out, n);
+                }
+            }
         }
 
         Ok(out)
@@ -385,6 +513,74 @@ impl StromaEvent {
                 }
                 Ok(StromaEvent::NackMany { reqs })
             }
+            x if x == EventType::DeadLetter as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut reqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    let target_tp = rd_box_str(bytes, &mut i)?;
+                    let target_part = rd_u32(bytes, &mut i)?;
+                    let target_group_str = rd_box_str(bytes, &mut i)?;
+                    let target_group = if target_group_str.is_empty() {
+                        None
+                    } else {
+                        Some(target_group_str)
+                    };
+                    reqs.push(DeadLetterMeta {
+                        off,
+                        target_tp,
+                        target_part,
+                        target_group,
+                    });
+                }
+                Ok(StromaEvent::DeadLetter { reqs })
+            }
+            x if x == EventType::DeadLetterCommit as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut offs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    offs.push(off);
+                }
+                Ok(StromaEvent::DeadLetterCommit { offs })
+            }
+            x if x == EventType::Declare as u16 => {
+                let flags = rd_u16(bytes, &mut i)?;
+                let dlq_policy = if flags & (1 << 0) != 0 {
+                    let tag = rd_u8(bytes, &mut i)?;
+                    match tag {
+                        0 => Some(DLQDiscardPolicyWire::Discard),
+                        1 => Some(DLQDiscardPolicyWire::GlobalDQL),
+                        2 => {
+                            let tp = rd_box_str(bytes, &mut i)?;
+                            let part = rd_u32(bytes, &mut i)?;
+                            let mut group = None;
+                            let group_tmp = rd_box_str(bytes, &mut i)?;
+                            if !group_tmp.is_empty() {
+                                group = Some(group_tmp);
+                            }
+                            Some(DLQDiscardPolicyWire::CustomDQL { tp, part, group })
+                        }
+                        _ => {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "invalid DLQ policy tag",
+                            ));
+                        }
+                    }
+                } else {
+                    None
+                };
+                let dlq_max_retries = if flags & (1 << 1) != 0 {
+                    Some(rd_u32(bytes, &mut i)?)
+                } else {
+                    None
+                };
+                Ok(StromaEvent::Declare(DeclareMeta {
+                    dlq_policy,
+                    dlq_max_retries,
+                }))
+            }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unknown event type",
@@ -469,6 +665,109 @@ mod tests {
         assert_eq!(event, decoded);
     }
 
+    #[test]
+    fn test_reset_queue_without_group() {
+        let event = StromaEvent::ResetQueue {
+            tp: "topic".into(),
+            part: 4,
+            group: None,
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_dead_letter_encode_decode() {
+        let event = StromaEvent::DeadLetter {
+            reqs: vec![
+                DeadLetterMeta {
+                    off: 500,
+                    target_tp: "dlq_topic".into(),
+                    target_part: 1,
+                    target_group: Some("dlq_group".into()),
+                },
+                DeadLetterMeta {
+                    off: 501,
+                    target_tp: "another_dlq".into(),
+                    target_part: 2,
+                    target_group: None,
+                },
+            ],
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_dead_letter_commit_encode_decode() {
+        let event = StromaEvent::DeadLetterCommit {
+            offs: vec![600, 601, 602],
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_declare_encode_decode_no_options() {
+        let event = StromaEvent::Declare(DeclareMeta {
+            dlq_policy: None,
+            dlq_max_retries: None,
+        });
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_declare_encode_decode_with_discard_policy() {
+        let event = StromaEvent::Declare(DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::Discard),
+            dlq_max_retries: None,
+        });
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_declare_encode_decode_with_global_dlq_policy() {
+        let event = StromaEvent::Declare(DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
+            dlq_max_retries: Some(10),
+        });
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_declare_encode_decode_with_custom_dlq_policy() {
+        let event = StromaEvent::Declare(DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::CustomDQL {
+                tp: "custom_dlq".into(),
+                part: 5,
+                group: Some("custom_dlq_group".into())
+            }),
+            dlq_max_retries: Some(5),
+        });
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_declare_encode_decode_with_retries_only() {
+        let event = StromaEvent::Declare(DeclareMeta {
+            dlq_policy: None,
+            dlq_max_retries: Some(3),
+        });
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
     #[test]
     fn test_snapshot_encode_decode() {
         let event = StromaEvent::Snapshot {

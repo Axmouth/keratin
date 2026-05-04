@@ -21,12 +21,13 @@ use tokio::sync::{OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    Result, StromaError,
-    event::{AckEventMeta, EnqueueEventMeta, NackEventMeta, StromaEvent},
+    DeclareMeta, Result, StromaError,
+    event::{AckEventMeta, DeadLetterMeta, EnqueueEventMeta, NackEventMeta, StromaEvent},
     metrics::StromaMetrics,
     partition::Partition,
     state::{
-        Offset, QueueCommand, QueueHandle, QueueStatusReport, StromaDebugSnapshot, UnixMillis,
+        CustomDLQ, NackOutcome, Offset, QueueCommand, QueueHandle, QueueSharedBundle,
+        QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
 };
 
@@ -65,22 +66,25 @@ impl Default for SnapshotConfig {
 pub struct GlobalDLQ {
     pub tp: String,
     pub part: u32,
+    pub group: Option<String>,
 }
 
 impl GlobalDLQ {
-    pub async fn new(tp: &str, part: u32) -> Result<Self> {
+    pub async fn new(tp: &str, part: u32, group: Option<&str>) -> Result<Self> {
         Ok(Self {
             tp: tp.to_string(),
             part,
+            group: group.map(|s| s.into()),
         })
     }
 
     // TODO: Helper to create DLQ message, with metadata about original message. (stabilize headers format first)
 
-    pub fn to_custom_dlq(&self) -> crate::state::CustomDLQ {
-        crate::state::CustomDLQ {
+    pub fn to_custom_dlq(&self) -> CustomDLQ {
+        CustomDLQ {
             tp: self.tp.clone(),
             part: self.part,
+            group: self.group.clone(),
         }
     }
 }
@@ -345,6 +349,7 @@ pub struct Stroma {
     // Materialized queue state
     queue_handles: Arc<ArcSwap<Registry>>,
 
+    // TODO: Consider using parking lot
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
 
@@ -611,14 +616,19 @@ impl Stroma {
             .get_or_try_init(|| async {
                 let msg_log = self.msg_log_init(tp, part, group).await?;
                 let event_log = self.event_log_init(tp, part, group).await?;
+                let global_dlq = self.global_dlq.clone();
+                let bundle = QueueSharedBundle {
+                    event_log,
+                    msg_log,
+                    task_group: self.task_group.clone(),
+                    metrics: self.metrics.clone(),
+                    global_dlq,
+                };
                 Ok(QueueHandle::init(
                     tp.into(),
                     part,
                     group.map(|s| s.into()),
-                    msg_log,
-                    event_log,
-                    self.task_group.clone(),
-                    self.metrics.clone(),
+                    bundle,
                 ))
             })
             .await?;
@@ -744,6 +754,28 @@ impl Stroma {
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
             }
+            StromaEvent::DeadLetter { reqs } => {
+                // On replay we just mark pending; recovery scan will re-issue copies.
+                let offsets: Vec<Offset> = reqs.iter().map(|r| r.off).collect();
+                // We need state.mark_pending_dlq, OR fold via nack(_, false)+pending insert.
+                // Cleanest: add an explicit MarkPendingDlq command for replay.
+                qh.blocking_command_enqueue(QueueCommand::MarkPendingDlq {
+                    offsets,
+                    response: None,
+                })?;
+            }
+            StromaEvent::DeadLetterCommit { offs } => {
+                qh.blocking_command_enqueue(QueueCommand::DeadLetterCommit {
+                    offsets: offs,
+                    response: None,
+                })?;
+            }
+            StromaEvent::Declare(m) => {
+                qh.blocking_command_enqueue(QueueCommand::Declare {
+                    meta: m,
+                    response: None,
+                })?;
+            }
             StromaEvent::ResetQueue { tp, part, group } => {
                 self.remove_queue(&tp, part, group.as_deref());
                 // TODO: More cleanup?
@@ -806,6 +838,19 @@ impl Stroma {
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
                 qh.nack_many(reqs).await;
+            }
+            StromaEvent::DeadLetter { reqs } => {
+                // On replay we just mark pending; recovery scan will re-issue copies.
+                let offsets: Vec<Offset> = reqs.iter().map(|r| r.off).collect();
+                // We need state.mark_pending_dlq, OR fold via nack(_, false)+pending insert.
+                // Cleanest: add an explicit MarkPendingDlq command for replay.
+                qh.mark_pending_dlq_many(offsets).await;
+            }
+            StromaEvent::DeadLetterCommit { offs } => {
+                qh.dead_letter_commit(offs).await;
+            }
+            StromaEvent::Declare(meta) => {
+                qh.declare(meta).await;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
                 self.remove_queue(&tp, part, group.as_deref());
@@ -1077,24 +1122,28 @@ impl Stroma {
             HashSet::from_iter(expired.clone().into_iter());
 
         let mut events_per_queue =
-            HashMap::<(String, u32, Option<String>), Vec<StromaEvent>>::new();
+            HashMap::<(String, u32, Option<String>), Vec<NackEventMeta>>::new();
 
         for (tp, part, group, off) in expired {
-            let ev = StromaEvent::Nack { off, requeue: true };
+            let meta = NackEventMeta { off, requeue: true };
 
             let entry = events_per_queue.entry((tp, part, group)).or_default();
-            entry.push(ev);
+            entry.push(meta);
         }
 
-        for ((tp, part, group), events) in events_per_queue {
-            self.append_events_durable(
-                &tp,
-                part,
-                group.as_deref(),
-                events,
-                KDurability::AfterFsync,
-            )
-            .await?;
+        let mut awaiters = Vec::new();
+        for ((tp, part, group), reqs) in events_per_queue {
+            let (completion, rx) = KeratinAppendCompletion::pair();
+            self.nack_enqueue_many(&tp, part, group.as_deref(), reqs, completion)
+                .await?;
+            awaiters.push(rx);
+        }
+
+        for awaiter in awaiters {
+            awaiter
+                .await
+                .map_err(|_err| StromaError::Io("Broken pipe".into()))?
+                .map_err(|err| StromaError::Io(err.to_string()))?;
         }
 
         Ok(expired_set)
@@ -1418,6 +1467,45 @@ impl Stroma {
             self.apply_event_inmem(ev, &qh).await?;
         }
 
+        let pending = qh.pending_dlq().await;
+        let source_tp = tp;
+        let source_part = part;
+        let source_group = group;
+        let target = qh.get_dlq_target().await;
+        let src = (
+            source_tp.to_string(),
+            source_part,
+            source_group.map(|s| s.into()),
+        );
+        for (off, _target) in pending {
+            // We don't have the resolved target stored in state — only in the DeadLetter event.
+            // Two options:
+            //   (a) walk the event log backward to find the matching DeadLetter event for this offset
+            //   (b) re-resolve via current dlq_policy
+            // (b) is simpler and matches "policy is mutable"; (a) is more faithful to original intent.
+            // Recommend (b): on recovery, the *current* policy wins. Document this.
+            match target {
+                Some((ref tp, part, ref grp)) => {
+                    let stroma = self.clone();
+                    let qh2 = qh.clone();
+                    let meta = DeadLetterMeta {
+                        off,
+                        target_tp: tp.clone().into(),
+                        target_part: part,
+                        target_group: grp.clone().map(Into::into),
+                    };
+                    let src = src.clone();
+                    tokio::spawn(async move {
+                        stroma.dlq_copy_then_commit(src, qh2, meta).await;
+                    });
+                }
+                None => {
+                    // Policy is now Discard -> ack locally.
+                    self.commit_dlq_event(&qh, vec![off]).await;
+                }
+            }
+        }
+
         let elapsed = start.elapsed();
         tracing::info!(
             "Recovered log tp: {tp}, partition: {part}, group: {} after {:.3} seconds",
@@ -1694,7 +1782,11 @@ impl Stroma {
         );
 
         msg_log
-            .append_batch_enqueue(messages, None, msg_completion)
+            .append_batch_enqueue(
+                messages,
+                Some(self.keratin_cfg_msg.default_durability),
+                msg_completion,
+            )
             .map_err(io_err)?;
 
         Ok(())
@@ -1833,23 +1925,17 @@ impl Stroma {
         requeue: bool,
         completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
-        let ev = StromaEvent::Nack {
-            off: offset,
-            requeue,
-        };
-
-        let qh = self.queue_handle(tp, part, group).await?;
-        let event_log = qh.event_log();
-        let event_msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
-        event_log
-            .append_enqueue(event_msg, None, outter_completion)
-            .map_err(io_err)?;
-
-        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
-        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
-
-        Ok(())
+        self.nack_enqueue_many(
+            tp,
+            part,
+            group,
+            vec![NackEventMeta {
+                off: offset,
+                requeue,
+            }],
+            completion,
+        )
+        .await
     }
 
     pub async fn nack_enqueue_many(
@@ -1860,20 +1946,236 @@ impl Stroma {
         reqs: Vec<NackEventMeta>,
         completion: Box<dyn AppendCompletion<IoError>>,
     ) -> Result<()> {
-        let ev = StromaEvent::NackMany { reqs };
-
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
-        let event_msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
-        event_log
-            .append_enqueue(event_msg, None, outter_completion)
-            .map_err(io_err)?;
 
-        // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
-        // self.maybe_snapshot(tp, part, group, applied_up_to).await?;
+        // Phase 1: durable Nack write
+        let nack_event = StromaEvent::NackMany { reqs: reqs.clone() };
+        let m = event_msg(&nack_event)?;
+        let ar = event_log
+            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .await
+            .map_err(io_err)?;
+        qh.applied_upto()
+            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        qh.set_dirty_snapshot(true);
+
+        // Apply -> get outcomes
+        let outcomes = qh.nack_many(reqs).await;
+        let dl_offsets: Vec<Offset> = outcomes
+            .iter()
+            .filter_map(|(o, oc)| matches!(oc, NackOutcome::DeadLetterRequested).then_some(*o))
+            .collect();
+
+        if dl_offsets.is_empty() {
+            completion.complete(Ok(ar));
+            return Ok(());
+        }
+
+        // Phase 2: resolve policy, decide per-offset
+        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_offsets).await;
+
+        // Discards: ack-locally directly, no DLQ event needed.
+        if !to_discard.is_empty() {
+            let ev = StromaEvent::DeadLetterCommit {
+                offs: to_discard.clone(),
+            };
+            // (DeadLetterCommit on replay = ack, same effect.)
+            // Could also use a distinct DiscardPending event; using commit keeps event types minimal.
+            let m = event_msg(&ev)?;
+            let _ = event_log
+                .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+                .await
+                .map_err(io_err)?;
+            qh.discard_pending_dlq(to_discard).await;
+        }
+
+        // DLQ-bound: emit DeadLetter event with resolved targets.
+        if !to_dlq.is_empty() {
+            let ev = StromaEvent::DeadLetter {
+                reqs: to_dlq.clone(),
+            };
+            let event_msg = event_msg(&ev)?;
+            let _ = event_log
+                .append_batch(
+                    vec![event_msg],
+                    Some(self.keratin_cfg_event.default_durability),
+                )
+                .await
+                .map_err(io_err)?;
+            // (Apply already done at phase-1 nack, which moved them to pending_dlq.
+            //  No second apply needed, DeadLetter event is for replay durability only.)
+
+            // Spawn background copy.
+            for meta in to_dlq {
+                let stroma = self.clone();
+                let src = (tp.to_string(), part, group.map(String::from));
+                let qh2 = qh.clone();
+                tokio::spawn(async move {
+                    stroma.dlq_copy_then_commit(src, qh2, meta).await;
+                });
+            }
+        }
+
+        completion.complete(Ok(ar));
+        Ok(())
+    }
+
+    pub async fn declare(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        meta: DeclareMeta,
+    ) -> Result<()> {
+        self.ensure_queue(tp, part, group).await?;
+
+        let _upto = self
+            .append_events_durable(
+                tp,
+                part,
+                group,
+                vec![StromaEvent::Declare(meta)],
+                KDurability::AfterFsync,
+            )
+            .await?;
 
         Ok(())
+    }
+
+    async fn resolve_dlq_targets(
+        &self,
+        qh: &QueueHandle,
+        offsets: &[Offset],
+    ) -> (Vec<DeadLetterMeta>, Vec<Offset>) {
+        let resolved = qh.get_dlq_target().await;
+        match resolved {
+            Some((tp, part, grp)) => {
+                let metas = offsets
+                    .iter()
+                    .map(|&off| DeadLetterMeta {
+                        off,
+                        target_tp: tp.clone().into(),
+                        target_part: part,
+                        target_group: grp.clone().map(Into::into),
+                    })
+                    .collect();
+                (metas, Vec::new())
+            }
+            None => (Vec::new(), offsets.to_vec()),
+        }
+    }
+
+    async fn dlq_copy_then_commit(
+        &self,
+        src: (String, u32, Option<String>),
+        src_qh: QueueHandle,
+        meta: DeadLetterMeta,
+    ) {
+        const MAX_ATTEMPTS: u32 = 5;
+        let (src_tp, src_part, src_group) = src;
+
+        // Fetch source message.
+        let msg = match self
+            .fetch_message_by_offset(&src_tp, src_part, src_group.as_deref(), meta.off)
+            .await
+        {
+            Ok(Some(m)) => m,
+            Ok(None) => {
+                tracing::error!(
+                    "DLQ copy: source message {} missing in {}/{}/{:?} — discarding",
+                    meta.off,
+                    src_tp,
+                    src_part,
+                    src_group
+                );
+                self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+                return;
+            }
+            Err(e) => {
+                tracing::error!("DLQ copy: fetch failed: {e}");
+                self.commit_dlq_event(&src_qh, vec![meta.off]).await; // give up, ack-locally
+                return;
+            }
+        };
+
+        // Decode original headers, augment with DLQ metadata.
+        let mut headers = MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
+            published: 0,
+            publish_received: 0,
+            extra: HashMap::new(),
+        });
+        headers
+            .extra
+            .insert("x-dlq-source-tp".into(), src_tp.clone());
+        headers
+            .extra
+            .insert("x-dlq-source-part".into(), src_part.to_string());
+        if let Some(g) = &src_group {
+            headers.extra.insert("x-dlq-source-group".into(), g.clone());
+        }
+        headers
+            .extra
+            .insert("x-dlq-source-offset".into(), meta.off.to_string());
+
+        // Append to target with bounded retries.
+        let mut attempt = 0u32;
+        let target_group = meta.target_group.as_deref();
+        loop {
+            let (cmp, rx) = KeratinAppendCompletion::pair();
+            let res = self
+                .append_message(
+                    &meta.target_tp,
+                    meta.target_part,
+                    target_group,
+                    &headers,
+                    msg.payload.clone(),
+                    cmp,
+                )
+                .await;
+
+            let durable = match res {
+                Ok(()) => rx.await.ok().and_then(|r| r.ok()),
+                Err(_) => None,
+            };
+
+            if durable.is_some() {
+                break;
+            }
+
+            attempt += 1;
+            if attempt >= MAX_ATTEMPTS {
+                tracing::error!(
+                    "DLQ copy permanently failed for {}/{}/{:?}@{} after {} attempts; ack-locally",
+                    src_tp,
+                    src_part,
+                    src_group,
+                    meta.off,
+                    MAX_ATTEMPTS
+                );
+                break; // fall through to commit (= local ack)
+            }
+            tokio::time::sleep(Duration::from_millis(100 * (1 << attempt.min(5)))).await;
+        }
+
+        self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+    }
+
+    async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) {
+        let ev = StromaEvent::DeadLetterCommit { offs: offs.clone() };
+        let Ok(m) = event_msg(&ev) else {
+            return;
+        };
+
+        if let Err(e) = qh
+            .event_log()
+            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .await
+        {
+            tracing::error!("DeadLetterCommit append failed: {e}");
+            return;
+        }
+        qh.dead_letter_commit(offs).await;
     }
 
     pub async fn fetch_message_by_offset(
@@ -1994,8 +2296,8 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let log = self.queue_handle(tp, part, group).await?.msg_log();
-        Ok(log.next_offset())
+        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        Ok(msg_log.next_offset())
     }
 
     /// Optional (used by cleanup_topic): truncate message log.
@@ -2127,6 +2429,21 @@ impl Stroma {
         off: Offset,
     ) -> Result<()> {
         self.ack_batch(tp.into(), part, group, &[off]).await
+    }
+
+    pub async fn nack_one(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        off: Offset,
+        requeue: bool,
+    ) -> Result<()> {
+        let (cmp, rx) = KeratinAppendCompletion::pair();
+        self.nack_enqueue(tp, part, group, off, requeue, cmp)
+            .await?;
+        let _ = rx.await; // wait for durability + DLQ resolution
+        Ok(())
     }
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
