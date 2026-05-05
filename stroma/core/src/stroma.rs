@@ -694,6 +694,21 @@ impl Stroma {
                 };
                 qh.blocking_command_enqueue(command)?;
             }
+            StromaEvent::EnqueueDelayed { off, not_before } => {
+                let command = QueueCommand::EnqueueDelayed {
+                    offset: off,
+                    not_before,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+            }
+            StromaEvent::EnqueueDelayedMany { reqs } => {
+                let command = QueueCommand::EnqueueDelayedMany {
+                    reqs,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+            }
             StromaEvent::MarkInflight { off, deadline } => {
                 let command = QueueCommand::MarkInflight {
                     offset: off,
@@ -800,6 +815,12 @@ impl Stroma {
             }
             StromaEvent::EnqueueMany { reqs } => {
                 qh.enqueue_many(reqs).await;
+            }
+            StromaEvent::EnqueueDelayed { off, not_before } => {
+                qh.enqueue_delayed(off, not_before).await;
+            }
+            StromaEvent::EnqueueDelayedMany { reqs } => {
+                qh.enqueue_delayed_many(reqs).await;
             }
             StromaEvent::MarkInflight { off, deadline } => {
                 qh.mark_inflight(off, deadline).await;

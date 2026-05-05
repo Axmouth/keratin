@@ -13,8 +13,7 @@ use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::event::{
-    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueEventMeta, MarkInflightEventMeta,
-    NackEventMeta,
+    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta
 };
 use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
@@ -173,6 +172,12 @@ pub struct QueueInternalState {
     // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
     expiry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
 
+    // min-heap via Reverse(deadline), serving delayed message publishing
+    delayed_enqueue_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
+
+    // min-heap via Reverse(deadline), serving delayed message retries
+    delayed_retry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
+
     // best-effort hint
     min_deadline_hint: Option<UnixMillis>,
 
@@ -198,6 +203,15 @@ pub enum QueueCommand {
         reqs: Vec<EnqueueEventMeta>,
         response: Option<oneshot::Sender<()>>,
     }, // list[offset, retries]
+    EnqueueDelayed {
+        offset: Offset,
+        not_before: UnixMillis,
+        response: Option<oneshot::Sender<()>>,
+    }, // offset, not_before
+    EnqueueDelayedMany {
+        reqs: Vec<EnqueueDelayedEventMeta>,
+        response: Option<oneshot::Sender<()>>,
+    }, // list[offset, not_before]
     MarkInflight {
         offset: Offset,
         deadline: UnixMillis,
@@ -416,6 +430,8 @@ impl QueueCommand {
             // Under overload, throttling publish is correct. Natural backpressure upstream.
             QueueCommand::Enqueue { .. } => CommandPrio::Medium,
             QueueCommand::EnqueueMany { .. } => CommandPrio::Medium,
+            QueueCommand::EnqueueDelayed { .. } => CommandPrio::Medium,
+            QueueCommand::EnqueueDelayedMany { .. } => CommandPrio::Medium,
 
             // === Background maintenance — wait for quiet periods ===
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
@@ -473,6 +489,8 @@ impl QueueCommand {
             QueueCommand::Declare { .. } => "Declare",
             QueueCommand::GetPendingDlq { .. } => "GetPendingDlq",
             QueueCommand::GetDlqTarget { .. } => "GetDlqTarget",
+            QueueCommand::EnqueueDelayed { .. } => "EnqueueDelayed",
+            QueueCommand::EnqueueDelayedMany { .. } => "EnqueueDelayedMany",
         }
     }
 }
@@ -853,6 +871,24 @@ impl QueueHandle {
             }
             QueueCommand::EnqueueMany { reqs, response } => {
                 state.enqueue_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !reqs.is_empty();
+            }
+            QueueCommand::EnqueueDelayed {
+                offset,
+                not_before,
+                response,
+            } => {
+                state.enqueue_delayed(offset, not_before);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = true;
+            }
+            QueueCommand::EnqueueDelayedMany { reqs, response } => {
+                state.enqueue_delayed_many(&reqs);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
@@ -1251,6 +1287,33 @@ impl QueueHandle {
 
         let _ = self
             .command_enqueue(QueueCommand::EnqueueMany {
+                reqs,
+                response: Some(tx),
+            })
+            .await;
+
+        rx.await.unwrap();
+    }
+
+    pub async fn enqueue_delayed(&self, offset: Offset, not_before: UnixMillis) {
+        let (tx, rx) = oneshot::channel();
+
+        let _ = self
+            .command_enqueue(QueueCommand::EnqueueDelayed {
+                offset,
+                not_before,
+                response: Some(tx),
+            })
+            .await;
+
+        rx.await.unwrap();
+    }
+
+    pub async fn enqueue_delayed_many(&self, reqs: Vec<EnqueueDelayedEventMeta>) {
+        let (tx, rx) = oneshot::channel();
+
+        let _ = self
+            .command_enqueue(QueueCommand::EnqueueDelayedMany {
                 reqs,
                 response: Some(tx),
             })
@@ -1796,6 +1859,8 @@ impl QueueInternalState {
             ready: RangeSet::new(),
             retries: HashMap::new(),
             expiry_heap: BinaryHeap::new(),
+            delayed_enqueue_heap: BinaryHeap::new(),
+            delayed_retry_heap: BinaryHeap::new(),
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
             dlq_discard_max_retries: 5,
@@ -2175,6 +2240,16 @@ impl QueueInternalState {
             self.enqueue(req.off, req.retries);
         }
     }
+    
+    pub fn enqueue_delayed(&mut self, offset: Offset, not_before: u64) {
+        self.delayed_enqueue_heap.push((Reverse(not_before), offset));
+    }
+
+    pub fn enqueue_delayed_many(&mut self, reqs: &[EnqueueDelayedEventMeta]) {
+        for req in reqs {
+            self.enqueue_delayed(req.off, req.not_before);
+        }
+    }
 
     // ---------------- Inflight API ----------------
 
@@ -2251,12 +2326,14 @@ impl QueueInternalState {
         self.recompute_hint_if_needed();
         // self.recompute_hint_full();
         // self.min_deadline_hint
+        let mut expiry_min = None;
         while let Some(top) = self.expiry_heap.peek() {
             let (Reverse(deadline), offset) = top;
 
             match self.inflight.get(offset) {
                 Some(d) if *d == *deadline => {
-                    return Some(*deadline);
+                    expiry_min = Some(*deadline);
+                    break;
                 }
                 _ => {
                     // stale heap entry -> drop it
@@ -2265,11 +2342,68 @@ impl QueueInternalState {
             }
         }
 
-        None
+        while let Some(top) = self.delayed_enqueue_heap.peek() {
+            let (Reverse(deadline), _offset) = top;
+
+            if let Some(min) = expiry_min {
+                if deadline < &min {
+                    expiry_min = Some(*deadline);
+                    break;
+                }
+            } else {
+                expiry_min = Some(*deadline);
+            }
+        }
+
+        while let Some(top) = self.delayed_retry_heap.peek() {
+            let (Reverse(deadline), _offset) = top;
+            if let Some(min) = expiry_min {
+                if deadline < &min {
+                    expiry_min = Some(*deadline);
+                    break;
+                }
+            } else {
+                expiry_min = Some(*deadline);
+            }
+        }
+
+        expiry_min
     }
 
     pub fn collect_expired(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let mut out = Vec::new();
+
+        let mut to_enqueue = Vec::new();
+        // Handle delayed publishes and retries
+        while let Some(&(Reverse(deadline), off)) = self.delayed_enqueue_heap.peek() {
+            if deadline > now {
+                break;
+            }
+
+            self.expiry_heap.pop();
+
+            let meta = EnqueueEventMeta {
+                off,
+                retries: 0,
+            };
+            to_enqueue.push(meta);
+        }
+        
+        while let Some(&(Reverse(deadline), off)) = self.delayed_retry_heap.peek() {
+            if deadline > now {
+                break;
+            }
+
+            self.expiry_heap.pop();
+
+            let meta = EnqueueEventMeta {
+                off,
+                retries: self.retries.get(&off).copied().unwrap_or(0),
+            };
+            to_enqueue.push(meta);
+        }
+
+        self.enqueue_many(&to_enqueue);
 
         while let Some(&(Reverse(deadline), off)) = self.expiry_heap.peek() {
             if deadline > now || out.len() >= max {

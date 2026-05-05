@@ -15,6 +15,8 @@ pub const STROMA_VER: u16 = 1;
 pub enum EventType {
     Enqueue = 0,
     EnqueueMany = 1,
+    EnqueueDelayed = 2,
+    EnqueueManyDelayed = 3,
     MarkInflight = 10,
     MarkInflightMany = 11,
     Ack = 20,
@@ -32,6 +34,12 @@ pub enum EventType {
 pub struct EnqueueEventMeta {
     pub off: Offset,
     pub retries: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EnqueueDelayedEventMeta {
+    pub off: Offset,
+    pub not_before: UnixMillis,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -130,6 +138,13 @@ pub enum StromaEvent {
     },
     EnqueueMany {
         reqs: Vec<EnqueueEventMeta>,
+    },
+    EnqueueDelayed {
+        off: Offset,
+        not_before: UnixMillis,
+    },
+    EnqueueDelayedMany {
+        reqs: Vec<EnqueueDelayedEventMeta>,
     },
     MarkInflight {
         off: Offset,
@@ -281,6 +296,27 @@ impl StromaEvent {
                 put_u64(&mut out, *off);
                 put_u32(&mut out, *retries);
             }
+            StromaEvent::EnqueueMany { reqs } => {
+                put_u16(&mut out, EventType::EnqueueMany as u16);
+                put_u32(&mut out, reqs.len() as u32);
+                for req in reqs {
+                    put_u64(&mut out, req.off);
+                    put_u32(&mut out, req.retries);
+                }
+            }
+            StromaEvent::EnqueueDelayed { off, not_before } => {
+                put_u16(&mut out, EventType::Enqueue as u16);
+                put_u64(&mut out, *off);
+                put_u64(&mut out, *not_before);
+            }
+            StromaEvent::EnqueueDelayedMany { reqs } => {
+                put_u16(&mut out, EventType::EnqueueMany as u16);
+                put_u32(&mut out, reqs.len() as u32);
+                for req in reqs {
+                    put_u64(&mut out, req.off);
+                    put_u64(&mut out, req.not_before);
+                }
+            }
             StromaEvent::MarkInflight { off, deadline } => {
                 put_u16(&mut out, EventType::MarkInflight as u16);
                 put_u64(&mut out, *off);
@@ -320,14 +356,6 @@ impl StromaEvent {
                 }
                 put_u32(&mut out, blob.len() as u32);
                 out.extend_from_slice(blob);
-            }
-            StromaEvent::EnqueueMany { reqs } => {
-                put_u16(&mut out, EventType::EnqueueMany as u16);
-                put_u32(&mut out, reqs.len() as u32);
-                for req in reqs {
-                    put_u64(&mut out, req.off);
-                    put_u32(&mut out, req.retries);
-                }
             }
             StromaEvent::MarkInflightMany { reqs } => {
                 put_u16(&mut out, EventType::MarkInflightMany as u16);
@@ -425,6 +453,31 @@ impl StromaEvent {
                 let retries = rd_u32(bytes, &mut i)?;
                 Ok(StromaEvent::Enqueue { off, retries })
             }
+            x if x == EventType::EnqueueMany as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut reqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    let retries = rd_u32(bytes, &mut i)?;
+                    reqs.push(EnqueueEventMeta { off, retries });
+                }
+                Ok(StromaEvent::EnqueueMany { reqs })
+            }
+            x if x == EventType::EnqueueDelayed as u16 => {
+                let off = rd_u64(bytes, &mut i)?;
+                let not_before = rd_u64(bytes, &mut i)?;
+                Ok(StromaEvent::EnqueueDelayed { off, not_before })
+            }
+            x if x == EventType::EnqueueManyDelayed as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut reqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    let not_before = rd_u64(bytes, &mut i)?;
+                    reqs.push(EnqueueDelayedEventMeta { off, not_before });
+                }
+                Ok(StromaEvent::EnqueueDelayedMany { reqs })
+            }
             x if x == EventType::MarkInflight as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let deadline = rd_u64(bytes, &mut i)?;
@@ -473,16 +526,6 @@ impl StromaEvent {
                     group,
                     blob,
                 })
-            }
-            x if x == EventType::EnqueueMany as u16 => {
-                let count = rd_u32(bytes, &mut i)? as usize;
-                let mut reqs = Vec::with_capacity(count);
-                for _ in 0..count {
-                    let off = rd_u64(bytes, &mut i)?;
-                    let retries = rd_u32(bytes, &mut i)?;
-                    reqs.push(EnqueueEventMeta { off, retries });
-                }
-                Ok(StromaEvent::EnqueueMany { reqs })
             }
             x if x == EventType::MarkInflightMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
