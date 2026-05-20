@@ -273,7 +273,7 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
     let _ = st.poll_ready("t", 0, None, 1, now + 10).await.unwrap();
 
     // expire
-    let expired = st.list_expired(now + 20, 10).await.unwrap();
+    let expired = st.collect_expired(now + 20, 10).await.unwrap();
     assert_eq!(expired.len(), 1);
 
     let msgs2 = st.poll_ready("t", 0, None, 1, now + 30).await.unwrap();

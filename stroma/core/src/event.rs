@@ -16,7 +16,7 @@ pub enum EventType {
     Enqueue = 0,
     EnqueueMany = 1,
     EnqueueDelayed = 2,
-    EnqueueManyDelayed = 3,
+    EnqueueDelayedMany = 3,
     MarkInflight = 10,
     MarkInflightMany = 11,
     Ack = 20,
@@ -49,22 +49,31 @@ pub struct AckEventMeta {
 
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum NackType {
-    Reject,
+    Discard,
+    RetryNow,
+    RetryLater { not_before: UnixMillis },
     RequeueNow,
-    RequeueAt { available_at: UnixMillis },
+    RequeueLater { not_before: UnixMillis },
 }
 
 impl NackType {
     pub fn write_bytes(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
         match self {
-            NackType::Reject => {
+            NackType::Discard => {
                 put_u8(out, 0);
             }
-            NackType::RequeueNow => {
+            NackType::RetryNow => {
                 put_u8(out, 1);
             }
-            NackType::RequeueAt { available_at: ts } => {
+            NackType::RetryLater { not_before: ts } => {
                 put_u8(out, 2);
+                put_u64(out, *ts);
+            }
+            NackType::RequeueNow => {
+                put_u8(out, 3);
+            }
+            NackType::RequeueLater { not_before: ts } => {
+                put_u8(out, 4);
                 put_u64(out, *ts);
             }
         }
@@ -77,11 +86,16 @@ impl NackType {
         let tag = rd_u8(input, &mut i)?;
 
         match tag {
-            0 => Ok(NackType::Reject),
-            1 => Ok(NackType::RequeueNow),
+            0 => Ok(NackType::Discard),
+            1 => Ok(NackType::RetryNow),
             2 => {
                 let ts = rd_u64(input, &mut i)?;
-                Ok(NackType::RequeueAt { available_at: ts })
+                Ok(NackType::RetryLater { not_before: ts })
+            }
+            3 => Ok(NackType::RequeueNow),
+            4 => {
+                let ts = rd_u64(input, &mut i)?;
+                Ok(NackType::RequeueLater { not_before: ts })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -305,12 +319,12 @@ impl StromaEvent {
                 }
             }
             StromaEvent::EnqueueDelayed { off, not_before } => {
-                put_u16(&mut out, EventType::Enqueue as u16);
+                put_u16(&mut out, EventType::EnqueueDelayed as u16);
                 put_u64(&mut out, *off);
                 put_u64(&mut out, *not_before);
             }
             StromaEvent::EnqueueDelayedMany { reqs } => {
-                put_u16(&mut out, EventType::EnqueueMany as u16);
+                put_u16(&mut out, EventType::EnqueueDelayedMany as u16);
                 put_u32(&mut out, reqs.len() as u32);
                 for req in reqs {
                     put_u64(&mut out, req.off);
@@ -468,7 +482,7 @@ impl StromaEvent {
                 let not_before = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::EnqueueDelayed { off, not_before })
             }
-            x if x == EventType::EnqueueManyDelayed as u16 => {
+            x if x == EventType::EnqueueDelayedMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {

@@ -17,12 +17,15 @@ use keratin_log::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{OnceCell, RwLock};
+use tokio::sync::{Notify, OnceCell, RwLock};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
     DeclareMeta, Result, StromaError,
-    event::{AckEventMeta, DeadLetterMeta, EnqueueEventMeta, NackEventMeta, StromaEvent},
+    event::{
+        AckEventMeta, DeadLetterMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, NackEventMeta,
+        StromaEvent,
+    },
     metrics::StromaMetrics,
     partition::Partition,
     state::{
@@ -46,6 +49,17 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
         headers: vec![],
         payload,
     })
+}
+
+pub struct PublishItem {
+    pub headers: MessageHeaders,
+    pub payload: Vec<u8>,
+    pub not_before: Option<UnixMillis>,
+    pub completion: Box<dyn AppendCompletion<IoError>>,
+}
+
+struct ItemMeta {
+    not_before: Option<UnixMillis>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -138,6 +152,11 @@ impl ApplyThenComplete {
     }
 }
 
+struct CompletionItem {
+    meta: ItemMeta,
+    completion: Box<dyn AppendCompletion<IoError>>,
+}
+
 /// Completion for the msg_log batch in append_message_batch.
 /// Once msg-log durability is reached, emits one EnqueueMany event_log entry,
 /// then fans out per client completions with assigned offsets.
@@ -146,7 +165,7 @@ struct MsgBatchCompletion {
     tp: Box<str>,
     part: u32,
     group: Option<Box<str>>,
-    completions: Vec<Box<dyn AppendCompletion<IoError>>>,
+    items: Vec<CompletionItem>,
     durability: KDurability,
     runtime: tokio::runtime::Handle,
 }
@@ -157,7 +176,7 @@ impl MsgBatchCompletion {
         tp: Box<str>,
         part: u32,
         group: Option<Box<str>>,
-        completions: Vec<Box<dyn AppendCompletion<IoError>>>,
+        items: Vec<CompletionItem>,
         durability: KDurability,
     ) -> Box<Self> {
         Box::new(Self {
@@ -165,7 +184,7 @@ impl MsgBatchCompletion {
             tp,
             part,
             group,
-            completions,
+            items,
             durability,
             runtime: tokio::runtime::Handle::current(),
         })
@@ -179,7 +198,7 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
             tp,
             part,
             group,
-            completions,
+            items,
             durability,
             runtime,
         } = *self;
@@ -188,7 +207,11 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
             Ok(ar) => ar,
             Err(err) => {
                 let err_msg = err.to_string();
-                for c in completions {
+                for CompletionItem {
+                    meta: _,
+                    completion: c,
+                } in items
+                {
                     c.complete(Err(IoError::new(err_msg.clone())));
                 }
                 return;
@@ -198,35 +221,54 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
         let base = ar.base_offset;
         let count = ar.count as u64;
 
-        if count != completions.len() as u64 {
+        if count != items.len() as u64 {
             tracing::error!(
                 "msg-log batch returned count={} but we had {} completions",
                 count,
-                completions.len()
+                items.len()
             );
             // Continue anyway with whichever is smaller, fan out will not go past either
         }
 
-        // Build EnqueueMany event for the event log
-        let metas: Vec<EnqueueEventMeta> = (0..count)
-            .map(|i| EnqueueEventMeta {
-                off: base + i,
-                retries: 0,
-            })
-            .collect();
+        // Build EnqueueMany events for the event log
+        let mut immediate = Vec::new();
+        let mut delayed = Vec::new();
+        for (i, CompletionItem { meta, .. }) in items.iter().enumerate() {
+            let off = base + i as u64;
+            match meta.not_before {
+                None => immediate.push(EnqueueEventMeta { off, retries: 0 }),
+                Some(nb) => delayed.push(EnqueueDelayedEventMeta {
+                    off,
+                    not_before: nb,
+                }),
+            }
+        }
 
-        let event = StromaEvent::EnqueueMany { reqs: metas };
+        let mut events = Vec::with_capacity(2);
+        if !immediate.is_empty() {
+            events.push(StromaEvent::EnqueueMany { reqs: immediate });
+        }
+        if !delayed.is_empty() {
+            events.push(StromaEvent::EnqueueDelayedMany { reqs: delayed });
+        }
 
         // Spawn the event_log append + fan-out. We are inside a sync completion
         // callback (called from the writer thread), so we cannot await directly.
         // The completion thread should not block, we hand off to the runtime
         runtime.spawn(async move {
             match stroma
-                .append_events_durable(&tp, part, group.as_deref(), vec![event], durability)
+                .append_events_durable(&tp, part, group.as_deref(), events, durability)
                 .await
             {
                 Ok(_) => {
-                    for (i, c) in completions.into_iter().enumerate() {
+                    for (
+                        i,
+                        CompletionItem {
+                            meta: _,
+                            completion: c,
+                        },
+                    ) in items.into_iter().enumerate()
+                    {
                         c.complete(Ok(AppendResult {
                             base_offset: base + i as u64,
                             count: 1,
@@ -235,7 +277,11 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
                 }
                 Err(err) => {
                     let err_msg = err.to_string();
-                    for c in completions {
+                    for CompletionItem {
+                        meta: _,
+                        completion: c,
+                    } in items
+                    {
                         c.complete(Err(IoError::new(err_msg.clone())));
                     }
                 }
@@ -358,6 +404,10 @@ pub struct Stroma {
     pub(crate) event_count: Arc<AtomicU64>,
 
     pub(crate) metrics: Arc<StromaMetrics>,
+
+    earliest_pending_deadline_sender: tokio::sync::watch::Sender<Option<UnixMillis>>,
+    earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
+    pub(crate) deadline_waker: Arc<Notify>,
 }
 
 impl Stroma {
@@ -382,6 +432,9 @@ impl Stroma {
             ..keratin_cfg_msg
         };
 
+        let (earliest_pending_deadline_sender, earliest_pending_deadline_receiver) =
+            tokio::sync::watch::channel(None);
+
         let st = Self {
             start_time,
             root,
@@ -394,6 +447,9 @@ impl Stroma {
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
             metrics: metrics.clone(),
+            earliest_pending_deadline_sender,
+            earliest_pending_deadline_receiver,
+            deadline_waker: Arc::new(Notify::new()),
         };
 
         // Recover from existing snapshot files + replay events.
@@ -558,6 +614,10 @@ impl Stroma {
         Ok(Arc::new(k))
     }
 
+    pub fn deadline_waker(&self) -> Arc<Notify> {
+        self.deadline_waker.clone()
+    }
+
     pub async fn queue_handle(
         &self,
         tp: &str,
@@ -623,6 +683,7 @@ impl Stroma {
                     task_group: self.task_group.clone(),
                     metrics: self.metrics.clone(),
                     global_dlq,
+                    deadline_waker: self.deadline_waker.clone(),
                 };
                 Ok(QueueHandle::init(
                     tp.into(),
@@ -935,9 +996,10 @@ impl Stroma {
 
         // Update applied watermark:
         let new_upto = event_log.head_offset();
-        self.applied_upto_entry(tp, part, group)
-            .await?
-            .store(new_upto, Ordering::Release);
+        // TODO:
+        // self.applied_upto_entry(tp, part, group)
+        //     .await?
+        //     .store(new_upto, Ordering::Release);
 
         self.metrics
             .event_log_appends
@@ -1102,7 +1164,16 @@ impl Stroma {
         Ok(q.next_deliverable(from, upper).await)
     }
 
-    pub async fn list_expired(
+    fn signal_earlier_deadline(&self, deadline_ms: UnixMillis) {
+        self.earliest_pending_deadline_sender
+            .send_replace(Some(deadline_ms));
+    }
+
+    async fn wait_for_earlier_deadline(&mut self) -> Result<Option<UnixMillis>> {
+        Ok(*self.earliest_pending_deadline_receiver.borrow_and_update())
+    }
+
+    pub async fn collect_expired(
         &self,
         now: UnixMillis,
         max: usize,
@@ -1138,7 +1209,7 @@ impl Stroma {
         now: UnixMillis,
         max: usize,
     ) -> Result<HashSet<(String, u32, Option<String>, u64)>> {
-        let expired = self.list_expired(now, max).await?;
+        let expired = self.collect_expired(now, max).await?;
         let expired_set: HashSet<(String, u32, Option<String>, u64)> =
             HashSet::from_iter(expired.clone().into_iter());
 
@@ -1170,15 +1241,14 @@ impl Stroma {
         Ok(expired_set)
     }
 
-    // ---------------- Snapshotting ----------------
-    //
-    // Snapshot files make restart fast:
-    // - durable event log = Keratin partition log
-    // - snapshot per (tp,part): { last_applied_event_offset, queue_state_blob }
-    //
-    // Recovery loads snapshots, then replays events AFTER the minimum snapshot offset,
-    // skipping events already covered by each queue's snapshot.
-
+    /// ---------------- Snapshotting ----------------
+    ///
+    /// Snapshot files make restart fast:
+    /// - durable event log = Keratin partition log
+    /// - snapshot per (tp,part): { last_applied_event_offset, queue_state_blob }
+    ///
+    /// Recovery loads snapshots, then replays events AFTER the minimum snapshot offset,
+    /// skipping events already covered by each queue's snapshot.
     async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
         if qh.creating_snapshot() {
             tracing::info!("Snapshot already in progress, skipping..");
@@ -1503,8 +1573,8 @@ impl Stroma {
             // Two options:
             //   (a) walk the event log backward to find the matching DeadLetter event for this offset
             //   (b) re-resolve via current dlq_policy
-            // (b) is simpler and matches "policy is mutable"; (a) is more faithful to original intent.
-            // Recommend (b): on recovery, the *current* policy wins. Document this.
+            // (b) is simpler and matches "policy is mutable", (a) is more faithful to original intent.
+            // oon recovery, the *current* policy wins.
             match target {
                 Some((ref tp, part, ref grp)) => {
                     let stroma = self.clone();
@@ -1544,6 +1614,7 @@ impl Stroma {
 
         self.metrics.recovery.startup_duration.observe(elapsed);
 
+        // TODO: only starts if we had a snapshot, derp. Move it elsewhere and make it waits for recovery to finish and queue to be ready
         self.periodic_snapshot(qh)?;
 
         Ok(())
@@ -1751,7 +1822,7 @@ impl Stroma {
         tp: &str,
         part: u32,
         group: Option<&str>,
-        items: Vec<(MessageHeaders, Vec<u8>, Box<dyn AppendCompletion<IoError>>)>,
+        items: Vec<PublishItem>,
     ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
@@ -1764,8 +1835,14 @@ impl Stroma {
         // Build msg_log batch and extract per client completions.
         // Per message header encode failures fail just that one completion.
         let mut messages = Vec::with_capacity(items.len());
-        let mut completions = Vec::with_capacity(items.len());
-        for (headers, payload, completion) in items {
+        let mut completion_items = Vec::with_capacity(items.len());
+        for item in items {
+            let PublishItem {
+                headers,
+                payload,
+                completion,
+                not_before,
+            } = item;
             let header_bytes = match headers.encode() {
                 Ok(b) => b,
                 Err(err) => {
@@ -1778,7 +1855,10 @@ impl Stroma {
                 headers: header_bytes,
                 payload,
             });
-            completions.push(completion);
+            completion_items.push(CompletionItem {
+                meta: ItemMeta { not_before },
+                completion,
+            });
         }
 
         if messages.is_empty() {
@@ -1798,7 +1878,7 @@ impl Stroma {
             tp_box,
             part,
             group_box,
-            completions,
+            completion_items,
             self.keratin_cfg_msg.default_durability,
         );
 

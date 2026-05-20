@@ -8,12 +8,13 @@ use keratin_log::Keratin;
 use keratin_log::util::unix_millis;
 use rangemap::RangeSet;
 use serde::Serialize;
-use tokio::sync::{RwLock, mpsc, oneshot};
+use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::Instant;
 use uuid::Uuid;
 
 use crate::event::{
-    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta
+    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueDelayedEventMeta, EnqueueEventMeta,
+    MarkInflightEventMeta, NackEventMeta,
 };
 use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
@@ -31,11 +32,47 @@ pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 pub const FORMAT_VERSION: u64 = 1;
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
+pub enum ExpiryDeadlineOutcome {
+    Updated(UnixMillis),
+    NoChange,
+}
+
+impl ExpiryDeadlineOutcome {
+    pub fn is_updated(&self) -> bool {
+        matches!(self, ExpiryDeadlineOutcome::Updated(_))
+    }
+
+    pub fn deadline(&self) -> Option<UnixMillis> {
+        match self {
+            ExpiryDeadlineOutcome::Updated(ts) => Some(*ts),
+            ExpiryDeadlineOutcome::NoChange => None,
+        }
+    }
+
+    pub fn min(a: Self, b: Self) -> Self {
+        match (a, b) {
+            (ExpiryDeadlineOutcome::Updated(ts_a), ExpiryDeadlineOutcome::Updated(ts_b)) => {
+                ExpiryDeadlineOutcome::Updated(ts_a.min(ts_b))
+            }
+            (ExpiryDeadlineOutcome::Updated(ts), ExpiryDeadlineOutcome::NoChange)
+            | (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::Updated(ts)) => {
+                ExpiryDeadlineOutcome::Updated(ts)
+            }
+            (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::NoChange) => {
+                ExpiryDeadlineOutcome::NoChange
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub enum NackOutcome {
     /// already settled / not in lifecycle
     NoOp,
     /// back to ready, retries++
     Requeued,
+    /// back to ready with delay, retries++
+    RequeuedLater { not_before: UnixMillis },
     /// retries exhausted OR requeue=false
     DeadLetterRequested,
 }
@@ -186,6 +223,8 @@ pub struct QueueInternalState {
 
     // when to send to DLQ
     dlq_discard_max_retries: u32,
+
+    deadline_waker: Arc<Notify>,
 }
 
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
@@ -281,10 +320,6 @@ pub enum QueueCommand {
         bits_bytes: Vec<u8>,
         response: Option<oneshot::Sender<std::io::Result<()>>>,
     }, // base, bits_bytes
-    LoadInflight {
-        entries: Vec<(Offset, UnixMillis)>,
-        response: Option<oneshot::Sender<()>>,
-    }, // entries
     EncodeSnapshot {
         last_snapshot_event_offset: u64,
         response: Option<oneshot::Sender<Option<Vec<u8>>>>,
@@ -381,7 +416,6 @@ impl QueueCommand {
             QueueCommand::SetAckedUntil { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindow { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindowFromBytes { .. } => CommandPrio::Express,
-            QueueCommand::LoadInflight { .. } => CommandPrio::Express,
             QueueCommand::Reset { .. } => CommandPrio::Express,
             QueueCommand::GetDlqTarget { .. } => CommandPrio::Express,
 
@@ -460,7 +494,6 @@ impl QueueCommand {
             QueueCommand::SetAckedUntil { .. } => "SetAckedUntil",
             QueueCommand::SetAckWindow { .. } => "SetAckWindow",
             QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
-            QueueCommand::LoadInflight { .. } => "LoadInflight",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
             QueueCommand::IsAcked { .. } => "IsAcked",
@@ -727,6 +760,7 @@ pub struct QueueSharedBundle {
     pub task_group: Arc<TaskGroup>,
     pub metrics: Arc<StromaMetrics>,
     pub global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
+    pub deadline_waker: Arc<Notify>,
 }
 
 #[derive(Debug, Clone)]
@@ -752,6 +786,8 @@ pub struct QueueHandle {
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
+
+    deadline_waker: Arc<Notify>,
 }
 
 impl QueueHandle {
@@ -768,6 +804,7 @@ impl QueueHandle {
             task_group,
             metrics,
             global_dlq,
+            deadline_waker,
         } = bundle;
         let (tx, mut rx) = CommandSender::channel_pair(metrics.clone());
         let dirty_since_snapshot = Arc::new(AtomicBool::new(false));
@@ -782,6 +819,7 @@ impl QueueHandle {
 
         let task_group_clone = task_group.clone();
 
+        let waker_for_state = deadline_waker.clone();
         let result = Self {
             command_sender: tx,
             topic,
@@ -797,12 +835,14 @@ impl QueueHandle {
             task_group,
             global_dlq,
             metrics,
+            deadline_waker,
         };
 
         let handle = result.clone();
 
         task_group_clone.spawn("queue control", async move {
-            let mut state: QueueInternalState = QueueInternalState::new(topic_clone, partition);
+            let mut state: QueueInternalState =
+                QueueInternalState::new_with_waker(topic_clone, partition, waker_for_state);
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
@@ -834,6 +874,10 @@ impl QueueHandle {
             creating_snapshot: self.creating_snapshot(),
             state,
         }
+    }
+
+    pub fn deadline_waker(&self) -> Arc<Notify> {
+        self.deadline_waker.clone()
     }
 
     #[tracing::instrument(skip(state, handle), fields(
@@ -1090,13 +1134,6 @@ impl QueueHandle {
                 }
                 dirty = true;
             }
-            QueueCommand::LoadInflight { entries, response } => {
-                state.load_inflight(&entries);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = !entries.is_empty();
-            }
             QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
                 response,
@@ -1332,6 +1369,7 @@ impl QueueHandle {
             })
             .await;
         rx.await.unwrap();
+        self.deadline_waker().notify_one();
     }
 
     pub async fn mark_inflight_batch(&self, reqs: Vec<MarkInflightEventMeta>) {
@@ -1343,6 +1381,7 @@ impl QueueHandle {
             })
             .await;
         rx.await.unwrap();
+        self.deadline_waker().notify_one();
     }
 
     pub async fn ack(&self, offset: Offset) {
@@ -1376,7 +1415,11 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap()
+        let outcome = rx.await.unwrap();
+        if let NackOutcome::RequeuedLater { .. } = outcome {
+            self.deadline_waker().notify_one();
+        }
+        outcome
     }
 
     pub async fn nack_many(&self, reqs: Vec<NackEventMeta>) -> Vec<(Offset, NackOutcome)> {
@@ -1387,7 +1430,14 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap()
+        let outcomes = rx.await.unwrap();
+        for (_offset, outcome) in &outcomes {
+            if let NackOutcome::RequeuedLater { .. } = outcome {
+                self.deadline_waker().notify_one();
+                break;
+            }
+        }
+        outcomes
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) {
@@ -1502,17 +1552,6 @@ impl QueueHandle {
             })
             .await;
         rx.await.unwrap().unwrap();
-    }
-
-    pub async fn load_inflight(&self, entries: Vec<(Offset, UnixMillis)>) {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::LoadInflight {
-                entries,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.unwrap();
     }
 
     pub async fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Option<Vec<u8>> {
@@ -1864,6 +1903,30 @@ impl QueueInternalState {
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
             dlq_discard_max_retries: 5,
+            deadline_waker: Arc::new(Notify::new()),
+        }
+    }
+
+    pub fn new_with_waker(topic: String, partition: u32, deadline_waker: Arc<Notify>) -> Self {
+        Self {
+            topic,
+            partition,
+            last_snapshot_timestamp: 0,
+            last_snapshot_event_offset: 0,
+            settled_until: 0,
+            ack_window_base: 0,
+            ack_bits: BitVec::repeat(false, ACK_WINDOW),
+            inflight: BTreeMap::new(),
+            pending_dlq: BTreeMap::new(),
+            ready: RangeSet::new(),
+            retries: HashMap::new(),
+            expiry_heap: BinaryHeap::new(),
+            delayed_enqueue_heap: BinaryHeap::new(),
+            delayed_retry_heap: BinaryHeap::new(),
+            min_deadline_hint: None,
+            dlq_policy: DLQDiscardPolicy::Discard,
+            dlq_discard_max_retries: 5,
+            deadline_waker,
         }
     }
 
@@ -1914,15 +1977,25 @@ impl QueueInternalState {
     pub fn safe_message_truncate_before(&self) -> Offset {
         let min_ready = self.ready.first().map(|r| r.start).unwrap_or(u64::MAX);
         let min_inflight = self.inflight.keys().copied().min().unwrap_or(u64::MAX);
-        let min_pending = self
-            .pending_dlq
-            .iter()
-            .map(|(off, _)| off)
-            .copied()
-            .next()
-            .unwrap_or(u64::MAX);
+        let min_pending = self.pending_dlq.keys().copied().next().unwrap_or(u64::MAX);
 
-        let result = min_ready.min(min_inflight).min(min_pending);
+        let min_delayed_enq = self
+            .delayed_enqueue_heap
+            .iter()
+            .map(|(_, off)| *off)
+            .min()
+            .unwrap_or(u64::MAX);
+        let min_delayed_retry = self
+            .delayed_retry_heap
+            .iter()
+            .map(|(_, off)| *off)
+            .min()
+            .unwrap_or(u64::MAX);
+        let result = min_ready
+            .min(min_inflight)
+            .min(min_pending)
+            .min(min_delayed_enq)
+            .min(min_delayed_retry);
         if result == 0 {
             return self.settled_until;
         }
@@ -2058,6 +2131,7 @@ impl QueueInternalState {
 
         self.inflight.remove(&offset);
 
+        // TODO: use the new enum type and implement delayed retry
         if !requeue {
             // Policy-driven: caller (Stroma) decides DLQ vs discard based on dlq_policy.
             // We only mark pending; the local ack happens later via commit_dlq or
@@ -2240,9 +2314,16 @@ impl QueueInternalState {
             self.enqueue(req.off, req.retries);
         }
     }
-    
+
     pub fn enqueue_delayed(&mut self, offset: Offset, not_before: u64) {
-        self.delayed_enqueue_heap.push((Reverse(not_before), offset));
+        let was_earlier_or_empty = self.delayed_enqueue_heap
+            .peek()
+            .is_none_or(|(Reverse(d), _)| not_before < *d);
+        self.delayed_enqueue_heap
+            .push((Reverse(not_before), offset));
+        if was_earlier_or_empty {
+            self.deadline_waker.notify_one();
+        }
     }
 
     pub fn enqueue_delayed_many(&mut self, reqs: &[EnqueueDelayedEventMeta]) {
@@ -2254,26 +2335,32 @@ impl QueueInternalState {
     // ---------------- Inflight API ----------------
 
     /// Mark inflight for an offset. If offset is already ACKed, no-op.
-    pub fn mark_inflight(&mut self, offset: Offset, deadline: UnixMillis) {
+    pub fn mark_inflight(&mut self, offset: Offset, deadline: UnixMillis) -> bool {
         // Below frontier is always acked
         if offset < self.settled_until {
-            return;
+            return false;
         }
 
         // Case 1: update existing inflight lease
         if let Some(cur) = self.inflight.get_mut(&offset) {
             *cur = deadline;
             self.expiry_heap.push((Reverse(deadline), offset));
-            self.min_deadline_hint = Some(match self.min_deadline_hint {
-                None => deadline,
-                Some(m) => m.min(deadline),
-            });
-            return;
+            // self.min_deadline_hint = Some(match self.min_deadline_hint {
+            //     None => deadline,
+            //     Some(m) => m.min(deadline),
+            // });
+            // TODO: test
+            self.recompute_hint_if_needed();
+            return self
+                .expiry_heap
+                .peek()
+                .map(|(Reverse(d), _)| *d == deadline)
+                .unwrap_or(false);
         }
 
         // Case 2: initial delivery, must be READY
         if !self.ready.contains(&offset) {
-            return;
+            return false;
         }
         self.ready.remove(offset..offset + 1);
 
@@ -2283,6 +2370,10 @@ impl QueueInternalState {
             None => deadline,
             Some(cur) => cur.min(deadline),
         });
+        self.expiry_heap
+            .peek()
+            .map(|(Reverse(d), _)| *d == deadline)
+            .unwrap_or(false)
     }
 
     pub fn mark_inflight_many(&mut self, reqs: &[MarkInflightEventMeta]) {
@@ -2324,55 +2415,22 @@ impl QueueInternalState {
     #[inline]
     pub fn next_expiry_hint(&mut self) -> Option<UnixMillis> {
         self.recompute_hint_if_needed();
-        // self.recompute_hint_full();
-        // self.min_deadline_hint
-        let mut expiry_min = None;
-        while let Some(top) = self.expiry_heap.peek() {
-            let (Reverse(deadline), offset) = top;
-
-            match self.inflight.get(offset) {
-                Some(d) if *d == *deadline => {
-                    expiry_min = Some(*deadline);
-                    break;
-                }
-                _ => {
-                    // stale heap entry -> drop it
-                    self.expiry_heap.pop();
-                }
-            }
-        }
-
-        while let Some(top) = self.delayed_enqueue_heap.peek() {
-            let (Reverse(deadline), _offset) = top;
-
-            if let Some(min) = expiry_min {
-                if deadline < &min {
-                    expiry_min = Some(*deadline);
-                    break;
-                }
-            } else {
-                expiry_min = Some(*deadline);
-            }
-        }
-
-        while let Some(top) = self.delayed_retry_heap.peek() {
-            let (Reverse(deadline), _offset) = top;
-            if let Some(min) = expiry_min {
-                if deadline < &min {
-                    expiry_min = Some(*deadline);
-                    break;
-                }
-            } else {
-                expiry_min = Some(*deadline);
-            }
-        }
-
-        expiry_min
+        let inflight_min = self.min_deadline_hint;
+        let delayed_enq_min = self.delayed_enqueue_heap.peek().map(|(Reverse(d), _)| *d);
+        let delayed_retry_min = self.delayed_retry_heap.peek().map(|(Reverse(d), _)| *d);
+        [inflight_min, delayed_enq_min, delayed_retry_min]
+            .into_iter()
+            .flatten()
+            .min()
     }
 
     pub fn collect_expired(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let mut out = Vec::new();
 
+        // TODO: Since we now use this to handle delayed things in one convenient place we might need to find a way to make the expiry worker go earlier
+        // TODO: in the case where a message is enqueued/retries with delay and will be available before the next schedule expiry worker run.
+        // TODO: At the very least, it should be documented that the guarantee is not published before timestamp, but guaranteed after,
+        // TODO: with maximum delayed equal to expiry worker period
         let mut to_enqueue = Vec::new();
         // Handle delayed publishes and retries
         while let Some(&(Reverse(deadline), off)) = self.delayed_enqueue_heap.peek() {
@@ -2380,21 +2438,18 @@ impl QueueInternalState {
                 break;
             }
 
-            self.expiry_heap.pop();
+            self.delayed_enqueue_heap.pop();
 
-            let meta = EnqueueEventMeta {
-                off,
-                retries: 0,
-            };
+            let meta = EnqueueEventMeta { off, retries: 0 };
             to_enqueue.push(meta);
         }
-        
+
         while let Some(&(Reverse(deadline), off)) = self.delayed_retry_heap.peek() {
             if deadline > now {
                 break;
             }
 
-            self.expiry_heap.pop();
+            self.delayed_retry_heap.pop();
 
             let meta = EnqueueEventMeta {
                 off,
@@ -2439,18 +2494,18 @@ impl QueueInternalState {
             || self.retries.contains_key(&offset)
     }
 
-    /// Walk heap until we find a valid inflight entry; rebuild if heap fully stale.
-    fn recompute_hint_if_needed(&mut self) {
+    /// Walk heap until we find a valid inflight entry, rebuild if heap fully stale.
+    fn recompute_hint_if_needed(&mut self) -> ExpiryDeadlineOutcome {
         if self.inflight.is_empty() {
             self.min_deadline_hint = None;
-            return;
+            return ExpiryDeadlineOutcome::NoChange;
         }
 
         while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
             match self.inflight.get(&off).copied() {
                 Some(cur) if cur == ts => {
                     self.min_deadline_hint = Some(ts);
-                    return;
+                    return ExpiryDeadlineOutcome::Updated(ts);
                 }
                 _ => {
                     self.expiry_heap.pop(); // stale
@@ -2465,7 +2520,17 @@ impl QueueInternalState {
             self.expiry_heap.push((Reverse(deadline), off));
             min = Some(min.map_or(deadline, |m| m.min(deadline)));
         }
+        let new_min = if self.min_deadline_hint > min {
+            if let Some(m) = min {
+                ExpiryDeadlineOutcome::Updated(m)
+            } else {
+                ExpiryDeadlineOutcome::NoChange
+            }
+        } else {
+            ExpiryDeadlineOutcome::NoChange
+        };
         self.min_deadline_hint = min;
+        new_min
     }
 
     fn recompute_hint_full(&mut self) {
@@ -2527,7 +2592,8 @@ impl QueueInternalState {
     }
 
     pub fn reset(&mut self) {
-        *self = QueueInternalState::new(self.topic.clone(), self.partition);
+        let waker = self.deadline_waker.clone();
+        *self = QueueInternalState::new_with_waker(self.topic.clone(), self.partition, waker);
     }
 
     // Snapshot/recovery setters (used by recover.rs)
@@ -2544,22 +2610,6 @@ impl QueueInternalState {
         if self.ack_bits.len() != ACK_WINDOW {
             self.ack_bits.resize(ACK_WINDOW, false);
         }
-    }
-
-    pub fn load_inflight(&mut self, entries: &[(Offset, UnixMillis)]) {
-        self.inflight.clear();
-        self.expiry_heap.clear();
-        self.min_deadline_hint = None;
-        for &(o, d) in entries {
-            self.inflight.insert(o, d);
-            self.expiry_heap.push((Reverse(d), o));
-            self.min_deadline_hint = Some(match self.min_deadline_hint {
-                None => d,
-                Some(cur) => cur.min(d),
-            });
-        }
-        // ensure heap top is valid
-        self.recompute_hint_if_needed();
     }
 
     pub fn ack_window_base(&self) -> u64 {
@@ -2647,6 +2697,21 @@ impl QueueInternalState {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }
+
+        // pending delayed enqueues
+        out.extend_from_slice(&(self.delayed_enqueue_heap.len() as u64).to_be_bytes());
+        for (Reverse(deadline), off) in self.delayed_enqueue_heap.iter() {
+            out.extend_from_slice(&deadline.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
+
+        // pending delayed retries
+        out.extend_from_slice(&(self.delayed_retry_heap.len() as u64).to_be_bytes());
+        for (Reverse(deadline), off) in self.delayed_retry_heap.iter() {
+            out.extend_from_slice(&deadline.to_be_bytes());
+            out.extend_from_slice(&off.to_be_bytes());
+        }
+
         // retries
         out.extend_from_slice(&(self.retries.len() as u64).to_be_bytes());
         for (&off, e) in self.retries.iter() {
@@ -2770,6 +2835,22 @@ impl QueueInternalState {
             let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let dl = u64::from_be_bytes(take::<8>(&mut bytes)?);
             self.inflight.insert(off, dl);
+        }
+
+        // pending delayed enqueues
+        let delayed_enq_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        for _ in 0..delayed_enq_len {
+            let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.delayed_enqueue_heap.push((Reverse(deadline), off));
+        }
+
+        // pending delayed retries
+        let delayed_retry_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        for _ in 0..delayed_retry_len {
+            let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.delayed_retry_heap.push((Reverse(deadline), off));
         }
 
         // retries
@@ -3409,7 +3490,9 @@ mod tests {
         for _ in 0..200_000 {
             let o = fastrand::u64(0..1000);
             match fastrand::u8(0..6) {
-                0 => s.mark_inflight(o, fastrand::u64(0..1000)),
+                0 => {
+                    s.mark_inflight(o, fastrand::u64(0..1000));
+                }
                 1 => s.clear_inflight(o),
                 2 => s.ack(o),
                 _ => {
@@ -3595,7 +3678,9 @@ mod tests {
         for _ in 0..1_000_000 {
             let o = fastrand::u64(0..30000);
             match fastrand::u8(0..8) {
-                0 => s.mark_inflight(o, fastrand::u64(0..100_000)),
+                0 => {
+                    s.mark_inflight(o, fastrand::u64(0..100_000));
+                }
                 1 => s.clear_inflight(o),
                 2 => s.ack(o),
                 _ => {
@@ -3822,7 +3907,7 @@ mod tests {
 
         // update 11 to later deadline; heap now has stale(400) + current(700).
         s.mark_inflight(11, 700);
-        s.recompute_hint_if_needed();
+
         // hint may still be 400 until recompute/pop, force recompute
         assert_eq!(s.next_expiry_hint(), Some(500));
     }

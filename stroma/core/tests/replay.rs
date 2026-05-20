@@ -62,7 +62,7 @@ async fn expired_messages_survive_restart() {
     st.mark_inflight_one("t", 0, None, 0, 10).await.unwrap();
     let offset = rx.await.unwrap().unwrap().base_offset;
 
-    st.list_expired(100, 10).await.unwrap();
+    st.collect_expired(100, 10).await.unwrap();
     st.shutdown().await.unwrap();
     drop(st);
 

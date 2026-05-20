@@ -16,7 +16,7 @@ pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, NackBatchOutcome, NackOutcome,
     QueueHandle, QueueInternalState, StromaDebugSnapshot,
 };
-pub use stroma::{GlobalDLQ, MessageHeaders, SnapshotConfig, Stroma};
+pub use stroma::{GlobalDLQ, MessageHeaders, PublishItem, SnapshotConfig, Stroma};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
