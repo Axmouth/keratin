@@ -931,4 +931,25 @@ mod tests {
         let decoded = StromaEvent::decode(&bytes);
         assert!(decoded.is_err());
     }
+
+    #[test]
+    fn test_enqueue_delayed_encode_decode() {
+        let event = StromaEvent::EnqueueDelayed { off: 100, not_before: 1234567890 };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_enqueue_delayed_many_encode_decode() {
+        let event = StromaEvent::EnqueueDelayedMany {
+            reqs: vec![
+                EnqueueDelayedEventMeta { off: 100, not_before: 1000 },
+                EnqueueDelayedEventMeta { off: 101, not_before: 2000 },
+            ],
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
 }
