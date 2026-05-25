@@ -1,4 +1,3 @@
-#[cfg(windows)]
 use std::io;
 use std::{
     path::{Path, PathBuf},

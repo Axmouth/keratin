@@ -1934,7 +1934,8 @@ impl QueueInternalState {
         QueueInternalDebugInfo {
             settled_until: self.settled_until,
             ack_window_base: self.ack_window_base,
-            ready_count: self.ready.len(),
+            ready_count: self.ready.iter().map(|r| (r.end - r.start) as usize).sum(),
+            ready_set_fragments: self.ready.len(),
             inflight_count: self.inflight.len(),
             retries_count: self.retries.len(),
             min_ready: self.ready.first().map(|r| r.start),
@@ -3005,7 +3006,7 @@ impl QueueInternalState {
             topic: self.topic.clone(),
             partition: self.partition,
             inflight_count: self.inflight.len(),
-            ready_count: self.ready.len(),
+            ready_count: self.ready.iter().map(|r| (r.end - r.start) as usize).sum(),
             next_expiry_hint: self.peek_next_expiry_hint(),
             lowest_unacked: self.lowest_unacked_offset(),
         }
@@ -3054,6 +3055,7 @@ pub struct QueueInternalDebugInfo {
     pub settled_until: Offset,
     pub ack_window_base: Offset,
     pub ready_count: usize,
+    pub ready_set_fragments: usize,
     pub inflight_count: usize,
     pub retries_count: usize,
     pub min_ready: Option<Offset>,
