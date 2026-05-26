@@ -784,6 +784,10 @@ pub struct QueueHandle {
     creating_snapshot: Arc<AtomicBool>,
     dirty_since_snapshot: Arc<AtomicBool>,
 
+    pub(crate) recovery_complete: Arc<AtomicBool>,
+    recovery_notify: Arc<Notify>,
+    snapshot_task_started: Arc<AtomicBool>,
+
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
 
@@ -815,7 +819,11 @@ impl QueueHandle {
         let applied_upto = Arc::new(AtomicU64::new(0));
         let last_snapshot_timestamp = Arc::new(AtomicU64::new(0));
         let last_snapshot_event_offset = Arc::new(AtomicU64::new(0));
+
         let creating_snapshot = Arc::new(AtomicBool::new(false));
+        let recovery_complete = Arc::new(AtomicBool::new(false));
+        let recovery_notify = Arc::new(Notify::new());
+        let snapshot_task_started = Arc::new(AtomicBool::new(false));
 
         let task_group_clone = task_group.clone();
 
@@ -832,6 +840,9 @@ impl QueueHandle {
             last_snapshot_event_offset,
             creating_snapshot,
             dirty_since_snapshot,
+            recovery_complete,
+            recovery_notify,
+            snapshot_task_started,
             task_group,
             global_dlq,
             metrics,
@@ -874,6 +885,31 @@ impl QueueHandle {
             creating_snapshot: self.creating_snapshot(),
             state,
         }
+    }
+
+    pub fn mark_recovery_complete(&self) {
+        self.recovery_complete.store(true, Ordering::Release);
+        self.recovery_notify.notify_waiters();
+    }
+
+    pub fn recovery_complete(&self) -> bool {
+        self.recovery_complete.load(Ordering::Acquire)
+    }
+
+    pub async fn wait_recovery_complete(&self) {
+        while !self.recovery_complete() {
+            self.recovery_notify.notified().await;
+        }
+    }
+
+    pub fn try_start_snapshot_task(&self) -> bool {
+        self.snapshot_task_started
+            .compare_exchange(false, true, Ordering::AcqRel, Ordering::Acquire)
+            .is_ok()
+    }
+
+    pub fn snapshot_task_started(&self) -> bool {
+        self.snapshot_task_started.load(Ordering::Acquire)
     }
 
     pub fn deadline_waker(&self) -> Arc<Notify> {
@@ -2317,7 +2353,8 @@ impl QueueInternalState {
     }
 
     pub fn enqueue_delayed(&mut self, offset: Offset, not_before: u64) {
-        let was_earlier_or_empty = self.delayed_enqueue_heap
+        let was_earlier_or_empty = self
+            .delayed_enqueue_heap
             .peek()
             .is_none_or(|(Reverse(d), _)| not_before < *d);
         self.delayed_enqueue_heap
@@ -4299,13 +4336,13 @@ mod tests {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.enqueue_delayed(5, 100);
         s.enqueue_delayed(6, 200);
-        
+
         let _ = s.collect_expired(150, 100);
-        
+
         assert!(s.is_ready(5));
         assert!(!s.is_ready(6));
         assert_eq!(s.delayed_enqueue_heap.len(), 1); // only 6 remains
-        
+
         let _ = s.collect_expired(250, 100);
         assert!(s.is_ready(6));
         assert_eq!(s.delayed_enqueue_heap.len(), 0);
@@ -4315,10 +4352,10 @@ mod tests {
     fn next_expiry_hint_considers_all_heaps() {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.enqueue(1, 0);
-        s.mark_inflight(1, 500);          // inflight expiry
-        s.enqueue_delayed(2, 300);         // delayed enqueue
+        s.mark_inflight(1, 500); // inflight expiry
+        s.enqueue_delayed(2, 300); // delayed enqueue
         // (when delayed_retry exists, add one at 400 too)
-        
+
         assert_eq!(s.next_expiry_hint(), Some(300));
     }
 
@@ -4328,17 +4365,17 @@ mod tests {
         s.enqueue(1, 0);
         s.mark_inflight(1, 100);
         s.enqueue_delayed(2, 500);
-        
+
         assert_eq!(s.next_expiry_hint(), Some(100));
     }
 
     #[test]
     fn safe_truncate_blocked_by_delayed_message() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue_delayed(5, 999_999_999);  // far future
-        s.ack(10);  // some higher offset done
+        s.enqueue_delayed(5, 999_999_999); // far future
+        s.ack(10); // some higher offset done
         s.ack(11);
-        
+
         assert!(s.safe_message_truncate_before() <= 5);
     }
 
@@ -4347,11 +4384,11 @@ mod tests {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.enqueue_delayed(5, 1_000_000);
         s.enqueue_delayed(6, 2_000_000);
-        
+
         let snap = s.encode_snapshot(0);
         let mut s2 = QueueInternalState::new("t".into(), 0);
         s2.load_snapshot(&snap).unwrap();
-        
+
         // After load, the delayed entries should still be tracked
         let _ = s2.collect_expired(1_500_000, 10);
         assert!(s2.is_ready(5));

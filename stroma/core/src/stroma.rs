@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     sync::{
         Arc,
-        atomic::{AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -17,7 +17,10 @@ use keratin_log::{
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
-use tokio::sync::{Notify, OnceCell, RwLock};
+use tokio::{
+    sync::{Notify, OnceCell, RwLock, Semaphore},
+    task::JoinSet,
+};
 use tokio_util::sync::CancellationToken;
 
 use crate::{
@@ -408,6 +411,7 @@ pub struct Stroma {
     earliest_pending_deadline_sender: tokio::sync::watch::Sender<Option<UnixMillis>>,
     earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
     pub(crate) deadline_waker: Arc<Notify>,
+    initial_recovery_complete: Arc<AtomicBool>,
 }
 
 impl Stroma {
@@ -450,11 +454,15 @@ impl Stroma {
             earliest_pending_deadline_sender,
             earliest_pending_deadline_receiver,
             deadline_waker: Arc::new(Notify::new()),
+            initial_recovery_complete: Arc::new(AtomicBool::new(false)),
         };
 
         // Recover from existing snapshot files + replay events.
         // TODO: do it lazily
         st.recover_all().await?;
+
+        st.initial_recovery_complete.store(true, Ordering::Release);
+        st.mark_all_queue_recoveries_complete();
 
         let st_metrics = st.clone();
         st.task_group.spawn("debug report", async move {
@@ -685,12 +693,16 @@ impl Stroma {
                     global_dlq,
                     deadline_waker: self.deadline_waker.clone(),
                 };
-                Ok(QueueHandle::init(
-                    tp.into(),
-                    part,
-                    group.map(|s| s.into()),
-                    bundle,
-                ))
+
+                let qh = QueueHandle::init(tp.into(), part, group.map(|s| s.into()), bundle);
+
+                if self.initial_recovery_complete.load(Ordering::Acquire) {
+                    qh.mark_recovery_complete();
+                }
+
+                self.periodic_snapshot(qh.clone());
+
+                Ok(qh)
             })
             .await?;
 
@@ -701,6 +713,16 @@ impl Stroma {
         self.queue_handle(tp, part, group).await?;
 
         Ok(())
+    }
+
+    fn mark_all_queue_recoveries_complete(&self) {
+        let current = self.queue_handles.load();
+
+        for cell in current.values() {
+            if let Some(qh) = cell.get() {
+                qh.mark_recovery_complete();
+            }
+        }
     }
 
     async fn applied_upto_entry(
@@ -1307,21 +1329,25 @@ impl Stroma {
         Ok(())
     }
 
-    fn periodic_snapshot(&self, qh: QueueHandle) -> Result<()> {
+    fn periodic_snapshot(&self, qh: QueueHandle) {
+        if !qh.try_start_snapshot_task() {
+            return;
+        }
+
         let stroma = self.clone();
-        tokio::spawn(async move {
+
+        self.task_group.spawn("periodic snapshot", async move {
+            qh.wait_recovery_complete().await;
+
             tracing::info!(
                 "Starting periodic snapshot service for tp={} part={} group={}",
                 qh.topic(),
                 qh.partition(),
                 qh.group().unwrap_or("Default")
             );
-            // TODO: Make configurable
+
             let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(10));
-            // avoid immediate tick
             ticker.tick().await;
-            let stroma = stroma.clone();
-            let qh = qh.clone();
 
             loop {
                 ticker.tick().await;
@@ -1332,8 +1358,6 @@ impl Stroma {
                 }
             }
         });
-
-        Ok(())
     }
 
     async fn write_snapshots_for_partition(
@@ -1473,13 +1497,39 @@ impl Stroma {
 
     async fn recover_all(&self) -> Result<()> {
         let partitions = self.discover_partitions()?; // decoded names
+        let max_parallel = std::thread::available_parallelism()
+            .map(|n| n.get())
+            .unwrap_or(4)
+            .max(1);
+
+        let permits = Arc::new(Semaphore::new(max_parallel));
+        let mut tasks = JoinSet::new();
 
         for (group, tp, part) in partitions {
-            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
-            let event_log = qh.event_log();
-            // TODO: Split to threads/tasks for faster work on many queues?
-            self.recover_one_log(&tp, part, group.as_deref(), event_log)
-                .await?;
+            let stroma = self.clone();
+            let permits = permits.clone();
+
+            tasks.spawn(async move {
+                let _permit = permits
+                    .acquire_owned()
+                    .await
+                    .map_err(|err| StromaError::Io(err.to_string()))?;
+
+                let qh = stroma.queue_handle(&tp, part, group.as_deref()).await?;
+                let event_log = qh.event_log();
+
+                stroma
+                    .recover_one_log(&tp, part, group.as_deref(), event_log)
+                    .await?;
+
+                qh.mark_recovery_complete();
+
+                Ok::<(), StromaError>(())
+            });
+        }
+
+        while let Some(joined) = tasks.join_next().await {
+            joined.map_err(|err| StromaError::Io(err.to_string()))??;
         }
 
         Ok(())
@@ -1613,9 +1663,6 @@ impl Stroma {
             .observe(replay_start.elapsed());
 
         self.metrics.recovery.startup_duration.observe(elapsed);
-
-        // TODO: only starts if we had a snapshot, derp. Move it elsewhere and make it waits for recovery to finish and queue to be ready
-        self.periodic_snapshot(qh)?;
 
         Ok(())
     }
@@ -2671,3 +2718,105 @@ fn collect_parts_decoded(
 }
 
 fn is_send<T: Send>(_: T) {}
+
+#[cfg(test)]
+mod tests {
+    use keratin_log::test_dir;
+
+use super::*;
+
+    #[tokio::test]
+    async fn queue_handle_starts_snapshot_task_once() {
+        let dir = test_dir!("test_data");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+
+        assert!(qh.snapshot_task_started());
+        assert!(qh.recovery_complete());
+
+        stroma.periodic_snapshot(qh.clone());
+
+        assert!(qh.snapshot_task_started());
+    }
+
+    #[tokio::test]
+    async fn new_queue_after_empty_recovery_is_marked_recovered() {
+        let dir = test_dir!("test_data");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        assert!(stroma.initial_recovery_complete.load(Ordering::Acquire));
+
+        let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+
+        assert!(qh.recovery_complete());
+        assert!(qh.snapshot_task_started());
+    }
+
+    #[tokio::test]
+    async fn mark_all_queue_recoveries_completes_existing_waiters() {
+        let dir = test_dir!("test_data");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+
+        qh.recovery_complete.store(false, Ordering::Release);
+
+        let qh_waiter = qh.clone();
+        let waiter = tokio::spawn(async move {
+            qh_waiter.wait_recovery_complete().await;
+        });
+
+        stroma.mark_all_queue_recoveries_complete();
+
+        waiter.await.unwrap();
+
+        assert!(qh.recovery_complete());
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn newly_created_queue_writes_periodic_snapshot() {
+        let dir = test_dir!("test_data");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+
+        qh.enqueue(0, 0).await;
+
+        tokio::time::advance(Duration::from_secs(21)).await;
+        // should find better way to ensure it runs ideally
+        for _ in 0..10000 {
+            tokio::task::yield_now().await;
+        }
+
+        assert!(stroma.snap_file("new-topic", 0, None).exists());
+    }
+}
