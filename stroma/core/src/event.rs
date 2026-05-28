@@ -140,7 +140,11 @@ pub struct DeclareMeta {
 pub enum DLQDiscardPolicyWire {
     Discard,
     GlobalDQL,
-    CustomDQL { tp: Box<str>, part: u32, group: Option<Box<str>> },
+    CustomDQL {
+        tp: Box<str>,
+        part: u32,
+        group: Option<Box<str>>,
+    },
 }
 
 // TODO: Add events for setting DLQ target and policy, timeouts, retry limits, etc.
@@ -806,7 +810,7 @@ mod tests {
             dlq_policy: Some(DLQDiscardPolicyWire::CustomDQL {
                 tp: "custom_dlq".into(),
                 part: 5,
-                group: Some("custom_dlq_group".into())
+                group: Some("custom_dlq_group".into()),
             }),
             dlq_max_retries: Some(5),
         });
@@ -934,7 +938,10 @@ mod tests {
 
     #[test]
     fn test_enqueue_delayed_encode_decode() {
-        let event = StromaEvent::EnqueueDelayed { off: 100, not_before: 1234567890 };
+        let event = StromaEvent::EnqueueDelayed {
+            off: 100,
+            not_before: 1234567890,
+        };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);
@@ -944,8 +951,14 @@ mod tests {
     fn test_enqueue_delayed_many_encode_decode() {
         let event = StromaEvent::EnqueueDelayedMany {
             reqs: vec![
-                EnqueueDelayedEventMeta { off: 100, not_before: 1000 },
-                EnqueueDelayedEventMeta { off: 101, not_before: 2000 },
+                EnqueueDelayedEventMeta {
+                    off: 100,
+                    not_before: 1000,
+                },
+                EnqueueDelayedEventMeta {
+                    off: 101,
+                    not_before: 2000,
+                },
             ],
         };
         let encoded = event.encode().unwrap();

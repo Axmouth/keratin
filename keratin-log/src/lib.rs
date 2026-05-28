@@ -80,7 +80,7 @@ where
 pub trait CompletionPair<E> {
     type Receiver;
 
-    fn pair() -> (Box<dyn AppendCompletion<E>>, Self::Receiver);
+    fn pair() -> (Box<dyn AppendCompletion<E> + Send>, Self::Receiver);
 }
 
 impl AppendCompletion<writer::IoError> for KeratinAppendCompletion {
@@ -92,7 +92,10 @@ impl AppendCompletion<writer::IoError> for KeratinAppendCompletion {
 impl CompletionPair<writer::IoError> for KeratinAppendCompletion {
     type Receiver = tokio::sync::oneshot::Receiver<Result<AppendResult, writer::IoError>>;
 
-    fn pair() -> (Box<dyn AppendCompletion<writer::IoError>>, Self::Receiver) {
+    fn pair() -> (
+        Box<dyn AppendCompletion<writer::IoError> + Send>,
+        Self::Receiver,
+    ) {
         let (result_tx, rx) = tokio::sync::oneshot::channel();
         (Box::new(KeratinAppendCompletion { result_tx }), rx)
     }

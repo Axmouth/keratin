@@ -103,7 +103,7 @@ impl Keratin {
         &self,
         payload: Message,
         durability: Option<KDurability>,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
         self.tx
             .send(WriterCmd::Append(AppendReq {
@@ -139,7 +139,7 @@ impl Keratin {
         &self,
         payloads: Vec<Message>,
         durability: Option<KDurability>,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
         self.tx
             .send(WriterCmd::Append(AppendReq {

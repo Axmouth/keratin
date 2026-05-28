@@ -98,14 +98,19 @@ async fn declare_dlq_custom(
     target_group: Option<&str>,
     max_retries: u32,
 ) {
-    st.declare(tp, part, group, DeclareMeta {
-        dlq_policy: Some(DLQDiscardPolicyWire::CustomDQL {
-            tp: target_tp.into(),
-            part: target_part,
-            group: target_group.map(Into::into),
-        }),
-        dlq_max_retries: Some(max_retries),
-    })
+    st.declare(
+        tp,
+        part,
+        group,
+        DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::CustomDQL {
+                tp: target_tp.into(),
+                part: target_part,
+                group: target_group.map(Into::into),
+            }),
+            dlq_max_retries: Some(max_retries),
+        },
+    )
     .await
     .unwrap();
 }
@@ -190,8 +195,9 @@ async fn nack_at_max_dead_letters_to_custom_target() {
         "DLQ should have exactly 1 message, got next_offset={next}"
     );
 
+    let qh = st.queue_handle("dlq", 0, None).await.unwrap();
     let m = st
-        .fetch_message_by_offset("dlq", 0, None, 0)
+        .fetch_message_by_offset(&qh, 0)
         .await
         .unwrap()
         .expect("DLQ message present");
@@ -340,12 +346,9 @@ async fn dlq_routing_preserves_distinct_payloads() {
     .await;
 
     let mut dlq_payloads: Vec<Vec<u8>> = Vec::new();
+    let qh = st.queue_handle("dlq", 0, None).await.unwrap();
     for i in 0..offs.len() as u64 {
-        let m = st
-            .fetch_message_by_offset("dlq", 0, None, i)
-            .await
-            .unwrap()
-            .unwrap();
+        let m = st.fetch_message_by_offset(&qh, i).await.unwrap().unwrap();
         dlq_payloads.push(m.payload);
     }
     dlq_payloads.sort();
@@ -383,11 +386,8 @@ async fn dlq_routing_survives_restart_no_duplicates() {
         "no duplicate DLQ messages after restart"
     );
 
-    let m = st2
-        .fetch_message_by_offset("dlq", 0, None, 0)
-        .await
-        .unwrap()
-        .unwrap();
+    let qh = st2.queue_handle("dlq", 0, None).await.unwrap();
+    let m = st2.fetch_message_by_offset(&qh, 0).await.unwrap().unwrap();
     assert_eq!(m.payload, b"persist");
 }
 

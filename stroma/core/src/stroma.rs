@@ -1,8 +1,9 @@
 use std::{
     fs,
-    hash::{Hash, Hasher},
+    hash::{BuildHasher, Hash, Hasher},
     io,
     path::{Path, PathBuf},
+    pin::Pin,
     sync::{
         Arc,
         atomic::{AtomicBool, AtomicU64, Ordering},
@@ -58,7 +59,7 @@ pub struct PublishItem {
     pub headers: MessageHeaders,
     pub payload: Vec<u8>,
     pub not_before: Option<UnixMillis>,
-    pub completion: Box<dyn AppendCompletion<IoError>>,
+    pub completion: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
 struct ItemMeta {
@@ -110,7 +111,7 @@ pub struct ApplyThenComplete {
     stroma: Stroma,
     ev: StromaEvent,
     qh: QueueHandle,
-    inner: Box<dyn AppendCompletion<IoError>>,
+    inner: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
 impl AppendCompletion<IoError> for ApplyThenComplete {
@@ -144,7 +145,7 @@ impl ApplyThenComplete {
         stroma: Stroma,
         ev: StromaEvent,
         qh: QueueHandle,
-        inner: Box<dyn AppendCompletion<IoError>>,
+        inner: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Box<Self> {
         Box::new(Self {
             stroma,
@@ -157,7 +158,7 @@ impl ApplyThenComplete {
 
 struct CompletionItem {
     meta: ItemMeta,
-    completion: Box<dyn AppendCompletion<IoError>>,
+    completion: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
 /// Completion for the msg_log batch in append_message_batch.
@@ -383,7 +384,32 @@ impl MessageHeaders {
     }
 }
 
-type Registry = HashMap<(Box<str>, u32, Option<Box<str>>), Arc<OnceCell<QueueHandle>>>;
+#[derive(Debug)]
+struct QueueSlot {
+    handle: OnceCell<QueueHandle>,
+    exists_on_disk: bool,
+}
+
+type Registry = hashbrown::HashMap<(Box<str>, u32, Option<Box<str>>), Arc<QueueSlot>>;
+
+fn slot_lookup_no_alloc<'a>(
+    map: &'a Registry,
+    tp: &str,
+    part: u32,
+    group: Option<&str>,
+) -> Option<&'a Arc<QueueSlot>> {
+    let mut hasher = map.hasher().build_hasher();
+    tp.hash(&mut hasher);
+    part.hash(&mut hasher);
+    group.hash(&mut hasher);
+    let hash = hasher.finish();
+
+    map.raw_entry()
+        .from_hash(hash, |k| {
+            k.0.as_ref() == tp && k.1 == part && k.2.as_deref() == group
+        })
+        .map(|(_, v)| v)
+}
 
 #[derive(Debug, Clone)]
 pub struct Stroma {
@@ -412,6 +438,12 @@ pub struct Stroma {
     earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
     pub(crate) deadline_waker: Arc<Notify>,
     initial_recovery_complete: Arc<AtomicBool>,
+
+    #[cfg(test)]
+    lazy_recoveries_started: Arc<AtomicU64>,
+
+    #[cfg(test)]
+    snapshot_worker_ticks: Arc<Notify>,
 }
 
 impl Stroma {
@@ -446,7 +478,7 @@ impl Stroma {
             keratin_cfg_event,
             snap_cfg,
             task_group: Arc::new(TaskGroup::new()),
-            queue_handles: Arc::new(ArcSwap::new(Arc::new(HashMap::new()))),
+            queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             global_dlq: Arc::new(RwLock::new(None)),
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
@@ -455,14 +487,16 @@ impl Stroma {
             earliest_pending_deadline_receiver,
             deadline_waker: Arc::new(Notify::new()),
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
+            #[cfg(test)]
+            lazy_recoveries_started: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            snapshot_worker_ticks: Arc::new(Notify::new()),
         };
 
-        // Recover from existing snapshot files + replay events.
-        // TODO: do it lazily
-        st.recover_all().await?;
-
+        // Discover persisted queues, but do not open logs or replay them yet.
+        // Recovery happens lazily on first queue_handle().
+        st.index_existing_queues()?;
         st.initial_recovery_complete.store(true, Ordering::Release);
-        st.mark_all_queue_recoveries_complete();
 
         let st_metrics = st.clone();
         st.task_group.spawn("debug report", async move {
@@ -589,6 +623,31 @@ impl Stroma {
         }
     }
 
+    fn index_existing_queues(&self) -> Result<()> {
+        let partitions = self.discover_partitions()?;
+        if partitions.is_empty() {
+            return Ok(());
+        }
+
+        let current = self.queue_handles.load();
+        let mut next = (**current).clone();
+
+        for (group, tp, part) in partitions {
+            let key = (tp.into_boxed_str(), part, group.map(Into::into));
+
+            next.entry(key).or_insert_with(|| {
+                Arc::new(QueueSlot {
+                    handle: OnceCell::new(),
+                    exists_on_disk: true,
+                })
+            });
+        }
+
+        self.queue_handles.store(Arc::new(next));
+
+        Ok(())
+    }
+
     // ---------------- Core accessors ----------------
 
     async fn event_log_init(
@@ -632,75 +691,77 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<QueueHandle> {
-        let cell = loop {
-            let current = self.queue_handles.load();
-
-            let key = (tp.into(), part, group.map(|s| s.into()));
-            if let Some(cell) = current.get(&key) {
-                break cell.clone();
-            }
-
-            let new_cell = Arc::new(OnceCell::new());
-            let mut next = (**current).clone();
-            next.insert(key.clone(), new_cell.clone());
-
-            tracing::debug!("Attempting to insert queue handle for ({tp}, {part}, {group:?})...");
-            // swap in the new map only if snapshot is still current
-            let prev = self
-                .queue_handles
-                .compare_and_swap(&current, Arc::new(next));
-            tracing::debug!(
-                "compare_and_swap result for ({tp}, {part}, {group:?}): {}",
-                if Arc::ptr_eq(&prev, &current) {
-                    "success"
+        let slot = loop {
+            let outcome = {
+                let current = self.queue_handles.load();
+                if let Some(slot) = slot_lookup_no_alloc(&current, tp, part, group) {
+                    Ok(slot.clone())
                 } else {
-                    "failure"
+                    let new_slot = Arc::new(QueueSlot {
+                        handle: OnceCell::new(),
+                        exists_on_disk: false,
+                    });
+                    let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+                    let mut next = (**current).clone();
+                    next.insert(key, new_slot.clone());
+
+                    tracing::debug!(
+                        "Attempting to insert queue handle for ({tp}, {part}, {group:?})..."
+                    );
+                    // swap in the new map only if snapshot is still current
+                    let prev = self
+                        .queue_handles
+                        .compare_and_swap(&current, Arc::new(next));
+                    tracing::debug!(
+                        "compare_and_swap result for ({tp}, {part}, {group:?}): {}",
+                        if Arc::ptr_eq(&prev, &current) {
+                            "success"
+                        } else {
+                            "failure"
+                        }
+                    );
+                    if Arc::ptr_eq(&prev, &current) {
+                        Ok(new_slot)
+                    } else {
+                        // lost race; retry
+                        tracing::debug!(
+                            "Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying..."
+                        );
+                        Err(()) // retry
+                    }
                 }
-            );
-
-            if Arc::ptr_eq(&prev, &current) {
-                break new_cell;
-            }
-
-            // lost race; retry
-            tracing::debug!(
-                "Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying..."
-            );
-            // make numeric hash of topic/part/group and sleep that long to reduce contention in high concurrency scenarios.
-            let hash = {
-                use std::collections::hash_map::DefaultHasher;
-                let mut hasher = DefaultHasher::new();
-                tp.hash(&mut hasher);
-                part.hash(&mut hasher);
-                group.hash(&mut hasher);
-                hasher.finish()
             };
-            let sleep_us = hash % 1000;
-            tracing::debug!("Sleeping for {sleep_us} microseconds before retrying...");
-            tokio::time::sleep(tokio::time::Duration::from_micros(sleep_us)).await;
+            match outcome {
+                Ok(slot) => break slot,
+                Err(()) => tokio::task::yield_now().await,
+            }
         };
 
-        let qh = cell
+        let qh = slot
+            .handle
             .get_or_try_init(|| async {
                 let msg_log = self.msg_log_init(tp, part, group).await?;
                 let event_log = self.event_log_init(tp, part, group).await?;
-                let global_dlq = self.global_dlq.clone();
+
                 let bundle = QueueSharedBundle {
-                    event_log,
+                    event_log: event_log.clone(),
                     msg_log,
                     task_group: self.task_group.clone(),
                     metrics: self.metrics.clone(),
-                    global_dlq,
+                    global_dlq: self.global_dlq.clone(),
                     deadline_waker: self.deadline_waker.clone(),
                 };
 
                 let qh = QueueHandle::init(tp.into(), part, group.map(|s| s.into()), bundle);
 
-                if self.initial_recovery_complete.load(Ordering::Acquire) {
-                    qh.mark_recovery_complete();
+                self.periodic_snapshot(qh.clone());
+
+                if slot.exists_on_disk {
+                    self.recover_one_log_with_handle(&qh, tp, part, group, event_log)
+                        .await?;
                 }
 
-                self.periodic_snapshot(qh.clone());
+                qh.mark_recovery_complete();
 
                 Ok(qh)
             })
@@ -719,7 +780,7 @@ impl Stroma {
         let current = self.queue_handles.load();
 
         for cell in current.values() {
-            if let Some(qh) = cell.get() {
+            if let Some(qh) = cell.handle.get() {
                 qh.mark_recovery_complete();
             }
         }
@@ -754,7 +815,8 @@ impl Stroma {
                 ),
             )
         })?;
-        cell.get()
+        cell.handle
+            .get()
             .cloned()
             .ok_or_else(|| io::Error::other("queue handle not initialized"))
     }
@@ -992,10 +1054,10 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
-        let msgs_count = msgs.len();
         for ev in &evs {
             msgs.push(event_msg(ev)?);
         }
+        let msgs_count = msgs.len();
         let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
 
         // Durable append first.
@@ -1353,6 +1415,8 @@ impl Stroma {
                 ticker.tick().await;
 
                 let res = Self::periodic_snapshot_step(&stroma, &qh).await;
+                #[cfg(test)]
+                stroma.snapshot_worker_ticks.notify_waiters();
                 if let Err(err) = res {
                     tracing::error!("Error during periodic snapshot: {err}");
                 }
@@ -1495,6 +1559,7 @@ impl Stroma {
 
     // ---------------- Recovery ----------------
 
+    // TODO: Reuse once we define opt in eager queues to load early, vs ones that are loaded on demand
     async fn recover_all(&self) -> Result<()> {
         let partitions = self.discover_partitions()?; // decoded names
         let max_parallel = std::thread::available_parallelism()
@@ -1542,13 +1607,60 @@ impl Stroma {
         group: Option<&str>,
         event_log: Arc<Keratin>,
     ) -> Result<()> {
+        let qh = self.queue_handle(tp, part, group).await?;
+
+        self.recover_one_log_with_handle(&qh, tp, part, group, event_log)
+            .await
+    }
+
+    fn recover_events_from_log(
+        event_log: Arc<Keratin>,
+        mut cur: u64,
+        tail: u64,
+        applied_upto: Arc<AtomicU64>,
+    ) -> Result<(Vec<StromaEvent>, u64)> {
+        let reader = event_log.reader();
+
+        let mut events = Vec::new();
+        let mut events_count = 0;
+
+        while cur < tail {
+            let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
+            if batch.is_empty() {
+                break;
+            }
+
+            for rec in batch {
+                cur = rec.offset + 1;
+                let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
+                events.push(ev);
+                applied_upto.store(cur, Ordering::Release);
+                events_count += 1;
+            }
+        }
+
+        Ok((events, events_count))
+    }
+
+    async fn recover_one_log_with_handle(
+        &self,
+        qh: &QueueHandle,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        event_log: Arc<Keratin>,
+    ) -> Result<()> {
         let start = Instant::now();
 
         tracing::info!(
             "Recovering log tp: {tp}, partition: {part}, group: {}",
             group.unwrap_or("Default")
         );
-        let qh = self.queue_handle(tp, part, group).await?;
+
+        #[cfg(test)]
+        {
+            self.lazy_recoveries_started.fetch_add(1, Ordering::Relaxed);
+        }
 
         let snap_load_start = Instant::now();
         // load snapshot...
@@ -1563,8 +1675,8 @@ impl Stroma {
             cur = applied_upto;
         }
 
-        let reader = event_log.reader();
         let tail = event_log.next_offset();
+        let applied_upto = qh.applied_upto();
 
         self.metrics
             .recovery
@@ -1572,34 +1684,9 @@ impl Stroma {
             .observe(snap_load_start.elapsed());
 
         let replay_start = Instant::now();
-        let mut events_count = 0;
 
-        let qh_clone = qh.clone();
-        let events = tokio::task::spawn_blocking(move || {
-            let mut events = Vec::new();
-            let _: Result<()> = {
-                while cur < tail {
-                    let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
-                    if batch.is_empty() {
-                        break;
-                    }
-
-                    for rec in batch {
-                        cur = rec.offset + 1;
-                        let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
-                        events.push(ev);
-                        // self.apply_event_inmem(ev, &qh).await?;
-                        // stroma
-                        //     .enqueue_event_inmem(ev, &qh_clone)
-                        //     .map_err(|err| StromaError::Io(err.to_string()))?;
-                        qh_clone.applied_upto().store(cur, Ordering::Release);
-                        events_count += 1;
-                    }
-                }
-
-                Ok(())
-            };
-            Ok(events)
+        let (events, events_count) = tokio::task::spawn_blocking(move || {
+            Self::recover_events_from_log(event_log, cur, tail, applied_upto)
         })
         .await
         .map_err(|err| StromaError::Io(err.to_string()))??;
@@ -1637,12 +1724,14 @@ impl Stroma {
                     };
                     let src = src.clone();
                     tokio::spawn(async move {
-                        stroma.dlq_copy_then_commit(src, qh2, meta).await;
+                        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
+                            Box::pin(stroma.dlq_copy_then_commit(src, qh2, meta));
+                        fut.await;
                     });
                 }
                 None => {
                     // Policy is now Discard -> ack locally.
-                    self.commit_dlq_event(&qh, vec![off]).await;
+                    // self.commit_dlq_event(&qh, vec![off]).await;
                 }
             }
         }
@@ -1723,12 +1812,7 @@ impl Stroma {
         Ok(out)
     }
 
-    fn remove_queue(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> Option<Arc<OnceCell<QueueHandle>>> {
+    fn remove_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Option<Arc<QueueSlot>> {
         let key = (tp.into(), part, group.map(|s| s.into()));
         loop {
             let current = self.queue_handles.load();
@@ -1753,11 +1837,11 @@ impl Stroma {
 
     pub async fn shutdown(&self) -> Result<()> {
         // Step 1: atomically take ownership of all queues
-        let old = self.queue_handles.swap(Arc::new(HashMap::new()));
+        let old = self.queue_handles.swap(Arc::new(hashbrown::HashMap::new()));
 
         // Step 2: shutdown everything from the old snapshot
-        for (_key, cell) in old.iter() {
-            if let Some(q) = cell.get() {
+        for (_key, slot) in old.iter() {
+            if let Some(q) = slot.handle.get() {
                 q.shutdown().await;
                 q.event_log().shutdown().await.map_err(io_err)?;
                 q.msg_log().shutdown().await.map_err(io_err)?;
@@ -1947,11 +2031,10 @@ impl Stroma {
         group: Option<&str>,
         headers: &MessageHeaders,
         payload: Vec<u8>,
-        event_completion: Box<dyn AppendCompletion<IoError>>,
+        event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
-        self.ensure_queue(tp, part, group).await?;
         msg_log
             .append_enqueue(
                 Message {
@@ -1989,17 +2072,13 @@ impl Stroma {
                 off: msg_offset,
             };
 
-            match stroma
-                .append_events_durable(
-                    &tp,
-                    part,
-                    group.as_deref(),
-                    vec![ev],
-                    stroma.keratin_cfg_msg.default_durability,
-                )
-                .await
-                .map_err(io_err)
-            {
+            let durability = stroma.keratin_cfg_msg.default_durability;
+
+            let event_res = stroma
+                .append_events_durable(&tp, part, group.as_deref(), vec![ev], durability)
+                .await;
+
+            match event_res {
                 Ok(_event_offset) => {
                     event_completion.complete(Ok(AppendResult {
                         base_offset: msg_offset,
@@ -2022,7 +2101,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         offset: Offset,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let ev = StromaEvent::Ack { off: offset };
 
@@ -2046,7 +2125,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         reqs: Vec<AckEventMeta>,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let ev = StromaEvent::AckMany { reqs };
 
@@ -2071,7 +2150,7 @@ impl Stroma {
         group: Option<&str>,
         offset: Offset,
         requeue: bool,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         self.nack_enqueue_many(
             tp,
@@ -2092,7 +2171,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         reqs: Vec<NackEventMeta>,
-        completion: Box<dyn AppendCompletion<IoError>>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
         let event_log = qh.event_log();
@@ -2214,99 +2293,99 @@ impl Stroma {
         }
     }
 
-    async fn dlq_copy_then_commit(
+    fn dlq_copy_then_commit(
         &self,
         src: (String, u32, Option<String>),
         src_qh: QueueHandle,
         meta: DeadLetterMeta,
-    ) {
-        const MAX_ATTEMPTS: u32 = 5;
-        let (src_tp, src_part, src_group) = src;
+    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+        Box::pin(async move {
+            const MAX_ATTEMPTS: u32 = 5;
+            let (src_tp, src_part, src_group) = src;
 
-        // Fetch source message.
-        let msg = match self
-            .fetch_message_by_offset(&src_tp, src_part, src_group.as_deref(), meta.off)
-            .await
-        {
-            Ok(Some(m)) => m,
-            Ok(None) => {
-                tracing::error!(
-                    "DLQ copy: source message {} missing in {}/{}/{:?} — discarding",
-                    meta.off,
-                    src_tp,
-                    src_part,
-                    src_group
-                );
-                self.commit_dlq_event(&src_qh, vec![meta.off]).await;
-                return;
-            }
-            Err(e) => {
-                tracing::error!("DLQ copy: fetch failed: {e}");
-                self.commit_dlq_event(&src_qh, vec![meta.off]).await; // give up, ack-locally
-                return;
-            }
-        };
-
-        // Decode original headers, augment with DLQ metadata.
-        let mut headers = MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
-            published: 0,
-            publish_received: 0,
-            extra: HashMap::new(),
-        });
-        headers
-            .extra
-            .insert("x-dlq-source-tp".into(), src_tp.clone());
-        headers
-            .extra
-            .insert("x-dlq-source-part".into(), src_part.to_string());
-        if let Some(g) = &src_group {
-            headers.extra.insert("x-dlq-source-group".into(), g.clone());
-        }
-        headers
-            .extra
-            .insert("x-dlq-source-offset".into(), meta.off.to_string());
-
-        // Append to target with bounded retries.
-        let mut attempt = 0u32;
-        let target_group = meta.target_group.as_deref();
-        loop {
-            let (cmp, rx) = KeratinAppendCompletion::pair();
-            let res = self
-                .append_message(
-                    &meta.target_tp,
-                    meta.target_part,
-                    target_group,
-                    &headers,
-                    msg.payload.clone(),
-                    cmp,
-                )
-                .await;
-
-            let durable = match res {
-                Ok(()) => rx.await.ok().and_then(|r| r.ok()),
-                Err(_) => None,
+            // Fetch source message.
+            let msg = match self.fetch_message_by_offset(&src_qh, meta.off).await {
+                Ok(Some(m)) => m,
+                Ok(None) => {
+                    tracing::error!(
+                        "DLQ copy: source message {} missing in {}/{}/{:?} — discarding",
+                        meta.off,
+                        src_tp,
+                        src_part,
+                        src_group
+                    );
+                    self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+                    return;
+                }
+                Err(e) => {
+                    tracing::error!("DLQ copy: fetch failed: {e}");
+                    self.commit_dlq_event(&src_qh, vec![meta.off]).await; // give up, ack-locally
+                    return;
+                }
             };
 
-            if durable.is_some() {
-                break;
+            // Decode original headers, augment with DLQ metadata.
+            let mut headers =
+                MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
+                    published: 0,
+                    publish_received: 0,
+                    extra: HashMap::new(),
+                });
+            headers
+                .extra
+                .insert("x-dlq-source-tp".into(), src_tp.clone());
+            headers
+                .extra
+                .insert("x-dlq-source-part".into(), src_part.to_string());
+            if let Some(g) = &src_group {
+                headers.extra.insert("x-dlq-source-group".into(), g.clone());
+            }
+            headers
+                .extra
+                .insert("x-dlq-source-offset".into(), meta.off.to_string());
+
+            // Append to target with bounded retries.
+            let mut attempt = 0u32;
+            let target_group = meta.target_group.as_deref();
+            loop {
+                let (cmp, rx) = KeratinAppendCompletion::pair();
+                let res = self
+                    .append_message(
+                        &meta.target_tp,
+                        meta.target_part,
+                        target_group,
+                        &headers,
+                        msg.payload.clone(),
+                        cmp,
+                    )
+                    .await;
+
+                let durable = match res {
+                    Ok(()) => rx.await.ok().and_then(|r| r.ok()),
+                    Err(_) => None,
+                };
+
+                if durable.is_some() {
+                    break;
+                }
+
+                attempt += 1;
+                if attempt >= MAX_ATTEMPTS {
+                    tracing::error!(
+                        "DLQ copy permanently failed for {}/{}/{:?}@{} after {} attempts; ack-locally",
+                        src_tp,
+                        src_part,
+                        src_group,
+                        meta.off,
+                        MAX_ATTEMPTS
+                    );
+                    break; // fall through to commit (= local ack)
+                }
+                tokio::time::sleep(Duration::from_millis(100 * (1 << attempt.min(5)))).await;
             }
 
-            attempt += 1;
-            if attempt >= MAX_ATTEMPTS {
-                tracing::error!(
-                    "DLQ copy permanently failed for {}/{}/{:?}@{} after {} attempts; ack-locally",
-                    src_tp,
-                    src_part,
-                    src_group,
-                    meta.off,
-                    MAX_ATTEMPTS
-                );
-                break; // fall through to commit (= local ack)
-            }
-            tokio::time::sleep(Duration::from_millis(100 * (1 << attempt.min(5)))).await;
-        }
-
-        self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+            self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+        })
     }
 
     async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) {
@@ -2328,12 +2407,10 @@ impl Stroma {
 
     pub async fn fetch_message_by_offset(
         &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
+        qh: &QueueHandle,
         off: Offset,
     ) -> Result<Option<Message>> {
-        let log = self.queue_handle(tp, part, group).await?.msg_log();
+        let log = qh.msg_log();
         let reader = log.reader();
         let rec = reader.fetch(off).map_err(io_err)?.map(|r| r.to_message());
         Ok(rec)
@@ -2717,13 +2794,69 @@ fn collect_parts_decoded(
     Ok(())
 }
 
-fn is_send<T: Send>(_: T) {}
+fn assert_send<T: Send>(_: T) {}
+
+#[allow(dead_code)]
+fn queue_handle_future_is_send(stroma: Stroma) {
+    assert_send(stroma.queue_handle("topic", 0, None));
+}
+
+#[allow(dead_code)]
+fn recover_future_is_send(stroma: Stroma, qh: QueueHandle, event_log: Arc<Keratin>) {
+    assert_send(stroma.recover_one_log_with_handle(&qh, "topic", 0, None, event_log));
+}
+
+#[allow(dead_code)]
+fn dlq_then_commit_future_is_send(stroma: Stroma, qh: QueueHandle, meta: DeadLetterMeta) {
+    assert_send(stroma.dlq_copy_then_commit(("topic".to_string(), 0, None), qh, meta));
+}
+
+#[allow(dead_code)]
+fn assert_append_message_send(stroma: Stroma) {
+    fn assert_send<T: Send>(_: T) {}
+    assert_send(async move {
+        let headers = MessageHeaders {
+            published: 0,
+            publish_received: 0,
+            extra: Default::default(),
+        };
+        let (cmp, _rx) = KeratinAppendCompletion::pair();
+        let _ = stroma
+            .append_message("t", 0, None, &headers, vec![], cmp)
+            .await;
+    });
+}
+
+#[cfg(test)]
+impl Stroma {
+    fn indexed_queue_count(&self) -> usize {
+        self.queue_handles.load().len()
+    }
+
+    fn materialized_queue_count(&self) -> usize {
+        self.queue_handles
+            .load()
+            .values()
+            .filter(|slot| slot.handle.get().is_some())
+            .count()
+    }
+
+    fn is_queue_materialized(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
+        let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+
+        self.queue_handles
+            .load()
+            .get(&key)
+            .and_then(|slot| slot.handle.get())
+            .is_some()
+    }
+}
 
 #[cfg(test)]
 mod tests {
     use keratin_log::test_dir;
 
-use super::*;
+    use super::*;
 
     #[tokio::test]
     async fn queue_handle_starts_snapshot_task_once() {
@@ -2806,17 +2939,167 @@ use super::*;
         )
         .await
         .unwrap();
+        let notified = stroma.snapshot_worker_ticks.notified();
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
 
         qh.enqueue(0, 0).await;
 
         tokio::time::advance(Duration::from_secs(21)).await;
-        // should find better way to ensure it runs ideally
-        for _ in 0..10000 {
-            tokio::task::yield_now().await;
-        }
+        notified.await;
 
         assert!(stroma.snap_file("new-topic", 0, None).exists());
+    }
+
+    #[tokio::test]
+    async fn open_indexes_existing_queues_without_materializing_them() {
+        let dir = test_dir!("lazy_recovery_indexes_only");
+
+        {
+            let stroma = Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap();
+
+            let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            qh.enqueue(0, 0).await;
+
+            stroma.shutdown().await.unwrap();
+        }
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stroma.indexed_queue_count(), 1);
+        assert_eq!(stroma.materialized_queue_count(), 0);
+        assert!(!stroma.is_queue_materialized("topic-a", 0, None));
+    }
+
+    async fn publish_one(stroma: &Stroma, tp: &str, part: u32, group: Option<&str>) -> Offset {
+        let (cmp, rx) = KeratinAppendCompletion::pair();
+        let headers = MessageHeaders {
+            published: 0,
+            publish_received: 0,
+            extra: Default::default(),
+        };
+        stroma
+            .append_message(tp, part, group, &headers, b"x".to_vec(), cmp)
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap().base_offset
+    }
+
+    #[tokio::test]
+    async fn first_queue_handle_recovers_persisted_queue() {
+        let dir = test_dir!("lazy_recovery_first_access");
+
+        let mut expected = Vec::new();
+        for _ in 0..5 {
+            let stroma = Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig::default(),
+            )
+            .await
+            .unwrap();
+            let _ = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let offset = publish_one(&stroma, "topic-a", 0, None).await;
+            expected.push(offset);
+            stroma.shutdown().await.unwrap();
+
+            let stroma = Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig::default(),
+            )
+            .await
+            .unwrap();
+            assert_eq!(stroma.materialized_queue_count(), 0);
+            let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            assert!(qh.recovery_complete());
+            for &off in &expected {
+                assert!(
+                    qh.is_ready(off).await,
+                    "offset {off} not ready after reopen"
+                );
+            }
+            stroma.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn new_queue_after_lazy_startup_is_recovered_immediately() {
+        let dir = test_dir!("lazy_recovery_new_queue");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        assert_eq!(stroma.indexed_queue_count(), 0);
+        assert_eq!(stroma.materialized_queue_count(), 0);
+
+        let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+
+        assert!(qh.recovery_complete());
+        assert!(qh.snapshot_task_started());
+        assert_eq!(stroma.materialized_queue_count(), 1);
+    }
+
+    #[tokio::test]
+    async fn concurrent_first_access_recovers_only_once() {
+        let dir = test_dir!("lazy_recovery_concurrent_once");
+
+        {
+            let stroma = Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap();
+
+            let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            qh.enqueue(0, 0).await;
+
+            stroma.shutdown().await.unwrap();
+        }
+
+        let stroma = Arc::new(
+            Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut joins = Vec::new();
+
+        for _ in 0..32 {
+            let stroma = stroma.clone();
+            joins.push(tokio::spawn(async move {
+                stroma.queue_handle("topic-a", 0, None).await.unwrap()
+            }));
+        }
+
+        for join in joins {
+            let qh = join.await.unwrap();
+            assert!(qh.recovery_complete());
+        }
+
+        assert_eq!(stroma.lazy_recoveries_started.load(Ordering::Relaxed), 1);
     }
 }

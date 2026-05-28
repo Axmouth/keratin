@@ -55,7 +55,7 @@ pub enum AppendPayload {
 pub struct AppendReq {
     pub records: AppendPayload,
     pub durability: Option<KDurability>,
-    pub completion: Box<dyn AppendCompletion<IoError>>,
+    pub completion: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
 impl AppendPayload {
@@ -81,7 +81,7 @@ pub struct WriterHandle {
 struct PendingAck {
     end_offset: u64, // inclusive
     durability: KDurability,
-    respond_to: Box<dyn AppendCompletion<IoError>>,
+    respond_to: Box<dyn AppendCompletion<IoError> + Send>,
     result: AppendResult,
 }
 

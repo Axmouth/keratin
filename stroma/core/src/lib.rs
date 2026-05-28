@@ -6,7 +6,10 @@ mod stroma;
 use keratin_log::KDurability;
 use thiserror::Error;
 
-pub use event::{AckEventMeta, EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta, DeclareMeta, DeadLetterMeta, DLQDiscardPolicyWire};
+pub use event::{
+    AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeclareMeta, EnqueueEventMeta,
+    MarkInflightEventMeta, NackEventMeta,
+};
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
