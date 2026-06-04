@@ -19,7 +19,9 @@ pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, NackBatchOutcome, NackOutcome,
     QueueHandle, QueueInternalState, StromaDebugSnapshot,
 };
-pub use stroma::{GlobalDLQ, MessageHeaders, PublishItem, SnapshotConfig, Stroma, TaskGroup};
+pub use stroma::{
+    EvictOutcome, GlobalDLQ, MessageHeaders, PublishItem, SnapshotConfig, Stroma, TaskGroup,
+};
 
 pub type Offset = u64;
 pub type UnixMillis = u64;
@@ -46,6 +48,9 @@ pub enum StromaError {
     #[error("decode: {0}")]
     Decode(String),
 
+    #[error("encode: {0}")]
+    Encode(String),
+
     #[error("io: {0}")]
     Io(String),
 
@@ -56,10 +61,16 @@ pub enum StromaError {
     Corruption(String),
 
     #[error("not found")]
-    NotFound,
+    NotFound(String),
 
     #[error("unsupported: {0}")]
     Unsupported(String),
+
+    #[error("queue actor is gone")]
+    QueueActorGone,
+
+    #[error("internal: {0}")]
+    Internal(String),
 }
 
 pub type Result<T> = std::result::Result<T, StromaError>;

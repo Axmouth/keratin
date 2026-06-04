@@ -36,6 +36,7 @@ use crate::{
         CustomDLQ, NackOutcome, Offset, QueueCommand, QueueHandle, QueueSharedBundle,
         QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
+    topic,
 };
 
 fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -388,6 +389,128 @@ impl MessageHeaders {
 struct QueueSlot {
     handle: OnceCell<QueueHandle>,
     exists_on_disk: bool,
+    eviction_state: Arc<EvictionState>,
+}
+
+#[derive(Debug)]
+struct EvictionState {
+    evicting: AtomicBool,
+    done: Notify,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EvictOutcome {
+    NotPresent,
+    NotMaterialized,
+    HasInflight,
+    RaceLost,
+    Evicted,
+}
+
+#[derive(Debug)]
+struct EvictionGuard {
+    state: Arc<EvictionState>,
+    completed: bool,
+}
+
+impl EvictionGuard {
+    fn new(state: Arc<EvictionState>) -> Self {
+        Self {
+            state,
+            completed: false,
+        }
+    }
+
+    fn complete(mut self) {
+        self.completed = true;
+        self.state.finish_eviction();
+    }
+}
+
+impl Drop for EvictionGuard {
+    fn drop(&mut self) {
+        if !self.completed {
+            self.state.finish_eviction();
+        }
+    }
+}
+
+impl EvictionState {
+    fn new() -> Self {
+        Self {
+            evicting: AtomicBool::new(false),
+            done: Notify::new(),
+        }
+    }
+
+    pub async fn wait_until_not_evicting(&self) {
+        loop {
+            // Create the notification future first — this registers us as a waiter.
+            let notified = self.done.notified();
+            // Then check the flag. If it's clear, we're done.
+            if !self.evicting.load(Ordering::Acquire) {
+                return;
+            }
+            // Flag was set when we checked. Wait. If the evictor fires
+            // notify_waiters between the check and the .await, we're already
+            // registered so the wakeup hits us.
+            notified.await;
+        }
+    }
+
+    pub fn start_eviction(&self) {
+        self.evicting.store(true, Ordering::Release);
+    }
+
+    pub fn finish_eviction(&self) {
+        self.evicting.store(false, Ordering::Release);
+        self.done.notify_waiters();
+    }
+
+    pub fn is_evicting(&self) -> bool {
+        self.evicting.load(Ordering::Acquire)
+    }
+}
+
+impl QueueSlot {
+    pub fn new() -> Self {
+        Self {
+            handle: OnceCell::new(),
+            exists_on_disk: false,
+            eviction_state: Arc::new(EvictionState::new()),
+        }
+    }
+
+    pub fn new_existing() -> Self {
+        Self {
+            handle: OnceCell::new(),
+            exists_on_disk: true,
+            eviction_state: Arc::new(EvictionState::new()),
+        }
+    }
+
+    pub fn wait_until_ready(&self) -> impl Future<Output = QueueHandle> + '_ {
+        async {
+            loop {
+                if let Some(handle) = self.handle.get() {
+                    return handle.clone();
+                }
+                self.eviction_state.done.notified().await;
+            }
+        }
+    }
+
+    pub fn start_eviction(&self) {
+        self.eviction_state.start_eviction();
+    }
+
+    fn is_evicting(&self) -> bool {
+        self.eviction_state.is_evicting()
+    }
+
+    async fn wait_until_not_evicting(&self) {
+        self.eviction_state.wait_until_not_evicting().await;
+    }
 }
 
 type Registry = hashbrown::HashMap<(Box<str>, u32, Option<Box<str>>), Arc<QueueSlot>>;
@@ -639,6 +762,7 @@ impl Stroma {
                 Arc::new(QueueSlot {
                     handle: OnceCell::new(),
                     exists_on_disk: true,
+                    eviction_state: Arc::new(EvictionState::new()),
                 })
             });
         }
@@ -700,6 +824,7 @@ impl Stroma {
                     let new_slot = Arc::new(QueueSlot {
                         handle: OnceCell::new(),
                         exists_on_disk: false,
+                        eviction_state: Arc::new(EvictionState::new()),
                     });
                     let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
                     let mut next = (**current).clone();
@@ -740,6 +865,7 @@ impl Stroma {
         let qh = slot
             .handle
             .get_or_try_init(|| async {
+                slot.wait_until_not_evicting().await;
                 let msg_log = self.msg_log_init(tp, part, group).await?;
                 let event_log = self.event_log_init(tp, part, group).await?;
 
@@ -763,11 +889,122 @@ impl Stroma {
 
                 qh.mark_recovery_complete();
 
-                Ok(qh)
+                Ok::<_, StromaError>(qh)
             })
             .await?;
 
         Ok(qh.clone())
+    }
+
+    fn swap_slot(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        old: &Arc<QueueSlot>,
+        new: Arc<QueueSlot>,
+    ) -> Result<bool> {
+        let current = self.queue_handles.load();
+        let mut next = (**current).clone();
+        let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
+
+        let Some(current_slot) = next.get(&key) else {
+            return Ok(false);
+        };
+        if !Arc::ptr_eq(current_slot, old) {
+            return Ok(false);
+        }
+
+        next.insert(key.clone(), new);
+
+        let prev = self
+            .queue_handles
+            .compare_and_swap(&current, Arc::new(next));
+        Ok(Arc::ptr_eq(&prev, &current))
+    }
+
+    pub async fn evict(&self, topic: &str, part: u32, group: Option<&str>) -> Result<EvictOutcome> {
+        // Lookup and check guards
+
+        let queues = self.queue_handles.load();
+        let old_slot = match slot_lookup_no_alloc(queues.as_ref(), topic, part, group) {
+            Some(s) => s,
+            None => return Ok(EvictOutcome::NotPresent),
+        };
+        let qh = match old_slot.handle.get() {
+            Some(h) => h.clone(),
+            None => return Ok(EvictOutcome::NotMaterialized),
+        };
+        if qh.inflight_len().await > 0 {
+            return Ok(EvictOutcome::HasInflight);
+        }
+
+        // Snapshot before swapping in the evicting slot. Snapshot writing may
+        // touch queue lookup paths, and those must not wait on the eviction
+        // guard that this same task is responsible for clearing.
+        if qh.dirty_snapshot() {
+            Self::periodic_snapshot_step(self, &qh).await?;
+        }
+
+        // Build replacement slot, marked evicting.
+        let new_eviction_state = Arc::new(EvictionState {
+            evicting: AtomicBool::new(true),
+            done: Notify::new(),
+        });
+        let new_slot = Arc::new(QueueSlot {
+            handle: OnceCell::new(),
+            exists_on_disk: true,
+            eviction_state: new_eviction_state.clone(),
+        });
+
+        // CAS-swap. If the registry has changed under us, bail.
+        if !self.swap_slot(&topic, part, group, &old_slot, new_slot)? {
+            return Ok(EvictOutcome::RaceLost);
+        }
+        let guard = EvictionGuard::new(new_eviction_state);
+
+        qh.cancel_background_tasks();
+
+        // Shut down old handle. Pending writes flush; logs close.
+        qh.shutdown().await;
+        qh.event_log().shutdown().await.map_err(io_err)?;
+        qh.msg_log().shutdown().await.map_err(io_err)?;
+
+        // Signal completion to any waiters.
+        guard.complete();
+
+        Ok(EvictOutcome::Evicted)
+    }
+
+    pub async fn unmaterialize(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<EvictOutcome> {
+        self.evict(topic, part, group).await
+    }
+
+    pub async fn materialize(&self, topic: &str, part: u32, group: Option<&str>) -> Result<()> {
+        self.queue_handle(topic, part, group).await?;
+        Ok(())
+    }
+
+    pub fn is_materialized(&self, topic: &str, part: u32, group: Option<&str>) -> bool {
+        let current = self.queue_handles.load();
+        slot_lookup_no_alloc(current.as_ref(), topic, part, group)
+            .is_some_and(|slot| slot.handle.get().is_some())
+    }
+
+    pub async fn has_inflight(&self, topic: &str, part: u32, group: Option<&str>) -> Result<bool> {
+        let current = self.queue_handles.load();
+        let Some(slot) = slot_lookup_no_alloc(current.as_ref(), topic, part, group) else {
+            return Ok(false);
+        };
+        let Some(handle) = slot.handle.get() else {
+            return Ok(false);
+        };
+        Ok(handle.inflight_len().await > 0)
     }
 
     async fn ensure_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
@@ -956,22 +1193,22 @@ impl Stroma {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue { off, retries } => {
-                qh.enqueue(off, retries).await;
+                qh.enqueue(off, retries).await?;
             }
             StromaEvent::EnqueueMany { reqs } => {
-                qh.enqueue_many(reqs).await;
+                qh.enqueue_many(reqs).await?;
             }
             StromaEvent::EnqueueDelayed { off, not_before } => {
-                qh.enqueue_delayed(off, not_before).await;
+                qh.enqueue_delayed(off, not_before).await?;
             }
             StromaEvent::EnqueueDelayedMany { reqs } => {
-                qh.enqueue_delayed_many(reqs).await;
+                qh.enqueue_delayed_many(reqs).await?;
             }
             StromaEvent::MarkInflight { off, deadline } => {
-                qh.mark_inflight(off, deadline).await;
+                qh.mark_inflight(off, deadline).await?;
             }
             StromaEvent::MarkInflightMany { reqs } => {
-                qh.mark_inflight_batch(reqs).await;
+                qh.mark_inflight_batch(reqs).await?;
             }
             StromaEvent::Ack { off } => {
                 // Accept ACK even if not inflight:
@@ -979,7 +1216,7 @@ impl Stroma {
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
-                qh.ack(off).await;
+                qh.ack(off).await?;
             }
             StromaEvent::AckMany { reqs } => {
                 // Accept ACK even if not inflight:
@@ -987,7 +1224,7 @@ impl Stroma {
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
-                qh.ack_many(reqs).await;
+                qh.ack_many(reqs).await?;
             }
             StromaEvent::Nack { off, requeue } => {
                 // Accept NACK even if not inflight:
@@ -995,7 +1232,7 @@ impl Stroma {
                 // - duplicate NACKs
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
-                qh.nack(off, requeue).await;
+                qh.nack(off, requeue).await?;
             }
             StromaEvent::NackMany { reqs } => {
                 // Accept NACK even if not inflight:
@@ -1003,20 +1240,20 @@ impl Stroma {
                 // - duplicate NACKs
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
-                qh.nack_many(reqs).await;
+                qh.nack_many(reqs).await?;
             }
             StromaEvent::DeadLetter { reqs } => {
                 // On replay we just mark pending; recovery scan will re-issue copies.
                 let offsets: Vec<Offset> = reqs.iter().map(|r| r.off).collect();
                 // We need state.mark_pending_dlq, OR fold via nack(_, false)+pending insert.
                 // Cleanest: add an explicit MarkPendingDlq command for replay.
-                qh.mark_pending_dlq_many(offsets).await;
+                qh.mark_pending_dlq_many(offsets).await?;
             }
             StromaEvent::DeadLetterCommit { offs } => {
-                qh.dead_letter_commit(offs).await;
+                qh.dead_letter_commit(offs).await?;
             }
             StromaEvent::Declare(meta) => {
-                qh.declare(meta).await;
+                qh.declare(meta).await?;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
                 self.remove_queue(&tp, part, group.as_deref());
@@ -1217,7 +1454,17 @@ impl Stroma {
 
     fn queue_keys_snapshot(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
         let map = self.queue_handles.load();
-        map.keys().cloned().collect()
+
+        let mut keys = Vec::with_capacity(map.len());
+
+        for (k, qh) in map.iter() {
+            if qh.handle.get().is_none() {
+                continue;
+            }
+            keys.push(k.clone());
+        }
+
+        keys
     }
 
     pub async fn next_expiry_hint(&self) -> Result<Option<UnixMillis>> {
@@ -1300,6 +1547,7 @@ impl Stroma {
         let mut events_per_queue =
             HashMap::<(String, u32, Option<String>), Vec<NackEventMeta>>::new();
 
+        // TODO: Examine ability to do in parallel, perhaps a joinset
         for (tp, part, group, off) in expired {
             let meta = NackEventMeta { off, requeue: true };
 
@@ -1397,6 +1645,7 @@ impl Stroma {
         }
 
         let stroma = self.clone();
+        let background_tasks = qh.background_cancellation_token();
 
         self.task_group.spawn("periodic snapshot", async move {
             qh.wait_recovery_complete().await;
@@ -1412,7 +1661,10 @@ impl Stroma {
             ticker.tick().await;
 
             loop {
-                ticker.tick().await;
+                tokio::select! {
+                    _ = background_tasks.cancelled() => break,
+                    _ = ticker.tick() => {}
+                }
 
                 let res = Self::periodic_snapshot_step(&stroma, &qh).await;
                 #[cfg(test)]
@@ -1433,9 +1685,10 @@ impl Stroma {
         let part = qh.partition();
         let group = qh.group();
         let qh: QueueHandle = self.queue_handle(tp, part, group).await?;
-        let blob = if let Some(blob) = qh.encode_snapshot(applied_upto).await {
+        let blob = if let Ok(blob) = qh.encode_snapshot(applied_upto).await {
             blob
         } else {
+            // TODO:
             return Ok(());
         };
 
@@ -1695,11 +1948,11 @@ impl Stroma {
             self.apply_event_inmem(ev, &qh).await?;
         }
 
-        let pending = qh.pending_dlq().await;
+        let pending = qh.pending_dlq().await?;
         let source_tp = tp;
         let source_part = part;
         let source_group = group;
-        let target = qh.get_dlq_target().await;
+        let target = qh.get_dlq_target().await?;
         let src = (
             source_tp.to_string(),
             source_part,
@@ -1724,9 +1977,19 @@ impl Stroma {
                     };
                     let src = src.clone();
                     tokio::spawn(async move {
-                        let fut: std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> =
-                            Box::pin(stroma.dlq_copy_then_commit(src, qh2, meta));
-                        fut.await;
+                        let fut: std::pin::Pin<
+                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                        > = Box::pin(stroma.dlq_copy_then_commit(src.clone(), qh2, meta));
+                        fut.await.unwrap_or_else(|err| {
+                            let (source_tp, source_part, source_group) = src;
+                            tracing::error!(
+                                "Error in dlq copy task for tp={} part={} group={:?} off={}: {err}",
+                                source_tp,
+                                source_part,
+                                source_group,
+                                off
+                            );
+                        });
                     });
                 }
                 None => {
@@ -1847,7 +2110,7 @@ impl Stroma {
                 q.msg_log().shutdown().await.map_err(io_err)?;
             }
         }
-        self.task_group.shutdown();
+        self.task_group.shutdown().await;
         Ok(())
     }
 
@@ -2188,7 +2451,7 @@ impl Stroma {
         qh.set_dirty_snapshot(true);
 
         // Apply -> get outcomes
-        let outcomes = qh.nack_many(reqs).await;
+        let outcomes = qh.nack_many(reqs).await?;
         let dl_offsets: Vec<Offset> = outcomes
             .iter()
             .filter_map(|(o, oc)| matches!(oc, NackOutcome::DeadLetterRequested).then_some(*o))
@@ -2200,7 +2463,7 @@ impl Stroma {
         }
 
         // Phase 2: resolve policy, decide per-offset
-        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_offsets).await;
+        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_offsets).await?;
 
         // Discards: ack-locally directly, no DLQ event needed.
         if !to_discard.is_empty() {
@@ -2214,7 +2477,7 @@ impl Stroma {
                 .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
                 .await
                 .map_err(io_err)?;
-            qh.discard_pending_dlq(to_discard).await;
+            qh.discard_pending_dlq(to_discard).await?;
         }
 
         // DLQ-bound: emit DeadLetter event with resolved targets.
@@ -2239,7 +2502,19 @@ impl Stroma {
                 let src = (tp.to_string(), part, group.map(String::from));
                 let qh2 = qh.clone();
                 tokio::spawn(async move {
-                    stroma.dlq_copy_then_commit(src, qh2, meta).await;
+                    stroma
+                        .dlq_copy_then_commit(src.clone(), qh2, meta.clone())
+                        .await
+                        .unwrap_or_else(|err| {
+                            let (source_tp, source_part, source_group) = src;
+                            tracing::error!(
+                                "Error in dlq copy task for tp={} part={} group={:?} off={}: {err}",
+                                source_tp,
+                                source_part,
+                                source_group,
+                                meta.off
+                            );
+                        });
                 });
             }
         }
@@ -2274,8 +2549,24 @@ impl Stroma {
         &self,
         qh: &QueueHandle,
         offsets: &[Offset],
-    ) -> (Vec<DeadLetterMeta>, Vec<Offset>) {
-        let resolved = qh.get_dlq_target().await;
+    ) -> Result<(Vec<DeadLetterMeta>, Vec<Offset>)> {
+        let resolved = match qh.get_dlq_target().await {
+            Ok(t) => t,
+            Err(e) => {
+                tracing::error!(
+                    "Failed to get DLQ target for {}/{}/{}: {e}",
+                    qh.topic(),
+                    qh.partition(),
+                    qh.group().unwrap_or("Default")
+                );
+                return Err(StromaError::NotFound(format!(
+                    "DLQ target not found for {}/{}/{}",
+                    qh.topic(),
+                    qh.partition(),
+                    qh.group().unwrap_or("Default")
+                )));
+            }
+        };
         match resolved {
             Some((tp, part, grp)) => {
                 let metas = offsets
@@ -2287,9 +2578,9 @@ impl Stroma {
                         target_group: grp.clone().map(Into::into),
                     })
                     .collect();
-                (metas, Vec::new())
+                Ok((metas, Vec::new()))
             }
-            None => (Vec::new(), offsets.to_vec()),
+            None => Ok((Vec::new(), offsets.to_vec())),
         }
     }
 
@@ -2298,7 +2589,7 @@ impl Stroma {
         src: (String, u32, Option<String>),
         src_qh: QueueHandle,
         meta: DeadLetterMeta,
-    ) -> Pin<Box<dyn Future<Output = ()> + Send + '_>> {
+    ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             const MAX_ATTEMPTS: u32 = 5;
             let (src_tp, src_part, src_group) = src;
@@ -2314,13 +2605,13 @@ impl Stroma {
                         src_part,
                         src_group
                     );
-                    self.commit_dlq_event(&src_qh, vec![meta.off]).await;
-                    return;
+                    self.commit_dlq_event(&src_qh, vec![meta.off]).await?;
+                    return Ok(());
                 }
                 Err(e) => {
                     tracing::error!("DLQ copy: fetch failed: {e}");
-                    self.commit_dlq_event(&src_qh, vec![meta.off]).await; // give up, ack-locally
-                    return;
+                    self.commit_dlq_event(&src_qh, vec![meta.off]).await?; // give up, ack-locally
+                    return Ok(());
                 }
             };
 
@@ -2384,14 +2675,18 @@ impl Stroma {
                 tokio::time::sleep(Duration::from_millis(100 * (1 << attempt.min(5)))).await;
             }
 
-            self.commit_dlq_event(&src_qh, vec![meta.off]).await;
+            self.commit_dlq_event(&src_qh, vec![meta.off]).await?;
+
+            Ok(())
         })
     }
 
-    async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) {
+    async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) -> Result<()> {
         let ev = StromaEvent::DeadLetterCommit { offs: offs.clone() };
         let Ok(m) = event_msg(&ev) else {
-            return;
+            return Err(StromaError::Encode(
+                "Failed to encode DeadLetterCommit event".into(),
+            ));
         };
 
         if let Err(e) = qh
@@ -2400,9 +2695,12 @@ impl Stroma {
             .await
         {
             tracing::error!("DeadLetterCommit append failed: {e}");
-            return;
+            return Err(StromaError::Encode(
+                "Failed to encode DeadLetterCommit event".into(),
+            ));
         }
-        qh.dead_letter_commit(offs).await;
+        qh.dead_letter_commit(offs).await?;
+        Ok(())
     }
 
     pub async fn fetch_message_by_offset(
@@ -3101,5 +3399,82 @@ mod tests {
         }
 
         assert_eq!(stroma.lazy_recoveries_started.load(Ordering::Relaxed), 1);
+    }
+
+    #[tokio::test]
+    async fn unmaterialize_drops_idle_handle_but_keeps_queue_indexed() {
+        let dir = test_dir!("evict_idle_materialized_queue");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        stroma.materialize("topic-a", 0, None).await.unwrap();
+        assert_eq!(stroma.indexed_queue_count(), 1);
+        assert_eq!(stroma.materialized_queue_count(), 1);
+
+        let outcome = stroma.unmaterialize("topic-a", 0, None).await.unwrap();
+
+        assert_eq!(outcome, EvictOutcome::Evicted);
+        assert_eq!(stroma.indexed_queue_count(), 1);
+        assert_eq!(stroma.materialized_queue_count(), 0);
+        assert!(!stroma.is_materialized("topic-a", 0, None));
+    }
+
+    #[tokio::test]
+    async fn materialize_after_unmaterialize_recovers_messages() {
+        let dir = test_dir!("evict_then_recover_queue");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let off = publish_one(&stroma, "topic-a", 0, None).await;
+
+        assert_eq!(
+            stroma.unmaterialize("topic-a", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+        assert_eq!(stroma.materialized_queue_count(), 0);
+
+        stroma.materialize("topic-a", 0, None).await.unwrap();
+        assert_eq!(stroma.materialized_queue_count(), 1);
+
+        let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        assert!(qh.is_ready(off).await);
+    }
+
+    #[tokio::test]
+    async fn unmaterialize_refuses_queue_with_inflight_messages() {
+        let dir = test_dir!("evict_refuses_inflight_queue");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            KeratinConfig::default(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let off = publish_one(&stroma, "topic-a", 0, None).await;
+        stroma
+            .mark_inflight_one("topic-a", 0, None, off, 1000)
+            .await
+            .unwrap();
+
+        assert!(stroma.has_inflight("topic-a", 0, None).await.unwrap());
+        assert_eq!(
+            stroma.unmaterialize("topic-a", 0, None).await.unwrap(),
+            EvictOutcome::HasInflight
+        );
+        assert!(stroma.is_materialized("topic-a", 0, None));
     }
 }

@@ -28,10 +28,10 @@ async fn random_operations_never_break_invariants() {
     for _ in 0..50_000 {
         let o = fastrand::u64(0..2000);
         match fastrand::u8(0..10) {
-            0 | 4 | 8 => q.mark_inflight(o, fastrand::u64(0..100_000)).await,
-            1 | 5 | 7 => q.ack(o).await,
+            0 | 4 | 8 => q.mark_inflight(o, fastrand::u64(0..100_000)).await.unwrap(),
+            1 | 5 | 7 => q.ack(o).await.unwrap(),
             i => {
-                q.nack(o, i.is_multiple_of(3)).await;
+                q.nack(o, i.is_multiple_of(3)).await.unwrap();
             }
         }
 

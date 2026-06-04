@@ -1,5 +1,6 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
+use std::ffi::os_str::Display;
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -10,8 +11,10 @@ use rangemap::RangeSet;
 use serde::Serialize;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::Instant;
+use tokio_util::sync::CancellationToken;
 use uuid::Uuid;
 
+use crate::StromaError;
 use crate::event::{
     AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueDelayedEventMeta, EnqueueEventMeta,
     MarkInflightEventMeta, NackEventMeta,
@@ -30,6 +33,42 @@ pub type UnixMillis = u64;
 pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
 pub const FORMAT_VERSION: u64 = 1;
+
+#[derive(Debug, Clone)]
+pub enum QueueHandleError {
+    ActorGone,
+    LoadSnapshotFailed(String),
+    SnapshotNotCreated,
+    SnapshotLoadFailed(String),
+}
+
+impl std::fmt::Display for QueueHandleError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            QueueHandleError::ActorGone => write!(f, "queue actor is gone"),
+            QueueHandleError::LoadSnapshotFailed(reason) => {
+                write!(f, "snapshot load failed: {reason}")
+            }
+            QueueHandleError::SnapshotNotCreated => write!(f, "snapshot not created"),
+            QueueHandleError::SnapshotLoadFailed(reason) => {
+                write!(f, "snapshot load failed: {reason}")
+            }
+        }
+    }
+}
+
+impl From<QueueHandleError> for StromaError {
+    fn from(value: QueueHandleError) -> Self {
+        match value {
+            QueueHandleError::ActorGone => StromaError::QueueActorGone,
+            QueueHandleError::LoadSnapshotFailed(reason) => StromaError::Internal(reason),
+            QueueHandleError::SnapshotNotCreated => {
+                StromaError::Internal("snapshot not created".to_string())
+            }
+            QueueHandleError::SnapshotLoadFailed(reason) => StromaError::Internal(reason),
+        }
+    }
+}
 
 #[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
 pub enum ExpiryDeadlineOutcome {
@@ -408,7 +447,6 @@ impl QueueCommand {
     pub fn prio(&self) -> CommandPrio {
         match self {
             // === Lifecycle / control — must preempt everything ===
-            QueueCommand::Shutdown { .. } => CommandPrio::Express,
 
             // === Recovery / loading — one-shot at startup, not in contention ===
             // Put at Express so they can't be blocked if something else is in the queue
@@ -475,6 +513,19 @@ impl QueueCommand {
             // This assumes snapshot encoding can tolerate being delayed under load.
             // If you need snapshots to run on schedule regardless of load, raise this.
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
+            // SuperLow: shutdown drains all queued commands before exiting. Each queued
+            // command may have a oneshot response sender that callers are awaiting, if
+            // shutdown jumped ahead (Express), those callers would see their rx future
+            // return Err and panic on the unwrap.
+            //
+            // The in memory state mutations performed during drain are wasted work, the
+            // caller (or evictor) is about to discard the state, but the *responses*
+            // matter. Draining is the cheapest way to honor the protocol.
+            //
+            // TODO: a separate ShutdownNow variant (Express) for cases where we accept
+            // caller visible errors in exchange for fast exit (e.g., process shutdown
+            // with hard deadline).
+            QueueCommand::Shutdown { .. } => CommandPrio::SuperLow,
         }
     }
 
@@ -787,6 +838,7 @@ pub struct QueueHandle {
     pub(crate) recovery_complete: Arc<AtomicBool>,
     recovery_notify: Arc<Notify>,
     snapshot_task_started: Arc<AtomicBool>,
+    background_tasks: CancellationToken,
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
@@ -824,6 +876,7 @@ impl QueueHandle {
         let recovery_complete = Arc::new(AtomicBool::new(false));
         let recovery_notify = Arc::new(Notify::new());
         let snapshot_task_started = Arc::new(AtomicBool::new(false));
+        let background_tasks = CancellationToken::new();
 
         let task_group_clone = task_group.clone();
 
@@ -843,6 +896,7 @@ impl QueueHandle {
             recovery_complete,
             recovery_notify,
             snapshot_task_started,
+            background_tasks,
             task_group,
             global_dlq,
             metrics,
@@ -1341,7 +1395,7 @@ impl QueueHandle {
             .unwrap_or_else(|_| QueueInternalDebugInfo::default())
     }
 
-    pub async fn enqueue(&self, offset: Offset, retries: u32) {
+    pub async fn enqueue(&self, offset: Offset, retries: u32) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1352,10 +1406,11 @@ impl QueueHandle {
             })
             .await;
 
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) {
+    pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1365,10 +1420,15 @@ impl QueueHandle {
             })
             .await;
 
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn enqueue_delayed(&self, offset: Offset, not_before: UnixMillis) {
+    pub async fn enqueue_delayed(
+        &self,
+        offset: Offset,
+        not_before: UnixMillis,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1379,10 +1439,14 @@ impl QueueHandle {
             })
             .await;
 
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn enqueue_delayed_many(&self, reqs: Vec<EnqueueDelayedEventMeta>) {
+    pub async fn enqueue_delayed_many(
+        &self,
+        reqs: Vec<EnqueueDelayedEventMeta>,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1392,10 +1456,15 @@ impl QueueHandle {
             })
             .await;
 
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn mark_inflight(&self, offset: Offset, deadline: UnixMillis) {
+    pub async fn mark_inflight(
+        &self,
+        offset: Offset,
+        deadline: UnixMillis,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
@@ -1404,11 +1473,15 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         self.deadline_waker().notify_one();
+        Ok(())
     }
 
-    pub async fn mark_inflight_batch(&self, reqs: Vec<MarkInflightEventMeta>) {
+    pub async fn mark_inflight_batch(
+        &self,
+        reqs: Vec<MarkInflightEventMeta>,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
@@ -1416,11 +1489,12 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         self.deadline_waker().notify_one();
+        Ok(())
     }
 
-    pub async fn ack(&self, offset: Offset) {
+    pub async fn ack(&self, offset: Offset) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
@@ -1428,10 +1502,11 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) {
+    pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
@@ -1439,10 +1514,15 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn nack(&self, offset: Offset, requeue: bool) -> NackOutcome {
+    pub async fn nack(
+        &self,
+        offset: Offset,
+        requeue: bool,
+    ) -> Result<NackOutcome, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
@@ -1451,14 +1531,17 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        let outcome = rx.await.unwrap();
+        let outcome = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         if let NackOutcome::RequeuedLater { .. } = outcome {
             self.deadline_waker().notify_one();
         }
-        outcome
+        Ok(outcome)
     }
 
-    pub async fn nack_many(&self, reqs: Vec<NackEventMeta>) -> Vec<(Offset, NackOutcome)> {
+    pub async fn nack_many(
+        &self,
+        reqs: Vec<NackEventMeta>,
+    ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
@@ -1466,17 +1549,17 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        let outcomes = rx.await.unwrap();
+        let outcomes = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         for (_offset, outcome) in &outcomes {
             if let NackOutcome::RequeuedLater { .. } = outcome {
                 self.deadline_waker().notify_one();
                 break;
             }
         }
-        outcomes
+        Ok(outcomes)
     }
 
-    pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) {
+    pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DeadLetterCommit {
@@ -1484,10 +1567,13 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn get_dlq_target(&self) -> Option<(String, u32, Option<String>)> {
+    pub async fn get_dlq_target(
+        &self,
+    ) -> Result<Option<(String, u32, Option<String>)>, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetDlqTarget {
@@ -1495,10 +1581,10 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
-    pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) {
+    pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DiscardPendingDlq {
@@ -1506,10 +1592,11 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn declare(&self, meta: DeclareMeta) {
+    pub async fn declare(&self, meta: DeclareMeta) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Declare {
@@ -1517,18 +1604,24 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn pending_dlq(&self) -> Vec<(Offset, Option<ResolvedDlqTarget>)> {
+    pub async fn pending_dlq(
+        &self,
+    ) -> Result<Vec<(Offset, Option<ResolvedDlqTarget>)>, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::GetPendingDlq { response: Some(tx) })
             .await;
-        rx.await.unwrap()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
-    pub async fn mark_pending_dlq_many(&self, offsets: Vec<Offset>) {
+    pub async fn mark_pending_dlq_many(
+        &self,
+        offsets: Vec<Offset>,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkPendingDlq {
@@ -1536,26 +1629,29 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn advance_frontier(&self) {
+    pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn reset(&self) {
+    pub async fn reset(&self) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn set_acked_until(&self, offset: Offset) {
+    pub async fn set_acked_until(&self, offset: Offset) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckedUntil {
@@ -1563,10 +1659,11 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn set_ack_window(&self, base: Offset, bits: BitVec) {
+    pub async fn set_ack_window(&self, base: Offset, bits: BitVec) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckWindow {
@@ -1575,10 +1672,15 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
     }
 
-    pub async fn set_ack_window_from_bytes(&self, base: Offset, bits_bytes: Vec<u8>) {
+    pub async fn set_ack_window_from_bytes(
+        &self,
+        base: Offset,
+        bits_bytes: Vec<u8>,
+    ) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::SetAckWindowFromBytes {
@@ -1587,10 +1689,14 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap().unwrap();
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?.unwrap();
+        Ok(())
     }
 
-    pub async fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Option<Vec<u8>> {
+    pub async fn encode_snapshot(
+        &self,
+        last_snapshot_event_offset: u64,
+    ) -> Result<Vec<u8>, QueueHandleError> {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
@@ -1609,10 +1715,11 @@ impl QueueHandle {
             .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
         self.creating_snapshot
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        res.ok().flatten()
+        res.map_err(|_| QueueHandleError::ActorGone)?
+            .ok_or_else(|| QueueHandleError::SnapshotNotCreated)
     }
 
-    pub async fn load_snapshot(&self, data: Vec<u8>) -> std::io::Result<SnapshotMeta> {
+    pub async fn load_snapshot(&self, data: Vec<u8>) -> Result<SnapshotMeta, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::LoadSnapshot {
@@ -1622,7 +1729,8 @@ impl QueueHandle {
             .await;
         let snapmeta = rx
             .await
-            .unwrap_or_else(|_| Err(std::io::Error::other("Snapshot load failed")))?;
+            .map_err(|_| QueueHandleError::ActorGone)?
+            .map_err(|_| QueueHandleError::SnapshotLoadFailed("Failed to load snapshot".into()))?;
 
         self.last_snapshot_event_offset.store(
             snapmeta.last_snapshot_event_offset,
@@ -1881,6 +1989,14 @@ impl QueueHandle {
     pub fn set_dirty_snapshot(&self, dirty: bool) {
         self.dirty_since_snapshot
             .store(dirty, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    pub fn background_cancellation_token(&self) -> CancellationToken {
+        self.background_tasks.clone()
+    }
+
+    pub fn cancel_background_tasks(&self) {
+        self.background_tasks.cancel();
     }
 }
 

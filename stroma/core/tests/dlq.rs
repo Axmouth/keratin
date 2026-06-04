@@ -127,7 +127,8 @@ async fn declare_discard(
         dlq_policy: Some(DLQDiscardPolicyWire::Discard),
         dlq_max_retries: Some(max_retries),
     })
-    .await;
+    .await
+    .unwrap();
 }
 
 async fn wait_until<F, Fut>(timeout: Duration, label: &str, mut cond: F)
@@ -217,7 +218,7 @@ async fn nack_at_max_dead_letters_to_custom_target() {
     assert!(!q.is_ready(off).await);
     assert!(!q.is_inflight(off).await);
     assert!(
-        q.pending_dlq().await.is_empty(),
+        q.pending_dlq().await.unwrap().is_empty(),
         "pending_dlq should be drained"
     );
 }
@@ -427,7 +428,7 @@ async fn pending_dlq_blocks_msg_truncation_watermark() {
     nack_one(&st, "src", 0, None, off, false).await;
 
     let q = st.queue_handle("src", 0, None).await.unwrap();
-    let pending = q.pending_dlq().await;
+    let pending = q.pending_dlq().await.unwrap();
     let watermark = q.lowest_not_acked_offset().await;
 
     if pending.iter().any(|(o, _)| o == &off) {
