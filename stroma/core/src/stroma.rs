@@ -3444,6 +3444,8 @@ mod tests {
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_materialized("topic-a", 0, None));
+
+        stroma.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -3471,6 +3473,8 @@ mod tests {
 
         let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
         assert!(qh.is_ready(off).await);
+
+        stroma.shutdown().await.unwrap();
     }
 
     #[tokio::test]

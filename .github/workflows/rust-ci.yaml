@@ -50,6 +50,7 @@ jobs:
   workspace-tests:
     name: Workspace tests
     runs-on: ubuntu-latest
+    timeout-minutes: 15
     steps:
       - name: Check out repository
         uses: actions/checkout@v4
