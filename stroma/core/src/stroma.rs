@@ -3186,10 +3186,22 @@ mod tests {
 
     use super::*;
 
-    async fn shutdown_stroma(stroma: &Stroma) {
-        tokio::time::timeout(Duration::from_secs(10), stroma.shutdown())
+    async fn test_step<T>(
+        label: impl std::fmt::Display,
+        fut: impl std::future::Future<Output = T>,
+    ) -> T {
+        let label = label.to_string();
+        eprintln!("stroma test step start: {label}");
+        let output = tokio::time::timeout(Duration::from_secs(15), fut)
             .await
-            .expect("stroma shutdown timed out")
+            .unwrap_or_else(|_| panic!("stroma test step timed out: {label}"));
+        eprintln!("stroma test step done: {label}");
+        output
+    }
+
+    async fn shutdown_stroma(label: impl std::fmt::Display, stroma: &Stroma) {
+        test_step(format!("{label}/shutdown"), stroma.shutdown())
+            .await
             .expect("stroma shutdown failed");
     }
 
@@ -3214,7 +3226,7 @@ mod tests {
 
         assert!(qh.snapshot_task_started());
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma("queue_handle_starts_snapshot_task_once", &stroma).await;
     }
 
     #[tokio::test]
@@ -3236,7 +3248,11 @@ mod tests {
         assert!(qh.recovery_complete());
         assert!(qh.snapshot_task_started());
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "new_queue_after_empty_recovery_is_marked_recovered",
+            &stroma,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3266,7 +3282,11 @@ mod tests {
 
         assert!(qh.recovery_complete());
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "mark_all_queue_recoveries_completes_existing_waiters",
+            &stroma,
+        )
+        .await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3310,13 +3330,20 @@ mod tests {
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             qh.enqueue(0, 0).await;
 
-            shutdown_stroma(&stroma).await;
+            shutdown_stroma(
+                "open_indexes_existing_queues_without_materializing_them/setup",
+                &stroma,
+            )
+            .await;
         }
 
-        let stroma = Stroma::open(
-            &dir.root,
-            KeratinConfig::default(),
-            SnapshotConfig { every_events: 1 },
+        let stroma = test_step(
+            "open_indexes_existing_queues_without_materializing_them/reopen",
+            Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            ),
         )
         .await
         .unwrap();
@@ -3325,7 +3352,11 @@ mod tests {
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_queue_materialized("topic-a", 0, None));
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "open_indexes_existing_queues_without_materializing_them/reopened",
+            &stroma,
+        )
+        .await;
     }
 
     async fn publish_one(stroma: &Stroma, tp: &str, part: u32, group: Option<&str>) -> Offset {
@@ -3335,11 +3366,17 @@ mod tests {
             publish_received: 0,
             extra: Default::default(),
         };
-        stroma
-            .append_message(tp, part, group, &headers, b"x".to_vec(), cmp)
+        test_step(
+            format!("publish_one/{tp}/{part}/{group:?}/append_message"),
+            stroma.append_message(tp, part, group, &headers, b"x".to_vec(), cmp),
+        )
+        .await
+        .unwrap();
+        test_step(format!("publish_one/{tp}/{part}/{group:?}/completion"), rx)
             .await
-            .unwrap();
-        rx.await.unwrap().unwrap().base_offset
+            .unwrap()
+            .unwrap()
+            .base_offset
     }
 
     #[tokio::test]
@@ -3347,36 +3384,64 @@ mod tests {
         let dir = test_dir!("lazy_recovery_first_access");
 
         let mut expected = Vec::new();
-        for _ in 0..5 {
-            let stroma = Stroma::open(
-                &dir.root,
-                KeratinConfig::default(),
-                SnapshotConfig::default(),
+        for i in 0..5 {
+            let stroma = test_step(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/open-write"),
+                Stroma::open(
+                    &dir.root,
+                    KeratinConfig::default(),
+                    SnapshotConfig::default(),
+                ),
             )
             .await
             .unwrap();
-            let _ = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let _ = test_step(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/queue_handle-write"),
+                stroma.queue_handle("topic-a", 0, None),
+            )
+            .await
+            .unwrap();
             let offset = publish_one(&stroma, "topic-a", 0, None).await;
             expected.push(offset);
-            shutdown_stroma(&stroma).await;
+            shutdown_stroma(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/write"),
+                &stroma,
+            )
+            .await;
 
-            let stroma = Stroma::open(
-                &dir.root,
-                KeratinConfig::default(),
-                SnapshotConfig::default(),
+            let stroma = test_step(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/open-read"),
+                Stroma::open(
+                    &dir.root,
+                    KeratinConfig::default(),
+                    SnapshotConfig::default(),
+                ),
             )
             .await
             .unwrap();
             assert_eq!(stroma.materialized_queue_count(), 0);
-            let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let qh = test_step(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/queue_handle-read"),
+                stroma.queue_handle("topic-a", 0, None),
+            )
+            .await
+            .unwrap();
             assert!(qh.recovery_complete());
             for &off in &expected {
                 assert!(
-                    qh.is_ready(off).await,
+                    test_step(
+                        format!("first_queue_handle_recovers_persisted_queue/{i}/is_ready/{off}"),
+                        qh.is_ready(off),
+                    )
+                    .await,
                     "offset {off} not ready after reopen"
                 );
             }
-            shutdown_stroma(&stroma).await;
+            shutdown_stroma(
+                format!("first_queue_handle_recovers_persisted_queue/{i}/read"),
+                &stroma,
+            )
+            .await;
         }
     }
 
@@ -3384,10 +3449,13 @@ mod tests {
     async fn new_queue_after_lazy_startup_is_recovered_immediately() {
         let dir = test_dir!("lazy_recovery_new_queue");
 
-        let stroma = Stroma::open(
-            &dir.root,
-            KeratinConfig::default(),
-            SnapshotConfig { every_events: 1 },
+        let stroma = test_step(
+            "new_queue_after_lazy_startup_is_recovered_immediately/open",
+            Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            ),
         )
         .await
         .unwrap();
@@ -3401,7 +3469,11 @@ mod tests {
         assert!(qh.snapshot_task_started());
         assert_eq!(stroma.materialized_queue_count(), 1);
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "new_queue_after_lazy_startup_is_recovered_immediately",
+            &stroma,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3420,7 +3492,7 @@ mod tests {
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             qh.enqueue(0, 0).await;
 
-            shutdown_stroma(&stroma).await;
+            shutdown_stroma("concurrent_first_access_recovers_only_once/setup", &stroma).await;
         }
 
         let stroma = Arc::new(
@@ -3449,33 +3521,50 @@ mod tests {
 
         assert_eq!(stroma.lazy_recoveries_started.load(Ordering::Relaxed), 1);
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma("concurrent_first_access_recovers_only_once/main", &stroma).await;
     }
 
     #[tokio::test]
     async fn unmaterialize_drops_idle_handle_but_keeps_queue_indexed() {
         let dir = test_dir!("evict_idle_materialized_queue");
 
-        let stroma = Stroma::open(
-            &dir.root,
-            KeratinConfig::default(),
-            SnapshotConfig { every_events: 1 },
+        let stroma = test_step(
+            "unmaterialize_drops_idle_handle_but_keeps_queue_indexed/open",
+            Stroma::open(
+                &dir.root,
+                KeratinConfig::default(),
+                SnapshotConfig { every_events: 1 },
+            ),
         )
         .await
         .unwrap();
 
-        stroma.materialize("topic-a", 0, None).await.unwrap();
+        test_step(
+            "unmaterialize_drops_idle_handle_but_keeps_queue_indexed/materialize",
+            stroma.materialize("topic-a", 0, None),
+        )
+        .await
+        .unwrap();
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert_eq!(stroma.materialized_queue_count(), 1);
 
-        let outcome = stroma.unmaterialize("topic-a", 0, None).await.unwrap();
+        let outcome = test_step(
+            "unmaterialize_drops_idle_handle_but_keeps_queue_indexed/unmaterialize",
+            stroma.unmaterialize("topic-a", 0, None),
+        )
+        .await
+        .unwrap();
 
         assert_eq!(outcome, EvictOutcome::Evicted);
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_materialized("topic-a", 0, None));
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "unmaterialize_drops_idle_handle_but_keeps_queue_indexed",
+            &stroma,
+        )
+        .await;
     }
 
     #[tokio::test]
@@ -3493,18 +3582,39 @@ mod tests {
         let off = publish_one(&stroma, "topic-a", 0, None).await;
 
         assert_eq!(
-            stroma.unmaterialize("topic-a", 0, None).await.unwrap(),
+            test_step(
+                "materialize_after_unmaterialize_recovers_messages/unmaterialize",
+                stroma.unmaterialize("topic-a", 0, None),
+            )
+            .await
+            .unwrap(),
             EvictOutcome::Evicted
         );
         assert_eq!(stroma.materialized_queue_count(), 0);
 
-        stroma.materialize("topic-a", 0, None).await.unwrap();
+        test_step(
+            "materialize_after_unmaterialize_recovers_messages/materialize",
+            stroma.materialize("topic-a", 0, None),
+        )
+        .await
+        .unwrap();
         assert_eq!(stroma.materialized_queue_count(), 1);
 
-        let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
-        assert!(qh.is_ready(off).await);
+        let qh = test_step(
+            "materialize_after_unmaterialize_recovers_messages/queue_handle",
+            stroma.queue_handle("topic-a", 0, None),
+        )
+        .await
+        .unwrap();
+        assert!(
+            test_step(
+                format!("materialize_after_unmaterialize_recovers_messages/is_ready/{off}"),
+                qh.is_ready(off),
+            )
+            .await
+        );
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma("materialize_after_unmaterialize_recovers_messages", &stroma).await;
     }
 
     #[tokio::test]
@@ -3532,6 +3642,10 @@ mod tests {
         );
         assert!(stroma.is_materialized("topic-a", 0, None));
 
-        shutdown_stroma(&stroma).await;
+        shutdown_stroma(
+            "unmaterialize_refuses_queue_with_inflight_messages",
+            &stroma,
+        )
+        .await;
     }
 }
