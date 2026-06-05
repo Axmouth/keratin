@@ -2104,7 +2104,16 @@ impl Stroma {
         // Step 1: atomically take ownership of all queues
         let old = self.queue_handles.swap(Arc::new(hashbrown::HashMap::new()));
 
-        // Step 2: shutdown everything from the old snapshot
+        // Step 2: stop per-queue background work before draining queue actors.
+        // Snapshot tasks can otherwise enqueue work while shutdown is trying to
+        // drain the same queue, which is especially visible in slow CI runs.
+        for (_key, slot) in old.iter() {
+            if let Some(q) = slot.handle.get() {
+                q.cancel_background_tasks();
+            }
+        }
+
+        // Step 3: shutdown everything from the old snapshot
         let mut futs = FuturesUnordered::new();
         for (_key, slot) in old.iter() {
             if let Some(q) = slot.handle.get() {
