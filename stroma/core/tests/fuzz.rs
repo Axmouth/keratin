@@ -45,6 +45,20 @@ async fn many_new_topics_congestion() {
     let (st, _test_dir) = open_test_stroma().await;
     let topics_target = 200;
 
+    #[cfg(target_os = "linux")]
+    if let Ok(limits) = std::fs::read_to_string("/proc/self/limits") {
+        if let Some(open_files) = limits
+            .lines()
+            .find(|line| line.starts_with("Max open files"))
+        {
+            eprintln!(
+                "many_new_topics_congestion materializes {topics_target} queues concurrently; \
+                 if this fails with `Too many open files`, rerun with `ulimit -n 4096` or higher. \
+                 Current limit: {open_files}"
+            );
+        }
+    }
+
     let mut topics = (0..topics_target)
         .map(|i| format!("topic-{i}"))
         .collect::<HashSet<_>>();

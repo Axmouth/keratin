@@ -30,6 +30,7 @@ use crate::{
         AckEventMeta, DeadLetterMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, NackEventMeta,
         StromaEvent,
     },
+    global::GlobalStore,
     metrics::StromaMetrics,
     partition::Partition,
     state::{
@@ -541,6 +542,7 @@ pub struct Stroma {
     pub(crate) keratin_cfg_msg: KeratinConfig,
     pub(crate) keratin_cfg_event: KeratinConfig,
     pub(crate) snap_cfg: SnapshotConfig,
+    pub(crate) global_store: Arc<OnceCell<Arc<GlobalStore>>>,
 
     pub(crate) task_group: Arc<TaskGroup>,
 
@@ -600,6 +602,7 @@ impl Stroma {
             keratin_cfg_msg,
             keratin_cfg_event,
             snap_cfg,
+            global_store: Arc::new(OnceCell::new()),
             task_group: Arc::new(TaskGroup::new()),
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             global_dlq: Arc::new(RwLock::new(None)),
@@ -658,6 +661,18 @@ impl Stroma {
 
     pub fn metrics(&self) -> Arc<StromaMetrics> {
         self.metrics.clone()
+    }
+
+    pub async fn global_store(&self) -> Result<Arc<GlobalStore>> {
+        self.global_store
+            .get_or_try_init(|| async {
+                let dir = self.root.join("global");
+                fs::create_dir_all(&dir).map_err(io_err)?;
+                let store = GlobalStore::open(dir, self.keratin_cfg_event).await?;
+                Ok::<_, StromaError>(Arc::new(store))
+            })
+            .await
+            .cloned()
     }
 
     /// Encode a string into a path-safe component (stable & reversible-ish).
@@ -2137,6 +2152,12 @@ impl Stroma {
         }
 
         self.task_group.shutdown().await;
+        if let Some(global_store) = self.global_store.get()
+            && let Err(err) = global_store.shutdown().await
+            && first_error.is_none()
+        {
+            first_error = Some(err);
+        }
         if let Some(err) = first_error {
             return Err(err);
         }

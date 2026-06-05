@@ -1,4 +1,5 @@
 mod event;
+mod global;
 mod metrics;
 mod state;
 mod stroma;
@@ -10,6 +11,7 @@ pub use event::{
     AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeclareMeta, EnqueueEventMeta,
     MarkInflightEventMeta, NackEventMeta,
 };
+pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
