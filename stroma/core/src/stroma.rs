@@ -3185,17 +3185,81 @@ mod tests {
     use keratin_log::test_dir;
 
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    struct WatchdogSnapshot {
+        label: String,
+        active: bool,
+        since: Instant,
+    }
+
+    static TEST_WATCHDOG: OnceLock<Arc<Mutex<WatchdogSnapshot>>> = OnceLock::new();
+
+    fn watchdog() -> &'static Arc<Mutex<WatchdogSnapshot>> {
+        TEST_WATCHDOG.get_or_init(|| {
+            let state = Arc::new(Mutex::new(WatchdogSnapshot {
+                label: "idle".to_string(),
+                active: false,
+                since: Instant::now(),
+            }));
+            let watcher_state = state.clone();
+
+            std::thread::spawn(move || {
+                loop {
+                    std::thread::sleep(Duration::from_secs(10));
+
+                    let (label, active, elapsed) = {
+                        let state = watcher_state.lock().expect("stroma test watchdog poisoned");
+                        (state.label.clone(), state.active, state.since.elapsed())
+                    };
+
+                    if !active {
+                        continue;
+                    }
+
+                    eprintln!(
+                        "stroma test watchdog: still running after {:.1}s: {label}",
+                        elapsed.as_secs_f64()
+                    );
+
+                    if elapsed >= Duration::from_secs(75) {
+                        eprintln!("stroma test watchdog: aborting stuck step: {label}");
+                        std::process::abort();
+                    }
+                }
+            });
+
+            state
+        })
+    }
+
+    fn watchdog_start(label: &str) {
+        let mut state = watchdog().lock().expect("stroma test watchdog poisoned");
+        state.label = label.to_string();
+        state.active = true;
+        state.since = Instant::now();
+    }
+
+    fn watchdog_done(label: &str) {
+        let mut state = watchdog().lock().expect("stroma test watchdog poisoned");
+        if state.label == label {
+            state.active = false;
+            state.since = Instant::now();
+        }
+    }
 
     async fn test_step<T>(
         label: impl std::fmt::Display,
         fut: impl std::future::Future<Output = T>,
     ) -> T {
         let label = label.to_string();
+        watchdog_start(&label);
         eprintln!("stroma test step start: {label}");
         let output = tokio::time::timeout(Duration::from_secs(15), fut)
             .await
             .unwrap_or_else(|_| panic!("stroma test step timed out: {label}"));
         eprintln!("stroma test step done: {label}");
+        watchdog_done(&label);
         output
     }
 
@@ -3258,6 +3322,7 @@ mod tests {
     #[tokio::test]
     async fn mark_all_queue_recoveries_completes_existing_waiters() {
         let dir = test_dir!("test_data");
+        println!("DIAGNOSTIC: test dir: {}", dir.root.display());
 
         let stroma = Stroma::open(
             &dir.root,
@@ -3266,27 +3331,36 @@ mod tests {
         )
         .await
         .unwrap();
+        println!("DIAGNOSTIC: opened stroma");
 
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        println!("DIAGNOSTIC: got queue handle");
 
         qh.recovery_complete.store(false, Ordering::Release);
+        println!("DIAGNOSTIC: set recovery_complete to false");
 
         let qh_waiter = qh.clone();
+        println!("DIAGNOSTIC: cloned queue handle for waiter");
         let waiter = tokio::spawn(async move {
             qh_waiter.wait_recovery_complete().await;
         });
+        println!("DIAGNOSTIC: spawned waiter task");
 
         stroma.mark_all_queue_recoveries_complete();
+        println!("DIAGNOSTIC: marked all queue recoveries complete");
 
         waiter.await.unwrap();
+        println!("DIAGNOSTIC: waiter task completed");
 
         assert!(qh.recovery_complete());
+        println!("DIAGNOSTIC: queue handle recovery_complete is true");
 
         shutdown_stroma(
             "mark_all_queue_recoveries_completes_existing_waiters",
             &stroma,
         )
         .await;
+        println!("DIAGNOSTIC: shutdown stroma");
     }
 
     #[tokio::test(start_paused = true)]
@@ -3382,6 +3456,7 @@ mod tests {
     #[tokio::test]
     async fn first_queue_handle_recovers_persisted_queue() {
         let dir = test_dir!("lazy_recovery_first_access");
+        println!("DIAGNOSTIC: test dir: {}", dir.root.display());
 
         let mut expected = Vec::new();
         for i in 0..5 {
@@ -3395,12 +3470,14 @@ mod tests {
             )
             .await
             .unwrap();
+            println!("DIAGNOSTIC: opened stroma for iteration {i}");
             let _ = test_step(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/queue_handle-write"),
                 stroma.queue_handle("topic-a", 0, None),
             )
             .await
             .unwrap();
+        println!("DIAGNOSTIC: got queue handle for iteration {i}");
             let offset = publish_one(&stroma, "topic-a", 0, None).await;
             expected.push(offset);
             shutdown_stroma(
@@ -3408,6 +3485,7 @@ mod tests {
                 &stroma,
             )
             .await;
+        println!("DIAGNOSTIC: shutdown stroma for iteration {i}");
 
             let stroma = test_step(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/open-read"),
@@ -3419,6 +3497,7 @@ mod tests {
             )
             .await
             .unwrap();
+        println!("DIAGNOSTIC: reopened stroma for iteration {i}");
             assert_eq!(stroma.materialized_queue_count(), 0);
             let qh = test_step(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/queue_handle-read"),
@@ -3426,7 +3505,9 @@ mod tests {
             )
             .await
             .unwrap();
+        println!("got queue handle for iteration {i} after reopen");
             assert!(qh.recovery_complete());
+            println!("DIAGNOSTIC: queue handle recovery complete for iteration {i}");
             for &off in &expected {
                 assert!(
                     test_step(
@@ -3436,12 +3517,14 @@ mod tests {
                     .await,
                     "offset {off} not ready after reopen"
                 );
+                println!("DIAGNOSTIC: offset {off} is ready for iteration {i}");
             }
             shutdown_stroma(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/read"),
                 &stroma,
             )
             .await;
+            println!("DIAGNOSTIC: shutdown stroma for iteration {i} after reopen");
         }
     }
 
