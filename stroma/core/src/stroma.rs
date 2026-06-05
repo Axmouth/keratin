@@ -3186,6 +3186,13 @@ mod tests {
 
     use super::*;
 
+    async fn shutdown_stroma(stroma: &Stroma) {
+        tokio::time::timeout(Duration::from_secs(10), stroma.shutdown())
+            .await
+            .expect("stroma shutdown timed out")
+            .expect("stroma shutdown failed");
+    }
+
     #[tokio::test]
     async fn queue_handle_starts_snapshot_task_once() {
         let dir = test_dir!("test_data");
@@ -3206,6 +3213,8 @@ mod tests {
         stroma.periodic_snapshot(qh.clone());
 
         assert!(qh.snapshot_task_started());
+
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3226,6 +3235,8 @@ mod tests {
 
         assert!(qh.recovery_complete());
         assert!(qh.snapshot_task_started());
+
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3254,6 +3265,8 @@ mod tests {
         waiter.await.unwrap();
 
         assert!(qh.recovery_complete());
+
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test(start_paused = true)]
@@ -3277,6 +3290,8 @@ mod tests {
         notified.await;
 
         assert!(stroma.snap_file("new-topic", 0, None).exists());
+
+        stroma.shutdown().await.expect("stroma shutdown failed");
     }
 
     #[tokio::test]
@@ -3295,7 +3310,7 @@ mod tests {
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             qh.enqueue(0, 0).await;
 
-            stroma.shutdown().await.unwrap();
+            shutdown_stroma(&stroma).await;
         }
 
         let stroma = Stroma::open(
@@ -3309,6 +3324,8 @@ mod tests {
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_queue_materialized("topic-a", 0, None));
+
+        shutdown_stroma(&stroma).await;
     }
 
     async fn publish_one(stroma: &Stroma, tp: &str, part: u32, group: Option<&str>) -> Offset {
@@ -3341,7 +3358,7 @@ mod tests {
             let _ = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             let offset = publish_one(&stroma, "topic-a", 0, None).await;
             expected.push(offset);
-            stroma.shutdown().await.unwrap();
+            shutdown_stroma(&stroma).await;
 
             let stroma = Stroma::open(
                 &dir.root,
@@ -3359,7 +3376,7 @@ mod tests {
                     "offset {off} not ready after reopen"
                 );
             }
-            stroma.shutdown().await.unwrap();
+            shutdown_stroma(&stroma).await;
         }
     }
 
@@ -3383,6 +3400,8 @@ mod tests {
         assert!(qh.recovery_complete());
         assert!(qh.snapshot_task_started());
         assert_eq!(stroma.materialized_queue_count(), 1);
+
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3401,7 +3420,7 @@ mod tests {
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             qh.enqueue(0, 0).await;
 
-            stroma.shutdown().await.unwrap();
+            shutdown_stroma(&stroma).await;
         }
 
         let stroma = Arc::new(
@@ -3429,6 +3448,8 @@ mod tests {
         }
 
         assert_eq!(stroma.lazy_recoveries_started.load(Ordering::Relaxed), 1);
+
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3454,7 +3475,7 @@ mod tests {
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_materialized("topic-a", 0, None));
 
-        stroma.shutdown().await.unwrap();
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3483,7 +3504,7 @@ mod tests {
         let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
         assert!(qh.is_ready(off).await);
 
-        stroma.shutdown().await.unwrap();
+        shutdown_stroma(&stroma).await;
     }
 
     #[tokio::test]
@@ -3510,5 +3531,7 @@ mod tests {
             EvictOutcome::HasInflight
         );
         assert!(stroma.is_materialized("topic-a", 0, None));
+
+        shutdown_stroma(&stroma).await;
     }
 }
