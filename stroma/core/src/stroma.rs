@@ -2099,18 +2099,39 @@ impl Stroma {
     }
 
     pub async fn shutdown(&self) -> Result<()> {
+        use futures::stream::{FuturesUnordered, StreamExt};
+
         // Step 1: atomically take ownership of all queues
         let old = self.queue_handles.swap(Arc::new(hashbrown::HashMap::new()));
 
         // Step 2: shutdown everything from the old snapshot
+        let mut futs = FuturesUnordered::new();
         for (_key, slot) in old.iter() {
             if let Some(q) = slot.handle.get() {
-                q.shutdown().await;
-                q.event_log().shutdown().await.map_err(io_err)?;
-                q.msg_log().shutdown().await.map_err(io_err)?;
+                let q = q.clone();
+                futs.push(async move {
+                    q.shutdown().await;
+                    q.event_log().shutdown().await.map_err(io_err)?;
+                    q.msg_log().shutdown().await.map_err(io_err)?;
+                    Ok::<_, StromaError>(())
+                });
             }
         }
+
+        let mut first_error = None;
+        while let Some(result) = futs.next().await {
+            if let Err(err) = result
+                && first_error.is_none()
+            {
+                first_error = Some(err);
+            }
+        }
+
         self.task_group.shutdown().await;
+        if let Some(err) = first_error {
+            return Err(err);
+        }
+
         Ok(())
     }
 

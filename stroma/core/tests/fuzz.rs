@@ -49,10 +49,6 @@ async fn many_new_topics_congestion() {
         .map(|i| format!("topic-{i}"))
         .collect::<HashSet<_>>();
     let mut handles = Vec::new();
-    println!(
-        "Spawning tasks to create queue handles for {} new topics...",
-        topics_target
-    );
     for topic in topics.iter() {
         let st = st.clone();
         let topic = topic.clone();
@@ -60,16 +56,13 @@ async fn many_new_topics_congestion() {
         handles.push(handle);
     }
 
-    println!("All tasks spawned, waiting for them to complete...");
     let mut queue_handles = Vec::new();
     for handle in handles {
-        println!("Waiting for a task to complete...");
         let qh = handle.await.unwrap();
         queue_handles.push(qh);
     }
 
     let added_topics = st.list_topics();
-    println!("Topics after adding: {:?}", added_topics);
 
     assert_eq!(added_topics.len(), topics_target);
     assert_eq!(
@@ -85,4 +78,7 @@ async fn many_new_topics_congestion() {
     }
 
     assert!(topics.is_empty());
+    // Keep the congestion assertion focused on queue creation; explicit async
+    // shutdown avoids hundreds of log handles falling back to blocking Drop.
+    st.shutdown().await.unwrap();
 }

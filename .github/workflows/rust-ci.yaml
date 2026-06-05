@@ -1,0 +1,82 @@
+name: Rust CI
+
+on:
+  workflow_call:
+  pull_request:
+    paths:
+      - ".github/workflows/rust-ci.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "keratin-log/**"
+      - "stroma/**"
+  push:
+    branches:
+      - main
+    paths:
+      - ".github/workflows/rust-ci.yaml"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "keratin-log/**"
+      - "stroma/**"
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  formatting-advisory:
+    name: Formatting advisory
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Check formatting
+        run: |
+          if ! cargo fmt --all --check; then
+            echo "::warning::cargo fmt --all --check failed. Formatting drift is currently non-blocking."
+          fi
+
+  workspace-tests:
+    name: Workspace tests
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Run tests
+        run: |
+          ulimit -n 4096
+          cargo test --workspace --locked
+
+  release-build:
+    name: Release build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      - name: Build workspace release
+        run: cargo build --workspace --release --locked
