@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::Ordering;
+use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 
 use crate::log::{AppendResult, Log, LogState};
@@ -23,6 +23,7 @@ pub struct Keratin {
     log_state: Arc<LogState>,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
     _lock: Option<File>,
+    shutdown_started: AtomicBool,
 }
 
 pub enum WriterCmd {
@@ -92,6 +93,7 @@ impl Keratin {
             log_state,
             segment_mapping,
             _lock: Some(lock_file),
+            shutdown_started: AtomicBool::new(false),
         })
     }
 
@@ -196,6 +198,10 @@ impl Keratin {
     }
 
     pub async fn shutdown(&self) -> std::io::Result<()> {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return Ok(());
+        }
+
         let (notify_tx, notify_rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::Shutdown { notify_tx })
@@ -242,13 +248,25 @@ impl Keratin {
 
 impl Drop for Keratin {
     fn drop(&mut self) {
+        if self.shutdown_started.swap(true, Ordering::AcqRel) {
+            return;
+        }
+
         let (notify_tx, mut notify_rx) = oneshot::channel();
         if let Err(e) = self.tx.send(WriterCmd::Shutdown { notify_tx }) {
             println!("Failed to send shutdown command to writer: {}", e);
             return;
         } else {
+            let started = std::time::Instant::now();
             while let Err(e) = notify_rx.try_recv() {
                 tracing::warn!("Failed to receive shutdown notification from writer: {}", e);
+                if started.elapsed() >= std::time::Duration::from_secs(5) {
+                    println!(
+                        "Timed out waiting for writer shutdown notification for {}",
+                        self.root.display()
+                    );
+                    return;
+                }
                 std::thread::sleep(std::time::Duration::from_millis(100));
             }
         }

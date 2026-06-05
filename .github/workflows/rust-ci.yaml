@@ -64,7 +64,7 @@ jobs:
       - name: Run tests
         run: |
           ulimit -n 4096
-          cargo test --workspace --locked -- --test-threads=2 --nocapture
+          cargo test --workspace --locked -- --test-threads=2
 
   release-build:
     name: Release build
