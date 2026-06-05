@@ -54,7 +54,10 @@ impl Keratin {
             .write(true)
             .open(&lock_path)?;
 
-        println!("Attempting to acquire lock on {}", lock_path.display());
+        tracing::debug!(
+            "attempting to acquire Keratin lock at {}",
+            lock_path.display()
+        );
         // Try to acquire exclusive lock (non-blocking)
         lock_file.try_lock_exclusive().map_err(|_| {
             io::Error::new(
@@ -62,7 +65,7 @@ impl Keratin {
                 format!("Keratin already open for {}", root.display()),
             )
         })?;
-        println!("Lock acquired on {}", lock_path.display());
+        tracing::debug!("acquired Keratin lock at {}", lock_path.display());
 
         let now = crate::util::unix_millis();
 
@@ -209,15 +212,15 @@ impl Keratin {
         notify_rx
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?;
-        println!("Shutdown command sent to writer");
-        println!(
-            "Releasing lock on {}",
+        tracing::debug!("shutdown command sent to Keratin writer");
+        tracing::debug!(
+            "releasing Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
         self._lock.as_ref().map(|f| f.unlock()).transpose()?;
         self._lock.as_ref().map(|f| f.sync_all()).transpose()?;
-        println!(
-            "Lock released on {}",
+        tracing::debug!(
+            "released Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
         Ok(())
@@ -235,7 +238,7 @@ impl Keratin {
     /// Force to close without waiting for writer to acknowledge shutdown (for testing)
     /// Do NOT touch in normal operation, as it may cause data loss or corruption if the writer is still processing appends.
     pub async fn force_close(self) -> std::io::Result<()> {
-        println!("Force closing Keratin instance without waiting for writer acknowledgment");
+        tracing::warn!("force closing Keratin instance without waiting for writer acknowledgment");
         if let Some(lock) = &self._lock {
             lock.unlock()?;
             lock.sync_all()?;
@@ -254,15 +257,15 @@ impl Drop for Keratin {
 
         let (notify_tx, mut notify_rx) = oneshot::channel();
         if let Err(e) = self.tx.send(WriterCmd::Shutdown { notify_tx }) {
-            println!("Failed to send shutdown command to writer: {}", e);
+            tracing::warn!("failed to send shutdown command to Keratin writer: {e}");
             return;
         } else {
             let started = std::time::Instant::now();
             while let Err(e) = notify_rx.try_recv() {
                 tracing::warn!("Failed to receive shutdown notification from writer: {}", e);
                 if started.elapsed() >= std::time::Duration::from_secs(5) {
-                    println!(
-                        "Timed out waiting for writer shutdown notification for {}",
+                    tracing::warn!(
+                        "timed out waiting for Keratin writer shutdown notification for {}",
                         self.root.display()
                     );
                     return;
@@ -271,19 +274,19 @@ impl Drop for Keratin {
             }
         }
 
-        println!("Shutdown command sent to writer");
-        println!(
-            "Releasing lock on {}",
+        tracing::debug!("shutdown command sent to Keratin writer");
+        tracing::debug!(
+            "releasing Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
         if let Err(e) = self._lock.as_ref().map(|f| f.unlock()).transpose() {
-            println!("Failed to unlock lock file: {}", e);
+            tracing::warn!("failed to unlock Keratin lock file: {e}");
         }
         if let Err(e) = self._lock.as_ref().map(|f| f.sync_all()).transpose() {
-            println!("Failed to sync lock file: {}", e);
+            tracing::warn!("failed to sync Keratin lock file: {e}");
         }
-        println!(
-            "Lock released on {}",
+        tracing::debug!(
+            "released Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
     }
