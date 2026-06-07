@@ -33,10 +33,10 @@ use crate::{
     global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome},
     group,
     metrics::StromaMetrics,
-    partition::Partition,
     state::{
-        CustomDLQ, NackOutcome, Offset, QueueCommand, QueueHandle, QueueSharedBundle,
-        QueueStatusReport, StromaDebugSnapshot, UnixMillis,
+        CustomDLQ, InspectMode, NackOutcome, Offset, QueueCommand, QueueHandle,
+        QueueInspectionSnapshot, QueueInspectionState, QueueSharedBundle, QueueStatusReport,
+        StromaDebugSnapshot, UnixMillis,
     },
     topic,
 };
@@ -500,6 +500,22 @@ pub struct MessageHeaders {
     #[serde(default)]
     pub content_type: Option<MessageContentType>,
     pub extra: HashMap<String, String>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageInspectionPage {
+    pub next_offset_hint: Offset,
+    pub items: Vec<MessageInspectionItem>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+pub struct MessageInspectionItem {
+    pub state: QueueInspectionState,
+    pub headers: Option<MessageHeaders>,
+    pub payload_len: Option<usize>,
+    pub payload: Option<Vec<u8>>,
+    pub payload_truncated: bool,
+    pub missing_payload: bool,
 }
 
 impl MessageHeaders {
@@ -3092,6 +3108,73 @@ impl Stroma {
             .collect::<Result<Vec<(Offset, Vec<u8>, MessageHeaders)>>>()
     }
 
+    pub async fn inspect_messages(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        limit: usize,
+        mode: InspectMode,
+        include_payload: bool,
+        payload_limit_bytes: usize,
+    ) -> Result<MessageInspectionPage> {
+        let qh = self.queue_handle(tp, part, group).await?;
+        let snapshot: QueueInspectionSnapshot = qh.inspect_offsets(from, limit, mode).await;
+        if snapshot.items.is_empty() {
+            return Ok(MessageInspectionPage {
+                next_offset_hint: snapshot.next_offset_hint,
+                items: Vec::new(),
+            });
+        }
+
+        let mut records = HashMap::with_capacity(snapshot.items.len());
+        for (start, len) in contiguous_spans(snapshot.items.iter().map(|item| item.offset)) {
+            for (offset, payload, headers) in self.scan_messages_from(&qh, start, len)? {
+                records.insert(offset, (payload, headers));
+            }
+        }
+
+        let items = snapshot
+            .items
+            .into_iter()
+            .map(|state| {
+                let Some((payload, headers)) = records.remove(&state.offset) else {
+                    return MessageInspectionItem {
+                        state,
+                        headers: None,
+                        payload_len: None,
+                        payload: None,
+                        payload_truncated: false,
+                        missing_payload: true,
+                    };
+                };
+
+                let payload_len = payload.len();
+                let payload_truncated = include_payload && payload_len > payload_limit_bytes;
+                let payload = if include_payload {
+                    Some(payload.into_iter().take(payload_limit_bytes).collect())
+                } else {
+                    None
+                };
+
+                MessageInspectionItem {
+                    state,
+                    headers: Some(headers),
+                    payload_len: Some(payload_len),
+                    payload,
+                    payload_truncated,
+                    missing_payload: false,
+                }
+            })
+            .collect();
+
+        Ok(MessageInspectionPage {
+            next_offset_hint: snapshot.next_offset_hint,
+            items,
+        })
+    }
+
     pub async fn current_next_offset(
         &self,
         tp: &str,
@@ -3369,6 +3452,31 @@ fn collect_parts_decoded(
     }
 
     Ok(())
+}
+
+fn contiguous_spans(offsets: impl IntoIterator<Item = Offset>) -> Vec<(Offset, usize)> {
+    let mut spans = Vec::new();
+    let mut iter = offsets.into_iter();
+    let Some(mut start) = iter.next() else {
+        return spans;
+    };
+    let mut last = start;
+    let mut len = 1usize;
+
+    for offset in iter {
+        if offset == last.saturating_add(1) {
+            last = offset;
+            len += 1;
+        } else {
+            spans.push((start, len));
+            start = offset;
+            last = offset;
+            len = 1;
+        }
+    }
+
+    spans.push((start, len));
+    spans
 }
 
 fn assert_send<T: Send>(_: T) {}

@@ -18,12 +18,14 @@ pub use keratin_log::{
 };
 pub use metrics::StromaMetrics;
 pub use state::{
-    AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, NackBatchOutcome, NackOutcome,
-    QueueHandle, QueueInternalState, StromaDebugSnapshot,
+    AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
+    MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueInspectionSnapshot,
+    QueueInspectionState, QueueInternalState, StromaDebugSnapshot,
 };
 pub use stroma::{
     EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
-    MessageHeaders, PublishItem, SnapshotConfig, Stroma, StromaKeratinConfig, TaskGroup,
+    MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem, SnapshotConfig,
+    Stroma, StromaKeratinConfig, TaskGroup,
 };
 
 pub type Offset = u64;

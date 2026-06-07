@@ -1,6 +1,5 @@
 use std::cmp::Reverse;
-use std::collections::{BTreeMap, BTreeSet, BinaryHeap, HashMap};
-use std::ffi::os_str::Display;
+use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
@@ -155,6 +154,38 @@ pub struct ResolvedDlqTarget {
     pub tp: String,
     pub part: u32,
     pub group: Option<String>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InspectMode {
+    ActiveOnly,
+    IncludeSettled,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueInspectionSnapshot {
+    pub next_offset_hint: Offset,
+    pub items: Vec<QueueInspectionState>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize)]
+pub struct QueueInspectionState {
+    pub offset: Offset,
+    pub status: MessageInspectionStatus,
+    pub retry_count: u32,
+    pub inflight_deadline_ms: Option<UnixMillis>,
+    pub available_at_ms: Option<UnixMillis>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MessageInspectionStatus {
+    Ready,
+    Inflight,
+    Delayed,
+    PendingDlq,
+    Settled,
 }
 
 /// QueueState invariants and transitions:
@@ -339,6 +370,12 @@ pub enum QueueCommand {
     GetPendingDlq {
         response: Option<oneshot::Sender<Vec<(Offset, Option<ResolvedDlqTarget>)>>>,
     },
+    InspectOffsets {
+        from: Offset,
+        limit: usize,
+        mode: InspectMode,
+        response: Option<oneshot::Sender<QueueInspectionSnapshot>>,
+    },
     GetDlqTarget {
         global: Option<GlobalDLQ>,
         response: Option<oneshot::Sender<Option<(String, u32, Option<String>)>>>,
@@ -464,6 +501,7 @@ impl QueueCommand {
             // === Observability / admin queries — fast, cheap, must stay responsive ===
             QueueCommand::GetDebugInfo { .. } => CommandPrio::Express,
             QueueCommand::GetStatusReport { .. } => CommandPrio::Express,
+            QueueCommand::InspectOffsets { .. } => CommandPrio::Express,
             QueueCommand::GetInflightLen { .. } => CommandPrio::Express,
             QueueCommand::GetSettledUntil { .. } => CommandPrio::Express,
             QueueCommand::GetLowestUnacked { .. } => CommandPrio::Express,
@@ -568,6 +606,7 @@ impl QueueCommand {
             QueueCommand::GetAckBitsBytes { .. } => "GetAckBitsBytes",
             QueueCommand::GetCanonicalQueueState { .. } => "GetCanonicalQueueState",
             QueueCommand::GetStatusReport { .. } => "GetStatusReport",
+            QueueCommand::InspectOffsets { .. } => "InspectOffsets",
             QueueCommand::CollectExpired { .. } => "CollectExpired",
             QueueCommand::DumpInflight { .. } => "DumpInflight",
             QueueCommand::GetDebugInfo { .. } => "GetDebugInfo",
@@ -1127,6 +1166,17 @@ impl QueueHandle {
                     let _ = r.send(v);
                 }
             }
+            QueueCommand::InspectOffsets {
+                from,
+                limit,
+                mode,
+                response,
+            } => {
+                let v = state.inspect_offsets(from, limit, mode);
+                if let Some(r) = response {
+                    let _ = r.send(v);
+                }
+            }
             QueueCommand::IsAcked { offset, response } => {
                 let result = state.is_acked(offset);
                 if let Some(r) = response {
@@ -1622,6 +1672,27 @@ impl QueueHandle {
             .command_enqueue(QueueCommand::GetPendingDlq { response: Some(tx) })
             .await;
         rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
+    pub async fn inspect_offsets(
+        &self,
+        from: Offset,
+        limit: usize,
+        mode: InspectMode,
+    ) -> QueueInspectionSnapshot {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::InspectOffsets {
+                from,
+                limit,
+                mode,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.unwrap_or(QueueInspectionSnapshot {
+            next_offset_hint: from,
+            items: Vec::new(),
+        })
     }
 
     pub async fn mark_pending_dlq_many(
@@ -2384,6 +2455,109 @@ impl QueueInternalState {
         &self,
     ) -> impl Iterator<Item = (Offset, Option<ResolvedDlqTarget>)> + '_ {
         self.pending_dlq.iter().map(|(&o, t)| (o, t.clone()))
+    }
+
+    pub fn inspect_offsets(
+        &self,
+        from: Offset,
+        limit: usize,
+        mode: InspectMode,
+    ) -> QueueInspectionSnapshot {
+        let limit = limit.min(10_000);
+        let Some(end) = from.checked_add(limit as Offset) else {
+            return QueueInspectionSnapshot {
+                next_offset_hint: Offset::MAX,
+                items: Vec::new(),
+            };
+        };
+
+        let mut states: BTreeMap<Offset, QueueInspectionState> = BTreeMap::new();
+
+        for range in self.ready.iter() {
+            let start = range.start.max(from);
+            let stop = range.end.min(end);
+            for offset in start..stop {
+                states.insert(
+                    offset,
+                    self.inspection_state(offset, MessageInspectionStatus::Ready),
+                );
+            }
+        }
+
+        for (&offset, &deadline) in self.inflight.range(from..end) {
+            states.insert(
+                offset,
+                QueueInspectionState {
+                    offset,
+                    status: MessageInspectionStatus::Inflight,
+                    retry_count: self.get_retries(offset),
+                    inflight_deadline_ms: Some(deadline),
+                    available_at_ms: None,
+                },
+            );
+        }
+
+        for &(Reverse(deadline), offset) in &self.delayed_enqueue_heap {
+            if (from..end).contains(&offset) && !self.is_acked(offset) {
+                states.entry(offset).or_insert(QueueInspectionState {
+                    offset,
+                    status: MessageInspectionStatus::Delayed,
+                    retry_count: self.get_retries(offset),
+                    inflight_deadline_ms: None,
+                    available_at_ms: Some(deadline),
+                });
+            }
+        }
+
+        for &(Reverse(deadline), offset) in &self.delayed_retry_heap {
+            if (from..end).contains(&offset) && !self.is_acked(offset) {
+                states.entry(offset).or_insert(QueueInspectionState {
+                    offset,
+                    status: MessageInspectionStatus::Delayed,
+                    retry_count: self.get_retries(offset),
+                    inflight_deadline_ms: None,
+                    available_at_ms: Some(deadline),
+                });
+            }
+        }
+
+        for (&offset, _) in self.pending_dlq.range(from..end) {
+            states.insert(
+                offset,
+                self.inspection_state(offset, MessageInspectionStatus::PendingDlq),
+            );
+        }
+
+        if mode == InspectMode::IncludeSettled {
+            for offset in from..end {
+                states.entry(offset).or_insert(QueueInspectionState {
+                    offset,
+                    status: MessageInspectionStatus::Settled,
+                    retry_count: 0,
+                    inflight_deadline_ms: None,
+                    available_at_ms: None,
+                });
+            }
+        }
+
+        QueueInspectionSnapshot {
+            next_offset_hint: end,
+            items: states.into_values().collect(),
+        }
+    }
+
+    fn inspection_state(
+        &self,
+        offset: Offset,
+        status: MessageInspectionStatus,
+    ) -> QueueInspectionState {
+        QueueInspectionState {
+            offset,
+            status,
+            retry_count: self.get_retries(offset),
+            inflight_deadline_ms: None,
+            available_at_ms: None,
+        }
     }
 
     pub fn is_pending_dlq(&self, offset: Offset) -> bool {
@@ -3270,7 +3444,7 @@ impl Default for CanonicalQueueState {
 
 #[cfg(test)]
 mod tests {
-    use super::{Offset, QueueInternalState};
+    use super::{InspectMode, MessageInspectionStatus, QueueInternalState};
     use crate::event::DeadLetterReason;
     use crate::{
         event::{AckEventMeta, DLQDiscardPolicyWire, DeclareMeta},
@@ -3289,6 +3463,65 @@ mod tests {
 
         s.enqueue(5, 0);
         assert_eq!(s.next_deliverable(0, 10), 5);
+    }
+
+    #[test]
+    fn inspect_offsets_active_only_returns_tracked_messages() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.enqueue(2, 2);
+        s.mark_inflight(2, 500);
+        s.enqueue_delayed(3, 700);
+        s.enqueue(4, 1);
+        s.mark_pending_dlq_many(&[4]);
+        s.enqueue(5, 0);
+        s.ack(5);
+
+        let snapshot = s.inspect_offsets(0, 8, InspectMode::ActiveOnly);
+        let statuses: Vec<_> = snapshot
+            .items
+            .iter()
+            .map(|item| (item.offset, item.status, item.retry_count))
+            .collect();
+
+        assert_eq!(snapshot.next_offset_hint, 8);
+        assert_eq!(
+            statuses,
+            vec![
+                (1, MessageInspectionStatus::Ready, 0),
+                (2, MessageInspectionStatus::Inflight, 2),
+                (3, MessageInspectionStatus::Delayed, 0),
+                (4, MessageInspectionStatus::PendingDlq, 0),
+            ]
+        );
+        assert_eq!(snapshot.items[1].inflight_deadline_ms, Some(500));
+        assert_eq!(snapshot.items[2].available_at_ms, Some(700));
+    }
+
+    #[test]
+    fn inspect_offsets_can_include_settled_records() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 0);
+        s.enqueue(2, 0);
+
+        let snapshot = s.inspect_offsets(0, 4, InspectMode::IncludeSettled);
+        let statuses: Vec<_> = snapshot
+            .items
+            .iter()
+            .map(|item| (item.offset, item.status))
+            .collect();
+
+        assert_eq!(
+            statuses,
+            vec![
+                (0, MessageInspectionStatus::Settled),
+                (1, MessageInspectionStatus::Ready),
+                (2, MessageInspectionStatus::Ready),
+                (3, MessageInspectionStatus::Settled),
+            ]
+        );
     }
 
     #[test]
