@@ -30,7 +30,8 @@ use crate::{
         AckEventMeta, DeadLetterMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, NackEventMeta,
         StromaEvent,
     },
-    global::GlobalStore,
+    global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome},
+    group,
     metrics::StromaMetrics,
     partition::Partition,
     state::{
@@ -46,6 +47,10 @@ fn io_err(e: impl std::fmt::Display) -> StromaError {
 
 fn decode_err(e: impl std::fmt::Display) -> StromaError {
     StromaError::Decode(e.to_string())
+}
+
+fn encode_err(e: impl std::fmt::Display) -> StromaError {
+    StromaError::Encode(e.to_string())
 }
 
 pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
@@ -82,7 +87,35 @@ impl Default for SnapshotConfig {
     }
 }
 
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Copy)]
+pub struct StromaKeratinConfig {
+    pub message_log: KeratinConfig,
+    pub event_log: KeratinConfig,
+}
+
+impl StromaKeratinConfig {
+    pub fn from_message_log(message_log: KeratinConfig) -> Self {
+        Self {
+            message_log,
+            event_log: derived_event_log_config(message_log),
+        }
+    }
+}
+
+fn derived_event_log_config(message_log: KeratinConfig) -> KeratinConfig {
+    KeratinConfig {
+        flush_target_bytes: message_log.flush_target_bytes / 8,
+        max_batch_bytes: message_log.max_batch_bytes / 8,
+        index_stride_bytes: message_log.index_stride_bytes / 8,
+        segment_max_bytes: message_log.segment_max_bytes / 8,
+        ..message_log
+    }
+}
+
+const GLOBAL_DLQ_NAMESPACE: &str = "stroma.settings";
+const GLOBAL_DLQ_KEY: &str = "global_dlq";
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalDLQ {
     pub tp: String,
     pub part: u32,
@@ -91,11 +124,23 @@ pub struct GlobalDLQ {
 
 impl GlobalDLQ {
     pub async fn new(tp: &str, part: u32, group: Option<&str>) -> Result<Self> {
-        Ok(Self {
+        let dlq = Self {
             tp: tp.to_string(),
             part,
             group: group.map(|s| s.into()),
-        })
+        };
+        dlq.validate()?;
+        Ok(dlq)
+    }
+
+    pub fn validate(&self) -> Result<()> {
+        topic::Topic::parse(&self.tp)
+            .map_err(|err| StromaError::InvalidArgument(err.to_string()))?;
+        if let Some(group) = &self.group {
+            group::Group::parse(group)
+                .map_err(|err| StromaError::InvalidArgument(err.to_string()))?;
+        }
+        Ok(())
     }
 
     // TODO: Helper to create DLQ message, with metadata about original message. (stabilize headers format first)
@@ -106,6 +151,56 @@ impl GlobalDLQ {
             part: self.part,
             group: self.group.clone(),
         }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GlobalDlqSnapshot {
+    pub version: u64,
+    pub target: Option<GlobalDLQ>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum GlobalDlqUpdateOutcome {
+    Stored(GlobalDlqSnapshot),
+    Conflict(GlobalDlqSnapshot),
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct GlobalDlqRecord {
+    target: Option<GlobalDLQ>,
+}
+
+impl GlobalDlqRecord {
+    fn encode(&self) -> Result<Vec<u8>> {
+        rmp_serde::to_vec_named(self).map_err(encode_err)
+    }
+
+    fn decode(bytes: &[u8]) -> Result<Self> {
+        rmp_serde::from_slice(bytes).map_err(decode_err)
+    }
+}
+
+fn global_dlq_key() -> Result<GlobalKey> {
+    GlobalKey::new(GLOBAL_DLQ_NAMESPACE, GLOBAL_DLQ_KEY)
+}
+
+fn global_dlq_snapshot_from_value(value: Option<GlobalValue>) -> Result<GlobalDlqSnapshot> {
+    match value {
+        Some(value) => {
+            let record = GlobalDlqRecord::decode(&value.bytes)?;
+            if let Some(target) = &record.target {
+                target.validate()?;
+            }
+            Ok(GlobalDlqSnapshot {
+                version: value.version,
+                target: record.target,
+            })
+        }
+        None => Ok(GlobalDlqSnapshot {
+            version: 0,
+            target: None,
+        }),
     }
 }
 
@@ -574,7 +669,7 @@ pub struct Stroma {
 impl Stroma {
     pub async fn open(
         root: impl AsRef<Path>,
-        keratin_cfg_msg: KeratinConfig,
+        keratin_cfg: StromaKeratinConfig,
         snap_cfg: SnapshotConfig,
     ) -> Result<Self> {
         let start_time = Instant::now();
@@ -585,13 +680,8 @@ impl Stroma {
         fs::create_dir_all(root.join("tmp")).map_err(io_err)?;
 
         let metrics = Arc::new(StromaMetrics::new(60));
-        let keratin_cfg_event = KeratinConfig {
-            flush_target_bytes: keratin_cfg_msg.flush_target_bytes / 8,
-            max_batch_bytes: keratin_cfg_msg.max_batch_bytes / 8,
-            index_stride_bytes: keratin_cfg_msg.index_stride_bytes / 8,
-            segment_max_bytes: keratin_cfg_msg.segment_max_bytes / 8,
-            ..keratin_cfg_msg
-        };
+        let keratin_cfg_msg = keratin_cfg.message_log;
+        let keratin_cfg_event = keratin_cfg.event_log;
 
         let (earliest_pending_deadline_sender, earliest_pending_deadline_receiver) =
             tokio::sync::watch::channel(None);
@@ -618,6 +708,8 @@ impl Stroma {
             #[cfg(test)]
             snapshot_worker_ticks: Arc::new(Notify::new()),
         };
+
+        st.load_global_dlq_setting().await?;
 
         // Discover persisted queues, but do not open logs or replay them yet.
         // Recovery happens lazily on first queue_handle().
@@ -673,6 +765,50 @@ impl Stroma {
             })
             .await
             .cloned()
+    }
+
+    pub async fn global_dlq(&self) -> Result<GlobalDlqSnapshot> {
+        let store = self.global_store().await?;
+        let key = global_dlq_key()?;
+        global_dlq_snapshot_from_value(store.get(&key).await?)
+    }
+
+    pub async fn set_global_dlq(
+        &self,
+        target: Option<GlobalDLQ>,
+        expected_version: u64,
+    ) -> Result<GlobalDlqUpdateOutcome> {
+        if let Some(target) = &target {
+            target.validate()?;
+        }
+        let store = self.global_store().await?;
+        let key = global_dlq_key()?;
+        let bytes = GlobalDlqRecord {
+            target: target.clone(),
+        }
+        .encode()?;
+
+        match store.put(key, bytes, Some(expected_version)).await? {
+            PutOutcome::Stored { version } => {
+                let snapshot = GlobalDlqSnapshot { version, target };
+                self.apply_global_dlq_snapshot(&snapshot).await;
+                Ok(GlobalDlqUpdateOutcome::Stored(snapshot))
+            }
+            PutOutcome::Conflict { current } => {
+                let snapshot = global_dlq_snapshot_from_value(current)?;
+                Ok(GlobalDlqUpdateOutcome::Conflict(snapshot))
+            }
+        }
+    }
+
+    async fn load_global_dlq_setting(&self) -> Result<()> {
+        let snapshot = self.global_dlq().await?;
+        self.apply_global_dlq_snapshot(&snapshot).await;
+        Ok(())
+    }
+
+    async fn apply_global_dlq_snapshot(&self, snapshot: &GlobalDlqSnapshot) {
+        *self.global_dlq.write().await = snapshot.target.clone();
     }
 
     /// Encode a string into a path-safe component (stable & reversible-ish).
@@ -3223,13 +3359,135 @@ mod tests {
             .expect("stroma shutdown failed");
     }
 
+    fn test_keratin_config() -> StromaKeratinConfig {
+        StromaKeratinConfig::from_message_log(KeratinConfig::default())
+    }
+
+    #[tokio::test]
+    async fn global_dlq_setting_is_persisted_and_loaded() {
+        let dir = test_dir!("global_dlq_setting");
+        let target = GlobalDLQ::new("_dlq.orders", 0, Some("failed"))
+            .await
+            .unwrap();
+
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            stroma.global_dlq().await.unwrap(),
+            GlobalDlqSnapshot {
+                version: 0,
+                target: None,
+            }
+        );
+
+        assert_eq!(
+            stroma
+                .set_global_dlq(Some(target.clone()), 0)
+                .await
+                .unwrap(),
+            GlobalDlqUpdateOutcome::Stored(GlobalDlqSnapshot {
+                version: 1,
+                target: Some(target.clone()),
+            })
+        );
+        assert_eq!(*stroma.global_dlq.read().await, Some(target.clone()));
+        shutdown_stroma("global_dlq_setting_is_persisted_and_loaded/write", &stroma).await;
+        drop(stroma);
+
+        let recovered = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            recovered.global_dlq().await.unwrap(),
+            GlobalDlqSnapshot {
+                version: 1,
+                target: Some(target.clone()),
+            }
+        );
+        assert_eq!(*recovered.global_dlq.read().await, Some(target));
+        shutdown_stroma(
+            "global_dlq_setting_is_persisted_and_loaded/read",
+            &recovered,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn global_dlq_setting_uses_expected_version() {
+        let dir = test_dir!("global_dlq_setting_cas");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let first = GlobalDLQ::new("_dlq.one", 0, None).await.unwrap();
+        let second = GlobalDLQ::new("_dlq.two", 0, None).await.unwrap();
+
+        stroma.set_global_dlq(Some(first.clone()), 0).await.unwrap();
+        assert_eq!(
+            stroma.set_global_dlq(Some(second), 0).await.unwrap(),
+            GlobalDlqUpdateOutcome::Conflict(GlobalDlqSnapshot {
+                version: 1,
+                target: Some(first.clone()),
+            })
+        );
+        assert_eq!(
+            stroma.set_global_dlq(None, 1).await.unwrap(),
+            GlobalDlqUpdateOutcome::Stored(GlobalDlqSnapshot {
+                version: 2,
+                target: None,
+            })
+        );
+        assert_eq!(*stroma.global_dlq.read().await, None);
+
+        shutdown_stroma("global_dlq_setting_uses_expected_version", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn global_dlq_setting_validates_target() {
+        let dir = test_dir!("global_dlq_setting_validation");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let err = stroma
+            .set_global_dlq(
+                Some(GlobalDLQ {
+                    tp: "BadTopic".into(),
+                    part: 0,
+                    group: None,
+                }),
+                0,
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StromaError::InvalidArgument(_)));
+
+        shutdown_stroma("global_dlq_setting_validates_target", &stroma).await;
+    }
+
     #[tokio::test]
     async fn queue_handle_starts_snapshot_task_once() {
         let dir = test_dir!("test_data");
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await
@@ -3253,7 +3511,7 @@ mod tests {
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await
@@ -3279,7 +3537,7 @@ mod tests {
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await
@@ -3313,7 +3571,7 @@ mod tests {
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await
@@ -3339,7 +3597,7 @@ mod tests {
         {
             let stroma = Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             )
             .await
@@ -3359,7 +3617,7 @@ mod tests {
             "open_indexes_existing_queues_without_materializing_them/reopen",
             Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             ),
         )
@@ -3405,11 +3663,7 @@ mod tests {
         for i in 0..5 {
             let stroma = test_step(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/open-write"),
-                Stroma::open(
-                    &dir.root,
-                    KeratinConfig::default(),
-                    SnapshotConfig::default(),
-                ),
+                Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()),
             )
             .await
             .unwrap();
@@ -3429,11 +3683,7 @@ mod tests {
 
             let stroma = test_step(
                 format!("first_queue_handle_recovers_persisted_queue/{i}/open-read"),
-                Stroma::open(
-                    &dir.root,
-                    KeratinConfig::default(),
-                    SnapshotConfig::default(),
-                ),
+                Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()),
             )
             .await
             .unwrap();
@@ -3471,7 +3721,7 @@ mod tests {
             "new_queue_after_lazy_startup_is_recovered_immediately/open",
             Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             ),
         )
@@ -3501,7 +3751,7 @@ mod tests {
         {
             let stroma = Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             )
             .await
@@ -3516,7 +3766,7 @@ mod tests {
         let stroma = Arc::new(
             Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             )
             .await
@@ -3550,7 +3800,7 @@ mod tests {
             "unmaterialize_drops_idle_handle_but_keeps_queue_indexed/open",
             Stroma::open(
                 &dir.root,
-                KeratinConfig::default(),
+                test_keratin_config(),
                 SnapshotConfig { every_events: 1 },
             ),
         )
@@ -3591,7 +3841,7 @@ mod tests {
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await
@@ -3641,7 +3891,7 @@ mod tests {
 
         let stroma = Stroma::open(
             &dir.root,
-            KeratinConfig::default(),
+            test_keratin_config(),
             SnapshotConfig { every_events: 1 },
         )
         .await

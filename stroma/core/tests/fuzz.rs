@@ -2,14 +2,14 @@ use std::sync::Arc;
 
 use hashbrown::HashSet;
 use keratin_log::KeratinConfig;
-use stroma_core::{SnapshotConfig, Stroma, TempDir, test_dir};
+use stroma_core::{SnapshotConfig, Stroma, StromaKeratinConfig, TempDir, test_dir};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir!("test_data");
     let res = Arc::new(
         Stroma::open(
             &test_dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await

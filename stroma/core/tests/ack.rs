@@ -3,14 +3,14 @@ use std::sync::Arc;
 use keratin_log::{
     CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
 };
-use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma};
+use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma, StromaKeratinConfig};
 
 async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let test_dir = test_dir!("test_data");
     let res = Arc::new(
         Stroma::open(
             &test_dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await
@@ -99,7 +99,7 @@ async fn expiry_never_resurrects_acked_offsets_after_restart() {
 
     let st2 = Stroma::open(
         &dir.root,
-        KeratinConfig::test_default(),
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
         SnapshotConfig::default(),
     )
     .await

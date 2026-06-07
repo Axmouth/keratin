@@ -6,7 +6,7 @@ use keratin_log::{
 };
 use stroma_core::{
     DLQDiscardPolicyWire, DeclareMeta, MessageHeaders, NackEventMeta, Offset, SnapshotConfig,
-    Stroma,
+    Stroma, StromaKeratinConfig,
 };
 use tokio::time::Instant;
 
@@ -17,7 +17,7 @@ async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
     let s = Arc::new(
         Stroma::open(
             &test_dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await
@@ -30,7 +30,7 @@ async fn reopen_test_stroma(dir: &TempDir) -> Arc<Stroma> {
     Arc::new(
         Stroma::open(
             &dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await

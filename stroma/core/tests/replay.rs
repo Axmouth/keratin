@@ -7,7 +7,7 @@ use stroma_core::*;
 #[tokio::test]
 async fn snapshot_delta_replay_is_deterministic() {
     let dir = test_dir!("stroma_replay");
-    let kcfg = KeratinConfig::test_default();
+    let kcfg = StromaKeratinConfig::from_message_log(KeratinConfig::test_default());
     let scfg = SnapshotConfig::default();
 
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
@@ -43,7 +43,7 @@ async fn expired_messages_survive_restart() {
     let st = Arc::new(
         Stroma::open(
             &dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await
@@ -68,7 +68,7 @@ async fn expired_messages_survive_restart() {
 
     let st2 = Stroma::open(
         &dir.root,
-        KeratinConfig::test_default(),
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
         SnapshotConfig::default(),
     )
     .await
@@ -84,7 +84,7 @@ async fn discover_partitions_handles_encoded_names() {
     let st = Arc::new(
         Stroma::open(
             &dir.root,
-            KeratinConfig::test_default(),
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
         )
         .await

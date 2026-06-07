@@ -393,7 +393,7 @@ mod tests {
 
         let stroma = crate::Stroma::open(
             &dir.root,
-            KeratinConfig::test_default(),
+            crate::StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             crate::SnapshotConfig::default(),
         )
         .await
@@ -410,7 +410,7 @@ mod tests {
 
         let recovered = crate::Stroma::open(
             &dir.root,
-            KeratinConfig::test_default(),
+            crate::StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             crate::SnapshotConfig::default(),
         )
         .await
