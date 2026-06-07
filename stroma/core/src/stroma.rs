@@ -114,6 +114,14 @@ fn derived_event_log_config(message_log: KeratinConfig) -> KeratinConfig {
 
 const GLOBAL_DLQ_NAMESPACE: &str = "stroma.settings";
 const GLOBAL_DLQ_KEY: &str = "global_dlq";
+const DEFAULT_GROUP_ALIAS: &str = "default";
+
+fn normalize_group(group: Option<&str>) -> Option<&str> {
+    match group {
+        Some(DEFAULT_GROUP_ALIAS) | None => None,
+        Some(group) => Some(group),
+    }
+}
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct GlobalDLQ {
@@ -124,6 +132,7 @@ pub struct GlobalDLQ {
 
 impl GlobalDLQ {
     pub async fn new(tp: &str, part: u32, group: Option<&str>) -> Result<Self> {
+        let group = normalize_group(group);
         let dlq = Self {
             tp: tp.to_string(),
             part,
@@ -137,6 +146,11 @@ impl GlobalDLQ {
         topic::Topic::parse(&self.tp)
             .map_err(|err| StromaError::InvalidArgument(err.to_string()))?;
         if let Some(group) = &self.group {
+            if group == DEFAULT_GROUP_ALIAS {
+                return Err(StromaError::InvalidArgument(
+                    "group \"default\" is reserved for the ungrouped queue".to_string(),
+                ));
+            }
             group::Group::parse(group)
                 .map_err(|err| StromaError::InvalidArgument(err.to_string()))?;
         }
@@ -673,6 +687,7 @@ fn slot_lookup_no_alloc<'a>(
     part: u32,
     group: Option<&str>,
 ) -> Option<&'a Arc<QueueSlot>> {
+    let group = normalize_group(group);
     let mut hasher = map.hasher().build_hasher();
     tp.hash(&mut hasher);
     part.hash(&mut hasher);
@@ -908,6 +923,7 @@ impl Stroma {
     }
 
     fn msg_tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        let group = normalize_group(group);
         let mut p = self.messages_root();
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
@@ -917,6 +933,7 @@ impl Stroma {
     }
 
     fn tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        let group = normalize_group(group);
         let mut p = self.events_root();
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
@@ -926,6 +943,7 @@ impl Stroma {
     }
 
     fn snap_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        let group = normalize_group(group);
         let mut p = self.snapshots_root();
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
@@ -940,6 +958,7 @@ impl Stroma {
     }
 
     fn snap_tmp_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        let group = normalize_group(group);
         let p = self.root.join("tmp");
         if let Some(g) = group {
             p.join(format!(
@@ -1022,6 +1041,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<QueueHandle> {
+        let group = normalize_group(group);
         let slot = loop {
             let outcome = {
                 let current = self.queue_handles.load();
@@ -1111,6 +1131,7 @@ impl Stroma {
         old: &Arc<QueueSlot>,
         new: Arc<QueueSlot>,
     ) -> Result<bool> {
+        let group = normalize_group(group);
         let current = self.queue_handles.load();
         let mut next = (**current).clone();
         let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
@@ -1248,6 +1269,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> std::io::Result<QueueHandle> {
+        let group = normalize_group(group);
         let current = self.queue_handles.load();
         let key = (tp.into(), part, group.map(|s| s.into()));
         let cell = current.get(&key).ok_or_else(|| {
@@ -2290,6 +2312,7 @@ impl Stroma {
     }
 
     fn remove_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Option<Arc<QueueSlot>> {
+        let group = normalize_group(group);
         let key = (tp.into(), part, group.map(|s| s.into()));
         loop {
             let current = self.queue_handles.load();
@@ -2519,7 +2542,7 @@ impl Stroma {
         //   3. fans out per client completions with their assigned offsets
         let stroma = self.clone();
         let tp_box: Box<str> = tp.into();
-        let group_box: Option<Box<str>> = group.map(|s| s.into());
+        let group_box: Option<Box<str>> = normalize_group(group).map(|s| s.into());
 
         let msg_completion = MsgBatchCompletion::new(
             stroma,
@@ -2578,7 +2601,7 @@ impl Stroma {
             )
             .map_err(io_err)?;
         let tp: Box<str> = tp.into();
-        let group: Option<Box<str>> = group.map(|s| s.into());
+        let group: Option<Box<str>> = normalize_group(group).map(|s| s.into());
         let stroma = self.clone();
         tokio::spawn(async move {
             let msg_res = msg_rx.await;
@@ -2774,7 +2797,11 @@ impl Stroma {
             // Spawn background copy.
             for meta in to_dlq {
                 let stroma = self.clone();
-                let src = (tp.to_string(), part, group.map(String::from));
+                let src = (
+                    tp.to_string(),
+                    part,
+                    normalize_group(group).map(String::from),
+                );
                 let qh2 = qh.clone();
                 tokio::spawn(async move {
                     stroma
@@ -3138,16 +3165,9 @@ impl Stroma {
         let items = snapshot
             .items
             .into_iter()
-            .map(|state| {
+            .filter_map(|state| {
                 let Some((payload, headers)) = records.remove(&state.offset) else {
-                    return MessageInspectionItem {
-                        state,
-                        headers: None,
-                        payload_len: None,
-                        payload: None,
-                        payload_truncated: false,
-                        missing_payload: true,
-                    };
+                    return None;
                 };
 
                 let payload_len = payload.len();
@@ -3158,14 +3178,14 @@ impl Stroma {
                     None
                 };
 
-                MessageInspectionItem {
+                Some(MessageInspectionItem {
                     state,
                     headers: Some(headers),
                     payload_len: Some(payload_len),
                     payload,
                     payload_truncated,
                     missing_payload: false,
-                }
+                })
             })
             .collect();
 
@@ -3528,6 +3548,7 @@ impl Stroma {
     }
 
     fn is_queue_materialized(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
+        let group = normalize_group(group);
         let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
 
         self.queue_handles
@@ -3711,6 +3732,79 @@ mod tests {
 
         assert!(matches!(err, StromaError::InvalidArgument(_)));
         shutdown_stroma("append_message_rejects_user_stroma_headers", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn inspect_messages_skips_offsets_without_log_records() {
+        let dir = test_dir!("inspect_messages_missing_log_records");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        qh.enqueue(0, 0).await.unwrap();
+
+        let page = stroma
+            .inspect_messages("topic", 0, None, 0, 10, InspectMode::ActiveOnly, true, 1024)
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+
+        let page = stroma
+            .inspect_messages(
+                "topic",
+                0,
+                None,
+                0,
+                10,
+                InspectMode::IncludeSettled,
+                true,
+                1024,
+            )
+            .await
+            .unwrap();
+        assert!(page.items.is_empty());
+
+        shutdown_stroma(
+            "inspect_messages_skips_offsets_without_log_records",
+            &stroma,
+        )
+        .await;
+    }
+
+    #[tokio::test]
+    async fn default_group_aliases_ungrouped_queue() {
+        let dir = test_dir!("default_group_aliases_ungrouped_queue");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let offset = publish_one(&stroma, "topic", 0, Some("default")).await;
+        assert_eq!(offset, 0);
+        assert_eq!(stroma.indexed_queue_count(), 1);
+        assert!(stroma.is_queue_materialized("topic", 0, None));
+        assert!(stroma.is_queue_materialized("topic", 0, Some("default")));
+
+        let page = stroma
+            .inspect_messages("topic", 0, None, 0, 10, InspectMode::ActiveOnly, true, 1024)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 1);
+        assert_eq!(page.items[0].state.offset, 0);
+
+        let dlq = GlobalDLQ::new("_dlq.topic", 0, Some("default"))
+            .await
+            .unwrap();
+        assert_eq!(dlq.group, None);
+
+        shutdown_stroma("default_group_aliases_ungrouped_queue", &stroma).await;
     }
 
     #[tokio::test]
