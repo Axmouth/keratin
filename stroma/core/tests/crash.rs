@@ -32,6 +32,7 @@ pub async fn append_one(
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message(tp, part, group, &headers, payload.to_vec(), c)
@@ -81,6 +82,7 @@ async fn enqueue_is_durable_and_replayed() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"hello".to_vec(), completion)
@@ -121,6 +123,7 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"hello".to_vec(), completion)

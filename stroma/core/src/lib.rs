@@ -22,8 +22,8 @@ pub use state::{
     QueueHandle, QueueInternalState, StromaDebugSnapshot,
 };
 pub use stroma::{
-    EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageHeaders,
-    PublishItem, SnapshotConfig, Stroma, StromaKeratinConfig, TaskGroup,
+    EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
+    MessageHeaders, PublishItem, SnapshotConfig, Stroma, StromaKeratinConfig, TaskGroup,
 };
 
 pub type Offset = u64;

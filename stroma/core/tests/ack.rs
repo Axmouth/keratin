@@ -30,6 +30,7 @@ pub async fn append_one(
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message(tp, part, group, &headers, payload.to_vec(), c)
@@ -63,6 +64,7 @@ async fn acked_offsets_never_resurrect() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
 

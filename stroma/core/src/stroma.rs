@@ -465,9 +465,40 @@ impl Drop for TaskGroup {
 }
 
 #[derive(Debug, Clone, Deserialize, Serialize)]
+pub enum MessageContentType {
+    MsgPack,
+    Json,
+    Text,
+    Custom(Box<str>),
+}
+
+impl MessageContentType {
+    pub fn from_header(value: impl Into<String>) -> Self {
+        let value = value.into();
+        match value.split(';').next().map(str::trim) {
+            Some("application/msgpack") => MessageContentType::MsgPack,
+            Some("application/json") => MessageContentType::Json,
+            Some("text/plain") if value == "text/plain; charset=utf-8" => MessageContentType::Text,
+            _ => MessageContentType::Custom(value.into_boxed_str()),
+        }
+    }
+
+    pub fn as_header(&self) -> &str {
+        match self {
+            MessageContentType::MsgPack => "application/msgpack",
+            MessageContentType::Json => "application/json",
+            MessageContentType::Text => "text/plain; charset=utf-8",
+            MessageContentType::Custom(value) => value,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Deserialize, Serialize)]
 pub struct MessageHeaders {
     pub published: u64,
     pub publish_received: u64,
+    #[serde(default)]
+    pub content_type: Option<MessageContentType>,
     pub extra: HashMap<String, String>,
 }
 
@@ -2806,6 +2837,7 @@ impl Stroma {
             let headers = MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
                 published: 0,
                 publish_received: 0,
+                content_type: None,
                 extra: HashMap::new(),
             });
 
@@ -3290,6 +3322,7 @@ fn assert_append_message_send(stroma: Stroma) {
         let headers = MessageHeaders {
             published: 0,
             publish_received: 0,
+            content_type: None,
             extra: Default::default(),
         };
         let (cmp, _rx) = KeratinAppendCompletion::pair();
@@ -3627,6 +3660,7 @@ mod tests {
         let headers = MessageHeaders {
             published: 0,
             publish_received: 0,
+            content_type: None,
             extra: Default::default(),
         };
         test_step(

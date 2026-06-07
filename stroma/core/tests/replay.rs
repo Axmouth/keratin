@@ -54,6 +54,7 @@ async fn expired_messages_survive_restart() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"x".to_vec(), c)

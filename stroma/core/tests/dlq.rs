@@ -49,6 +49,7 @@ async fn append_one(
     let headers = MessageHeaders {
         published: 0,
         publish_received: 0,
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message(tp, part, group, &headers, payload.to_vec(), c)

@@ -32,6 +32,7 @@ pub async fn append_one(
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message(tp, part, group, &headers, payload.to_vec(), c)
@@ -68,6 +69,7 @@ async fn mark_inflight_after_enqueue_is_applied() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"x".to_vec(), completion)
@@ -96,6 +98,7 @@ async fn published_messages_become_deliverable_eventually() {
         let headers = MessageHeaders {
             published: Default::default(),
             publish_received: Default::default(),
+            content_type: None,
             extra: Default::default(),
         };
         st.append_message(
@@ -142,6 +145,7 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"x".to_vec(), completion)
@@ -168,6 +172,7 @@ async fn inflight_before_enqueue_is_ignored() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, "s".as_bytes().to_vec(), completion)
@@ -188,6 +193,7 @@ async fn append_completion_implies_enqueued() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
@@ -209,6 +215,7 @@ async fn append_completions_may_arrive_out_of_order() {
         let headers = MessageHeaders {
             published: Default::default(),
             publish_received: Default::default(),
+            content_type: None,
             extra: Default::default(),
         };
         st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
@@ -236,6 +243,7 @@ async fn poll_ready_delivers_and_marks_inflight() {
         let headers = MessageHeaders {
             published: Default::default(),
             publish_received: Default::default(),
+            content_type: None,
             extra: Default::default(),
         };
         st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
@@ -262,6 +270,7 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
+        content_type: None,
         extra: Default::default(),
     };
     st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
