@@ -16,8 +16,8 @@ use uuid::Uuid;
 
 use crate::StromaError;
 use crate::event::{
-    AckEventMeta, DLQDiscardPolicyWire, DeclareMeta, EnqueueDelayedEventMeta, EnqueueEventMeta,
-    MarkInflightEventMeta, NackEventMeta,
+    AckEventMeta, DLQDiscardPolicyWire, DeadLetterReason, DeclareMeta, EnqueueDelayedEventMeta,
+    EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta,
 };
 use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
@@ -113,7 +113,10 @@ pub enum NackOutcome {
     /// back to ready with delay, retries++
     RequeuedLater { not_before: UnixMillis },
     /// retries exhausted OR requeue=false
-    DeadLetterRequested,
+    DeadLetterRequested {
+        retry_count: u32,
+        reason: DeadLetterReason,
+    },
 }
 
 #[derive(Debug, Clone)]
@@ -2284,8 +2287,8 @@ impl QueueInternalState {
 
         self.inflight.remove(&offset);
 
-        // TODO: use the new enum type and implement delayed retry
         if !requeue {
+            let retry_count = self.retries.get(&offset).copied().unwrap_or(0);
             // Policy-driven: caller (Stroma) decides DLQ vs discard based on dlq_policy.
             // We only mark pending; the local ack happens later via commit_dlq or
             // discard_pending_dlq depending on policy.
@@ -2296,16 +2299,23 @@ impl QueueInternalState {
             // if let DLQDiscardPolicy::Discard = self.dlq_policy {
             //     return NackOutcome::NoOp;
             // }
-            return NackOutcome::DeadLetterRequested;
+            return NackOutcome::DeadLetterRequested {
+                retry_count,
+                reason: DeadLetterReason::TerminalNack,
+            };
         }
 
         let retries = self.retries.entry(offset).or_insert(0);
         if *retries >= self.dlq_discard_max_retries {
+            let retry_count = *retries;
             self.ready.remove(offset..offset + 1);
             self.retries.remove(&offset);
             self.pending_dlq.insert(offset, None);
             self.recompute_hint_if_needed();
-            return NackOutcome::DeadLetterRequested;
+            return NackOutcome::DeadLetterRequested {
+                retry_count,
+                reason: DeadLetterReason::RetriesExhausted,
+            };
         }
 
         *retries += 1;
@@ -3243,6 +3253,7 @@ impl Default for CanonicalQueueState {
 #[cfg(test)]
 mod tests {
     use super::{Offset, QueueInternalState};
+    use crate::event::DeadLetterReason;
     use crate::{
         event::{AckEventMeta, DLQDiscardPolicyWire, DeclareMeta},
         state::{CustomDLQ, DLQDiscardPolicy, NackOutcome},
@@ -4167,7 +4178,13 @@ mod tests {
         s.mark_inflight(1, 100);
         let out = s.nack(1, true); // retries==max -> DLQ
 
-        assert_eq!(out, NackOutcome::DeadLetterRequested);
+        assert_eq!(
+            out,
+            NackOutcome::DeadLetterRequested {
+                retry_count: 2,
+                reason: DeadLetterReason::RetriesExhausted,
+            }
+        );
         assert!(s.is_pending_dlq(1));
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
@@ -4182,7 +4199,13 @@ mod tests {
 
         let out = s.nack(1, false);
 
-        assert_eq!(out, NackOutcome::DeadLetterRequested);
+        assert_eq!(
+            out,
+            NackOutcome::DeadLetterRequested {
+                retry_count: 0,
+                reason: DeadLetterReason::TerminalNack,
+            }
+        );
         assert!(s.is_pending_dlq(1));
         assert!(!s.is_acked(1));
     }
@@ -4214,7 +4237,13 @@ mod tests {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.enqueue(0, 0);
         s.mark_inflight(0, 100);
-        assert_eq!(s.nack(0, false), NackOutcome::DeadLetterRequested);
+        assert_eq!(
+            s.nack(0, false),
+            NackOutcome::DeadLetterRequested {
+                retry_count: 0,
+                reason: DeadLetterReason::TerminalNack,
+            }
+        );
 
         s.commit_dlq(0);
 

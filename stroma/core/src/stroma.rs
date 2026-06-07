@@ -14,7 +14,7 @@ use std::{
 use arc_swap::ArcSwap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
-    KeratinAppendCompletion, KeratinConfig, Message,
+    KeratinAppendCompletion, KeratinConfig, Message, util::unix_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -27,8 +27,8 @@ use tokio_util::sync::CancellationToken;
 use crate::{
     DeclareMeta, Result, StromaError,
     event::{
-        AckEventMeta, DeadLetterMeta, EnqueueDelayedEventMeta, EnqueueEventMeta, NackEventMeta,
-        StromaEvent,
+        AckEventMeta, DeadLetterMeta, DeadLetterReason, EnqueueDelayedEventMeta, EnqueueEventMeta,
+        NackEventMeta, StromaEvent,
     },
     global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome},
     group,
@@ -510,6 +510,15 @@ impl MessageHeaders {
     pub fn decode(bytes: &[u8]) -> Result<Self> {
         rmp_serde::from_slice(bytes).map_err(|err| StromaError::Decode(err.to_string()))
     }
+}
+
+fn validate_user_message_headers(headers: &MessageHeaders) -> Result<()> {
+    if let Some(key) = headers.extra.keys().find(|key| key.starts_with("stroma.")) {
+        return Err(StromaError::InvalidArgument(format!(
+            "header {key:?} uses reserved stroma.* namespace"
+        )));
+    }
+    Ok(())
 }
 
 #[derive(Debug)]
@@ -2153,6 +2162,8 @@ impl Stroma {
                     let qh2 = qh.clone();
                     let meta = DeadLetterMeta {
                         off,
+                        retry_count: 0,
+                        reason: DeadLetterReason::PendingRecovery,
                         target_tp: tp.clone().into(),
                         target_part: part,
                         target_group: grp.clone().map(Into::into),
@@ -2455,6 +2466,10 @@ impl Stroma {
                 completion,
                 not_before,
             } = item;
+            if let Err(err) = validate_user_message_headers(&headers) {
+                completion.complete(Err(IoError::new(err.to_string())));
+                continue;
+            }
             let header_bytes = match headers.encode() {
                 Ok(b) => b,
                 Err(err) => {
@@ -2506,6 +2521,20 @@ impl Stroma {
     }
 
     pub async fn append_message(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        headers: &MessageHeaders,
+        payload: Vec<u8>,
+        event_completion: Box<dyn AppendCompletion<IoError> + Send>,
+    ) -> Result<()> {
+        validate_user_message_headers(headers)?;
+        self.append_message_unchecked(tp, part, group, headers, payload, event_completion)
+            .await
+    }
+
+    async fn append_message_unchecked(
         &self,
         tp: &str,
         part: u32,
@@ -2670,18 +2699,24 @@ impl Stroma {
 
         // Apply -> get outcomes
         let outcomes = qh.nack_many(reqs).await?;
-        let dl_offsets: Vec<Offset> = outcomes
+        let dl_requests: Vec<(Offset, u32, DeadLetterReason)> = outcomes
             .iter()
-            .filter_map(|(o, oc)| matches!(oc, NackOutcome::DeadLetterRequested).then_some(*o))
+            .filter_map(|(o, oc)| match oc {
+                NackOutcome::DeadLetterRequested {
+                    retry_count,
+                    reason,
+                } => Some((*o, *retry_count, *reason)),
+                _ => None,
+            })
             .collect();
 
-        if dl_offsets.is_empty() {
+        if dl_requests.is_empty() {
             completion.complete(Ok(ar));
             return Ok(());
         }
 
         // Phase 2: resolve policy, decide per-offset
-        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_offsets).await?;
+        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_requests).await?;
 
         // Discards: ack-locally directly, no DLQ event needed.
         if !to_discard.is_empty() {
@@ -2766,7 +2801,7 @@ impl Stroma {
     async fn resolve_dlq_targets(
         &self,
         qh: &QueueHandle,
-        offsets: &[Offset],
+        requests: &[(Offset, u32, DeadLetterReason)],
     ) -> Result<(Vec<DeadLetterMeta>, Vec<Offset>)> {
         let resolved = match qh.get_dlq_target().await {
             Ok(t) => t,
@@ -2787,10 +2822,12 @@ impl Stroma {
         };
         match resolved {
             Some((tp, part, grp)) => {
-                let metas = offsets
+                let metas = requests
                     .iter()
-                    .map(|&off| DeadLetterMeta {
-                        off,
+                    .map(|(off, retry_count, reason)| DeadLetterMeta {
+                        off: *off,
+                        retry_count: *retry_count,
+                        reason: *reason,
                         target_tp: tp.clone().into(),
                         target_part: part,
                         target_group: grp.clone().map(Into::into),
@@ -2798,7 +2835,10 @@ impl Stroma {
                     .collect();
                 Ok((metas, Vec::new()))
             }
-            None => Ok((Vec::new(), offsets.to_vec())),
+            None => Ok((
+                Vec::new(),
+                requests.iter().map(|(off, _, _)| *off).collect(),
+            )),
         }
     }
 
@@ -2833,13 +2873,40 @@ impl Stroma {
                 }
             };
 
-            // Preserve user headers without inventing public DLQ metadata.
-            let headers = MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
-                published: 0,
-                publish_received: 0,
-                content_type: None,
-                extra: HashMap::new(),
-            });
+            let mut headers =
+                MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
+                    published: 0,
+                    publish_received: 0,
+                    content_type: None,
+                    extra: HashMap::new(),
+                });
+            headers
+                .extra
+                .insert("stroma.dlq.source_topic".to_string(), src_tp.clone());
+            if let Some(group) = &src_group {
+                headers
+                    .extra
+                    .insert("stroma.dlq.source_group".to_string(), group.clone());
+            }
+            headers
+                .extra
+                .insert("stroma.dlq.source_offset".to_string(), meta.off.to_string());
+            headers.extra.insert(
+                "stroma.dlq.retry_count".to_string(),
+                meta.retry_count.to_string(),
+            );
+            headers.extra.insert(
+                "stroma.dlq.reason".to_string(),
+                meta.reason.as_header().to_string(),
+            );
+            headers.extra.insert(
+                "stroma.dlq.dead_lettered_at_ms".to_string(),
+                unix_millis().to_string(),
+            );
+
+            // Preserve user headers and add Stroma-owned DLQ metadata only on
+            // this uncommon path. Regular messages do not pay for these fields.
+            let headers = headers;
 
             // Append to target with bounded retries.
             let mut attempt = 0u32;
@@ -2847,7 +2914,7 @@ impl Stroma {
             loop {
                 let (cmp, rx) = KeratinAppendCompletion::pair();
                 let res = self
-                    .append_message(
+                    .append_message_unchecked(
                         &meta.target_tp,
                         meta.target_part,
                         target_group,
@@ -3499,6 +3566,37 @@ mod tests {
         assert!(matches!(err, StromaError::InvalidArgument(_)));
 
         shutdown_stroma("global_dlq_setting_validates_target", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn append_message_rejects_user_stroma_headers() {
+        let dir = test_dir!("reserved_header_validation");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let mut headers = MessageHeaders {
+            published: 0,
+            publish_received: 0,
+            content_type: None,
+            extra: HashMap::new(),
+        };
+        headers
+            .extra
+            .insert("stroma.dlq.source_topic".to_string(), "source".to_string());
+        let (cmp, _rx) = KeratinAppendCompletion::pair();
+
+        let err = stroma
+            .append_message("topic", 0, None, &headers, b"x".to_vec(), cmp)
+            .await
+            .unwrap_err();
+
+        assert!(matches!(err, StromaError::InvalidArgument(_)));
+        shutdown_stroma("append_message_rejects_user_stroma_headers", &stroma).await;
     }
 
     #[tokio::test]

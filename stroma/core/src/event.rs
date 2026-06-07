@@ -118,9 +118,48 @@ pub struct MarkInflightEventMeta {
     pub deadline: UnixMillis,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
+pub enum DeadLetterReason {
+    RetriesExhausted,
+    TerminalNack,
+    PendingRecovery,
+}
+
+impl DeadLetterReason {
+    pub fn as_header(&self) -> &'static str {
+        match self {
+            DeadLetterReason::RetriesExhausted => "retries_exhausted",
+            DeadLetterReason::TerminalNack => "terminal_nack",
+            DeadLetterReason::PendingRecovery => "pending_recovery",
+        }
+    }
+
+    fn tag(&self) -> u8 {
+        match self {
+            DeadLetterReason::RetriesExhausted => 0,
+            DeadLetterReason::TerminalNack => 1,
+            DeadLetterReason::PendingRecovery => 2,
+        }
+    }
+
+    fn from_tag(tag: u8) -> io::Result<Self> {
+        match tag {
+            0 => Ok(DeadLetterReason::RetriesExhausted),
+            1 => Ok(DeadLetterReason::TerminalNack),
+            2 => Ok(DeadLetterReason::PendingRecovery),
+            _ => Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid dead letter reason tag",
+            )),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DeadLetterMeta {
     pub off: Offset,
+    pub retry_count: u32,
+    pub reason: DeadLetterReason,
     pub target_tp: Box<str>,
     pub target_part: u32,
     pub target_group: Option<Box<str>>,
@@ -403,6 +442,8 @@ impl StromaEvent {
                 put_u32(&mut out, reqs.len() as u32);
                 for r in reqs {
                     put_u64(&mut out, r.off);
+                    put_u32(&mut out, r.retry_count);
+                    put_u8(&mut out, r.reason.tag());
                     put_str(&mut out, &r.target_tp)?;
                     put_u32(&mut out, r.target_part);
                     put_str(&mut out, r.target_group.as_deref().unwrap_or(""))?;
@@ -579,6 +620,8 @@ impl StromaEvent {
                 let mut reqs = Vec::with_capacity(count);
                 for _ in 0..count {
                     let off = rd_u64(bytes, &mut i)?;
+                    let retry_count = rd_u32(bytes, &mut i)?;
+                    let reason = DeadLetterReason::from_tag(rd_u8(bytes, &mut i)?)?;
                     let target_tp = rd_box_str(bytes, &mut i)?;
                     let target_part = rd_u32(bytes, &mut i)?;
                     let target_group_str = rd_box_str(bytes, &mut i)?;
@@ -589,6 +632,8 @@ impl StromaEvent {
                     };
                     reqs.push(DeadLetterMeta {
                         off,
+                        retry_count,
+                        reason,
                         target_tp,
                         target_part,
                         target_group,
@@ -744,12 +789,16 @@ mod tests {
             reqs: vec![
                 DeadLetterMeta {
                     off: 500,
+                    retry_count: 3,
+                    reason: DeadLetterReason::RetriesExhausted,
                     target_tp: "dlq_topic".into(),
                     target_part: 1,
                     target_group: Some("dlq_group".into()),
                 },
                 DeadLetterMeta {
                     off: 501,
+                    retry_count: 0,
+                    reason: DeadLetterReason::TerminalNack,
                     target_tp: "another_dlq".into(),
                     target_part: 2,
                     target_group: None,
