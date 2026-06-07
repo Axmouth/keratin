@@ -109,6 +109,7 @@ impl NackType {
 pub struct NackEventMeta {
     pub off: Offset,
     pub requeue: bool,
+    pub not_before: Option<UnixMillis>,
 }
 
 // TODO: Add delivery tag?
@@ -435,6 +436,13 @@ impl StromaEvent {
                 for req in reqs {
                     put_u64(&mut out, req.off);
                     put_bool(&mut out, req.requeue);
+                    match req.not_before {
+                        Some(not_before) => {
+                            put_bool(&mut out, true);
+                            put_u64(&mut out, not_before);
+                        }
+                        None => put_bool(&mut out, false),
+                    }
                 }
             }
             StromaEvent::DeadLetter { reqs } => {
@@ -611,7 +619,14 @@ impl StromaEvent {
                 for _ in 0..count {
                     let off = rd_u64(bytes, &mut i)?;
                     let requeue = rd_bool(bytes, &mut i)?;
-                    reqs.push(NackEventMeta { off, requeue });
+                    let not_before = rd_bool(bytes, &mut i)?
+                        .then(|| rd_u64(bytes, &mut i))
+                        .transpose()?;
+                    reqs.push(NackEventMeta {
+                        off,
+                        requeue,
+                        not_before,
+                    });
                 }
                 Ok(StromaEvent::NackMany { reqs })
             }
@@ -946,10 +961,12 @@ mod tests {
                 NackEventMeta {
                     off: 400,
                     requeue: true,
+                    not_before: None,
                 },
                 NackEventMeta {
                     off: 401,
-                    requeue: false,
+                    requeue: true,
+                    not_before: Some(12_345),
                 },
             ],
         };

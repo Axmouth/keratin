@@ -281,18 +281,22 @@ async fn batched_nacks_split_requeue_and_dlq() {
         NackEventMeta {
             off: offs[0],
             requeue: false,
+            not_before: None,
         },
         NackEventMeta {
             off: offs[1],
             requeue: false,
+            not_before: None,
         },
         NackEventMeta {
             off: offs[2],
             requeue: true,
+            not_before: None,
         },
         NackEventMeta {
             off: offs[3],
             requeue: true,
+            not_before: None,
         },
     ];
     nack_many(&st, "src", 0, None, reqs).await;
@@ -334,6 +338,7 @@ async fn dlq_routing_preserves_distinct_payloads() {
         .map(|&off| NackEventMeta {
             off,
             requeue: false,
+            not_before: None,
         })
         .collect();
     nack_many(&st, "src", 0, None, reqs).await;

@@ -1321,6 +1321,7 @@ impl Stroma {
                 let command = QueueCommand::Nack {
                     offset: off,
                     requeue,
+                    not_before: None,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -1740,7 +1741,11 @@ impl Stroma {
 
         // TODO: Examine ability to do in parallel, perhaps a joinset
         for (tp, part, group, off) in expired {
-            let meta = NackEventMeta { off, requeue: true };
+            let meta = NackEventMeta {
+                off,
+                requeue: true,
+                not_before: None,
+            };
 
             let entry = events_per_queue.entry((tp, part, group)).or_default();
             entry.push(meta);
@@ -2669,6 +2674,7 @@ impl Stroma {
             vec![NackEventMeta {
                 off: offset,
                 requeue,
+                not_before: None,
             }],
             completion,
         )

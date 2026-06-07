@@ -313,8 +313,9 @@ pub enum QueueCommand {
     Nack {
         offset: Offset,
         requeue: bool,
+        not_before: Option<UnixMillis>,
         response: Option<oneshot::Sender<NackOutcome>>,
-    }, // offset, requeue
+    }, // offset, requeue, optional retry deadline
     NackMany {
         reqs: Vec<NackEventMeta>,
         response: Option<oneshot::Sender<Vec<(Offset, NackOutcome)>>>,
@@ -1066,9 +1067,10 @@ impl QueueHandle {
             QueueCommand::Nack {
                 offset,
                 requeue,
+                not_before,
                 response,
             } => {
-                let outcome = state.nack(offset, requeue);
+                let outcome = state.nack_at(offset, requeue, not_before);
                 if let Some(r) = response {
                     let _ = r.send(outcome);
                 }
@@ -1531,6 +1533,7 @@ impl QueueHandle {
             .command_enqueue(QueueCommand::Nack {
                 offset,
                 requeue,
+                not_before: None,
                 response: Some(tx),
             })
             .await;
@@ -2273,6 +2276,15 @@ impl QueueInternalState {
     }
 
     pub fn nack(&mut self, offset: u64, requeue: bool) -> NackOutcome {
+        self.nack_at(offset, requeue, None)
+    }
+
+    pub fn nack_at(
+        &mut self,
+        offset: u64,
+        requeue: bool,
+        not_before: Option<UnixMillis>,
+    ) -> NackOutcome {
         if offset < self.settled_until {
             self.inflight.remove(&offset);
             return NackOutcome::NoOp;
@@ -2319,6 +2331,12 @@ impl QueueInternalState {
         }
 
         *retries += 1;
+        if let Some(not_before) = not_before {
+            self.delayed_retry_heap.push((Reverse(not_before), offset));
+            self.recompute_hint_if_needed();
+            return NackOutcome::RequeuedLater { not_before };
+        }
+
         self.ready.insert(offset..offset + 1);
         self.recompute_hint_if_needed();
         NackOutcome::Requeued
@@ -2326,7 +2344,7 @@ impl QueueInternalState {
 
     pub fn nack_many(&mut self, reqs: &[NackEventMeta]) -> Vec<(Offset, NackOutcome)> {
         reqs.iter()
-            .map(|r| (r.off, self.nack(r.off, r.requeue)))
+            .map(|r| (r.off, self.nack_at(r.off, r.requeue, r.not_before)))
             .collect()
     }
 
@@ -4162,6 +4180,27 @@ mod tests {
         assert_eq!(out, NackOutcome::Requeued);
         assert!(s.is_ready(1));
         assert!(!s.is_pending_dlq(1));
+        assert_eq!(s.get_retries(1), 1);
+    }
+
+    #[test]
+    fn nack_requeue_later_waits_until_deadline() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(1, 0);
+        s.mark_inflight(1, 100);
+
+        let out = s.nack_at(1, true, Some(500));
+
+        assert_eq!(out, NackOutcome::RequeuedLater { not_before: 500 });
+        assert!(!s.is_ready(1));
+        assert!(!s.is_inflight(1));
+        assert_eq!(s.get_retries(1), 1);
+
+        let _ = s.collect_expired(499, 100);
+        assert!(!s.is_ready(1));
+
+        let _ = s.collect_expired(500, 100);
+        assert!(s.is_ready(1));
         assert_eq!(s.get_retries(1), 1);
     }
 
