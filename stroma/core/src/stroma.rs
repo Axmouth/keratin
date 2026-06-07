@@ -34,9 +34,9 @@ use crate::{
     group,
     metrics::StromaMetrics,
     state::{
-        CustomDLQ, InspectMode, NackOutcome, Offset, QueueCommand, QueueHandle,
-        QueueInspectionSnapshot, QueueInspectionState, QueueSharedBundle, QueueStatusReport,
-        StromaDebugSnapshot, UnixMillis,
+        CustomDLQ, InspectMode, NackOutcome, Offset, QueueCommand, QueueDebugInfo, QueueHandle,
+        QueueInspectionSnapshot, QueueInspectionState, QueueInternalDebugInfo, QueueSharedBundle,
+        QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
     topic,
 };
@@ -2397,26 +2397,63 @@ impl Stroma {
     // Until then, snapshots give fast startup even if the event log grows.
 
     pub async fn debug_snapshot(&self) -> Result<StromaDebugSnapshot> {
-        let keys = self.queue_keys_snapshot();
+        let map = self.queue_handles.load();
 
         use futures::stream::{FuturesUnordered, StreamExt};
 
         let mut futs = FuturesUnordered::new();
-        for (tp, part, group) in keys {
-            let stroma = self.clone();
-            futs.push(async move {
-                let qh = stroma.queue_handle(&tp, part, group.as_deref()).await?;
-                Ok::<_, StromaError>(qh.full_debug_info().await)
+        let mut queues = Vec::with_capacity(map.len());
+        let mut materialized_queue_count = 0;
+        for ((tp, part, group), slot) in map.iter() {
+            let materialized = slot.handle.get().cloned();
+            let evicting = slot.is_evicting();
+            let exists_on_disk = slot.exists_on_disk;
+            let tp = tp.clone();
+            let group = group.clone();
+            if let Some(qh) = materialized {
+                materialized_queue_count += 1;
+                futs.push(async move {
+                    let mut info = qh.full_debug_info().await;
+                    info.materialized = true;
+                    info.exists_on_disk = exists_on_disk;
+                    info.evicting = evicting;
+                    Ok::<_, StromaError>(info)
+                });
+                continue;
+            }
+
+            queues.push(QueueDebugInfo {
+                topic: tp.to_string(),
+                partition: *part,
+                group: group.map(|group| group.to_string()),
+                materialized: false,
+                exists_on_disk,
+                evicting,
+                applied_upto: 0,
+                last_snapshot_timestamp: 0,
+                last_snapshot_event_offset: 0,
+                dirty_since_snapshot: false,
+                creating_snapshot: false,
+                state: QueueInternalDebugInfo::default(),
             });
         }
 
-        let mut queues = Vec::with_capacity(futs.len());
+        drop(map);
+
         while let Some(result) = futs.next().await {
             queues.push(result?);
         }
 
+        queues.sort_by(|a, b| {
+            a.group
+                .cmp(&b.group)
+                .then_with(|| a.topic.cmp(&b.topic))
+                .then_with(|| a.partition.cmp(&b.partition))
+        });
+
         Ok(StromaDebugSnapshot {
             queue_count: queues.len(),
+            materialized_queue_count,
             queues,
             cmd_queue_depths: self.metrics.cmd_queue_depths_snapshot(),
             snapshot_metrics: self.metrics.snapshot.snapshot(),
@@ -2434,7 +2471,13 @@ impl Stroma {
 
         writeln!(out, "=== Stroma debug report ===").unwrap();
         writeln!(out, "Uptime: {}s", snap.uptime_seconds).unwrap();
-        writeln!(out, "Active queues: {}", snap.queue_count).unwrap();
+        writeln!(out, "Indexed queues: {}", snap.queue_count).unwrap();
+        writeln!(
+            out,
+            "Materialized queues: {}",
+            snap.materialized_queue_count
+        )
+        .unwrap();
         writeln!(out).unwrap();
 
         writeln!(out, "Command queue depths:").unwrap();
@@ -2464,10 +2507,11 @@ impl Stroma {
             let g = q.group.as_deref().unwrap_or("Default");
             writeln!(
                 out,
-                "  {}/{}/{}: ready={} inflight={} settled={} dirty={}",
+                "  {}/{}/{}: loaded={} ready={} inflight={} settled={} dirty={}",
                 q.topic,
                 q.partition,
                 g,
+                q.materialized,
                 q.state.ready_count,
                 q.state.inflight_count,
                 q.state.settled_until,
@@ -3250,8 +3294,8 @@ impl Stroma {
     }
 
     pub fn list_queues(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
-        self.queue_keys_snapshot()
-            .iter()
+        let map = self.queue_handles.load();
+        map.keys()
             .map(|k| {
                 let (tp, part, group) = k;
                 (tp.clone(), *part, group.clone())
@@ -3277,8 +3321,8 @@ impl Stroma {
 
     pub fn list_topics(&self) -> Vec<Box<str>> {
         // TODO: Should return groups too
-        self.queue_keys_snapshot()
-            .iter()
+        let map = self.queue_handles.load();
+        map.keys()
             .map(|k| {
                 let (tp, _, _) = k;
                 tp.clone()
@@ -4154,6 +4198,13 @@ mod tests {
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert_eq!(stroma.materialized_queue_count(), 0);
         assert!(!stroma.is_materialized("topic-a", 0, None));
+        let debug = stroma.debug_snapshot().await.unwrap();
+        assert_eq!(debug.queue_count, 1);
+        assert_eq!(debug.materialized_queue_count, 0);
+        assert_eq!(debug.queues[0].topic, "topic-a");
+        assert!(!debug.queues[0].materialized);
+        assert!(debug.queues[0].exists_on_disk);
+        assert_eq!(stroma.materialized_queue_count(), 0);
 
         shutdown_stroma(
             "unmaterialize_drops_idle_handle_but_keeps_queue_indexed",

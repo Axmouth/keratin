@@ -975,6 +975,9 @@ impl QueueHandle {
             topic: self.topic.clone(),
             partition: self.partition,
             group: self.group.clone(),
+            materialized: true,
+            exists_on_disk: true,
+            evicting: false,
             applied_upto: self.applied_upto.load(Ordering::Relaxed),
             last_snapshot_timestamp: self.last_snapshot_timestamp(),
             last_snapshot_event_offset: self.last_snapshot_event_offset(),
@@ -3383,6 +3386,7 @@ pub struct QueueStatusReport {
 pub struct StromaDebugSnapshot {
     pub queues: Vec<QueueDebugInfo>,
     pub queue_count: usize,
+    pub materialized_queue_count: usize,
     pub cmd_queue_depths: HashMap<String, usize>, // lane name -> depth
     pub snapshot_metrics: SnapshotMetricsSnapshot,
     pub recovery_metrics: RecoveryMetricsSnapshot,
@@ -3395,6 +3399,9 @@ pub struct QueueDebugInfo {
     pub topic: String,
     pub partition: u32,
     pub group: Option<String>,
+    pub materialized: bool,
+    pub exists_on_disk: bool,
+    pub evicting: bool,
 
     pub applied_upto: u64,
     pub last_snapshot_timestamp: u64,
