@@ -2802,25 +2802,12 @@ impl Stroma {
                 }
             };
 
-            // Decode original headers, augment with DLQ metadata.
-            let mut headers =
-                MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
-                    published: 0,
-                    publish_received: 0,
-                    extra: HashMap::new(),
-                });
-            headers
-                .extra
-                .insert("x-dlq-source-tp".into(), src_tp.clone());
-            headers
-                .extra
-                .insert("x-dlq-source-part".into(), src_part.to_string());
-            if let Some(g) = &src_group {
-                headers.extra.insert("x-dlq-source-group".into(), g.clone());
-            }
-            headers
-                .extra
-                .insert("x-dlq-source-offset".into(), meta.off.to_string());
+            // Preserve user headers without inventing public DLQ metadata.
+            let headers = MessageHeaders::decode(&msg.headers).unwrap_or_else(|_| MessageHeaders {
+                published: 0,
+                publish_received: 0,
+                extra: HashMap::new(),
+            });
 
             // Append to target with bounded retries.
             let mut attempt = 0u32;

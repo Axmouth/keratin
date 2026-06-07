@@ -205,14 +205,10 @@ async fn nack_at_max_dead_letters_to_custom_target() {
     assert_eq!(m.payload, b"payload");
 
     let headers = MessageHeaders::decode(&m.headers).unwrap();
-    assert_eq!(
-        headers.extra.get("x-dlq-source-tp").map(String::as_str),
-        Some("src")
-    );
-    assert_eq!(
-        headers.extra.get("x-dlq-source-offset").map(String::as_str),
-        Some(off.to_string().as_str())
-    );
+    assert!(!headers.extra.contains_key("x-dlq-source-tp"));
+    assert!(!headers.extra.contains_key("x-dlq-source-part"));
+    assert!(!headers.extra.contains_key("x-dlq-source-group"));
+    assert!(!headers.extra.contains_key("x-dlq-source-offset"));
 
     let q = st.queue_handle("src", 0, None).await.unwrap();
     assert!(!q.is_ready(off).await);
