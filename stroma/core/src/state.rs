@@ -31,7 +31,7 @@ pub type UnixMillis = u64;
 
 pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
-pub const FORMAT_VERSION: u64 = 1;
+pub const FORMAT_VERSION: u64 = 2;
 
 #[derive(Debug, Clone)]
 pub enum QueueHandleError {
@@ -3178,7 +3178,10 @@ impl QueueInternalState {
         const VERSION_SIZE: usize = size_of::<u64>();
         let version = u64::from_be_bytes(take::<VERSION_SIZE>(&mut bytes)?);
         if version != FORMAT_VERSION {
-            return Err(Error::new(ErrorKind::InvalidData, "unsupported version"));
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!("unsupported snapshot version {version}, expected {FORMAT_VERSION}"),
+            ));
         }
 
         self.reset();

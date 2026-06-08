@@ -2119,7 +2119,12 @@ impl Stroma {
 
             for rec in batch {
                 cur = rec.offset + 1;
-                let ev = StromaEvent::decode(&rec.payload).map_err(decode_err)?;
+                let ev = StromaEvent::decode(&rec.payload).map_err(|err| {
+                    StromaError::Decode(format!(
+                        "event log decode failed at offset {}: {err}",
+                        rec.offset
+                    ))
+                })?;
                 events.push(ev);
                 applied_upto.store(cur, Ordering::Release);
                 events_count += 1;
@@ -2157,7 +2162,11 @@ impl Stroma {
         if let Some((applied_upto, blob)) =
             self.read_queue_snapshot(&self.snap_file(tp, part, group))?
         {
-            qh.load_snapshot(blob).await.map_err(io_err)?;
+            qh.load_snapshot(blob).await.map_err(|err| {
+                StromaError::Io(format!(
+                    "snapshot load failed for tp={tp} part={part} group={group:?}: {err}"
+                ))
+            })?;
             qh.applied_upto().store(applied_upto, Ordering::Release);
             cur = applied_upto;
         }

@@ -8,7 +8,7 @@ pub type Offset = u64;
 pub type UnixMillis = u64;
 
 pub const STROMA_MAGIC: &[u8; 8] = b"STROMA\0\0";
-pub const STROMA_VER: u16 = 1;
+pub const STROMA_VER: u16 = 2;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
