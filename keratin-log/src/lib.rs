@@ -14,7 +14,7 @@ mod writer;
 
 pub use config::*;
 pub use durability::KDurability;
-pub use keratin::Keratin;
+pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};

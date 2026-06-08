@@ -45,6 +45,7 @@ async fn replicated_append_exact_fit_applies_offsets() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     let outcome = k
         .append_replicated_batch(0, vec![msg("a"), msg("b")], Some(KDurability::AfterFsync))
@@ -74,6 +75,7 @@ async fn replicated_append_rejects_gap_without_writing() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     let outcome = k
         .append_replicated_batch(3, vec![msg("late")], None)
@@ -97,6 +99,7 @@ async fn replicated_append_reports_already_present_batch() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
         .await
@@ -124,6 +127,7 @@ async fn replicated_append_reports_partial_overlap_without_writing() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
         .await
@@ -152,6 +156,7 @@ async fn replicated_append_can_append_suffix_after_known_prefix() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
         .await
@@ -193,6 +198,7 @@ async fn reset_to_checkpoint_starts_empty_log_at_offset() {
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
         .await
         .unwrap();
+    k.become_follower();
 
     k.append_replicated_batch(0, vec![msg("old-a"), msg("old-b")], None)
         .await
@@ -244,6 +250,7 @@ async fn reset_to_checkpoint_persists_across_reopen() {
         let k = Keratin::open(&dir.root, KeratinConfig::test_default())
             .await
             .unwrap();
+        k.become_follower();
         k.append_replicated_batch(0, vec![msg("old")], None)
             .await
             .unwrap();
@@ -263,6 +270,52 @@ async fn reset_to_checkpoint_persists_across_reopen() {
     assert_eq!(got.len(), 1);
     assert_eq!(got[0].offset, 5);
     assert_eq!(got[0].payload, b"new");
+}
+
+#[tokio::test]
+async fn keratin_role_guards_normal_and_replicated_writes() {
+    let dir = test_dir!("keratin_role_guards");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    assert_eq!(k.role(), KeratinRole::Owner);
+    assert!(
+        k.append_replicated_batch(0, vec![msg("replicated")], None)
+            .await
+            .is_err(),
+        "owner mode must not accept replicated appends"
+    );
+
+    k.become_follower();
+    assert_eq!(k.role(), KeratinRole::Follower);
+    assert!(
+        k.append(msg("owner-write"), None).await.is_err(),
+        "follower mode must not accept owner appends"
+    );
+    assert!(
+        k.append_replicated_batch(0, vec![msg("replicated")], None)
+            .await
+            .is_ok(),
+        "follower mode should accept replicated appends"
+    );
+
+    k.freeze();
+    assert_eq!(k.role(), KeratinRole::Frozen);
+    assert!(
+        k.append(msg("owner-write"), None).await.is_err(),
+        "frozen mode must not accept owner appends"
+    );
+    assert!(
+        k.append_replicated_batch(1, vec![msg("replicated")], None)
+            .await
+            .is_err(),
+        "frozen mode must not accept replicated appends"
+    );
+
+    k.become_owner();
+    assert_eq!(k.role(), KeratinRole::Owner);
+    assert!(k.append(msg("owner-write"), None).await.is_ok());
 }
 
 #[tokio::test]

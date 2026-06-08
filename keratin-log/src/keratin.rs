@@ -5,7 +5,7 @@ use std::fs::File;
 use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::oneshot;
 
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
@@ -24,6 +24,55 @@ pub struct Keratin {
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
     _lock: Option<File>,
     shutdown_started: AtomicBool,
+    role: AtomicU8,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum KeratinRole {
+    Owner,
+    Follower,
+    Frozen,
+}
+
+impl KeratinRole {
+    const OWNER: u8 = 0;
+    const FOLLOWER: u8 = 1;
+    const FROZEN: u8 = 2;
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            Self::FOLLOWER => Self::Follower,
+            Self::FROZEN => Self::Frozen,
+            _ => Self::Owner,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Owner => Self::OWNER,
+            Self::Follower => Self::FOLLOWER,
+            Self::Frozen => Self::FROZEN,
+        }
+    }
+}
+
+pub trait KeratinReplicaExt {
+    async fn append_replicated_batch(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError>;
+
+    async fn append_replicated_batch_with_mode(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        mode: ReplicatedAppendMode,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError>;
+
+    async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()>;
 }
 
 pub enum WriterCmd {
@@ -108,6 +157,7 @@ impl Keratin {
             segment_mapping,
             _lock: Some(lock_file),
             shutdown_started: AtomicBool::new(false),
+            role: AtomicU8::new(KeratinRole::Owner.as_u8()),
         })
     }
 
@@ -121,6 +171,7 @@ impl Keratin {
         durability: Option<KDurability>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
+        self.ensure_role(KeratinRole::Owner, "append")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::One(payload),
@@ -137,6 +188,7 @@ impl Keratin {
         payload: Message,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
+        self.ensure_role(KeratinRole::Owner, "append")?;
         let (completion, rx) = KeratinAppendCompletion::pair();
 
         let req = crate::writer::AppendReq {
@@ -157,6 +209,7 @@ impl Keratin {
         durability: Option<KDurability>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
+        self.ensure_role(KeratinRole::Owner, "append_batch")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::Many(payloads),
@@ -173,6 +226,7 @@ impl Keratin {
         payloads: Vec<Message>,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
+        self.ensure_role(KeratinRole::Owner, "append_batch")?;
         let (completion, rx) = KeratinAppendCompletion::pair();
 
         let req = crate::writer::AppendReq {
@@ -182,42 +236,6 @@ impl Keratin {
         };
         self.tx
             .send(WriterCmd::Append(req))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
-        rx.await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
-    }
-
-    pub async fn append_replicated_batch(
-        &self,
-        first_offset: u64,
-        records: Vec<Message>,
-        durability: Option<KDurability>,
-    ) -> Result<ReplicatedAppendOutcome, IoError> {
-        self.append_replicated_batch_with_mode(
-            first_offset,
-            records,
-            ReplicatedAppendMode::ExactFit,
-            durability,
-        )
-        .await
-    }
-
-    pub async fn append_replicated_batch_with_mode(
-        &self,
-        first_offset: u64,
-        records: Vec<Message>,
-        mode: ReplicatedAppendMode,
-        durability: Option<KDurability>,
-    ) -> Result<ReplicatedAppendOutcome, IoError> {
-        let (respond_to, rx) = oneshot::channel();
-        self.tx
-            .send(WriterCmd::ReplicatedAppend {
-                first_offset,
-                records,
-                mode,
-                durability,
-                respond_to,
-            })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
@@ -247,16 +265,33 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
-    pub async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
-        let (respond_to, rx) = oneshot::channel();
-        self.tx
-            .send(WriterCmd::ResetToCheckpoint {
-                next_offset,
-                respond_to,
-            })
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
-        rx.await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    pub fn role(&self) -> KeratinRole {
+        KeratinRole::from_u8(self.role.load(Ordering::Acquire))
+    }
+
+    pub fn become_owner(&self) {
+        self.role
+            .store(KeratinRole::Owner.as_u8(), Ordering::Release);
+    }
+
+    pub fn become_follower(&self) {
+        self.role
+            .store(KeratinRole::Follower.as_u8(), Ordering::Release);
+    }
+
+    pub fn freeze(&self) {
+        self.role
+            .store(KeratinRole::Frozen.as_u8(), Ordering::Release);
+    }
+
+    fn ensure_role(&self, expected: KeratinRole, op: &str) -> Result<(), IoError> {
+        let actual = self.role();
+        if actual == expected {
+            return Ok(());
+        }
+        Err(IoError::new(format!(
+            "{op} requires Keratin role {expected:?}, current role is {actual:?}"
+        )))
     }
 
     pub async fn shutdown(&self) -> std::io::Result<()> {
@@ -305,6 +340,59 @@ impl Keratin {
 
         std::mem::forget(self); // 💀 Drop will NOT run
         Ok(())
+    }
+}
+
+impl KeratinReplicaExt for Keratin {
+    async fn append_replicated_batch(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError> {
+        self.append_replicated_batch_with_mode(
+            first_offset,
+            records,
+            ReplicatedAppendMode::ExactFit,
+            durability,
+        )
+        .await
+    }
+
+    async fn append_replicated_batch_with_mode(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        mode: ReplicatedAppendMode,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError> {
+        self.ensure_role(KeratinRole::Follower, "append_replicated_batch")?;
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ReplicatedAppend {
+                first_offset,
+                records,
+                mode,
+                durability,
+                respond_to,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
+        self.ensure_role(KeratinRole::Follower, "reset_to_checkpoint")
+            .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ResetToCheckpoint {
+                next_offset,
+                respond_to,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 }
 
