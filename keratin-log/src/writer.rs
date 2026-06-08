@@ -9,7 +9,7 @@ use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
 use crate::batcher::{BatcherConfig, BatcherCore, Deadline, FlushReason, PushResult};
 use crate::durability::KDurability;
 use crate::keratin::WriterCmd;
-use crate::log::{AppendResult, Log, LogState};
+use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
 use crate::record::Message;
 use crate::{AppendCompletion, KeratinConfig};
 
@@ -336,6 +336,45 @@ fn writer_loop(
                     }
                 }
             }
+            WriterCmd::ReplicatedAppend {
+                first_offset,
+                records,
+                mode,
+                durability,
+                respond_to,
+            } => {
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    let total_bytes =
+                        stage_reqs(log, &cfg, &state, &mut pending, unstaged, &notify_tx);
+                    post_stage_commit_and_tune(
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        &mut durable_offset,
+                        &mut last_fsync,
+                        fsync_interval,
+                        total_bytes,
+                        &notify_tx,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+
+                let res = stage_replicated_req(
+                    log,
+                    &state,
+                    first_offset,
+                    &records,
+                    mode,
+                    durability.unwrap_or(cfg.default_durability),
+                );
+                if let Err(_err) = respond_to.send(res) {
+                    tracing::info!("Error sending replicated append response");
+                }
+            }
             WriterCmd::Truncate { before, respond_to } => {
                 tracing::info!("Truncate before {before}..");
                 if let Err(e) = respond_to.send(log.truncate_before(before)).map_err(|_| {
@@ -373,6 +412,40 @@ fn writer_loop(
             }
         }
     }
+}
+
+fn stage_replicated_req(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    first_offset: u64,
+    records: &[Message],
+    mode: ReplicatedAppendMode,
+    durability: KDurability,
+) -> Result<ReplicatedAppendOutcome, IoError> {
+    let now_ms = crate::util::unix_millis();
+    let (outcome, end_offset) =
+        log.stage_replicated_append_batch(first_offset, records, mode, now_ms)?;
+
+    if let Some(end_offset) = end_offset {
+        state.tail.store(end_offset + 1, Ordering::Release);
+
+        match durability {
+            KDurability::AfterWrite => {
+                log.flush_buffers()?;
+                log.flush()?;
+            }
+            KDurability::AfterFsync => {
+                log.flush_buffers()?;
+                log.flush()?;
+                log.fsync()?;
+                state
+                    .durable
+                    .store(log.durable_watermark(), Ordering::Release);
+            }
+        }
+    }
+
+    Ok(outcome)
 }
 
 /// Stage a flushed batch of AppendReqs.

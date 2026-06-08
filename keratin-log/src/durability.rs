@@ -2,5 +2,4 @@
 pub enum KDurability {
     AfterWrite,
     AfterFsync,
-    AfterReplicated, // reserved
 }

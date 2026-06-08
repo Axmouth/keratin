@@ -8,7 +8,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, Ordering};
 use tokio::sync::oneshot;
 
-use crate::log::{AppendResult, Log, LogState};
+use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::writer::{AppendPayload, AppendReq, IoError, WriterHandle};
@@ -28,6 +28,13 @@ pub struct Keratin {
 
 pub enum WriterCmd {
     Append(AppendReq),
+    ReplicatedAppend {
+        first_offset: u64,
+        records: Vec<Message>,
+        mode: ReplicatedAppendMode,
+        durability: Option<KDurability>,
+        respond_to: oneshot::Sender<Result<ReplicatedAppendOutcome, IoError>>,
+    },
     Truncate {
         before: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
@@ -171,6 +178,42 @@ impl Keratin {
         };
         self.tx
             .send(WriterCmd::Append(req))
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    pub async fn append_replicated_batch(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError> {
+        self.append_replicated_batch_with_mode(
+            first_offset,
+            records,
+            ReplicatedAppendMode::ExactFit,
+            durability,
+        )
+        .await
+    }
+
+    pub async fn append_replicated_batch_with_mode(
+        &self,
+        first_offset: u64,
+        records: Vec<Message>,
+        mode: ReplicatedAppendMode,
+        durability: Option<KDurability>,
+    ) -> Result<ReplicatedAppendOutcome, IoError> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ReplicatedAppend {
+                first_offset,
+                records,
+                mode,
+                durability,
+                respond_to,
+            })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?

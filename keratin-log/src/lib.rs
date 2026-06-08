@@ -15,7 +15,7 @@ mod writer;
 pub use config::*;
 pub use durability::KDurability;
 pub use keratin::Keratin;
-pub use log::AppendResult;
+pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
 pub use writer::IoError;

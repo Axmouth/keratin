@@ -26,6 +26,36 @@ pub struct AppendResult {
     pub count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicatedAppendOutcome {
+    Applied(AppendResult),
+    AppliedSuffix {
+        requested_first_offset: u64,
+        skipped_count: u32,
+        result: AppendResult,
+    },
+    AlreadyPresent {
+        first_offset: u64,
+        count: u32,
+        next_offset: u64,
+    },
+    Overlap {
+        first_offset: u64,
+        count: u32,
+        next_offset: u64,
+    },
+    Gap {
+        expected_offset: u64,
+        first_offset: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicatedAppendMode {
+    ExactFit,
+    AppendSuffixAfterKnownPrefix,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogState {
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
@@ -314,6 +344,179 @@ impl Log {
                 count: payloads.len() as u32,
             },
             end_offset,
+        ))
+    }
+
+    pub fn stage_replicated_append_batch(
+        &mut self,
+        first_offset: u64,
+        payloads: &[Message],
+        mode: ReplicatedAppendMode,
+        now_ms: u64,
+    ) -> io::Result<(ReplicatedAppendOutcome, Option<u64>)> {
+        let count = u32::try_from(payloads.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "replicated batch too large")
+        })?;
+        let current_next = self.next_offset;
+
+        if payloads.is_empty() {
+            return Ok((
+                if first_offset == current_next {
+                    ReplicatedAppendOutcome::Applied(AppendResult {
+                        base_offset: first_offset,
+                        count,
+                    })
+                } else if first_offset < current_next {
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    }
+                } else {
+                    ReplicatedAppendOutcome::Gap {
+                        expected_offset: current_next,
+                        first_offset,
+                    }
+                },
+                None,
+            ));
+        }
+
+        if first_offset > current_next {
+            return Ok((
+                ReplicatedAppendOutcome::Gap {
+                    expected_offset: current_next,
+                    first_offset,
+                },
+                None,
+            ));
+        }
+
+        let end_offset = first_offset
+            .checked_add(payloads.len() as u64)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+
+        if first_offset < current_next {
+            if end_offset < current_next {
+                return Ok((
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            if end_offset == current_next.saturating_sub(1) {
+                return Ok((
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            if mode == ReplicatedAppendMode::ExactFit {
+                return Ok((
+                    ReplicatedAppendOutcome::Overlap {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            let skip = usize::try_from(current_next - first_offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replicated suffix skip overflow",
+                )
+            })?;
+            let suffix = &payloads[skip..];
+            let (outcome, end_offset) = self.stage_replicated_append_batch(
+                current_next,
+                suffix,
+                ReplicatedAppendMode::ExactFit,
+                now_ms,
+            )?;
+
+            return Ok((
+                match outcome {
+                    ReplicatedAppendOutcome::Applied(result) => {
+                        ReplicatedAppendOutcome::AppliedSuffix {
+                            requested_first_offset: first_offset,
+                            skipped_count: skip as u32,
+                            result,
+                        }
+                    }
+                    _ => outcome,
+                },
+                end_offset,
+            ));
+        }
+
+        let estimated: usize = payloads.iter().map(|p| p.bytes_len()).sum();
+
+        let pending_bytes = self.write_buf.len() as u64;
+        if self.active.bytes_written + pending_bytes + estimated as u64
+            > self.manifest.segment_max_bytes
+        {
+            self.roll(now_ms)?;
+        }
+
+        self.write_buf.reserve(estimated);
+        self.idx_buf
+            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+
+        let t_encode = Instant::now();
+
+        for (idx, payload) in payloads.iter().enumerate() {
+            let offset = first_offset + idx as u64;
+
+            let r = Record {
+                flags: payload.flags,
+                timestamp_ms: now_ms,
+                offset,
+                headers: &payload.headers,
+                payload: &payload.payload,
+            };
+
+            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
+
+            encode_record(&mut self.write_buf, &r)
+                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+            if (record_start_pos - self.last_index_at_log_pos)
+                >= self.manifest.index_stride_bytes as u64
+            {
+                let rel = (offset - self.active.base_offset) as u32;
+
+                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
+                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
+                self.idx_buf
+                    .extend_from_slice(&record_start_pos.to_be_bytes());
+
+                self.last_index_at_log_pos = record_start_pos;
+            }
+        }
+
+        self.next_offset = end_offset + 1;
+        self.stats.encode += t_encode.elapsed();
+        self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
+        self.stats.records += payloads.len() as u64;
+        self.staged_end_offset = end_offset;
+
+        Ok((
+            ReplicatedAppendOutcome::Applied(AppendResult {
+                base_offset: first_offset,
+                count,
+            }),
+            Some(end_offset),
         ))
     }
 

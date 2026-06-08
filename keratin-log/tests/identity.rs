@@ -2,6 +2,14 @@ use std::sync::Arc;
 
 use keratin_log::*;
 
+fn msg(payload: impl Into<Vec<u8>>) -> Message {
+    Message {
+        flags: 0,
+        headers: vec![],
+        payload: payload.into(),
+    }
+}
+
 #[tokio::test]
 async fn open_fails_when_already_open() {
     let dir = test_dir!("keratin_lock");
@@ -29,6 +37,154 @@ async fn open_fails_when_already_open() {
         .expect("open after drop should succeed");
 
     drop(k3);
+}
+
+#[tokio::test]
+async fn replicated_append_exact_fit_applies_offsets() {
+    let dir = test_dir!("replicated_exact_fit");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    let outcome = k
+        .append_replicated_batch(0, vec![msg("a"), msg("b")], Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::Applied(AppendResult {
+            base_offset: 0,
+            count: 2
+        })
+    );
+    assert_eq!(k.next_offset(), 2);
+
+    let got = k.reader().scan_from(0, 10).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].offset, 0);
+    assert_eq!(got[0].payload, b"a");
+    assert_eq!(got[1].offset, 1);
+    assert_eq!(got[1].payload, b"b");
+}
+
+#[tokio::test]
+async fn replicated_append_rejects_gap_without_writing() {
+    let dir = test_dir!("replicated_gap");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    let outcome = k
+        .append_replicated_batch(3, vec![msg("late")], None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::Gap {
+            expected_offset: 0,
+            first_offset: 3,
+        }
+    );
+    assert_eq!(k.next_offset(), 0);
+    assert!(k.reader().scan_from(0, 10).unwrap().is_empty());
+}
+
+#[tokio::test]
+async fn replicated_append_reports_already_present_batch() {
+    let dir = test_dir!("replicated_already_present");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    let outcome = k
+        .append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::AlreadyPresent {
+            first_offset: 0,
+            count: 2,
+            next_offset: 2,
+        }
+    );
+    assert_eq!(k.reader().scan_from(0, 10).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replicated_append_reports_partial_overlap_without_writing() {
+    let dir = test_dir!("replicated_partial_overlap");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    let outcome = k
+        .append_replicated_batch(1, vec![msg("b"), msg("c")], None)
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::Overlap {
+            first_offset: 1,
+            count: 2,
+            next_offset: 2,
+        }
+    );
+    assert_eq!(k.next_offset(), 2);
+    assert_eq!(k.reader().scan_from(0, 10).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replicated_append_can_append_suffix_after_known_prefix() {
+    let dir = test_dir!("replicated_suffix_overlap");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    let outcome = k
+        .append_replicated_batch_with_mode(
+            1,
+            vec![msg("b"), msg("c"), msg("d")],
+            ReplicatedAppendMode::AppendSuffixAfterKnownPrefix,
+            None,
+        )
+        .await
+        .unwrap();
+
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::AppliedSuffix {
+            requested_first_offset: 1,
+            skipped_count: 1,
+            result: AppendResult {
+                base_offset: 2,
+                count: 2
+            },
+        }
+    );
+
+    let got = k.reader().scan_from(0, 10).unwrap();
+    assert_eq!(got.len(), 4);
+    assert_eq!(got[0].payload, b"a");
+    assert_eq!(got[1].payload, b"b");
+    assert_eq!(got[2].payload, b"c");
+    assert_eq!(got[3].payload, b"d");
 }
 
 #[tokio::test]
