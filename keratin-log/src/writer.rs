@@ -385,6 +385,26 @@ fn writer_loop(
                     tracing::info!("Truncate successful, before {before}");
                 }
             }
+            WriterCmd::ResetToCheckpoint {
+                next_offset,
+                respond_to,
+            } => {
+                shutdown_fail_reqs(batcher.flush(), "writer reset to checkpoint", &notify_tx);
+                fail_all_pending(
+                    &mut pending,
+                    "writer reset to checkpoint",
+                    &notify_tx,
+                    false,
+                );
+                let res = log.reset_to_checkpoint(next_offset, crate::util::unix_millis());
+                if res.is_ok() {
+                    durable_offset = log.durable_watermark();
+                    last_fsync = Instant::now();
+                }
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending reset-to-checkpoint response");
+                }
+            }
             WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
                 // Sync changes
@@ -632,7 +652,10 @@ fn shutdown_fail_unstaged(
     _why: FlushReason,
     notify_tx: &Sender<NotifyMsg>,
 ) {
-    let reqs = batcher.flush();
+    shutdown_fail_reqs(batcher.flush(), msg, notify_tx);
+}
+
+fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<NotifyMsg>) {
     let mut items = Vec::new();
     for r in reqs {
         items.push(NotifyItem {
@@ -642,7 +665,9 @@ fn shutdown_fail_unstaged(
             }),
         });
     }
-    let _ = notify_tx.send(NotifyMsg::Batch(items));
+    if !items.is_empty() {
+        let _ = notify_tx.send(NotifyMsg::Batch(items));
+    }
 }
 
 fn commit(

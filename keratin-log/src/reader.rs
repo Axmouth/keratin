@@ -71,7 +71,15 @@ impl LogReader {
         while out.len() < max {
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
-                None => break,
+                None => {
+                    if let Some(first) = self.first_segment_base()
+                        && cur < first
+                    {
+                        cur = first;
+                        continue;
+                    }
+                    break;
+                }
             };
 
             let mut log = self.open_log(base)?;
@@ -288,6 +296,10 @@ impl LogReader {
             .range((base + 1)..)
             .next()
             .map(|(k, _)| *k)
+    }
+
+    fn first_segment_base(&self) -> Option<u64> {
+        self.segment_mapping.read().keys().next().copied()
     }
 
     fn find_segment_base(&self, offset: u64) -> io::Result<Option<u64>> {

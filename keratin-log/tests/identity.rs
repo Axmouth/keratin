@@ -188,6 +188,84 @@ async fn replicated_append_can_append_suffix_after_known_prefix() {
 }
 
 #[tokio::test]
+async fn reset_to_checkpoint_starts_empty_log_at_offset() {
+    let dir = test_dir!("reset_to_checkpoint");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    k.append_replicated_batch(0, vec![msg("old-a"), msg("old-b")], None)
+        .await
+        .unwrap();
+    k.reset_to_checkpoint(10).await.unwrap();
+
+    assert_eq!(k.head_offset(), 10);
+    assert_eq!(k.next_offset(), 10);
+    assert!(k.reader().scan_from(0, 20).unwrap().is_empty());
+
+    let old_outcome = k
+        .append_replicated_batch(8, vec![msg("too-old")], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        old_outcome,
+        ReplicatedAppendOutcome::AlreadyPresent {
+            first_offset: 8,
+            count: 1,
+            next_offset: 10,
+        }
+    );
+
+    let outcome = k
+        .append_replicated_batch(10, vec![msg("new-a"), msg("new-b")], None)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        ReplicatedAppendOutcome::Applied(AppendResult {
+            base_offset: 10,
+            count: 2
+        })
+    );
+
+    let got = k.reader().scan_from(10, 20).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].offset, 10);
+    assert_eq!(got[0].payload, b"new-a");
+    assert_eq!(got[1].offset, 11);
+    assert_eq!(got[1].payload, b"new-b");
+}
+
+#[tokio::test]
+async fn reset_to_checkpoint_persists_across_reopen() {
+    let dir = test_dir!("reset_to_checkpoint_reopen");
+
+    {
+        let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        k.append_replicated_batch(0, vec![msg("old")], None)
+            .await
+            .unwrap();
+        k.reset_to_checkpoint(5).await.unwrap();
+        k.append_replicated_batch(5, vec![msg("new")], Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+    }
+
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    assert_eq!(k.head_offset(), 5);
+    assert_eq!(k.next_offset(), 6);
+
+    let got = k.reader().scan_from(0, 20).unwrap();
+    assert_eq!(got.len(), 1);
+    assert_eq!(got[0].offset, 5);
+    assert_eq!(got[0].payload, b"new");
+}
+
+#[tokio::test]
 async fn wal_append_scan_identity() {
     let dir = test_dir!("wal_identity");
 

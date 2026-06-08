@@ -18,6 +18,7 @@ use crate::{
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
     segment::Segment,
+    util::fsync_dir,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -828,6 +829,54 @@ impl Log {
         self.log_state.head.store(new_head, Ordering::Release);
 
         Ok(new_head)
+    }
+
+    pub fn reset_to_checkpoint(&mut self, next_offset: u64, now_ms: u64) -> io::Result<()> {
+        self.flush_buffers()?;
+        self.flush()?;
+        self.fsync()?;
+
+        let seg_dir = self.root.join("segments");
+        for ent in fs::read_dir(&seg_dir)? {
+            let ent = ent?;
+            let path = ent.path();
+            let is_log_or_idx = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "log" || ext == "idx")
+                .unwrap_or(false);
+            if is_log_or_idx {
+                fs::remove_file(path)?;
+            }
+        }
+
+        self.segment_mapping.write().clear();
+
+        let (seg, idx, seg_path) = create_segment_pair(&self.root, next_offset, now_ms)?;
+        self.active = seg;
+        self.index = idx;
+        self.segment_mapping.write().insert(next_offset, seg_path);
+
+        self.write_buf.clear();
+        self.idx_buf.clear();
+        self.next_offset = next_offset;
+        self.staged_end_offset = next_offset.saturating_sub(1);
+        self.durable_offset = self.staged_end_offset;
+        self.last_index_at_log_pos = self.active.bytes_written;
+
+        self.manifest.active_base_offset = next_offset;
+        self.manifest.next_offset = next_offset;
+        self.manifest.head_offset = next_offset;
+        self.manifest.store_atomic(&self.root)?;
+        fsync_dir(&seg_dir)?;
+
+        self.log_state.head.store(next_offset, Ordering::Release);
+        self.log_state.tail.store(next_offset, Ordering::Release);
+        self.log_state
+            .durable
+            .store(self.durable_offset, Ordering::Release);
+
+        Ok(())
     }
 
     fn cleanup_orphans(seg_dir: &Path) -> io::Result<()> {

@@ -39,6 +39,10 @@ pub enum WriterCmd {
         before: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
     },
+    ResetToCheckpoint {
+        next_offset: u64,
+        respond_to: oneshot::Sender<io::Result<()>>,
+    },
     Shutdown {
         notify_tx: oneshot::Sender<()>,
     },
@@ -237,6 +241,18 @@ impl Keratin {
             .send(WriterCmd::Truncate {
                 before,
                 respond_to: tx,
+            })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    pub async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ResetToCheckpoint {
+                next_offset,
+                respond_to,
             })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
