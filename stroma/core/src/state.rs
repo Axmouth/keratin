@@ -847,6 +847,16 @@ impl CommandSender {
     }
 }
 
+fn command_send_error(err: mpsc::error::SendError<QueueCommandPackage>) -> std::io::Error {
+    std::io::Error::new(
+        std::io::ErrorKind::BrokenPipe,
+        format!(
+            "queue actor is gone while sending {}",
+            err.0.command.variant_name()
+        ),
+    )
+}
+
 #[derive(Debug, Clone)]
 pub struct QueueSharedBundle {
     pub msg_log: Arc<Keratin>,
@@ -1426,22 +1436,22 @@ impl QueueHandle {
     }
 
     pub async fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        let _ = self
-            .command_sender
+        self.command_sender
             .send(QueueCommandPackage {
                 command: cmd,
                 enqueued_at: Instant::now(),
             })
-            .await;
-        Ok(())
+            .await
+            .map_err(command_send_error)
     }
 
     pub fn blocking_command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        let _ = self.command_sender.blocking_send(QueueCommandPackage {
-            command: cmd,
-            enqueued_at: Instant::now(),
-        });
-        Ok(())
+        self.command_sender
+            .blocking_send(QueueCommandPackage {
+                command: cmd,
+                enqueued_at: Instant::now(),
+            })
+            .map_err(command_send_error)
     }
 
     pub async fn debug_info(&self) -> QueueInternalDebugInfo {

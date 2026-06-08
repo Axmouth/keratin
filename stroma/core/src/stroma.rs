@@ -4214,6 +4214,49 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn displaced_queue_handle_rejects_commands_after_unmaterialize() {
+        let dir = test_dir!("evicted_handle_rejects_commands");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        assert_eq!(
+            stroma.unmaterialize("topic-a", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+
+        let async_err = qh
+            .command_enqueue(QueueCommand::Enqueue {
+                offset: 1,
+                retries: 0,
+                response: None,
+            })
+            .await
+            .expect_err("displaced async queue handle should reject commands");
+        assert_eq!(async_err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        let blocking_err = std::thread::spawn(move || {
+            qh.blocking_command_enqueue(QueueCommand::Enqueue {
+                offset: 2,
+                retries: 0,
+                response: None,
+            })
+            .expect_err("displaced blocking queue handle should reject commands")
+        })
+        .join()
+        .expect("blocking enqueue thread panicked");
+        assert_eq!(blocking_err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        shutdown_stroma("displaced_queue_handle_rejects_commands", &stroma).await;
+    }
+
+    #[tokio::test]
     async fn materialize_after_unmaterialize_recovers_messages() {
         let dir = test_dir!("evict_then_recover_queue");
 
@@ -4261,6 +4304,68 @@ mod tests {
         );
 
         shutdown_stroma("materialize_after_unmaterialize_recovers_messages", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn materialize_and_unmaterialize_race_without_double_open() {
+        let dir = test_dir!("materialize_unmaterialize_race");
+
+        let stroma = Arc::new(
+            Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap(),
+        );
+        publish_one(&stroma, "topic-a", 0, None).await;
+
+        for i in 0..64 {
+            let barrier = Arc::new(tokio::sync::Barrier::new(3));
+
+            let materialize_barrier = barrier.clone();
+            let materialize_stroma = stroma.clone();
+            let materialize = tokio::spawn(async move {
+                materialize_barrier.wait().await;
+                materialize_stroma.materialize("topic-a", 0, None).await
+            });
+
+            let evict_barrier = barrier.clone();
+            let evict_stroma = stroma.clone();
+            let evict = tokio::spawn(async move {
+                evict_barrier.wait().await;
+                evict_stroma.unmaterialize("topic-a", 0, None).await
+            });
+
+            barrier.wait().await;
+
+            materialize
+                .await
+                .unwrap()
+                .unwrap_or_else(|err| panic!("materialize failed on iteration {i}: {err:?}"));
+
+            match evict.await.unwrap() {
+                Ok(
+                    EvictOutcome::Evicted | EvictOutcome::NotMaterialized | EvictOutcome::RaceLost,
+                ) => {}
+                Ok(other) => panic!("unexpected evict outcome on iteration {i}: {other:?}"),
+                Err(err) => panic!("unmaterialize failed on iteration {i}: {err:?}"),
+            }
+        }
+
+        test_step(
+            "materialize_and_unmaterialize_race_without_double_open/final-materialize",
+            stroma.materialize("topic-a", 0, None),
+        )
+        .await
+        .unwrap();
+
+        shutdown_stroma(
+            "materialize_and_unmaterialize_race_without_double_open",
+            &stroma,
+        )
+        .await;
     }
 
     #[tokio::test]
