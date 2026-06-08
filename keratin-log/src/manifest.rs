@@ -80,7 +80,9 @@ impl Manifest {
         if ver != MAN_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
-                "bad manifest version",
+                format!(
+                    "unsupported Keratin manifest version {ver}, expected {MAN_VERSION}. Pre-0.1 data may need to be recreated"
+                ),
             ));
         }
         let header_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;

@@ -66,7 +66,9 @@ pub enum ReplicatedAppendMode {
 pub struct LogState {
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
-    pub durable: Arc<AtomicU64>, // inclusive; last fsynced offset (u64::MAX if none)
+    // Inclusive last fsynced offset. Empty logs currently report 0, matching
+    // existing public behavior rather than using a nullable/sentinel value.
+    pub durable: Arc<AtomicU64>,
     pub epoch: Arc<AtomicU64>,
 }
 
@@ -88,7 +90,7 @@ pub struct Log {
 
     // watermarks (inclusive)
     staged_end_offset: u64, // last offset staged into buffers
-    durable_offset: u64,    // last offset fsynced (inclusive)
+    durable_offset: u64,    // inclusive last fsynced offset, 0 for an empty log
 
     root: PathBuf,
     pub manifest: Manifest,
