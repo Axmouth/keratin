@@ -48,7 +48,12 @@ async fn replicated_append_exact_fit_applies_offsets() {
     k.become_follower();
 
     let outcome = k
-        .append_replicated_batch(0, vec![msg("a"), msg("b")], Some(KDurability::AfterFsync))
+        .append_replicated_batch(
+            0,
+            0,
+            vec![msg("a"), msg("b")],
+            Some(KDurability::AfterFsync),
+        )
         .await
         .unwrap();
 
@@ -78,7 +83,7 @@ async fn replicated_append_rejects_gap_without_writing() {
     k.become_follower();
 
     let outcome = k
-        .append_replicated_batch(3, vec![msg("late")], None)
+        .append_replicated_batch(0, 3, vec![msg("late")], None)
         .await
         .unwrap();
 
@@ -101,12 +106,12 @@ async fn replicated_append_reports_already_present_batch() {
         .unwrap();
     k.become_follower();
 
-    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+    k.append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
         .await
         .unwrap();
 
     let outcome = k
-        .append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+        .append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
         .await
         .unwrap();
 
@@ -129,12 +134,12 @@ async fn replicated_append_reports_partial_overlap_without_writing() {
         .unwrap();
     k.become_follower();
 
-    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+    k.append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
         .await
         .unwrap();
 
     let outcome = k
-        .append_replicated_batch(1, vec![msg("b"), msg("c")], None)
+        .append_replicated_batch(0, 1, vec![msg("b"), msg("c")], None)
         .await
         .unwrap();
 
@@ -158,12 +163,13 @@ async fn replicated_append_can_append_suffix_after_known_prefix() {
         .unwrap();
     k.become_follower();
 
-    k.append_replicated_batch(0, vec![msg("a"), msg("b")], None)
+    k.append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
         .await
         .unwrap();
 
     let outcome = k
         .append_replicated_batch_with_mode(
+            0,
             1,
             vec![msg("b"), msg("c"), msg("d")],
             ReplicatedAppendMode::AppendSuffixAfterKnownPrefix,
@@ -193,6 +199,129 @@ async fn replicated_append_can_append_suffix_after_known_prefix() {
 }
 
 #[tokio::test]
+async fn replicated_suffix_overlap_rejects_mismatched_prefix() {
+    let dir = test_dir!("replicated_suffix_overlap_mismatch");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    k.become_follower();
+
+    k.append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    let err = k
+        .append_replicated_batch_with_mode(
+            0,
+            1,
+            vec![msg("different"), msg("c")],
+            ReplicatedAppendMode::AppendSuffixAfterKnownPrefix,
+            None,
+        )
+        .await
+        .expect_err("overlap prefix must match existing records");
+
+    assert!(err.to_string().contains("replicated overlap mismatch"));
+    assert_eq!(k.next_offset(), 2);
+    assert_eq!(k.reader().scan_from(0, 10).unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn replicated_append_persists_new_epoch_and_rejects_stale_epoch() {
+    let dir = test_dir!("replicated_epoch");
+
+    {
+        let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        k.become_follower();
+
+        let outcome = k
+            .append_replicated_batch(7, 0, vec![msg("new-epoch")], Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        assert!(matches!(outcome, ReplicatedAppendOutcome::Applied(_)));
+        assert_eq!(k.current_epoch(), 7);
+
+        let stale = k
+            .append_replicated_batch(6, 1, vec![msg("stale")], None)
+            .await
+            .unwrap();
+        assert_eq!(
+            stale,
+            ReplicatedAppendOutcome::StaleEpoch {
+                current_epoch: 7,
+                attempted_epoch: 6,
+            }
+        );
+        assert_eq!(k.next_offset(), 1);
+    }
+
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    assert_eq!(k.current_epoch(), 7);
+    assert_eq!(k.next_offset(), 1);
+}
+
+#[tokio::test]
+async fn advance_epoch_is_monotonic() {
+    let dir = test_dir!("advance_epoch_monotonic");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    assert_eq!(k.current_epoch(), 0);
+    assert_eq!(k.advance_epoch(3).await.unwrap(), 3);
+    assert_eq!(k.current_epoch(), 3);
+    assert!(k.advance_epoch(2).await.is_err());
+    assert_eq!(k.current_epoch(), 3);
+}
+
+#[tokio::test]
+async fn offsets_and_fetch_stay_consistent_across_reopen() {
+    let dir = test_dir!("offsets_fetch_reopen");
+
+    {
+        let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+
+        let result = k
+            .append_batch(
+                vec![msg("zero"), msg("one"), msg("two")],
+                Some(KDurability::AfterFsync),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result,
+            AppendResult {
+                base_offset: 0,
+                count: 3,
+            }
+        );
+        assert_eq!(k.head_offset(), 0);
+        assert_eq!(k.next_offset(), 3);
+        assert_eq!(k.durable_offset(), 2);
+
+        let reader = k.reader();
+        assert_eq!(reader.fetch(0).unwrap().unwrap().payload, b"zero");
+        assert_eq!(reader.fetch(2).unwrap().unwrap().payload, b"two");
+        assert!(reader.fetch(3).unwrap().is_none());
+    }
+
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    assert_eq!(k.head_offset(), 0);
+    assert_eq!(k.next_offset(), 3);
+    assert_eq!(k.reader().fetch(1).unwrap().unwrap().payload, b"one");
+    assert!(k.reader().fetch(3).unwrap().is_none());
+}
+
+#[tokio::test]
 async fn reset_to_checkpoint_starts_empty_log_at_offset() {
     let dir = test_dir!("reset_to_checkpoint");
     let k = Keratin::open(&dir.root, KeratinConfig::test_default())
@@ -200,17 +329,17 @@ async fn reset_to_checkpoint_starts_empty_log_at_offset() {
         .unwrap();
     k.become_follower();
 
-    k.append_replicated_batch(0, vec![msg("old-a"), msg("old-b")], None)
+    k.append_replicated_batch(0, 0, vec![msg("old-a"), msg("old-b")], None)
         .await
         .unwrap();
-    k.reset_to_checkpoint(10).await.unwrap();
+    k.destructive_reset_to_checkpoint(10).await.unwrap();
 
     assert_eq!(k.head_offset(), 10);
     assert_eq!(k.next_offset(), 10);
     assert!(k.reader().scan_from(0, 20).unwrap().is_empty());
 
     let old_outcome = k
-        .append_replicated_batch(8, vec![msg("too-old")], None)
+        .append_replicated_batch(0, 8, vec![msg("too-old")], None)
         .await
         .unwrap();
     assert_eq!(
@@ -223,7 +352,7 @@ async fn reset_to_checkpoint_starts_empty_log_at_offset() {
     );
 
     let outcome = k
-        .append_replicated_batch(10, vec![msg("new-a"), msg("new-b")], None)
+        .append_replicated_batch(0, 10, vec![msg("new-a"), msg("new-b")], None)
         .await
         .unwrap();
     assert_eq!(
@@ -251,11 +380,11 @@ async fn reset_to_checkpoint_persists_across_reopen() {
             .await
             .unwrap();
         k.become_follower();
-        k.append_replicated_batch(0, vec![msg("old")], None)
+        k.append_replicated_batch(0, 0, vec![msg("old")], None)
             .await
             .unwrap();
-        k.reset_to_checkpoint(5).await.unwrap();
-        k.append_replicated_batch(5, vec![msg("new")], Some(KDurability::AfterFsync))
+        k.destructive_reset_to_checkpoint(5).await.unwrap();
+        k.append_replicated_batch(0, 5, vec![msg("new")], Some(KDurability::AfterFsync))
             .await
             .unwrap();
     }
@@ -281,7 +410,7 @@ async fn keratin_role_guards_normal_and_replicated_writes() {
 
     assert_eq!(k.role(), KeratinRole::Owner);
     assert!(
-        k.append_replicated_batch(0, vec![msg("replicated")], None)
+        k.append_replicated_batch(0, 0, vec![msg("replicated")], None)
             .await
             .is_err(),
         "owner mode must not accept replicated appends"
@@ -294,7 +423,7 @@ async fn keratin_role_guards_normal_and_replicated_writes() {
         "follower mode must not accept owner appends"
     );
     assert!(
-        k.append_replicated_batch(0, vec![msg("replicated")], None)
+        k.append_replicated_batch(0, 0, vec![msg("replicated")], None)
             .await
             .is_ok(),
         "follower mode should accept replicated appends"
@@ -307,7 +436,7 @@ async fn keratin_role_guards_normal_and_replicated_writes() {
         "frozen mode must not accept owner appends"
     );
     assert!(
-        k.append_replicated_batch(1, vec![msg("replicated")], None)
+        k.append_replicated_batch(0, 1, vec![msg("replicated")], None)
             .await
             .is_err(),
         "frozen mode must not accept replicated appends"

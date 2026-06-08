@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 use crate::{
     index::Index,
     manifest::Manifest,
+    reader::LogReader,
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
     segment::Segment,
@@ -49,6 +50,10 @@ pub enum ReplicatedAppendOutcome {
         expected_offset: u64,
         first_offset: u64,
     },
+    StaleEpoch {
+        current_epoch: u64,
+        attempted_epoch: u64,
+    },
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,6 +67,7 @@ pub struct LogState {
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
     pub durable: Arc<AtomicU64>, // inclusive; last fsynced offset (u64::MAX if none)
+    pub epoch: Arc<AtomicU64>,
 }
 
 impl LogState {
@@ -70,6 +76,7 @@ impl LogState {
             head: Arc::new(AtomicU64::new(head)),
             tail: Arc::new(AtomicU64::new(tail)),
             durable: Arc::new(AtomicU64::new(durable)),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 }
@@ -350,11 +357,26 @@ impl Log {
 
     pub fn stage_replicated_append_batch(
         &mut self,
+        epoch: u64,
         first_offset: u64,
         payloads: &[Message],
         mode: ReplicatedAppendMode,
         now_ms: u64,
     ) -> io::Result<(ReplicatedAppendOutcome, Option<u64>)> {
+        let current_epoch = self.manifest.epoch;
+        if epoch < current_epoch {
+            return Ok((
+                ReplicatedAppendOutcome::StaleEpoch {
+                    current_epoch,
+                    attempted_epoch: epoch,
+                },
+                None,
+            ));
+        }
+        if epoch > current_epoch {
+            self.advance_epoch(epoch)?;
+        }
+
         let count = u32::try_from(payloads.len()).map_err(|_| {
             io::Error::new(io::ErrorKind::InvalidInput, "replicated batch too large")
         })?;
@@ -438,8 +460,10 @@ impl Log {
                     "replicated suffix skip overflow",
                 )
             })?;
+            self.verify_existing_prefix(first_offset, &payloads[..skip])?;
             let suffix = &payloads[skip..];
             let (outcome, end_offset) = self.stage_replicated_append_batch(
+                epoch,
                 current_next,
                 suffix,
                 ReplicatedAppendMode::ExactFit,
@@ -691,6 +715,35 @@ impl Log {
         self.next_offset
     }
 
+    pub fn current_epoch(&self) -> u64 {
+        self.manifest.epoch
+    }
+
+    pub fn advance_epoch(&mut self, epoch: u64) -> io::Result<u64> {
+        let current = self.manifest.epoch;
+        if epoch < current {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("stale epoch {epoch}, current epoch is {current}"),
+            ));
+        }
+        if epoch == current {
+            return Ok(current);
+        }
+
+        self.flush_buffers()?;
+        self.flush()?;
+        self.fsync()?;
+
+        self.manifest.epoch = epoch;
+        self.manifest.next_offset = self.next_offset;
+        self.manifest.active_base_offset = self.active.base_offset;
+        self.manifest.store_atomic(&self.root)?;
+        self.log_state.epoch.store(epoch, Ordering::Release);
+
+        Ok(epoch)
+    }
+
     #[inline]
     pub fn should_flush(&self) -> bool {
         self.write_buf.len() >= self.flush_target_bytes
@@ -875,6 +928,37 @@ impl Log {
         self.log_state
             .durable
             .store(self.durable_offset, Ordering::Release);
+
+        Ok(())
+    }
+
+    fn verify_existing_prefix(&self, first_offset: u64, payloads: &[Message]) -> io::Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let reader = LogReader::new(&self.root, self.segment_mapping.clone());
+        let got = reader.scan_from(first_offset, payloads.len())?;
+        if got.len() != payloads.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replicated overlap prefix is not fully readable",
+            ));
+        }
+
+        for (idx, (existing, incoming)) in got.iter().zip(payloads).enumerate() {
+            let expected_offset = first_offset + idx as u64;
+            if existing.offset != expected_offset
+                || existing.flags != incoming.flags
+                || existing.headers != incoming.headers
+                || existing.payload != incoming.payload
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("replicated overlap mismatch at offset {expected_offset}"),
+                ));
+            }
+        }
 
         Ok(())
     }

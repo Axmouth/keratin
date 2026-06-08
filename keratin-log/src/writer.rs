@@ -337,6 +337,7 @@ fn writer_loop(
                 }
             }
             WriterCmd::ReplicatedAppend {
+                epoch,
                 first_offset,
                 records,
                 mode,
@@ -366,6 +367,7 @@ fn writer_loop(
                 let res = stage_replicated_req(
                     log,
                     &state,
+                    epoch,
                     first_offset,
                     &records,
                     mode,
@@ -405,6 +407,42 @@ fn writer_loop(
                     tracing::info!("Error sending reset-to-checkpoint response");
                 }
             }
+            WriterCmd::AdvanceEpoch { epoch, respond_to } => {
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    let total_bytes =
+                        stage_reqs(log, &cfg, &state, &mut pending, unstaged, &notify_tx);
+                    post_stage_commit_and_tune(
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        &mut durable_offset,
+                        &mut last_fsync,
+                        fsync_interval,
+                        total_bytes,
+                        &notify_tx,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+                let res = commit(
+                    log,
+                    &mut pending,
+                    &mut durable_offset,
+                    &mut last_fsync,
+                    state.clone(),
+                    &notify_tx,
+                )
+                .and_then(|_| log.advance_epoch(epoch));
+                if let Ok(epoch) = res {
+                    state.epoch.store(epoch, Ordering::Release);
+                }
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending advance-epoch response");
+                }
+            }
             WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
                 // Sync changes
@@ -437,6 +475,7 @@ fn writer_loop(
 fn stage_replicated_req(
     log: &mut Log,
     state: &Arc<LogState>,
+    epoch: u64,
     first_offset: u64,
     records: &[Message],
     mode: ReplicatedAppendMode,
@@ -444,7 +483,8 @@ fn stage_replicated_req(
 ) -> Result<ReplicatedAppendOutcome, IoError> {
     let now_ms = crate::util::unix_millis();
     let (outcome, end_offset) =
-        log.stage_replicated_append_batch(first_offset, records, mode, now_ms)?;
+        log.stage_replicated_append_batch(epoch, first_offset, records, mode, now_ms)?;
+    state.epoch.store(log.current_epoch(), Ordering::Release);
 
     if let Some(end_offset) = end_offset {
         state.tail.store(end_offset + 1, Ordering::Release);

@@ -59,6 +59,7 @@ impl KeratinRole {
 pub trait KeratinReplicaExt {
     async fn append_replicated_batch(
         &self,
+        epoch: u64,
         first_offset: u64,
         records: Vec<Message>,
         durability: Option<KDurability>,
@@ -66,18 +67,20 @@ pub trait KeratinReplicaExt {
 
     async fn append_replicated_batch_with_mode(
         &self,
+        epoch: u64,
         first_offset: u64,
         records: Vec<Message>,
         mode: ReplicatedAppendMode,
         durability: Option<KDurability>,
     ) -> Result<ReplicatedAppendOutcome, IoError>;
 
-    async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()>;
+    async fn destructive_reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()>;
 }
 
 pub enum WriterCmd {
     Append(AppendReq),
     ReplicatedAppend {
+        epoch: u64,
         first_offset: u64,
         records: Vec<Message>,
         mode: ReplicatedAppendMode,
@@ -91,6 +94,10 @@ pub enum WriterCmd {
     ResetToCheckpoint {
         next_offset: u64,
         respond_to: oneshot::Sender<io::Result<()>>,
+    },
+    AdvanceEpoch {
+        epoch: u64,
+        respond_to: oneshot::Sender<io::Result<u64>>,
     },
     Shutdown {
         notify_tx: oneshot::Sender<()>,
@@ -147,6 +154,7 @@ impl Keratin {
         log_state
             .head
             .store(log.manifest.head_offset, Ordering::SeqCst);
+        log_state.epoch.store(log.current_epoch(), Ordering::SeqCst);
 
         let WriterHandle { tx } = crate::writer::spawn_writer(log, cfg, log_state.clone());
 
@@ -253,6 +261,19 @@ impl Keratin {
         self.log_state.head.load(Ordering::Acquire)
     }
 
+    pub fn current_epoch(&self) -> u64 {
+        self.log_state.epoch.load(Ordering::Acquire)
+    }
+
+    pub async fn advance_epoch(&self, epoch: u64) -> std::io::Result<u64> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::AdvanceEpoch { epoch, respond_to })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
     pub async fn truncate_before(&self, before: u64) -> std::io::Result<u64> {
         let (tx, rx) = oneshot::channel();
         self.tx
@@ -346,11 +367,13 @@ impl Keratin {
 impl KeratinReplicaExt for Keratin {
     async fn append_replicated_batch(
         &self,
+        epoch: u64,
         first_offset: u64,
         records: Vec<Message>,
         durability: Option<KDurability>,
     ) -> Result<ReplicatedAppendOutcome, IoError> {
         self.append_replicated_batch_with_mode(
+            epoch,
             first_offset,
             records,
             ReplicatedAppendMode::ExactFit,
@@ -361,6 +384,7 @@ impl KeratinReplicaExt for Keratin {
 
     async fn append_replicated_batch_with_mode(
         &self,
+        epoch: u64,
         first_offset: u64,
         records: Vec<Message>,
         mode: ReplicatedAppendMode,
@@ -370,6 +394,7 @@ impl KeratinReplicaExt for Keratin {
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::ReplicatedAppend {
+                epoch,
                 first_offset,
                 records,
                 mode,
@@ -381,8 +406,8 @@ impl KeratinReplicaExt for Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
-    async fn reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
-        self.ensure_role(KeratinRole::Follower, "reset_to_checkpoint")
+    async fn destructive_reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
+        self.ensure_role(KeratinRole::Follower, "destructive_reset_to_checkpoint")
             .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
         let (respond_to, rx) = oneshot::channel();
         self.tx

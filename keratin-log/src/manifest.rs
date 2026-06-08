@@ -7,7 +7,7 @@ use crc32c::crc32c;
 use crate::util::fsync_dir;
 
 const MAN_MAGIC: &[u8; 8] = b"KERATIN\0";
-const MAN_VERSION: u16 = 1;
+const MAN_VERSION: u16 = 2;
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -17,6 +17,7 @@ pub struct Manifest {
     pub active_base_offset: u64,
     pub next_offset: u64,
     pub head_offset: u64,
+    pub epoch: u64,
 }
 
 impl Manifest {
@@ -28,6 +29,7 @@ impl Manifest {
             active_base_offset: 0,
             next_offset: 0,
             head_offset: 0,
+            epoch: 0,
         }
     }
 
@@ -98,9 +100,10 @@ impl Manifest {
             ));
         }
 
-        // payload v1:
-        // created_ts(8) segment_max(8) index_stride(4) pad(4) active_base(8) next_offset(8) head_offset(8)
-        if payload.len() != 8 + 8 + 4 + 4 + 8 + 8 + 8 {
+        // payload v2:
+        // created_ts(8) segment_max(8) index_stride(4) pad(4)
+        // active_base(8) next_offset(8) head_offset(8) epoch(8)
+        if payload.len() != 8 + 8 + 4 + 4 + 8 + 8 + 8 + 8 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "manifest payload len mismatch",
@@ -112,6 +115,7 @@ impl Manifest {
         let active_base_offset = u64::from_be_bytes(payload[24..32].try_into().unwrap());
         let next_offset = u64::from_be_bytes(payload[32..40].try_into().unwrap());
         let head_offset = u64::from_be_bytes(payload[40..48].try_into().unwrap());
+        let epoch = u64::from_be_bytes(payload[48..56].try_into().unwrap());
 
         Ok(Self {
             created_ts_ms,
@@ -120,6 +124,7 @@ impl Manifest {
             active_base_offset,
             next_offset,
             head_offset,
+            epoch,
         })
     }
 
@@ -144,7 +149,7 @@ impl Manifest {
         out.extend_from_slice(&header_len.to_be_bytes());
 
         // payload
-        let mut payload = Vec::with_capacity(40);
+        let mut payload = Vec::with_capacity(56);
         payload.extend_from_slice(&self.created_ts_ms.to_be_bytes());
         payload.extend_from_slice(&self.segment_max_bytes.to_be_bytes());
         payload.extend_from_slice(&self.index_stride_bytes.to_be_bytes());
@@ -152,6 +157,7 @@ impl Manifest {
         payload.extend_from_slice(&self.active_base_offset.to_be_bytes());
         payload.extend_from_slice(&self.next_offset.to_be_bytes());
         payload.extend_from_slice(&self.head_offset.to_be_bytes());
+        payload.extend_from_slice(&self.epoch.to_be_bytes());
 
         let crc = crc32c(&payload);
         out.extend_from_slice(&crc.to_be_bytes());
@@ -180,10 +186,12 @@ fn manifest_roundtrip() {
     use crate::test_dir;
 
     let dir = test_dir!("test_data/manifest_roundtrip");
-    let m1 = Manifest::default_new(123, 4096, 128);
+    let mut m1 = Manifest::default_new(123, 4096, 128);
+    m1.epoch = 7;
     m1.store_atomic(&dir.root).unwrap();
     let m2 = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
     assert_eq!(m1.created_ts_ms, m2.created_ts_ms);
     assert_eq!(m1.segment_max_bytes, m2.segment_max_bytes);
     assert_eq!(m1.index_stride_bytes, m2.index_stride_bytes);
+    assert_eq!(m1.epoch, m2.epoch);
 }
