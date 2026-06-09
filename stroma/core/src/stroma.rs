@@ -1601,8 +1601,10 @@ impl Stroma {
                     )
                     .await
                     .map_err(io_err)?;
-                for event in batch.events {
+                for (idx, event) in batch.events.into_iter().enumerate() {
                     self.apply_event_inmem(event, &qh).await?;
+                    qh.applied_upto()
+                        .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
                 }
                 Some(outcome)
             }
@@ -4543,6 +4545,220 @@ mod tests {
         );
 
         shutdown_stroma("owner_replication_read_checkpoint_required", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn follower_can_catch_up_from_owner_read_batches_and_promote() {
+        let owner_dir = test_dir!("owner_replication_pull_owner");
+        let owner = Stroma::open(
+            &owner_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let follower_dir = test_dir!("owner_replication_pull_follower");
+        let follower = Stroma::open(
+            &follower_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&owner, "topic", 0, None).await;
+        publish_one(&owner, "topic", 0, None).await;
+        follower
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+
+        let message_read = owner
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let event_read = owner
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+
+        let OwnerReplicationRead::Batch(message_read) = message_read else {
+            panic!("expected owner message batch");
+        };
+        let OwnerReplicationRead::Batch(event_read) = event_read else {
+            panic!("expected owner event batch");
+        };
+
+        let messages = Some(ReplicatedMessageBatch {
+            epoch: message_read.epoch,
+            first_offset: message_read.records[0].0,
+            records: message_read
+                .records
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect(),
+            durability: None,
+        });
+        let events = Some(ReplicatedEventBatch {
+            epoch: event_read.epoch,
+            first_offset: event_read.records[0].0,
+            events: event_read
+                .records
+                .into_iter()
+                .map(|(_, event)| event)
+                .collect(),
+            durability: None,
+        });
+
+        follower
+            .apply_replicated_queue_batch("topic", 0, None, messages, events)
+            .await
+            .unwrap();
+
+        let outcome = follower
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            QueuePromotionOutcome::Promoted {
+                message_next_offset: 2,
+                event_next_offset: 2,
+                applied_event_offset: Some(1),
+            }
+        );
+
+        let delivered = follower
+            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!(delivered[0].0, 0);
+        assert_eq!(delivered[1].0, 1);
+
+        shutdown_stroma("owner_replication_pull_owner", &owner).await;
+        shutdown_stroma("owner_replication_pull_follower", &follower).await;
+    }
+
+    #[tokio::test]
+    async fn follower_promotion_refuses_partial_replication() {
+        let owner_dir = test_dir!("partial_replication_owner");
+        let owner = Stroma::open(
+            &owner_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        publish_one(&owner, "topic", 0, None).await;
+        publish_one(&owner, "topic", 0, None).await;
+
+        let message_read = owner
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let event_read = owner
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(message_read) = message_read else {
+            panic!("expected owner message batch");
+        };
+        let OwnerReplicationRead::Batch(event_read) = event_read else {
+            panic!("expected owner event batch");
+        };
+
+        let messages_only_dir = test_dir!("partial_replication_messages_only");
+        let messages_only = Stroma::open(
+            &messages_only_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        messages_only
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+        messages_only
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: message_read.epoch,
+                    first_offset: message_read.records[0].0,
+                    records: message_read
+                        .records
+                        .clone()
+                        .into_iter()
+                        .map(|(_, message)| message)
+                        .collect(),
+                    durability: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        let outcome = messages_only
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            QueuePromotionOutcome::EventLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2,
+            }
+        );
+
+        let events_only_dir = test_dir!("partial_replication_events_only");
+        let events_only = Stroma::open(
+            &events_only_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        events_only
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+        events_only
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                None,
+                Some(ReplicatedEventBatch {
+                    epoch: event_read.epoch,
+                    first_offset: event_read.records[0].0,
+                    events: event_read
+                        .records
+                        .clone()
+                        .into_iter()
+                        .map(|(_, event)| event)
+                        .collect(),
+                    durability: None,
+                }),
+            )
+            .await
+            .unwrap();
+        let outcome = events_only
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcome,
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2,
+            }
+        );
+
+        shutdown_stroma("partial_replication_owner", &owner).await;
+        shutdown_stroma("partial_replication_messages_only", &messages_only).await;
+        shutdown_stroma("partial_replication_events_only", &events_only).await;
     }
 
     #[tokio::test]
