@@ -5,8 +5,8 @@ use keratin_log::{
     ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
 use stroma_core::{
-    DeadLetterMeta, DeadLetterReason, EnqueueEventMeta, MessageHeaders, QueueHandle,
-    QueueHandleError, QueuePromotionOutcome, QueueRole, ReplicatedEventBatch,
+    DeadLetterMeta, DeadLetterReason, EnqueueEventMeta, MessageHeaders, QueueDemotionOutcome,
+    QueueHandle, QueueHandleError, QueuePromotionOutcome, QueueRole, ReplicatedEventBatch,
     ReplicatedMessageBatch, SnapshotConfig, Stroma, StromaError, StromaEvent, StromaKeratinConfig,
 };
 use tokio::time::{Instant, timeout};
@@ -144,6 +144,103 @@ async fn freeze_waits_for_active_owner_operation_before_role_swap() {
 
     st.become_queue_owner("topic-a", 0, None).await.unwrap();
     qh.enqueue(3, 0).await.unwrap();
+}
+
+#[tokio::test]
+async fn demotion_freezes_drains_and_switches_owner_to_follower() {
+    let (st, _dir) = open_delayed_fsync_stroma("stroma_roles_demote_owner_to_follower").await;
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+    let headers = MessageHeaders {
+        published: 1,
+        publish_received: 2,
+        content_type: None,
+        extra: Default::default(),
+    };
+    let (completion, rx) = KeratinAppendCompletion::pair();
+
+    st.append_message(
+        "topic-a",
+        0,
+        None,
+        &headers,
+        b"accepted".to_vec(),
+        completion,
+    )
+    .await
+    .unwrap();
+    wait_for_active_owner_operation(&qh).await;
+
+    let demoter = {
+        let st = st.clone();
+        tokio::spawn(async move {
+            st.demote_queue_owner_to_follower("topic-a", 0, None)
+                .await
+                .unwrap()
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert_eq!(qh.role(), QueueRole::Frozen);
+    assert_wrong_role(qh.enqueue(1, 0).await, QueueRole::Frozen);
+
+    let appended = timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("owner publish before demotion did not complete")
+        .unwrap()
+        .unwrap();
+    assert_eq!(appended.base_offset, 0);
+
+    let outcome = timeout(Duration::from_secs(2), demoter)
+        .await
+        .expect("demotion did not finish")
+        .unwrap();
+    assert_eq!(
+        outcome,
+        QueueDemotionOutcome {
+            message_next_offset: 1,
+            event_next_offset: 1,
+            applied_event_offset: Some(0),
+        }
+    );
+    assert_eq!(qh.role(), QueueRole::Follower);
+    assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
+
+    st.apply_replicated_queue_batch(
+        "topic-a",
+        0,
+        None,
+        Some(ReplicatedMessageBatch {
+            epoch: 0,
+            first_offset: 1,
+            records: vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: b"replicated".to_vec(),
+            }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 1,
+            events: vec![StromaEvent::Enqueue { off: 1, retries: 0 }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+    )
+    .await
+    .unwrap();
+    assert!(qh.is_ready(1).await);
+}
+
+#[tokio::test]
+async fn demotion_refuses_non_owner_without_changing_role() {
+    let (st, _dir) = open_test_stroma("stroma_roles_demote_refuses_non_owner").await;
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+
+    let result = st.demote_queue_owner_to_follower("topic-a", 0, None).await;
+
+    assert_stroma_wrong_role(result, QueueRole::Follower);
+    assert_eq!(qh.role(), QueueRole::Follower);
 }
 
 #[tokio::test]

@@ -1107,6 +1107,24 @@ impl QueueHandle {
         self.set_role(QueueRole::Frozen);
     }
 
+    pub fn try_freeze_owner(&self) -> Result<(), QueueHandleError> {
+        match self.role.compare_exchange(
+            QueueRole::Owner.as_u8(),
+            QueueRole::Frozen.as_u8(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.role_generation.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            Err(actual) => Err(QueueHandleError::WrongRole {
+                expected: QueueRole::Owner,
+                actual: QueueRole::from_u8(actual),
+            }),
+        }
+    }
+
     fn set_role(&self, role: QueueRole) {
         let old = self.role.swap(role.as_u8(), Ordering::AcqRel);
         if old != role.as_u8() {
@@ -1142,8 +1160,8 @@ impl QueueHandle {
         })
     }
 
-    pub async fn freeze_and_wait_owner_operations(&self) {
-        self.freeze();
+    pub async fn freeze_owner_and_wait_operations(&self) -> Result<(), QueueHandleError> {
+        self.try_freeze_owner()?;
         loop {
             let drained = self.owner_operations_drained.notified();
             if self.active_owner_operations() == 0 {
@@ -1151,6 +1169,7 @@ impl QueueHandle {
             }
             drained.await;
         }
+        Ok(())
     }
 
     pub fn recovery_complete(&self) -> bool {

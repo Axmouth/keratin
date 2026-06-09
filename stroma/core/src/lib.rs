@@ -26,7 +26,7 @@ pub use state::{
 pub use stroma::{
     EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
     MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem,
-    QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
+    QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
     ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma, StromaKeratinConfig, TaskGroup,
 };
 

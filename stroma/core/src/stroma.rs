@@ -122,6 +122,13 @@ pub enum QueuePromotionOutcome {
     },
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QueueDemotionOutcome {
+    pub message_next_offset: Offset,
+    pub event_next_offset: Offset,
+    pub applied_event_offset: Option<Offset>,
+}
+
 struct ItemMeta {
     not_before: Option<UnixMillis>,
 }
@@ -1277,10 +1284,40 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
-        qh.freeze_and_wait_owner_operations().await;
+        qh.freeze_owner_and_wait_operations().await?;
         qh.msg_log().freeze();
         qh.event_log().freeze();
         Ok(())
+    }
+
+    pub async fn demote_queue_owner_to_follower(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<QueueDemotionOutcome> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        qh.freeze_owner_and_wait_operations().await?;
+        qh.msg_log().freeze();
+        qh.event_log().freeze();
+
+        let message_next_offset = qh.msg_log().next_offset();
+        let event_next_offset = qh.event_log().next_offset();
+        let applied_event_offset = if event_next_offset == 0 {
+            None
+        } else {
+            Some(qh.applied_upto().load(Ordering::Acquire))
+        };
+
+        qh.become_follower();
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+
+        Ok(QueueDemotionOutcome {
+            message_next_offset,
+            event_next_offset,
+            applied_event_offset,
+        })
     }
 
     pub async fn become_queue_follower(
