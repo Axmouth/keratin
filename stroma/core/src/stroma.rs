@@ -1464,8 +1464,8 @@ impl Stroma {
             });
         }
 
-        let records = if max == 0 {
-            Vec::new()
+        let (records, batch_next_offset) = if max == 0 {
+            (Vec::new(), from)
         } else {
             let reader = log.reader();
             let raw = reader.scan_from(from, max).map_err(io_err)?;
@@ -1481,13 +1481,13 @@ impl Stroma {
                 expected = record.offset + 1;
                 records.push((record.offset, record.to_message()));
             }
-            records
+            (records, expected)
         };
 
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
             epoch,
             requested_offset: from,
-            next_offset,
+            next_offset: batch_next_offset,
             records,
         }))
     }
@@ -1522,8 +1522,8 @@ impl Stroma {
             });
         }
 
-        let records = if max == 0 {
-            Vec::new()
+        let (records, batch_next_offset) = if max == 0 {
+            (Vec::new(), from)
         } else {
             let reader = log.reader();
             let raw = reader.scan_from(from, max).map_err(io_err)?;
@@ -1540,13 +1540,13 @@ impl Stroma {
                 let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
                 records.push((record.offset, event));
             }
-            records
+            (records, expected)
         };
 
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
             epoch,
             requested_offset: from,
-            next_offset,
+            next_offset: batch_next_offset,
             records,
         }))
     }
@@ -4441,6 +4441,71 @@ mod tests {
         );
 
         shutdown_stroma("owner_replication_read_records", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_read_next_offset_tracks_returned_batch() {
+        let dir = test_dir!("owner_replication_read_bounded_next_offset");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        publish_one(&stroma, "topic", 0, None).await;
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, 0, 1)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(messages) = messages else {
+            panic!("expected message batch");
+        };
+        assert_eq!(messages.requested_offset, 0);
+        assert_eq!(messages.next_offset, 1);
+        assert_eq!(messages.records.len(), 1);
+        assert_eq!(messages.records[0].0, 0);
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, messages.next_offset, 1)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(messages) = messages else {
+            panic!("expected message batch");
+        };
+        assert_eq!(messages.requested_offset, 1);
+        assert_eq!(messages.next_offset, 2);
+        assert_eq!(messages.records.len(), 1);
+        assert_eq!(messages.records[0].0, 1);
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, 0, 1)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(events) = events else {
+            panic!("expected event batch");
+        };
+        assert_eq!(events.requested_offset, 0);
+        assert_eq!(events.next_offset, 1);
+        assert_eq!(events.records.len(), 1);
+        assert_eq!(events.records[0].0, 0);
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, events.next_offset, 1)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(events) = events else {
+            panic!("expected event batch");
+        };
+        assert_eq!(events.requested_offset, 1);
+        assert_eq!(events.next_offset, 2);
+        assert_eq!(events.records.len(), 1);
+        assert_eq!(events.records[0].0, 1);
+
+        shutdown_stroma("owner_replication_read_bounded_next_offset", &stroma).await;
     }
 
     #[tokio::test]
