@@ -88,6 +88,25 @@ pub struct ReplicatedEventBatch {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerReplicationBatch<T> {
+    pub epoch: u64,
+    pub requested_offset: Offset,
+    pub next_offset: Offset,
+    pub records: Vec<(Offset, T)>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum OwnerReplicationRead<T> {
+    Batch(OwnerReplicationBatch<T>),
+    CheckpointRequired {
+        epoch: u64,
+        requested_offset: Offset,
+        head_offset: Offset,
+        next_offset: Offset,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ReplicatedQueueApplyOutcome {
     pub message_log: Option<ReplicatedAppendOutcome>,
     pub event_log: Option<ReplicatedAppendOutcome>,
@@ -1413,6 +1432,123 @@ impl Stroma {
             event_next_offset,
             applied_event_offset,
         })
+    }
+
+    pub async fn read_owner_message_records(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Owner {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: role,
+            });
+        }
+
+        let log = qh.msg_log();
+        let epoch = log.current_epoch();
+        let head_offset = log.head_offset();
+        let next_offset = log.next_offset();
+        if from < head_offset {
+            return Ok(OwnerReplicationRead::CheckpointRequired {
+                epoch,
+                requested_offset: from,
+                head_offset,
+                next_offset,
+            });
+        }
+
+        let records = if max == 0 {
+            Vec::new()
+        } else {
+            let reader = log.reader();
+            let raw = reader.scan_from(from, max).map_err(io_err)?;
+            let mut expected = from;
+            let mut records = Vec::with_capacity(raw.len());
+            for record in raw {
+                if record.offset != expected {
+                    return Err(StromaError::Corruption(format!(
+                        "message log gap while reading owner records: expected offset {expected}, got {}",
+                        record.offset
+                    )));
+                }
+                expected = record.offset + 1;
+                records.push((record.offset, record.to_message()));
+            }
+            records
+        };
+
+        Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+            epoch,
+            requested_offset: from,
+            next_offset,
+            records,
+        }))
+    }
+
+    pub async fn read_owner_event_records(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Owner {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: role,
+            });
+        }
+
+        let log = qh.event_log();
+        let epoch = log.current_epoch();
+        let head_offset = log.head_offset();
+        let next_offset = log.next_offset();
+        if from < head_offset {
+            return Ok(OwnerReplicationRead::CheckpointRequired {
+                epoch,
+                requested_offset: from,
+                head_offset,
+                next_offset,
+            });
+        }
+
+        let records = if max == 0 {
+            Vec::new()
+        } else {
+            let reader = log.reader();
+            let raw = reader.scan_from(from, max).map_err(io_err)?;
+            let mut expected = from;
+            let mut records = Vec::with_capacity(raw.len());
+            for record in raw {
+                if record.offset != expected {
+                    return Err(StromaError::Corruption(format!(
+                        "event log gap while reading owner records: expected offset {expected}, got {}",
+                        record.offset
+                    )));
+                }
+                expected = record.offset + 1;
+                let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
+                records.push((record.offset, event));
+            }
+            records
+        };
+
+        Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+            epoch,
+            requested_offset: from,
+            next_offset,
+            records,
+        }))
     }
 
     pub async fn apply_replicated_queue_batch(
@@ -4257,6 +4393,156 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_read_returns_message_and_event_records() {
+        let dir = test_dir!("owner_replication_read_records");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let offset = publish_one(&stroma, "topic", 0, None).await;
+        assert_eq!(offset, 0);
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(messages) = messages else {
+            panic!("expected message batch");
+        };
+        assert_eq!(messages.epoch, 0);
+        assert_eq!(messages.requested_offset, 0);
+        assert_eq!(messages.next_offset, 1);
+        assert_eq!(messages.records.len(), 1);
+        assert_eq!(messages.records[0].0, 0);
+        assert_eq!(messages.records[0].1.payload, b"x");
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(events) = events else {
+            panic!("expected event batch");
+        };
+        assert_eq!(events.epoch, 0);
+        assert_eq!(events.requested_offset, 0);
+        assert_eq!(events.next_offset, 1);
+        assert_eq!(
+            events.records,
+            vec![(0, StromaEvent::Enqueue { off: 0, retries: 0 })]
+        );
+
+        shutdown_stroma("owner_replication_read_records", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_read_rejects_follower_queue() {
+        let dir = test_dir!("owner_replication_read_rejects_follower");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        stroma
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+
+        let err = stroma
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: QueueRole::Follower
+            }
+        ));
+
+        let err = stroma
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: QueueRole::Follower
+            }
+        ));
+
+        shutdown_stroma("owner_replication_read_rejects_follower", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_read_reports_checkpoint_required_after_truncation() {
+        let dir = test_dir!("owner_replication_read_checkpoint_required");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+        qh.msg_log()
+            .destructive_reset_to_checkpoint(1)
+            .await
+            .unwrap();
+        qh.event_log()
+            .destructive_reset_to_checkpoint(1)
+            .await
+            .unwrap();
+        qh.msg_log().become_owner();
+        qh.event_log().become_owner();
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::CheckpointRequired {
+            epoch,
+            requested_offset,
+            head_offset,
+            next_offset,
+        } = messages
+        else {
+            panic!("expected message checkpoint requirement");
+        };
+        assert_eq!(epoch, 0);
+        assert_eq!(requested_offset, 0);
+        assert_eq!(head_offset, 1);
+        assert_eq!(next_offset, 1);
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            events,
+            OwnerReplicationRead::CheckpointRequired {
+                epoch: 0,
+                requested_offset: 0,
+                head_offset: 1,
+                next_offset: 1,
+            }
+        );
+
+        shutdown_stroma("owner_replication_read_checkpoint_required", &stroma).await;
     }
 
     #[tokio::test]
