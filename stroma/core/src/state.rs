@@ -408,6 +408,10 @@ pub enum QueueCommand {
         reqs: Vec<AckEventMeta>,
         response: Option<oneshot::Sender<()>>,
     }, // list[offset]
+    ReleaseInflightMany {
+        reqs: Vec<AckEventMeta>,
+        response: Option<oneshot::Sender<()>>,
+    },
     Nack {
         offset: Offset,
         requeue: bool,
@@ -606,6 +610,7 @@ impl QueueCommand {
             // low priority, consumers stall waiting for acks to register
             QueueCommand::Ack { .. } => CommandPrio::High,
             QueueCommand::AckMany { .. } => CommandPrio::High,
+            QueueCommand::ReleaseInflightMany { .. } => CommandPrio::High,
             QueueCommand::Nack { .. } => CommandPrio::High,
             QueueCommand::NackMany { .. } => CommandPrio::High,
             QueueCommand::DeadLetterCommit { .. } => CommandPrio::High,
@@ -654,6 +659,7 @@ impl QueueCommand {
             QueueCommand::MarkInflightMany { .. } => "MarkInflightMany",
             QueueCommand::Ack { .. } => "Ack",
             QueueCommand::AckMany { .. } => "AckMany",
+            QueueCommand::ReleaseInflightMany { .. } => "ReleaseInflightMany",
             QueueCommand::Nack { .. } => "Nack",
             QueueCommand::NackMany { .. } => "NackMany",
             QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
@@ -1294,6 +1300,13 @@ impl QueueHandle {
                 }
                 dirty = !reqs.is_empty();
             }
+            QueueCommand::ReleaseInflightMany { reqs, response } => {
+                let released = state.release_inflight_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = released > 0;
+            }
             QueueCommand::Nack {
                 offset,
                 requeue,
@@ -1781,6 +1794,23 @@ impl QueueHandle {
             })
             .await;
         rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
+    }
+
+    pub async fn release_inflight_many(
+        &self,
+        reqs: Vec<AckEventMeta>,
+    ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation()?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::ReleaseInflightMany {
+                reqs,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        self.deadline_waker().notify_one();
         Ok(())
     }
 
@@ -2614,6 +2644,23 @@ impl QueueInternalState {
             // far settle: leave for persistence/event log (still applied logically by replay later)
             // (Materialized model can ignore or store it.)
         }
+    }
+
+    pub fn release_inflight(&mut self, offset: u64) -> bool {
+        if offset < self.settled_until || !self.inflight.contains_key(&offset) {
+            return false;
+        }
+
+        self.inflight.remove(&offset);
+        self.ready.insert(offset..offset + 1);
+        self.recompute_hint_if_needed();
+        true
+    }
+
+    pub fn release_inflight_many(&mut self, reqs: &[AckEventMeta]) -> usize {
+        reqs.iter()
+            .filter(|req| self.release_inflight(req.off))
+            .count()
     }
 
     pub fn nack(&mut self, offset: u64, requeue: bool) -> NackOutcome {
@@ -4004,6 +4051,19 @@ mod tests {
         s.mark_inflight(1, 200);
         s.nack(1, true);
 
+        assert_eq!(s.get_retries(1), 2);
+    }
+
+    #[test]
+    fn release_inflight_returns_ready_without_retry_accounting() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 2);
+        s.mark_inflight(1, 100);
+        assert!(s.release_inflight(1));
+
+        assert!(s.is_ready(1));
+        assert!(!s.is_inflight(1));
         assert_eq!(s.get_retries(1), 2);
     }
 

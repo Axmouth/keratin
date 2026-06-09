@@ -21,6 +21,7 @@ pub enum EventType {
     MarkInflightMany = 11,
     Ack = 20,
     AckMany = 21,
+    ReleaseInflightMany = 22,
     Nack = 30,
     NackMany = 31,
     DeadLetter = 40,
@@ -215,6 +216,9 @@ pub enum StromaEvent {
         off: Offset,
     },
     AckMany {
+        reqs: Vec<AckEventMeta>,
+    },
+    ReleaseInflightMany {
         reqs: Vec<AckEventMeta>,
     },
     Nack {
@@ -430,6 +434,13 @@ impl StromaEvent {
                     put_u64(&mut out, req.off);
                 }
             }
+            StromaEvent::ReleaseInflightMany { reqs } => {
+                put_u16(&mut out, EventType::ReleaseInflightMany as u16);
+                put_u32(&mut out, reqs.len() as u32);
+                for req in reqs {
+                    put_u64(&mut out, req.off);
+                }
+            }
             StromaEvent::NackMany { reqs } => {
                 put_u16(&mut out, EventType::NackMany as u16);
                 put_u32(&mut out, reqs.len() as u32);
@@ -613,6 +624,15 @@ impl StromaEvent {
                 }
                 Ok(StromaEvent::AckMany { reqs })
             }
+            x if x == EventType::ReleaseInflightMany as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut reqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    reqs.push(AckEventMeta { off });
+                }
+                Ok(StromaEvent::ReleaseInflightMany { reqs })
+            }
             x if x == EventType::NackMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
                 let mut reqs = Vec::with_capacity(count);
@@ -747,6 +767,16 @@ mod tests {
     #[test]
     fn test_ack_encode_decode() {
         let event = StromaEvent::Ack { off: 300 };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_release_inflight_many_encode_decode() {
+        let event = StromaEvent::ReleaseInflightMany {
+            reqs: vec![AckEventMeta { off: 300 }, AckEventMeta { off: 301 }],
+        };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);

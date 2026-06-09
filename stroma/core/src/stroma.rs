@@ -1934,6 +1934,15 @@ impl Stroma {
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
             }
+            StromaEvent::ReleaseInflightMany { reqs } => {
+                let command = QueueCommand::ReleaseInflightMany {
+                    reqs,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+                // Release is a broker handoff primitive. It returns currently
+                // leased offsets to ready without consuming retry budget.
+            }
             StromaEvent::Nack { off, requeue } => {
                 let command = QueueCommand::Nack {
                     offset: off,
@@ -2087,6 +2096,16 @@ impl Stroma {
                 // ACK is idempotent and safe.
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::AckMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            StromaEvent::ReleaseInflightMany { reqs } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::ReleaseInflightMany {
                     reqs,
                     response: Some(tx),
                 })
@@ -3466,6 +3485,37 @@ impl Stroma {
             completion,
         )
         .await
+    }
+
+    pub async fn release_inflight_many(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<AckEventMeta>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(tp, part, group).await?;
+        let owner_operation = qh.begin_owner_operation()?;
+        let event_log = qh.event_log();
+
+        let event = StromaEvent::ReleaseInflightMany { reqs: reqs.clone() };
+        let m = event_msg(&event)?;
+        let ar = event_log
+            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .await
+            .map_err(io_err)?;
+        qh.applied_upto()
+            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        qh.set_dirty_snapshot(true);
+
+        qh.release_inflight_many(reqs)
+            .await
+            .map_err(|err| StromaError::Io(err.to_string()))?;
+
+        completion.complete(Ok(ar));
+        drop(owner_operation);
+        Ok(())
     }
 
     pub async fn nack_enqueue_many(
