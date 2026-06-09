@@ -469,6 +469,7 @@ pub enum QueueCommand {
     }, // base, bits_bytes
     EncodeSnapshot {
         last_snapshot_event_offset: u64,
+        force: bool,
         response: Option<oneshot::Sender<Option<Vec<u8>>>>,
     },
     LoadSnapshot {
@@ -1471,12 +1472,13 @@ impl QueueHandle {
             }
             QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
+                force,
                 response,
             } => {
                 let trigger_time = Instant::now();
                 handle.metrics.snapshot.attempts.incr();
 
-                if !handle.dirty_snapshot() {
+                if !force && !handle.dirty_snapshot() {
                     handle
                         .metrics
                         .snapshot
@@ -1991,12 +1993,30 @@ impl QueueHandle {
         &self,
         last_snapshot_event_offset: u64,
     ) -> Result<Vec<u8>, QueueHandleError> {
+        self.encode_snapshot_inner(last_snapshot_event_offset, false)
+            .await
+    }
+
+    pub async fn force_encode_snapshot(
+        &self,
+        last_snapshot_event_offset: u64,
+    ) -> Result<Vec<u8>, QueueHandleError> {
+        self.encode_snapshot_inner(last_snapshot_event_offset, true)
+            .await
+    }
+
+    async fn encode_snapshot_inner(
+        &self,
+        last_snapshot_event_offset: u64,
+        force: bool,
+    ) -> Result<Vec<u8>, QueueHandleError> {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
+                force,
                 response: Some(tx),
             })
             .await;

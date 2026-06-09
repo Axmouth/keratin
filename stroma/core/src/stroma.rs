@@ -133,6 +133,22 @@ pub struct FollowerStateCheckpointInstallOutcome {
     pub snapshot_meta: crate::state::SnapshotMeta,
 }
 
+/// Compacted queue state exported by an owner at one coherent point.
+///
+/// `message_checkpoint_offset` is the first message offset the installed state
+/// may still reference. `message_next_offset` is the owner message-log tail the
+/// follower must catch up to before promotion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct OwnerStateCheckpoint {
+    pub message_epoch: u64,
+    pub event_epoch: u64,
+    pub message_checkpoint_offset: Offset,
+    pub message_next_offset: Offset,
+    pub event_next_offset: Offset,
+    pub applied_event_offset: Offset,
+    pub state_snapshot: Vec<u8>,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuePromotionOutcome {
     Promoted {
@@ -1570,6 +1586,58 @@ impl Stroma {
             next_offset: batch_next_offset,
             records,
         }))
+    }
+
+    pub async fn export_owner_state_checkpoint(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<OwnerStateCheckpoint> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Owner {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: role,
+            });
+        }
+
+        qh.freeze_owner_and_wait_operations().await?;
+        qh.msg_log().freeze();
+        qh.event_log().freeze();
+
+        let result = async {
+            let message_checkpoint_offset = qh.lowest_not_acked_offset().await;
+            let message_next_offset = qh.msg_log().next_offset();
+            let event_next_offset = qh.event_log().next_offset();
+            let applied_event_offset = event_next_offset.saturating_sub(1);
+            let state_snapshot = qh
+                .force_encode_snapshot(applied_event_offset)
+                .await
+                .map_err(|err| {
+                    StromaError::Io(format!(
+                        "owner checkpoint snapshot export failed for tp={topic} part={part} group={group:?}: {err}"
+                    ))
+                })?;
+
+            Ok(OwnerStateCheckpoint {
+                message_epoch: qh.msg_log().current_epoch(),
+                event_epoch: qh.event_log().current_epoch(),
+                message_checkpoint_offset,
+                message_next_offset,
+                event_next_offset,
+                applied_event_offset,
+                state_snapshot,
+            })
+        }
+        .await;
+
+        qh.become_owner();
+        qh.msg_log().become_owner();
+        qh.event_log().become_owner();
+
+        result
     }
 
     pub async fn apply_replicated_queue_batch(
@@ -4948,6 +5016,174 @@ mod tests {
 
         shutdown_stroma("state_checkpoint_owner", &owner).await;
         shutdown_stroma("state_checkpoint_follower", &follower).await;
+    }
+
+    #[tokio::test]
+    async fn owner_state_checkpoint_export_rejects_follower_role() {
+        let dir = test_dir!("owner_state_checkpoint_rejects_follower");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        stroma
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+
+        let err = stroma
+            .export_owner_state_checkpoint("topic", 0, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StromaError::WrongQueueRole {
+                expected: QueueRole::Owner,
+                actual: QueueRole::Follower
+            }
+        ));
+
+        shutdown_stroma("owner_state_checkpoint_rejects_follower", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_state_checkpoint_export_installs_on_follower_then_messages_catch_up() {
+        let owner_dir = test_dir!("owner_state_checkpoint_export_owner");
+        let owner = Stroma::open(
+            &owner_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let follower_dir = test_dir!("owner_state_checkpoint_export_follower");
+        let follower = Stroma::open(
+            &follower_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&owner, "topic", 0, None).await;
+        publish_one(&owner, "topic", 0, None).await;
+
+        let checkpoint = owner
+            .export_owner_state_checkpoint("topic", 0, None)
+            .await
+            .unwrap();
+        assert_eq!(checkpoint.message_checkpoint_offset, 0);
+        assert_eq!(checkpoint.message_next_offset, 2);
+        assert_eq!(checkpoint.event_next_offset, 2);
+        assert_eq!(checkpoint.applied_event_offset, 1);
+
+        let repeated_checkpoint = owner
+            .export_owner_state_checkpoint("topic", 0, None)
+            .await
+            .unwrap();
+        assert_eq!(repeated_checkpoint.message_checkpoint_offset, 0);
+        assert_eq!(repeated_checkpoint.message_next_offset, 2);
+        assert_eq!(repeated_checkpoint.event_next_offset, 2);
+        assert_eq!(repeated_checkpoint.applied_event_offset, 1);
+
+        let owner_read_after_export = owner
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        assert!(matches!(
+            owner_read_after_export,
+            OwnerReplicationRead::Batch(_)
+        ));
+
+        follower
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+        follower
+            .install_follower_state_checkpoint(
+                "topic",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_next_offset: checkpoint.message_checkpoint_offset,
+                    event_next_offset: checkpoint.event_next_offset,
+                    applied_event_offset: checkpoint.applied_event_offset,
+                    state_snapshot: checkpoint.state_snapshot,
+                },
+            )
+            .await
+            .unwrap();
+
+        let not_ready = follower
+            .promote_queue_follower_if_caught_up(
+                "topic",
+                0,
+                None,
+                checkpoint.message_next_offset,
+                checkpoint.event_next_offset,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ready,
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: checkpoint.message_checkpoint_offset,
+                expected_next_offset: checkpoint.message_next_offset,
+            }
+        );
+
+        let message_read = owner
+            .read_owner_message_records("topic", 0, None, checkpoint.message_checkpoint_offset, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(message_read) = message_read else {
+            panic!("expected owner message batch");
+        };
+        follower
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: message_read.epoch,
+                    first_offset: message_read.records[0].0,
+                    records: message_read
+                        .records
+                        .into_iter()
+                        .map(|(_, message)| message)
+                        .collect(),
+                    durability: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let promoted = follower
+            .promote_queue_follower_if_caught_up(
+                "topic",
+                0,
+                None,
+                checkpoint.message_next_offset,
+                checkpoint.event_next_offset,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted,
+            QueuePromotionOutcome::Promoted {
+                message_next_offset: 2,
+                event_next_offset: 2,
+                applied_event_offset: Some(1),
+            }
+        );
+
+        shutdown_stroma("owner_state_checkpoint_export_owner", &owner).await;
+        shutdown_stroma("owner_state_checkpoint_export_follower", &follower).await;
     }
 
     #[tokio::test]

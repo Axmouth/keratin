@@ -27,9 +27,9 @@ pub use stroma::{
     EvictOutcome, FollowerStateCheckpointInstall, FollowerStateCheckpointInstallOutcome, GlobalDLQ,
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
-    PublishItem, QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch,
-    ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma,
-    StromaKeratinConfig, TaskGroup,
+    OwnerStateCheckpoint, PublishItem, QueueDemotionOutcome, QueuePromotionOutcome,
+    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig,
+    Stroma, StromaKeratinConfig, TaskGroup,
 };
 
 pub type Offset = u64;
