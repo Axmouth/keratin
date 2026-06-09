@@ -1389,6 +1389,27 @@ impl Stroma {
         Ok(())
     }
 
+    pub async fn stop_queue_follower_for_transition(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+
+        qh.freeze();
+        qh.msg_log().freeze();
+        qh.event_log().freeze();
+        Ok(())
+    }
+
     pub async fn become_queue_owner(
         &self,
         topic: &str,
@@ -4779,6 +4800,41 @@ mod tests {
         ));
 
         shutdown_stroma("owner_replication_read_rejects_follower", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn stopped_follower_rejects_replicated_ingest() {
+        let dir = test_dir!("stopped_follower_rejects_replicated_ingest");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        stroma
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+        stroma
+            .stop_queue_follower_for_transition("topic", 0, None)
+            .await
+            .unwrap();
+
+        let err = stroma
+            .apply_replicated_queue_batch("topic", 0, None, None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: QueueRole::Frozen
+            }
+        ));
+
+        shutdown_stroma("stopped_follower_rejects_replicated_ingest", &stroma).await;
     }
 
     #[tokio::test]
