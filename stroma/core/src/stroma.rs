@@ -93,6 +93,35 @@ pub struct ReplicatedQueueApplyOutcome {
     pub event_log: Option<ReplicatedAppendOutcome>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum QueuePromotionOutcome {
+    Promoted {
+        message_next_offset: Offset,
+        event_next_offset: Offset,
+        applied_event_offset: Option<Offset>,
+    },
+    MessageLogBehind {
+        local_next_offset: Offset,
+        expected_next_offset: Offset,
+    },
+    MessageLogAhead {
+        local_next_offset: Offset,
+        expected_next_offset: Offset,
+    },
+    EventLogBehind {
+        local_next_offset: Offset,
+        expected_next_offset: Offset,
+    },
+    EventLogAhead {
+        local_next_offset: Offset,
+        expected_next_offset: Offset,
+    },
+    EventsNotApplied {
+        applied_event_offset: Option<Offset>,
+        event_next_offset: Offset,
+    },
+}
+
 struct ItemMeta {
     not_before: Option<UnixMillis>,
 }
@@ -1278,6 +1307,75 @@ impl Stroma {
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
         Ok(())
+    }
+
+    pub async fn promote_queue_follower_if_caught_up(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        expected_message_next_offset: Offset,
+        expected_event_next_offset: Offset,
+    ) -> Result<QueuePromotionOutcome> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+
+        let message_next_offset = qh.msg_log().next_offset();
+        if message_next_offset < expected_message_next_offset {
+            return Ok(QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: message_next_offset,
+                expected_next_offset: expected_message_next_offset,
+            });
+        }
+        if message_next_offset > expected_message_next_offset {
+            return Ok(QueuePromotionOutcome::MessageLogAhead {
+                local_next_offset: message_next_offset,
+                expected_next_offset: expected_message_next_offset,
+            });
+        }
+
+        let event_next_offset = qh.event_log().next_offset();
+        if event_next_offset < expected_event_next_offset {
+            return Ok(QueuePromotionOutcome::EventLogBehind {
+                local_next_offset: event_next_offset,
+                expected_next_offset: expected_event_next_offset,
+            });
+        }
+        if event_next_offset > expected_event_next_offset {
+            return Ok(QueuePromotionOutcome::EventLogAhead {
+                local_next_offset: event_next_offset,
+                expected_next_offset: expected_event_next_offset,
+            });
+        }
+
+        let applied_upto = qh.applied_upto().load(Ordering::Acquire);
+        let applied_event_offset = if event_next_offset == 0 {
+            None
+        } else {
+            Some(applied_upto)
+        };
+        if event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1) {
+            return Ok(QueuePromotionOutcome::EventsNotApplied {
+                applied_event_offset,
+                event_next_offset,
+            });
+        }
+
+        qh.become_owner();
+        qh.msg_log().become_owner();
+        qh.event_log().become_owner();
+
+        Ok(QueuePromotionOutcome::Promoted {
+            message_next_offset,
+            event_next_offset,
+            applied_event_offset,
+        })
     }
 
     pub async fn apply_replicated_queue_batch(

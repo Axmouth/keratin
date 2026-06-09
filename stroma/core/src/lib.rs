@@ -26,8 +26,8 @@ pub use state::{
 pub use stroma::{
     EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
     MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem,
-    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig,
-    Stroma, StromaKeratinConfig, TaskGroup,
+    QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
+    ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma, StromaKeratinConfig, TaskGroup,
 };
 
 pub type Offset = u64;

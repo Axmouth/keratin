@@ -6,8 +6,8 @@ use keratin_log::{
 };
 use stroma_core::{
     DeadLetterMeta, DeadLetterReason, EnqueueEventMeta, MessageHeaders, QueueHandle,
-    QueueHandleError, QueueRole, ReplicatedEventBatch, ReplicatedMessageBatch, SnapshotConfig,
-    Stroma, StromaError, StromaEvent, StromaKeratinConfig,
+    QueueHandleError, QueuePromotionOutcome, QueueRole, ReplicatedEventBatch,
+    ReplicatedMessageBatch, SnapshotConfig, Stroma, StromaError, StromaEvent, StromaKeratinConfig,
 };
 use tokio::time::{Instant, timeout};
 
@@ -387,4 +387,133 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
         !st.is_materialized("dlq", 0, None),
         "source follower must not materialize or write the DLQ target queue"
     );
+}
+
+#[tokio::test]
+async fn caught_up_follower_can_promote_and_accept_owner_writes() {
+    let (st, _dir) = open_test_stroma("stroma_roles_promote_caught_up_follower").await;
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+
+    st.apply_replicated_queue_batch(
+        "topic-a",
+        0,
+        None,
+        Some(ReplicatedMessageBatch {
+            epoch: 0,
+            first_offset: 0,
+            records: vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: b"replicated".to_vec(),
+            }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 0,
+            events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let promoted = st
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        promoted,
+        QueuePromotionOutcome::Promoted {
+            message_next_offset: 1,
+            event_next_offset: 1,
+            applied_event_offset: Some(0),
+        }
+    );
+    assert_eq!(qh.role(), QueueRole::Owner);
+
+    let headers = MessageHeaders {
+        published: 3,
+        publish_received: 4,
+        content_type: None,
+        extra: Default::default(),
+    };
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.append_message("topic-a", 0, None, &headers, b"owner".to_vec(), completion)
+        .await
+        .unwrap();
+    let appended = timeout(Duration::from_secs(2), rx)
+        .await
+        .expect("owner publish after promotion did not complete")
+        .unwrap()
+        .unwrap();
+    assert_eq!(appended.base_offset, 1);
+    assert!(qh.is_ready(1).await);
+}
+
+#[tokio::test]
+async fn promotion_reports_follower_lag_without_changing_role() {
+    let (st, _dir) = open_test_stroma("stroma_roles_promote_reports_lag").await;
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+
+    let outcome = st
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 1, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        QueuePromotionOutcome::MessageLogBehind {
+            local_next_offset: 0,
+            expected_next_offset: 1,
+        }
+    );
+    assert_eq!(qh.role(), QueueRole::Follower);
+    assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);
+}
+
+#[tokio::test]
+async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
+    let (st, _dir) = open_test_stroma("stroma_roles_promote_reports_ahead").await;
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+
+    st.apply_replicated_queue_batch(
+        "topic-a",
+        0,
+        None,
+        Some(ReplicatedMessageBatch {
+            epoch: 0,
+            first_offset: 0,
+            records: vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: b"replicated".to_vec(),
+            }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 0,
+            events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let outcome = st
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 0, 1)
+        .await
+        .unwrap();
+    assert_eq!(
+        outcome,
+        QueuePromotionOutcome::MessageLogAhead {
+            local_next_offset: 1,
+            expected_next_offset: 0,
+        }
+    );
+    assert_eq!(qh.role(), QueueRole::Follower);
+    assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);
 }
