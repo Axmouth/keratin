@@ -1,11 +1,13 @@
 use std::time::Duration;
 
 use keratin_log::{
-    CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
+    CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig, Message,
+    ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
 use stroma_core::{
-    MessageHeaders, QueueHandle, QueueHandleError, QueueRole, SnapshotConfig, Stroma, StromaError,
-    StromaKeratinConfig,
+    DeadLetterMeta, DeadLetterReason, EnqueueEventMeta, MessageHeaders, QueueHandle,
+    QueueHandleError, QueueRole, ReplicatedEventBatch, ReplicatedMessageBatch, SnapshotConfig,
+    Stroma, StromaError, StromaEvent, StromaKeratinConfig,
 };
 use tokio::time::{Instant, timeout};
 
@@ -241,4 +243,148 @@ async fn freeze_allows_started_ack_to_finish_but_rejects_new_ack() {
     freezer.await.unwrap();
     assert_eq!(qh.active_owner_operations(), 0);
     assert!(st.is_acked("topic-a", 0, None, 0).await.unwrap());
+}
+
+#[tokio::test]
+async fn follower_ingest_applies_replicated_messages_and_events() {
+    let (st, _dir) = open_test_stroma("stroma_roles_follower_ingest").await;
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+    let headers = MessageHeaders {
+        published: 1,
+        publish_received: 2,
+        content_type: None,
+        extra: Default::default(),
+    };
+
+    let outcome = st
+        .apply_replicated_queue_batch(
+            "topic-a",
+            0,
+            None,
+            Some(ReplicatedMessageBatch {
+                epoch: 0,
+                first_offset: 0,
+                records: vec![
+                    Message {
+                        flags: 0,
+                        headers: headers.encode().unwrap(),
+                        payload: b"one".to_vec(),
+                    },
+                    Message {
+                        flags: 0,
+                        headers: headers.encode().unwrap(),
+                        payload: b"two".to_vec(),
+                    },
+                ],
+                durability: Some(KDurability::AfterFsync),
+            }),
+            Some(ReplicatedEventBatch {
+                epoch: 0,
+                first_offset: 0,
+                events: vec![StromaEvent::EnqueueMany {
+                    reqs: vec![
+                        EnqueueEventMeta { off: 0, retries: 0 },
+                        EnqueueEventMeta { off: 1, retries: 0 },
+                    ],
+                }],
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome.message_log,
+        Some(ReplicatedAppendOutcome::Applied(result))
+            if result.base_offset == 0 && result.count == 2
+    ));
+    assert!(matches!(
+        outcome.event_log,
+        Some(ReplicatedAppendOutcome::Applied(result))
+            if result.base_offset == 0 && result.count == 1
+    ));
+    assert_eq!(qh.role(), QueueRole::Follower);
+    assert!(qh.is_ready(0).await);
+    assert!(qh.is_ready(1).await);
+    let fetched = st.fetch_message_by_offset(&qh, 1).await.unwrap().unwrap();
+    assert_eq!(fetched.payload, b"two");
+    assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
+}
+
+#[tokio::test]
+async fn replicated_ingest_rejects_owner_queue() {
+    let (st, _dir) = open_test_stroma("stroma_roles_replicated_ingest_rejects_owner").await;
+
+    let result = st
+        .apply_replicated_queue_batch(
+            "topic-a",
+            0,
+            None,
+            None,
+            Some(ReplicatedEventBatch {
+                epoch: 0,
+                first_offset: 0,
+                events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await;
+
+    assert!(matches!(
+        result,
+        Err(StromaError::WrongQueueRole {
+            expected: QueueRole::Follower,
+            actual: QueueRole::Owner,
+        })
+    ));
+}
+
+#[tokio::test]
+async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
+    let (st, _dir) = open_test_stroma("stroma_roles_follower_dlq_boundary").await;
+    st.become_queue_follower("src", 0, None).await.unwrap();
+    let src = st.queue_handle("src", 0, None).await.unwrap();
+
+    st.apply_replicated_queue_batch(
+        "src",
+        0,
+        None,
+        Some(ReplicatedMessageBatch {
+            epoch: 0,
+            first_offset: 0,
+            records: vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: b"source".to_vec(),
+            }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 0,
+            events: vec![
+                StromaEvent::Enqueue { off: 0, retries: 0 },
+                StromaEvent::DeadLetter {
+                    reqs: vec![DeadLetterMeta {
+                        off: 0,
+                        retry_count: 1,
+                        reason: DeadLetterReason::RetriesExhausted,
+                        target_tp: "dlq".into(),
+                        target_part: 0,
+                        target_group: None,
+                    }],
+                },
+            ],
+            durability: Some(KDurability::AfterFsync),
+        }),
+    )
+    .await
+    .unwrap();
+
+    assert_eq!(src.pending_dlq().await.unwrap().len(), 1);
+    assert!(
+        !st.is_materialized("dlq", 0, None),
+        "source follower must not materialize or write the DLQ target queue"
+    );
 }

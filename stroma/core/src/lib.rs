@@ -8,8 +8,8 @@ use keratin_log::KDurability;
 use thiserror::Error;
 
 pub use event::{
-    AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeclareMeta, EnqueueEventMeta,
-    MarkInflightEventMeta, NackEventMeta,
+    AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeadLetterReason, DeclareMeta,
+    EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta, StromaEvent,
 };
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
@@ -25,7 +25,8 @@ pub use state::{
 };
 pub use stroma::{
     EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
-    MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem, SnapshotConfig,
+    MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem,
+    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig,
     Stroma, StromaKeratinConfig, TaskGroup,
 };
 

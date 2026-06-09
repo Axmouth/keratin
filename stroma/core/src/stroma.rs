@@ -14,7 +14,8 @@ use std::{
 use arc_swap::ArcSwap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
-    KeratinAppendCompletion, KeratinConfig, Message, util::unix_millis,
+    KeratinAppendCompletion, KeratinConfig, KeratinReplicaExt, Message, ReplicatedAppendOutcome,
+    util::unix_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -68,6 +69,28 @@ pub struct PublishItem {
     pub payload: Vec<u8>,
     pub not_before: Option<UnixMillis>,
     pub completion: Box<dyn AppendCompletion<IoError> + Send>,
+}
+
+#[derive(Debug)]
+pub struct ReplicatedMessageBatch {
+    pub epoch: u64,
+    pub first_offset: Offset,
+    pub records: Vec<Message>,
+    pub durability: Option<KDurability>,
+}
+
+#[derive(Debug)]
+pub struct ReplicatedEventBatch {
+    pub epoch: u64,
+    pub first_offset: Offset,
+    pub events: Vec<StromaEvent>,
+    pub durability: Option<KDurability>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ReplicatedQueueApplyOutcome {
+    pub message_log: Option<ReplicatedAppendOutcome>,
+    pub event_log: Option<ReplicatedAppendOutcome>,
 }
 
 struct ItemMeta {
@@ -1226,6 +1249,8 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
         qh.freeze_and_wait_owner_operations().await;
+        qh.msg_log().freeze();
+        qh.event_log().freeze();
         Ok(())
     }
 
@@ -1237,6 +1262,8 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
         qh.become_follower();
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
         Ok(())
     }
 
@@ -1248,7 +1275,73 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
         qh.become_owner();
+        qh.msg_log().become_owner();
+        qh.event_log().become_owner();
         Ok(())
+    }
+
+    pub async fn apply_replicated_queue_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        messages: Option<ReplicatedMessageBatch>,
+        events: Option<ReplicatedEventBatch>,
+    ) -> Result<ReplicatedQueueApplyOutcome> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+
+        let message_log = match messages {
+            Some(batch) => Some(
+                qh.msg_log()
+                    .append_replicated_batch(
+                        batch.epoch,
+                        batch.first_offset,
+                        batch.records,
+                        batch.durability,
+                    )
+                    .await
+                    .map_err(io_err)?,
+            ),
+            None => None,
+        };
+
+        let event_log = match events {
+            Some(batch) => {
+                let mut records = Vec::with_capacity(batch.events.len());
+                for event in &batch.events {
+                    records.push(event_msg(event)?);
+                }
+                let outcome = qh
+                    .event_log()
+                    .append_replicated_batch(
+                        batch.epoch,
+                        batch.first_offset,
+                        records,
+                        batch.durability,
+                    )
+                    .await
+                    .map_err(io_err)?;
+                for event in batch.events {
+                    self.apply_event_inmem(event, &qh).await?;
+                }
+                Some(outcome)
+            }
+            None => None,
+        };
+
+        Ok(ReplicatedQueueApplyOutcome {
+            message_log,
+            event_log,
+        })
     }
 
     pub fn is_materialized(&self, topic: &str, part: u32, group: Option<&str>) -> bool {
