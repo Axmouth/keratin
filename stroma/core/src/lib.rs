@@ -20,15 +20,16 @@ pub use metrics::StromaMetrics;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
     MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
-    QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
+    QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole, SnapshotMeta,
     StromaDebugSnapshot,
 };
 pub use stroma::{
-    EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
-    MessageHeaders, MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch,
-    OwnerReplicationRead, PublishItem, QueueDemotionOutcome, QueuePromotionOutcome,
-    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig,
-    Stroma, StromaKeratinConfig, TaskGroup,
+    EvictOutcome, FollowerStateCheckpointInstall, FollowerStateCheckpointInstallOutcome, GlobalDLQ,
+    GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
+    MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
+    PublishItem, QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch,
+    ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma,
+    StromaKeratinConfig, TaskGroup,
 };
 
 pub type Offset = u64;

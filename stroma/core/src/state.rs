@@ -475,6 +475,11 @@ pub enum QueueCommand {
         data: Vec<u8>,
         response: Option<oneshot::Sender<std::io::Result<SnapshotMeta>>>,
     }, // data
+    InstallSnapshotState {
+        state: QueueInternalState,
+        meta: SnapshotMeta,
+        response: Option<oneshot::Sender<SnapshotMeta>>,
+    },
 
     IsAcked {
         offset: Offset,
@@ -559,6 +564,7 @@ impl QueueCommand {
             // === Recovery / loading — one-shot at startup, not in contention ===
             // Put at Express so they can't be blocked if something else is in the queue
             QueueCommand::LoadSnapshot { .. } => CommandPrio::Express,
+            QueueCommand::InstallSnapshotState { .. } => CommandPrio::Express,
             QueueCommand::SetAckedUntil { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindow { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindowFromBytes { .. } => CommandPrio::Express,
@@ -656,6 +662,7 @@ impl QueueCommand {
             QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
+            QueueCommand::InstallSnapshotState { .. } => "InstallSnapshotState",
             QueueCommand::IsAcked { .. } => "IsAcked",
             QueueCommand::IsInflight { .. } => "IsInflight",
             QueueCommand::IsInflightOrAcked { .. } => "IsInflightOrAcked",
@@ -731,7 +738,7 @@ pub struct QueueCommandPackage {
     pub enqueued_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotMeta {
     pub last_snapshot_timestamp: u64,
     pub last_snapshot_event_offset: u64,
@@ -1522,6 +1529,17 @@ impl QueueHandle {
                     let _ = r.send(result);
                 }
             }
+            QueueCommand::InstallSnapshotState {
+                state: mut loaded_state,
+                meta,
+                response,
+            } => {
+                loaded_state.deadline_waker = state.deadline_waker.clone();
+                *state = loaded_state;
+                if let Some(r) = response {
+                    let _ = r.send(meta);
+                }
+            }
             QueueCommand::IsInflightOrAcked { offset, response } => {
                 let result = state.is_inflight_or_acked(offset);
                 if let Some(r) = response {
@@ -2007,6 +2025,33 @@ impl QueueHandle {
             .await
             .map_err(|_| QueueHandleError::ActorGone)?
             .map_err(|_| QueueHandleError::SnapshotLoadFailed("Failed to load snapshot".into()))?;
+
+        self.last_snapshot_event_offset.store(
+            snapmeta.last_snapshot_event_offset,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.last_snapshot_timestamp.store(
+            snapmeta.last_snapshot_timestamp,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(snapmeta)
+    }
+
+    pub async fn install_snapshot_state(
+        &self,
+        state: QueueInternalState,
+        meta: SnapshotMeta,
+    ) -> Result<SnapshotMeta, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::InstallSnapshotState {
+                state,
+                meta,
+                response: Some(tx),
+            })
+            .await;
+        let snapmeta = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
 
         self.last_snapshot_event_offset.store(
             snapmeta.last_snapshot_event_offset,

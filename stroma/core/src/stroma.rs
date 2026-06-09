@@ -37,8 +37,8 @@ use crate::{
     state::{
         CustomDLQ, InspectMode, NackOutcome, Offset, OwnerOperationLease, QueueCommand,
         QueueDebugInfo, QueueHandle, QueueInspectionSnapshot, QueueInspectionState,
-        QueueInternalDebugInfo, QueueRole, QueueSharedBundle, QueueStatusReport,
-        StromaDebugSnapshot, UnixMillis,
+        QueueInternalDebugInfo, QueueInternalState, QueueRole, QueueSharedBundle,
+        QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
     topic,
 };
@@ -110,6 +110,27 @@ pub enum OwnerReplicationRead<T> {
 pub struct ReplicatedQueueApplyOutcome {
     pub message_log: Option<ReplicatedAppendOutcome>,
     pub event_log: Option<ReplicatedAppendOutcome>,
+}
+
+/// Compacted queue state for a follower that fell behind retained event logs.
+///
+/// This is not a message transfer. Messages at or after `message_next_offset`
+/// still need to be replicated through the message-log replication path before
+/// the follower can safely promote.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowerStateCheckpointInstall {
+    pub message_next_offset: Offset,
+    pub event_next_offset: Offset,
+    pub applied_event_offset: Offset,
+    pub state_snapshot: Vec<u8>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FollowerStateCheckpointInstallOutcome {
+    pub message_next_offset: Offset,
+    pub event_next_offset: Offset,
+    pub applied_event_offset: Offset,
+    pub snapshot_meta: crate::state::SnapshotMeta,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -1614,6 +1635,97 @@ impl Stroma {
         Ok(ReplicatedQueueApplyOutcome {
             message_log,
             event_log,
+        })
+    }
+
+    pub async fn install_follower_state_checkpoint(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        install: FollowerStateCheckpointInstall,
+    ) -> Result<FollowerStateCheckpointInstallOutcome> {
+        let expected_applied_event_offset = install.event_next_offset.saturating_sub(1);
+        if install.applied_event_offset != expected_applied_event_offset {
+            return Err(StromaError::InvalidArgument(format!(
+                "checkpoint applied event offset {} does not match event continuation {}",
+                install.applied_event_offset, install.event_next_offset
+            )));
+        }
+
+        let mut checkpoint_state = QueueInternalState::new(topic.to_string(), part);
+        let snapshot_meta = checkpoint_state
+            .load_snapshot(&install.state_snapshot)
+            .map_err(|err| StromaError::Decode(format!("checkpoint snapshot invalid: {err}")))?;
+        if snapshot_meta.last_snapshot_event_offset != install.applied_event_offset {
+            return Err(StromaError::InvalidArgument(format!(
+                "checkpoint snapshot event offset {} does not match applied event offset {}",
+                snapshot_meta.last_snapshot_event_offset, install.applied_event_offset
+            )));
+        }
+        let lowest_state_referenced_message = checkpoint_state.lowest_not_acked_offset();
+        if install.message_next_offset > lowest_state_referenced_message {
+            return Err(StromaError::InvalidArgument(format!(
+                "checkpoint message continuation {} is ahead of lowest state-referenced message {}",
+                install.message_next_offset, lowest_state_referenced_message
+            )));
+        }
+
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+
+        qh.msg_log()
+            .destructive_reset_to_checkpoint(install.message_next_offset)
+            .await
+            .map_err(io_err)?;
+        qh.event_log()
+            .destructive_reset_to_checkpoint(install.event_next_offset)
+            .await
+            .map_err(io_err)?;
+
+        qh.install_snapshot_state(checkpoint_state, snapshot_meta)
+            .await
+            .map_err(|err| {
+                StromaError::Io(format!(
+                    "checkpoint state install failed for tp={topic} part={part} group={group:?}: {err}"
+                ))
+            })?;
+        qh.applied_upto()
+            .store(install.applied_event_offset, Ordering::Release);
+        qh.set_dirty_snapshot(false);
+
+        let dir = self.snap_dir(topic, part, group);
+        let topic_owned = topic.to_string();
+        let group_owned = group.map(str::to_string);
+        let stroma = self.clone();
+        let state_snapshot = install.state_snapshot.clone();
+        let applied_event_offset = install.applied_event_offset;
+        tokio::task::spawn_blocking(move || {
+            fs::create_dir_all(&dir).map_err(io_err)?;
+            stroma.write_queue_snapshot(
+                &topic_owned,
+                part,
+                group_owned.as_deref(),
+                applied_event_offset,
+                &state_snapshot,
+            )
+        })
+        .await
+        .map_err(|err| StromaError::Io(err.to_string()))??;
+
+        Ok(FollowerStateCheckpointInstallOutcome {
+            message_next_offset: install.message_next_offset,
+            event_next_offset: install.event_next_offset,
+            applied_event_offset: install.applied_event_offset,
+            snapshot_meta,
         })
     }
 
@@ -4610,6 +4722,232 @@ mod tests {
         );
 
         shutdown_stroma("owner_replication_read_checkpoint_required", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn follower_state_checkpoint_install_rejects_owner_role() {
+        let dir = test_dir!("follower_state_checkpoint_rejects_owner");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let snapshot = qh.encode_snapshot(0).await.unwrap();
+
+        let err = stroma
+            .install_follower_state_checkpoint(
+                "topic",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_next_offset: 0,
+                    event_next_offset: 1,
+                    applied_event_offset: 0,
+                    state_snapshot: snapshot,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(
+            err,
+            StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: QueueRole::Owner
+            }
+        ));
+
+        shutdown_stroma("follower_state_checkpoint_rejects_owner", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn follower_state_checkpoint_install_requires_matching_snapshot_offset() {
+        let dir = test_dir!("follower_state_checkpoint_validates_offset");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let snapshot = qh.encode_snapshot(0).await.unwrap();
+        stroma
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+
+        let err = stroma
+            .install_follower_state_checkpoint(
+                "topic",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_next_offset: 1,
+                    event_next_offset: 2,
+                    applied_event_offset: 1,
+                    state_snapshot: snapshot,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StromaError::InvalidArgument(_)));
+
+        shutdown_stroma("follower_state_checkpoint_validates_offset", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn follower_state_checkpoint_install_rejects_skipped_referenced_messages() {
+        let dir = test_dir!("follower_state_checkpoint_validates_messages");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let snapshot = qh.encode_snapshot(1).await.unwrap();
+        stroma
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+
+        let err = stroma
+            .install_follower_state_checkpoint(
+                "topic",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_next_offset: 2,
+                    event_next_offset: 2,
+                    applied_event_offset: 1,
+                    state_snapshot: snapshot,
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(matches!(err, StromaError::InvalidArgument(_)));
+
+        shutdown_stroma("follower_state_checkpoint_validates_messages", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn follower_state_checkpoint_install_resets_logs_but_messages_still_need_replication() {
+        let owner_dir = test_dir!("state_checkpoint_owner");
+        let owner = Stroma::open(
+            &owner_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let follower_dir = test_dir!("state_checkpoint_follower");
+        let follower = Stroma::open(
+            &follower_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&owner, "topic", 0, None).await;
+        publish_one(&owner, "topic", 0, None).await;
+        let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
+        let state_snapshot = owner_qh.encode_snapshot(1).await.unwrap();
+
+        follower
+            .become_queue_follower("topic", 0, None)
+            .await
+            .unwrap();
+        let outcome = follower
+            .install_follower_state_checkpoint(
+                "topic",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_next_offset: 0,
+                    event_next_offset: 2,
+                    applied_event_offset: 1,
+                    state_snapshot,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(outcome.message_next_offset, 0);
+        assert_eq!(outcome.event_next_offset, 2);
+        assert_eq!(outcome.applied_event_offset, 1);
+        assert_eq!(outcome.snapshot_meta.last_snapshot_event_offset, 1);
+
+        let not_ready = follower
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            not_ready,
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2,
+            }
+        );
+
+        let message_read = owner
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(message_read) = message_read else {
+            panic!("expected owner message batch");
+        };
+        follower
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: message_read.epoch,
+                    first_offset: message_read.records[0].0,
+                    records: message_read
+                        .records
+                        .into_iter()
+                        .map(|(_, message)| message)
+                        .collect(),
+                    durability: None,
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+
+        let promoted = follower
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            promoted,
+            QueuePromotionOutcome::Promoted {
+                message_next_offset: 2,
+                event_next_offset: 2,
+                applied_event_offset: Some(1),
+            }
+        );
+
+        let delivered = follower
+            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000)
+            .await
+            .unwrap();
+        assert_eq!(delivered.len(), 2);
+
+        shutdown_stroma("state_checkpoint_owner", &owner).await;
+        shutdown_stroma("state_checkpoint_follower", &follower).await;
     }
 
     #[tokio::test]
