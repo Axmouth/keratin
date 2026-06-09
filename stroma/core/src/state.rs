@@ -1,7 +1,7 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
@@ -33,9 +33,43 @@ pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
 pub const FORMAT_VERSION: u64 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueRole {
+    Owner,
+    Follower,
+    Frozen,
+}
+
+impl QueueRole {
+    const OWNER: u8 = 0;
+    const FOLLOWER: u8 = 1;
+    const FROZEN: u8 = 2;
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            Self::FOLLOWER => Self::Follower,
+            Self::FROZEN => Self::Frozen,
+            _ => Self::Owner,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Owner => Self::OWNER,
+            Self::Follower => Self::FOLLOWER,
+            Self::Frozen => Self::FROZEN,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum QueueHandleError {
     ActorGone,
+    WrongRole {
+        expected: QueueRole,
+        actual: QueueRole,
+    },
     LoadSnapshotFailed(String),
     SnapshotNotCreated,
     SnapshotLoadFailed(String),
@@ -45,6 +79,12 @@ impl std::fmt::Display for QueueHandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueueHandleError::ActorGone => write!(f, "queue actor is gone"),
+            QueueHandleError::WrongRole { expected, actual } => {
+                write!(
+                    f,
+                    "queue role mismatch: expected {expected:?}, current role is {actual:?}"
+                )
+            }
             QueueHandleError::LoadSnapshotFailed(reason) => {
                 write!(f, "snapshot load failed: {reason}")
             }
@@ -60,6 +100,9 @@ impl From<QueueHandleError> for StromaError {
     fn from(value: QueueHandleError) -> Self {
         match value {
             QueueHandleError::ActorGone => StromaError::QueueActorGone,
+            QueueHandleError::WrongRole { expected, actual } => {
+                StromaError::WrongQueueRole { expected, actual }
+            }
             QueueHandleError::LoadSnapshotFailed(reason) => StromaError::Internal(reason),
             QueueHandleError::SnapshotNotCreated => {
                 StromaError::Internal("snapshot not created".to_string())
@@ -892,6 +935,8 @@ pub struct QueueHandle {
     recovery_notify: Arc<Notify>,
     snapshot_task_started: Arc<AtomicBool>,
     background_tasks: CancellationToken,
+    role: Arc<AtomicU8>,
+    role_generation: Arc<AtomicU64>,
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
@@ -930,6 +975,8 @@ impl QueueHandle {
         let recovery_notify = Arc::new(Notify::new());
         let snapshot_task_started = Arc::new(AtomicBool::new(false));
         let background_tasks = CancellationToken::new();
+        let role = Arc::new(AtomicU8::new(QueueRole::Owner.as_u8()));
+        let role_generation = Arc::new(AtomicU64::new(0));
 
         let task_group_clone = task_group.clone();
 
@@ -950,6 +997,8 @@ impl QueueHandle {
             recovery_notify,
             snapshot_task_started,
             background_tasks,
+            role,
+            role_generation,
             task_group,
             global_dlq,
             metrics,
@@ -988,6 +1037,8 @@ impl QueueHandle {
             materialized: true,
             exists_on_disk: true,
             evicting: false,
+            role: self.role(),
+            role_generation: self.role_generation(),
             applied_upto: self.applied_upto.load(Ordering::Relaxed),
             last_snapshot_timestamp: self.last_snapshot_timestamp(),
             last_snapshot_event_offset: self.last_snapshot_event_offset(),
@@ -1000,6 +1051,44 @@ impl QueueHandle {
     pub fn mark_recovery_complete(&self) {
         self.recovery_complete.store(true, Ordering::Release);
         self.recovery_notify.notify_waiters();
+    }
+
+    pub fn role(&self) -> QueueRole {
+        QueueRole::from_u8(self.role.load(Ordering::Acquire))
+    }
+
+    pub fn role_generation(&self) -> u64 {
+        self.role_generation.load(Ordering::Acquire)
+    }
+
+    pub fn become_owner(&self) {
+        self.set_role(QueueRole::Owner);
+    }
+
+    pub fn become_follower(&self) {
+        self.set_role(QueueRole::Follower);
+    }
+
+    pub fn freeze(&self) {
+        self.set_role(QueueRole::Frozen);
+    }
+
+    fn set_role(&self, role: QueueRole) {
+        let old = self.role.swap(role.as_u8(), Ordering::AcqRel);
+        if old != role.as_u8() {
+            self.role_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn ensure_owner(&self) -> Result<(), QueueHandleError> {
+        let actual = self.role();
+        if actual == QueueRole::Owner {
+            return Ok(());
+        }
+        Err(QueueHandleError::WrongRole {
+            expected: QueueRole::Owner,
+            actual,
+        })
     }
 
     pub fn recovery_complete(&self) -> bool {
@@ -1464,6 +1553,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1479,6 +1569,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1497,6 +1588,7 @@ impl QueueHandle {
         offset: Offset,
         not_before: UnixMillis,
     ) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1515,6 +1607,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<EnqueueDelayedEventMeta>,
     ) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1533,6 +1626,7 @@ impl QueueHandle {
         offset: Offset,
         deadline: UnixMillis,
     ) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
@@ -1550,6 +1644,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<MarkInflightEventMeta>,
     ) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
@@ -1563,6 +1658,7 @@ impl QueueHandle {
     }
 
     pub async fn ack(&self, offset: Offset) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
@@ -1575,6 +1671,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
@@ -1591,6 +1688,7 @@ impl QueueHandle {
         offset: Offset,
         requeue: bool,
     ) -> Result<NackOutcome, QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
@@ -1611,6 +1709,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<NackEventMeta>,
     ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
@@ -1629,6 +1728,7 @@ impl QueueHandle {
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DeadLetterCommit {
@@ -1654,6 +1754,7 @@ impl QueueHandle {
     }
 
     pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DiscardPendingDlq {
@@ -1666,6 +1767,7 @@ impl QueueHandle {
     }
 
     pub async fn declare(&self, meta: DeclareMeta) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Declare {
@@ -1712,6 +1814,7 @@ impl QueueHandle {
         &self,
         offsets: Vec<Offset>,
     ) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkPendingDlq {
@@ -1724,6 +1827,7 @@ impl QueueHandle {
     }
 
     pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
@@ -1733,6 +1837,7 @@ impl QueueHandle {
     }
 
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
@@ -1915,7 +2020,8 @@ impl QueueHandle {
         &self,
         max: usize,
         lease_deadline: UnixMillis,
-    ) -> Vec<(Offset, u32)> {
+    ) -> Result<Vec<(Offset, u32)>, QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::PollReadyAndMark {
@@ -1924,7 +2030,7 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap_or_default()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn lowest_unacked_offset(&self) -> Offset {
@@ -2004,7 +2110,12 @@ impl QueueHandle {
             .map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
     }
 
-    pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
+    pub async fn collect_expired(
+        &self,
+        now: UnixMillis,
+        max: usize,
+    ) -> Result<Vec<Offset>, QueueHandleError> {
+        self.ensure_owner()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::CollectExpired {
@@ -2013,7 +2124,7 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap_or_default()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
@@ -3415,6 +3526,8 @@ pub struct QueueDebugInfo {
     pub materialized: bool,
     pub exists_on_disk: bool,
     pub evicting: bool,
+    pub role: QueueRole,
+    pub role_generation: u64,
 
     pub applied_upto: u64,
     pub last_snapshot_timestamp: u64,

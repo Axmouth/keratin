@@ -35,8 +35,8 @@ use crate::{
     metrics::StromaMetrics,
     state::{
         CustomDLQ, InspectMode, NackOutcome, Offset, QueueCommand, QueueDebugInfo, QueueHandle,
-        QueueInspectionSnapshot, QueueInspectionState, QueueInternalDebugInfo, QueueSharedBundle,
-        QueueStatusReport, StromaDebugSnapshot, UnixMillis,
+        QueueInspectionSnapshot, QueueInspectionState, QueueInternalDebugInfo, QueueRole,
+        QueueSharedBundle, QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
     topic,
 };
@@ -1519,6 +1519,7 @@ impl Stroma {
         let start = Instant::now();
 
         let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in &evs {
@@ -1702,6 +1703,9 @@ impl Stroma {
         let keys = self.queue_keys_snapshot();
         for (t, p, g) in keys {
             let qh = self.queue_handle(&t, p, g.as_deref()).await?;
+            if qh.role() != QueueRole::Owner {
+                continue;
+            }
             if let Some(hint) = qh.next_expiry_hint().await {
                 min = Some(match min {
                     Some(m) => m.min(hint),
@@ -1745,11 +1749,14 @@ impl Stroma {
         for key in keys {
             let (tp, part, group) = key;
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            if qh.role() != QueueRole::Owner {
+                continue;
+            }
             if out.len() >= max {
                 break;
             }
             let want = max - out.len();
-            for off in qh.collect_expired(now, want).await {
+            for off in qh.collect_expired(now, want).await? {
                 out.push((
                     tp.to_string(),
                     part,
@@ -2443,6 +2450,8 @@ impl Stroma {
                 last_snapshot_event_offset: 0,
                 dirty_since_snapshot: false,
                 creating_snapshot: false,
+                role: QueueRole::Owner,
+                role_generation: 0,
                 state: QueueInternalDebugInfo::default(),
             });
         }
@@ -2548,8 +2557,8 @@ impl Stroma {
             return Ok(());
         }
 
-        self.ensure_queue(tp, part, group).await?;
         let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
         let msg_log = qh.msg_log();
 
         // Build msg_log batch and extract per client completions.
@@ -2641,7 +2650,9 @@ impl Stroma {
         event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
-        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
+        let msg_log = qh.msg_log();
         msg_log
             .append_enqueue(
                 Message {
@@ -2713,6 +2724,7 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
@@ -2737,6 +2749,7 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
         let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
@@ -2782,6 +2795,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
+        qh.ensure_owner()?;
         let event_log = qh.event_log();
 
         // Phase 1: durable Nack write
@@ -3057,6 +3071,7 @@ impl Stroma {
     }
 
     async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) -> Result<()> {
+        qh.ensure_owner()?;
         let ev = StromaEvent::DeadLetterCommit { offs: offs.clone() };
         let Ok(m) = event_msg(&ev) else {
             return Err(StromaError::Encode(
@@ -3100,7 +3115,7 @@ impl Stroma {
         let qs = self.queue_handle(tp, part, group).await?;
 
         // Offsets are now already marked inflight inside queue
-        let offs = qs.poll_ready_and_mark(max, lease_deadline).await;
+        let offs = qs.poll_ready_and_mark(max, lease_deadline).await?;
 
         if offs.is_empty() {
             return Ok(Vec::new());
@@ -3959,7 +3974,7 @@ mod tests {
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
 
-        qh.enqueue(0, 0).await;
+        qh.enqueue(0, 0).await.unwrap();
 
         tokio::time::advance(Duration::from_secs(21)).await;
         notified.await;
@@ -3983,7 +3998,7 @@ mod tests {
             .unwrap();
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
-            qh.enqueue(0, 0).await;
+            qh.enqueue(0, 0).await.unwrap();
 
             shutdown_stroma(
                 "open_indexes_existing_queues_without_materializing_them/setup",

@@ -47,15 +47,15 @@ async fn expired_messages_are_redelivered_and_never_lost() {
     let q = st.queue_handle("t", 0, None).await.unwrap();
 
     for i in 0..100 {
-        q.enqueue(i, 0).await;
-        q.mark_inflight(i, 1000).await;
+        q.enqueue(i, 0).await.unwrap();
+        q.mark_inflight(i, 1000).await.unwrap();
     }
 
-    let expired = q.collect_expired(2000, 1000).await;
+    let expired = q.collect_expired(2000, 1000).await.unwrap();
 
     for off in expired {
-        q.enqueue(off, 1).await;
-        q.mark_inflight(off, 3000).await;
+        q.enqueue(off, 1).await.unwrap();
+        q.mark_inflight(off, 3000).await.unwrap();
     }
 
     assert_eq!(q.inflight_len().await, 100);

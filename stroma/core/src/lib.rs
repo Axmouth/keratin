@@ -19,8 +19,9 @@ pub use keratin_log::{
 pub use metrics::StromaMetrics;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
-    MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueInspectionSnapshot,
-    QueueInspectionState, QueueInternalState, StromaDebugSnapshot,
+    MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
+    QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
+    StromaDebugSnapshot,
 };
 pub use stroma::{
     EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
@@ -73,6 +74,12 @@ pub enum StromaError {
 
     #[error("queue actor is gone")]
     QueueActorGone,
+
+    #[error("queue role mismatch: expected {expected:?}, current role is {actual:?}")]
+    WrongQueueRole {
+        expected: QueueRole,
+        actual: QueueRole,
+    },
 
     #[error("internal: {0}")]
     Internal(String),
