@@ -85,3 +85,42 @@ async fn expiry_scan_skips_follower_queues() {
     let expired = st.collect_expired(20, 10).await.unwrap();
     assert_eq!(expired, vec![("owner".to_string(), 0, None, 0)]);
 }
+
+#[tokio::test]
+async fn freeze_waits_for_active_owner_operation_before_role_swap() {
+    let dir = test_dir!("stroma_roles_freeze_waits_for_owner_operation");
+    let st = Stroma::open(
+        &dir.root,
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+    let owner_operation = qh.begin_owner_operation().unwrap();
+
+    let freezer = {
+        let st = st.clone();
+        tokio::spawn(async move {
+            st.freeze_queue_for_transition("topic-a", 0, None)
+                .await
+                .unwrap();
+        })
+    };
+
+    tokio::task::yield_now().await;
+    assert_eq!(qh.role(), QueueRole::Frozen);
+    assert_eq!(qh.active_owner_operations(), 1);
+    assert_wrong_role(qh.enqueue(1, 0).await, QueueRole::Frozen);
+
+    drop(owner_operation);
+    freezer.await.unwrap();
+    assert_eq!(qh.active_owner_operations(), 0);
+
+    st.become_queue_follower("topic-a", 0, None).await.unwrap();
+    assert_eq!(qh.role(), QueueRole::Follower);
+    assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
+
+    st.become_queue_owner("topic-a", 0, None).await.unwrap();
+    qh.enqueue(3, 0).await.unwrap();
+}

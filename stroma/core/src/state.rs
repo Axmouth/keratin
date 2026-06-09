@@ -75,6 +75,20 @@ pub enum QueueHandleError {
     SnapshotLoadFailed(String),
 }
 
+#[derive(Debug)]
+pub struct OwnerOperationLease {
+    active: Arc<AtomicU64>,
+    drained: Arc<Notify>,
+}
+
+impl Drop for OwnerOperationLease {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
+}
+
 impl std::fmt::Display for QueueHandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
@@ -937,6 +951,8 @@ pub struct QueueHandle {
     background_tasks: CancellationToken,
     role: Arc<AtomicU8>,
     role_generation: Arc<AtomicU64>,
+    owner_operations: Arc<AtomicU64>,
+    owner_operations_drained: Arc<Notify>,
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
@@ -977,6 +993,8 @@ impl QueueHandle {
         let background_tasks = CancellationToken::new();
         let role = Arc::new(AtomicU8::new(QueueRole::Owner.as_u8()));
         let role_generation = Arc::new(AtomicU64::new(0));
+        let owner_operations = Arc::new(AtomicU64::new(0));
+        let owner_operations_drained = Arc::new(Notify::new());
 
         let task_group_clone = task_group.clone();
 
@@ -999,6 +1017,8 @@ impl QueueHandle {
             background_tasks,
             role,
             role_generation,
+            owner_operations,
+            owner_operations_drained,
             task_group,
             global_dlq,
             metrics,
@@ -1061,6 +1081,10 @@ impl QueueHandle {
         self.role_generation.load(Ordering::Acquire)
     }
 
+    pub fn active_owner_operations(&self) -> u64 {
+        self.owner_operations.load(Ordering::Acquire)
+    }
+
     pub fn become_owner(&self) {
         self.set_role(QueueRole::Owner);
     }
@@ -1089,6 +1113,34 @@ impl QueueHandle {
             expected: QueueRole::Owner,
             actual,
         })
+    }
+
+    pub fn begin_owner_operation(&self) -> Result<OwnerOperationLease, QueueHandleError> {
+        self.ensure_owner()?;
+        self.owner_operations.fetch_add(1, Ordering::AcqRel);
+
+        if let Err(err) = self.ensure_owner() {
+            if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                self.owner_operations_drained.notify_waiters();
+            }
+            return Err(err);
+        }
+
+        Ok(OwnerOperationLease {
+            active: self.owner_operations.clone(),
+            drained: self.owner_operations_drained.clone(),
+        })
+    }
+
+    pub async fn freeze_and_wait_owner_operations(&self) {
+        self.freeze();
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
     }
 
     pub fn recovery_complete(&self) -> bool {
@@ -1553,7 +1605,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1569,7 +1621,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1588,7 +1640,7 @@ impl QueueHandle {
         offset: Offset,
         not_before: UnixMillis,
     ) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1607,7 +1659,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<EnqueueDelayedEventMeta>,
     ) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1626,7 +1678,7 @@ impl QueueHandle {
         offset: Offset,
         deadline: UnixMillis,
     ) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
@@ -1644,7 +1696,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<MarkInflightEventMeta>,
     ) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
@@ -1658,7 +1710,7 @@ impl QueueHandle {
     }
 
     pub async fn ack(&self, offset: Offset) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
@@ -1671,7 +1723,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
@@ -1688,7 +1740,7 @@ impl QueueHandle {
         offset: Offset,
         requeue: bool,
     ) -> Result<NackOutcome, QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
@@ -1709,7 +1761,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<NackEventMeta>,
     ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
@@ -1728,7 +1780,7 @@ impl QueueHandle {
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DeadLetterCommit {
@@ -1754,7 +1806,7 @@ impl QueueHandle {
     }
 
     pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DiscardPendingDlq {
@@ -1767,7 +1819,7 @@ impl QueueHandle {
     }
 
     pub async fn declare(&self, meta: DeclareMeta) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Declare {
@@ -1814,7 +1866,7 @@ impl QueueHandle {
         &self,
         offsets: Vec<Offset>,
     ) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkPendingDlq {
@@ -1827,7 +1879,7 @@ impl QueueHandle {
     }
 
     pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
@@ -1837,7 +1889,7 @@ impl QueueHandle {
     }
 
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
@@ -2021,7 +2073,7 @@ impl QueueHandle {
         max: usize,
         lease_deadline: UnixMillis,
     ) -> Result<Vec<(Offset, u32)>, QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::PollReadyAndMark {
@@ -2115,7 +2167,7 @@ impl QueueHandle {
         now: UnixMillis,
         max: usize,
     ) -> Result<Vec<Offset>, QueueHandleError> {
-        self.ensure_owner()?;
+        let _owner_operation = self.begin_owner_operation()?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::CollectExpired {

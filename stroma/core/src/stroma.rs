@@ -34,9 +34,10 @@ use crate::{
     group,
     metrics::StromaMetrics,
     state::{
-        CustomDLQ, InspectMode, NackOutcome, Offset, QueueCommand, QueueDebugInfo, QueueHandle,
-        QueueInspectionSnapshot, QueueInspectionState, QueueInternalDebugInfo, QueueRole,
-        QueueSharedBundle, QueueStatusReport, StromaDebugSnapshot, UnixMillis,
+        CustomDLQ, InspectMode, NackOutcome, Offset, OwnerOperationLease, QueueCommand,
+        QueueDebugInfo, QueueHandle, QueueInspectionSnapshot, QueueInspectionState,
+        QueueInternalDebugInfo, QueueRole, QueueSharedBundle, QueueStatusReport,
+        StromaDebugSnapshot, UnixMillis,
     },
     topic,
 };
@@ -222,6 +223,7 @@ pub struct ApplyThenComplete {
     stroma: Stroma,
     ev: StromaEvent,
     qh: QueueHandle,
+    _owner_operation: OwnerOperationLease,
     inner: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
@@ -256,12 +258,14 @@ impl ApplyThenComplete {
         stroma: Stroma,
         ev: StromaEvent,
         qh: QueueHandle,
+        owner_operation: OwnerOperationLease,
         inner: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Box<Self> {
         Box::new(Self {
             stroma,
             ev,
             qh,
+            _owner_operation: owner_operation,
             inner,
         })
     }
@@ -277,31 +281,28 @@ struct CompletionItem {
 /// then fans out per client completions with assigned offsets.
 struct MsgBatchCompletion {
     stroma: Stroma,
-    tp: Box<str>,
-    part: u32,
-    group: Option<Box<str>>,
     items: Vec<CompletionItem>,
     durability: KDurability,
     runtime: tokio::runtime::Handle,
+    qh: QueueHandle,
+    owner_operation: OwnerOperationLease,
 }
 
 impl MsgBatchCompletion {
     fn new(
         stroma: Stroma,
-        tp: Box<str>,
-        part: u32,
-        group: Option<Box<str>>,
         items: Vec<CompletionItem>,
         durability: KDurability,
+        qh: QueueHandle,
+        owner_operation: OwnerOperationLease,
     ) -> Box<Self> {
         Box::new(Self {
             stroma,
-            tp,
-            part,
-            group,
             items,
             durability,
             runtime: tokio::runtime::Handle::current(),
+            qh,
+            owner_operation,
         })
     }
 }
@@ -310,12 +311,11 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
     fn complete(self: Box<Self>, res: std::result::Result<AppendResult, IoError>) {
         let Self {
             stroma,
-            tp,
-            part,
-            group,
             items,
             durability,
             runtime,
+            qh,
+            owner_operation,
         } = *self;
 
         let ar = match res {
@@ -372,7 +372,7 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
         // The completion thread should not block, we hand off to the runtime
         runtime.spawn(async move {
             match stroma
-                .append_events_durable(&tp, part, group.as_deref(), events, durability)
+                .append_events_durable_leased(qh, events, durability, owner_operation)
                 .await
             {
                 Ok(_) => {
@@ -1218,6 +1218,39 @@ impl Stroma {
         Ok(())
     }
 
+    pub async fn freeze_queue_for_transition(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        qh.freeze_and_wait_owner_operations().await;
+        Ok(())
+    }
+
+    pub async fn become_queue_follower(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        qh.become_follower();
+        Ok(())
+    }
+
+    pub async fn become_queue_owner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        qh.become_owner();
+        Ok(())
+    }
+
     pub fn is_materialized(&self, topic: &str, part: u32, group: Option<&str>) -> bool {
         let current = self.queue_handles.load();
         slot_lookup_no_alloc(current.as_ref(), topic, part, group)
@@ -1423,22 +1456,67 @@ impl Stroma {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue { off, retries } => {
-                qh.enqueue(off, retries).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::Enqueue {
+                    offset: off,
+                    retries,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::EnqueueMany { reqs } => {
-                qh.enqueue_many(reqs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::EnqueueMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::EnqueueDelayed { off, not_before } => {
-                qh.enqueue_delayed(off, not_before).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::EnqueueDelayed {
+                    offset: off,
+                    not_before,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::EnqueueDelayedMany { reqs } => {
-                qh.enqueue_delayed_many(reqs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::EnqueueDelayedMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::MarkInflight { off, deadline } => {
-                qh.mark_inflight(off, deadline).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::MarkInflight {
+                    offset: off,
+                    deadline,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::MarkInflightMany { reqs } => {
-                qh.mark_inflight_batch(reqs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::MarkInflightMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::Ack { off } => {
                 // Accept ACK even if not inflight:
@@ -1446,7 +1524,14 @@ impl Stroma {
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
-                qh.ack(off).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::Ack {
+                    offset: off,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::AckMany { reqs } => {
                 // Accept ACK even if not inflight:
@@ -1454,7 +1539,14 @@ impl Stroma {
                 // - duplicate ACKs
                 // - late ACK after consumer retry
                 // ACK is idempotent and safe.
-                qh.ack_many(reqs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::AckMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::Nack { off, requeue } => {
                 // Accept NACK even if not inflight:
@@ -1462,7 +1554,16 @@ impl Stroma {
                 // - duplicate NACKs
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
-                qh.nack(off, requeue).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::Nack {
+                    offset: off,
+                    requeue,
+                    not_before: None,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::NackMany { reqs } => {
                 // Accept NACK even if not inflight:
@@ -1470,20 +1571,48 @@ impl Stroma {
                 // - duplicate NACKs
                 // - late NACK after consumer retry
                 // NACK is idempotent and safe.
-                qh.nack_many(reqs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::NackMany {
+                    reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::DeadLetter { reqs } => {
                 // On replay we just mark pending; recovery scan will re-issue copies.
                 let offsets: Vec<Offset> = reqs.iter().map(|r| r.off).collect();
                 // We need state.mark_pending_dlq, OR fold via nack(_, false)+pending insert.
                 // Cleanest: add an explicit MarkPendingDlq command for replay.
-                qh.mark_pending_dlq_many(offsets).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::MarkPendingDlq {
+                    offsets,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::DeadLetterCommit { offs } => {
-                qh.dead_letter_commit(offs).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::DeadLetterCommit {
+                    offsets: offs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::Declare(meta) => {
-                qh.declare(meta).await?;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::Declare {
+                    meta,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::ResetQueue { tp, part, group } => {
                 self.remove_queue(&tp, part, group.as_deref());
@@ -1516,10 +1645,21 @@ impl Stroma {
         }
 
         // let _timer = Timer::new(&self.metrics.event_log_appends.batches.latency);
-        let start = Instant::now();
-
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
+
+        self.append_events_durable_leased(qh, evs, durability, owner_operation)
+            .await
+    }
+
+    async fn append_events_durable_leased(
+        &self,
+        qh: QueueHandle,
+        evs: Vec<StromaEvent>,
+        durability: KDurability,
+        _owner_operation: OwnerOperationLease,
+    ) -> Result<Offset> {
+        let start = Instant::now();
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in &evs {
@@ -2231,7 +2371,7 @@ impl Stroma {
                     tokio::spawn(async move {
                         let fut: std::pin::Pin<
                             Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                        > = Box::pin(stroma.dlq_copy_then_commit(src.clone(), qh2, meta));
+                        > = Box::pin(stroma.dlq_copy_then_commit(src.clone(), qh2, meta, None));
                         fut.await.unwrap_or_else(|err| {
                             let (source_tp, source_part, source_group) = src;
                             tracing::error!(
@@ -2558,7 +2698,7 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
         let msg_log = qh.msg_log();
 
         // Build msg_log batch and extract per client completions.
@@ -2603,16 +2743,12 @@ impl Stroma {
         //   2. emits ONE event_log batch with EnqueueMany
         //   3. fans out per client completions with their assigned offsets
         let stroma = self.clone();
-        let tp_box: Box<str> = tp.into();
-        let group_box: Option<Box<str>> = normalize_group(group).map(|s| s.into());
-
         let msg_completion = MsgBatchCompletion::new(
             stroma,
-            tp_box,
-            part,
-            group_box,
             completion_items,
             self.keratin_cfg_msg.default_durability,
+            qh,
+            owner_operation,
         );
 
         msg_log
@@ -2651,7 +2787,7 @@ impl Stroma {
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
         let msg_log = qh.msg_log();
         msg_log
             .append_enqueue(
@@ -2664,8 +2800,6 @@ impl Stroma {
                 msg_completion,
             )
             .map_err(io_err)?;
-        let tp: Box<str> = tp.into();
-        let group: Option<Box<str>> = normalize_group(group).map(|s| s.into());
         let stroma = self.clone();
         tokio::spawn(async move {
             let msg_res = msg_rx.await;
@@ -2693,7 +2827,7 @@ impl Stroma {
             let durability = stroma.keratin_cfg_msg.default_durability;
 
             let event_res = stroma
-                .append_events_durable(&tp, part, group.as_deref(), vec![ev], durability)
+                .append_events_durable_leased(qh, vec![ev], durability, owner_operation)
                 .await;
 
             match event_res {
@@ -2724,10 +2858,11 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
+        let outter_completion =
+            ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
             .append_enqueue(event_msg, None, outter_completion)
             .map_err(io_err)?;
@@ -2749,10 +2884,11 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
-        let outter_completion = ApplyThenComplete::new(self.clone(), ev, qh, completion);
+        let outter_completion =
+            ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
             .append_enqueue(event_msg, None, outter_completion)
             .map_err(io_err)?;
@@ -2795,7 +2931,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
-        qh.ensure_owner()?;
+        let _owner_operation = qh.begin_owner_operation()?;
         let event_log = qh.event_log();
 
         // Phase 1: durable Nack write
@@ -2870,9 +3006,10 @@ impl Stroma {
                     normalize_group(group).map(String::from),
                 );
                 let qh2 = qh.clone();
+                let owner_operation = qh.begin_owner_operation()?;
                 tokio::spawn(async move {
                     stroma
-                        .dlq_copy_then_commit(src.clone(), qh2, meta.clone())
+                        .dlq_copy_then_commit(src.clone(), qh2, meta.clone(), Some(owner_operation))
                         .await
                         .unwrap_or_else(|err| {
                             let (source_tp, source_part, source_group) = src;
@@ -2963,6 +3100,7 @@ impl Stroma {
         src: (String, u32, Option<String>),
         src_qh: QueueHandle,
         meta: DeadLetterMeta,
+        mut owner_operation: Option<OwnerOperationLease>,
     ) -> Pin<Box<dyn Future<Output = Result<()>> + Send + '_>> {
         Box::pin(async move {
             const MAX_ATTEMPTS: u32 = 5;
@@ -2979,12 +3117,22 @@ impl Stroma {
                         src_part,
                         src_group
                     );
-                    self.commit_dlq_event(&src_qh, vec![meta.off]).await?;
+                    self.commit_dlq_event_with_optional_lease(
+                        &src_qh,
+                        vec![meta.off],
+                        owner_operation.take(),
+                    )
+                    .await?;
                     return Ok(());
                 }
                 Err(e) => {
                     tracing::error!("DLQ copy: fetch failed: {e}");
-                    self.commit_dlq_event(&src_qh, vec![meta.off]).await?; // give up, ack-locally
+                    self.commit_dlq_event_with_optional_lease(
+                        &src_qh,
+                        vec![meta.off],
+                        owner_operation.take(),
+                    )
+                    .await?; // give up, ack-locally
                     return Ok(());
                 }
             };
@@ -3064,14 +3212,44 @@ impl Stroma {
                 tokio::time::sleep(Duration::from_millis(100 * (1 << attempt.min(5)))).await;
             }
 
-            self.commit_dlq_event(&src_qh, vec![meta.off]).await?;
+            self.commit_dlq_event_with_optional_lease(
+                &src_qh,
+                vec![meta.off],
+                owner_operation.take(),
+            )
+            .await?;
 
             Ok(())
         })
     }
 
     async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) -> Result<()> {
-        qh.ensure_owner()?;
+        let owner_operation = qh.begin_owner_operation()?;
+        self.commit_dlq_event_leased(qh, offs, owner_operation)
+            .await
+    }
+
+    async fn commit_dlq_event_with_optional_lease(
+        &self,
+        qh: &QueueHandle,
+        offs: Vec<Offset>,
+        owner_operation: Option<OwnerOperationLease>,
+    ) -> Result<()> {
+        match owner_operation {
+            Some(owner_operation) => {
+                self.commit_dlq_event_leased(qh, offs, owner_operation)
+                    .await
+            }
+            None => self.commit_dlq_event(qh, offs).await,
+        }
+    }
+
+    async fn commit_dlq_event_leased(
+        &self,
+        qh: &QueueHandle,
+        offs: Vec<Offset>,
+        _owner_operation: OwnerOperationLease,
+    ) -> Result<()> {
         let ev = StromaEvent::DeadLetterCommit { offs: offs.clone() };
         let Ok(m) = event_msg(&ev) else {
             return Err(StromaError::Encode(
@@ -3089,7 +3267,8 @@ impl Stroma {
                 "Failed to encode DeadLetterCommit event".into(),
             ));
         }
-        qh.dead_letter_commit(offs).await?;
+        self.apply_event_inmem(StromaEvent::DeadLetterCommit { offs }, qh)
+            .await?;
         Ok(())
     }
 
@@ -3581,7 +3760,7 @@ fn recover_future_is_send(stroma: Stroma, qh: QueueHandle, event_log: Arc<Kerati
 
 #[allow(dead_code)]
 fn dlq_then_commit_future_is_send(stroma: Stroma, qh: QueueHandle, meta: DeadLetterMeta) {
-    assert_send(stroma.dlq_copy_then_commit(("topic".to_string(), 0, None), qh, meta));
+    assert_send(stroma.dlq_copy_then_commit(("topic".to_string(), 0, None), qh, meta, None));
 }
 
 #[allow(dead_code)]
