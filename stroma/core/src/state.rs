@@ -81,6 +81,16 @@ pub struct OwnerOperationLease {
     drained: Arc<Notify>,
 }
 
+impl OwnerOperationLease {
+    pub(crate) fn clone_for_continuation(&self) -> Self {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            active: self.active.clone(),
+            drained: self.drained.clone(),
+        }
+    }
+}
+
 impl Drop for OwnerOperationLease {
     fn drop(&mut self) {
         if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {

@@ -2931,7 +2931,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
-        let _owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation()?;
         let event_log = qh.event_log();
 
         // Phase 1: durable Nack write
@@ -2946,7 +2946,16 @@ impl Stroma {
         qh.set_dirty_snapshot(true);
 
         // Apply -> get outcomes
-        let outcomes = qh.nack_many(reqs).await?;
+        let outcomes = {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            qh.command_enqueue(QueueCommand::NackMany {
+                reqs,
+                response: Some(tx),
+            })
+            .await
+            .map_err(io_err)?;
+            rx.await.map_err(|_| StromaError::QueueActorGone)?
+        };
         let dl_requests: Vec<(Offset, u32, DeadLetterReason)> = outcomes
             .iter()
             .filter_map(|(o, oc)| match oc {
@@ -3006,7 +3015,7 @@ impl Stroma {
                     normalize_group(group).map(String::from),
                 );
                 let qh2 = qh.clone();
-                let owner_operation = qh.begin_owner_operation()?;
+                let owner_operation = owner_operation.clone_for_continuation();
                 tokio::spawn(async move {
                     stroma
                         .dlq_copy_then_commit(src.clone(), qh2, meta.clone(), Some(owner_operation))
