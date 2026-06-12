@@ -1492,6 +1492,53 @@ impl Stroma {
         })
     }
 
+    /// Promote a follower to owner at its own local log tails.
+    ///
+    /// Failover path: the previous owner is gone, so there are no external
+    /// expected tails to verify against — the assignment epoch fences the old
+    /// owner's unreplicated suffix instead. The events-applied gate stays:
+    /// every locally recorded event must be applied before serving as owner.
+    pub async fn promote_queue_follower_to_local_tail(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<QueuePromotionOutcome> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+
+        let message_next_offset = qh.msg_log().next_offset();
+        let event_next_offset = qh.event_log().next_offset();
+        let applied_upto = qh.applied_upto().load(Ordering::Acquire);
+        let applied_event_offset = if event_next_offset == 0 {
+            None
+        } else {
+            Some(applied_upto)
+        };
+        if event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1) {
+            return Ok(QueuePromotionOutcome::EventsNotApplied {
+                applied_event_offset,
+                event_next_offset,
+            });
+        }
+
+        qh.become_owner();
+        qh.msg_log().become_owner();
+        qh.event_log().become_owner();
+
+        Ok(QueuePromotionOutcome::Promoted {
+            message_next_offset,
+            event_next_offset,
+            applied_event_offset,
+        })
+    }
+
     pub async fn read_owner_message_records(
         &self,
         topic: &str,
