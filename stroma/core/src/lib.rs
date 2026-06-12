@@ -4,7 +4,6 @@ mod metrics;
 mod state;
 mod stroma;
 
-use keratin_log::KDurability;
 use thiserror::Error;
 
 pub use event::{
@@ -13,7 +12,7 @@ pub use event::{
 };
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
-    AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
+    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
