@@ -1423,6 +1423,50 @@ impl Stroma {
         Ok(())
     }
 
+    /// Advance both queue logs to the assignment fencing epoch.
+    ///
+    /// The epoch is persisted (Keratin manifest) BEFORE any role-specific
+    /// work uses it; replicated appends carrying an older epoch are rejected
+    /// from then on. Monotonic: re-applying the current epoch is a no-op,
+    /// regressing is an error.
+    pub async fn advance_queue_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        epoch: u64,
+    ) -> Result<u64> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
+        qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
+        Ok(epoch)
+    }
+
+    /// `become_queue_owner` fenced at the assignment epoch (persisted first).
+    pub async fn become_queue_owner_with_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        epoch: u64,
+    ) -> Result<()> {
+        self.advance_queue_epoch(topic, part, group, epoch).await?;
+        self.become_queue_owner(topic, part, group).await
+    }
+
+    /// `become_queue_follower` fenced at the assignment epoch: the follower's
+    /// logs reject replicated batches from any older-epoch (stale) owner.
+    pub async fn become_queue_follower_with_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        epoch: u64,
+    ) -> Result<()> {
+        self.advance_queue_epoch(topic, part, group, epoch).await?;
+        self.become_queue_follower(topic, part, group).await
+    }
+
     pub async fn promote_queue_follower_if_caught_up(
         &self,
         topic: &str,
@@ -1503,6 +1547,7 @@ impl Stroma {
         topic: &str,
         part: u32,
         group: Option<&str>,
+        epoch: u64,
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let role = qh.role();
@@ -1527,6 +1572,12 @@ impl Stroma {
                 event_next_offset,
             });
         }
+
+        // Persist the fencing epoch BEFORE serving as owner: from here on,
+        // replicated traffic from the previous (older-epoch) owner is
+        // rejected by both logs.
+        qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
+        qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
 
         qh.become_owner();
         qh.msg_log().become_owner();

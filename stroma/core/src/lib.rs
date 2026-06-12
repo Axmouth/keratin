@@ -14,7 +14,7 @@ pub use event::{
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
+    KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
 pub use state::{
