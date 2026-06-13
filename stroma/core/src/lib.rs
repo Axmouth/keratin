@@ -357,49 +357,16 @@ pub mod group {
     }
 }
 
+// Partition/Offset now live in the dependency-light `stroma-common` crate so
+// they can be shared upward (e.g. by network clients) without the engine.
+// Re-exported through these module paths so existing `partition::Partition` /
+// `offset::Offset` references keep working.
 pub mod partition {
-    #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-    pub struct Partition {
-        id: u32,
-    }
-
-    impl Partition {
-        #[inline]
-        pub const fn new(id: u32) -> Self {
-            Self { id }
-        }
-
-        #[inline]
-        pub const fn id(self) -> u32 {
-            self.id
-        }
-    }
+    pub use stroma_common::Partition;
 }
 
 pub mod offset {
-    #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-    pub struct Offset {
-        inner: u64,
-    }
-
-    impl Offset {
-        #[inline]
-        pub fn new(offset: u64) -> Self {
-            Self { inner: offset }
-        }
-
-        #[inline]
-        pub fn value(&self) -> u64 {
-            self.inner
-        }
-
-        #[inline]
-        pub const fn next(self) -> Self {
-            Self {
-                inner: self.inner + 1,
-            }
-        }
-    }
+    pub use stroma_common::Offset;
 }
 
 pub mod unix_millis {

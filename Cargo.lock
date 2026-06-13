@@ -820,6 +820,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stroma-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "stroma-core"
 version = "0.1.0"
 dependencies = [
@@ -839,6 +846,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "similar-asserts",
+ "stroma-common",
  "thiserror",
  "tokio",
  "tokio-util",
