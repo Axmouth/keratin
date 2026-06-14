@@ -208,6 +208,10 @@ Investigation note:
   a tiny enqueue-path cleanup.
 - Results were not stable enough to justify keeping it: one run improved, later
   sequential runs regressed.
+- Reusing the already-computed `estimated` byte total for `Log` stats was also
+  tested and reverted. Enqueue throughput dropped from `468,169 msg/s` to
+  roughly `422k msg/s` in two sequential runs. This is counterintuitive, but the
+  measurement was clear enough to avoid keeping the change.
 - The batcher currently has more API surface than active use justifies. Consider
   either removing it or simplifying it around the concrete writer-loop use case
   before spending more time on micro-optimizations inside it.
