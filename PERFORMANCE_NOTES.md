@@ -1,0 +1,190 @@
+# Keratin Performance Notes
+
+Status: investigative
+
+Date: 2026-06-14
+
+These notes track performance baselines and optimization ideas. Do not commit
+performance-focused implementation changes unless a before/after run shows the
+change is actually faster for the target workload.
+
+## Current Baseline
+
+Machine context:
+
+- `/home/george/code/keratin` is on ext4 over `/dev/sdb4`
+- `/tmp` is tmpfs
+- Results below are quick local runs, not a rigorous benchmark suite
+
+### Existing Binaries
+
+| Command | Storage | Result |
+| --- | --- | ---: |
+| `keratin_test` | repo disk | passed basic write/read sanity |
+| `keratin_bench` | repo disk | `338,608 msg/s` |
+| `keratin_bench_auto_batch` | repo disk | `234,358 msg/s` |
+
+`keratin_bench_auto_batch` also emitted a normal-looking drop-time shutdown
+notification warning. That warning is likely log-noise from polling the shutdown
+oneshot before the writer responds.
+
+### Configurable Throughput Utility
+
+Added local utility: `keratin-log/src/bin/keratin_throughput_bench.rs`
+
+Representative config:
+
+```text
+--messages 1000000
+--payload 1024
+--max-batch-records 4096
+--max-batch-mb 8
+--fsync-ms 20
+--linger-ms 20
+--flush-mb 32
+--durability fsync
+```
+
+| Mode | Producers | Storage | Result |
+| --- | ---: | --- | ---: |
+| batch | 8 | tmpfs | `1,368,087 msg/s` |
+| batch | 8 | repo disk | `352,980 msg/s` |
+| enqueue | 8 | tmpfs | `461,972 msg/s` |
+| enqueue | 8 | repo disk | `218,044 msg/s` |
+| batch | 1 | tmpfs | `344,052 msg/s` |
+| enqueue | 1 | tmpfs | `341,455 msg/s` |
+
+Interpretation:
+
+- The disk path is a large limiter on this machine.
+- The enqueue/completion path is the main target workload because it is closer
+  to how Fibril feeds Keratin: work is accepted, later completed, and callers
+  observe confirmation.
+- Direct batched appends can exceed 1M msg/s on tmpfs. Treat that as a useful
+  upper-bound/reference path, not the primary optimization target.
+- Enqueue currently tops out around `460k-470k msg/s` on tmpfs for this quick
+  run.
+- One producer underfeeds the writer or spends too much time constructing work.
+  Multiple producers are needed to approach the current ceiling.
+- Larger `max_batch_records=8192`, `max_batch_mb=12`, `fsync_ms=25`, and
+  `linger_ms=25` did not improve the tested tmpfs runs.
+- Larger enqueue confirmation windows did not improve the tested tmpfs runs.
+
+### Configurable Open Utility
+
+Added local utility: `keratin-log/src/bin/keratin_open_bench.rs`
+
+| Records | Payload | Segment size | Segments | Storage | Clean reopen |
+| ---: | ---: | ---: | ---: | --- | ---: |
+| 200k | 1KB | 16MB | 14 | tmpfs | `76.169 ms` |
+| 1M | 1KB | 16MB | 82 | tmpfs | `297.440 ms` |
+
+Interpretation:
+
+- Clean reopen currently scans all segments.
+- This is primarily a user-visible startup latency issue, not steady-state
+  throughput.
+- It still matters for sparse workloads with many queues, and for restart or
+  failover paths.
+
+## Candidate Improvements
+
+### 1. Clean-Shutdown Fast Open
+
+Current behavior:
+
+- `Log::open` discovers segments and scans every segment to repair partial tails
+  and compute the true next offset.
+- The scan is required after crash or dirty shutdown.
+- After a known clean shutdown, the manifest should be able to carry enough
+  state to skip full recovery scanning.
+
+Possible direction:
+
+- Store a clean/dirty flag in the manifest.
+- On open, mark the manifest dirty before returning a writable handle.
+- On clean shutdown, force-store final `next_offset`, active base, head, epoch,
+  and clean=true.
+- On next open, if clean=true and manifest/config invariants match, trust the
+  manifest and skip full segment scan.
+- If clean=false, manifest is missing, or validation fails, use the current full
+  scan path.
+
+Tests needed:
+
+- Clean shutdown skips full recovery path and still reads all records.
+- Crash or `force_close` leaves dirty state and uses full scan.
+- Truncated tail after dirty shutdown is repaired.
+- Clean fast path refuses obviously inconsistent metadata.
+
+### 2. Writer Pipeline
+
+Current behavior:
+
+- The writer loop receives work, batches it, encodes records into the write
+  buffer, writes/flushed buffers, fsyncs when due, then notifies completions.
+- Encoding and write/fsync scheduling are serial in one writer thread.
+
+Possible direction:
+
+- Split the pipeline into ordered stages:
+  1. encode stage builds immutable encoded batches and records completion fences
+  2. writer stage appends encoded bytes to log/index files in order
+  3. fsync stage receives durable fences when a flush/fsync boundary is due
+  4. notifier stage completes callers after the required durability point
+
+Risks:
+
+- Segment rolling and index emission must stay single-writer ordered.
+- Fsync acknowledgements must correspond exactly to bytes already written.
+- The writer cannot let an encoder get ahead in ways that force invalid segment
+  decisions.
+- Error handling must fail the right completions without losing later work.
+
+Benchmark target:
+
+- Improve enqueue tmpfs from roughly `460k-470k msg/s` toward `500k-600k msg/s`
+  without reducing correctness. This is the main throughput target for Fibril.
+- Improve disk-backed enqueue only if the disk is not already the dominant cap.
+
+### 3. Append Path Allocation and Repeated Accounting
+
+Current behavior:
+
+- `stage_reqs` computes payload byte totals.
+- `stage_append_batch` recomputes estimated bytes and stats totals.
+- Encoding loops over records again.
+
+Possible direction:
+
+- Carry precomputed byte totals from batcher/stage into the log append path.
+- Avoid repeated `bytes_len()` passes where it does not improve safety.
+- Measure carefully. The disk path is fsync-limited here, but tmpfs enqueue
+  numbers suggest CPU/accounting overhead matters.
+
+### 4. Reader Path Cleanup
+
+Current behavior:
+
+- `find_segment_base` iterates keys and uses `rfind`.
+- `scan_forward_exact` drains from the front of a `Vec` per decoded record.
+- `fetch` and `scan_from` open index/log files per call.
+
+Possible direction:
+
+- Use `range(..=offset).next_back()` for segment lookup.
+- Replace repeated front-drain with a cursor and compact only occasionally.
+- Add a read/scan benchmark before changing this.
+- Consider lightweight per-reader segment/index caching for sequential scans.
+
+### 5. Shutdown Warning Noise
+
+Current behavior:
+
+- `Drop` logs a warning while polling for the writer shutdown notification.
+- This can warn during normal shutdown latency.
+
+Possible direction:
+
+- Only warn after timeout or after a meaningful delay.
+- Not performance-sensitive, but cleaner for benchmarks and operator logs.

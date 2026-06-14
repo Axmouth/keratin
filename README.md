@@ -1,5 +1,9 @@
 # Keratin
 
+**Durability, Layer by Layer.**
+
+*The tough outer layer for your inner state.*
+
 [![Rust CI](https://github.com/Axmouth/keratin/actions/workflows/rust-ci.yaml/badge.svg)](https://github.com/Axmouth/keratin/actions/workflows/rust-ci.yaml)
 
 <img src="./bannerlogo.svg" width="240em">
