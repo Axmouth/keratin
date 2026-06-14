@@ -216,6 +216,11 @@ Investigation note:
   tested and reverted. Enqueue throughput dropped from `468,169 msg/s` to
   roughly `422k msg/s` in two sequential runs. This is counterintuitive, but the
   measurement was clear enough to avoid keeping the change.
+- Pending fsync detection was changed from scanning the pending ack queue to an
+  O(1) emptiness check. This is valid because `AfterWrite` completions are
+  answered immediately and only `AfterFsync` completions enter `pending`.
+  Enqueue throughput moved from `468,169 msg/s` to `471,858 msg/s` and
+  `477,139 msg/s` in two post-change runs.
 - The batcher currently has more API surface than active use justifies. Consider
   either removing it or simplifying it around the concrete writer-loop use case
   before spending more time on micro-optimizations inside it.

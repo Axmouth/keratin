@@ -80,16 +80,13 @@ pub struct WriterHandle {
 
 struct PendingAck {
     end_offset: u64, // inclusive
-    durability: KDurability,
     respond_to: Box<dyn AppendCompletion<IoError> + Send>,
     result: AppendResult,
 }
 
 #[inline]
 fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
-    pending
-        .iter()
-        .any(|p| p.durability >= KDurability::AfterFsync)
+    !pending.is_empty()
 }
 
 enum NotifyMsg {
@@ -537,7 +534,6 @@ fn stage_reqs(
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
-                            durability: dur,
                             respond_to: r.completion,
                             result: ar,
                         });
@@ -567,7 +563,6 @@ fn stage_reqs(
                     } else {
                         pending.push_back(PendingAck {
                             end_offset,
-                            durability: dur,
                             respond_to: r.completion,
                             result: ar,
                         });
