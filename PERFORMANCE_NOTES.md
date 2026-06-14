@@ -311,6 +311,12 @@ Investigation note:
   and reverted. It reduced notifier channel sends, but delayed immediate
   completions enough to lower write-durability enqueue throughput from
   `447,207 msg/s` to `407,554 msg/s`.
+- Coalescing flushed single-message `AppendReq`s into one `stage_append_batch`
+  call was tested and reverted. A fresh baseline after rebuild was
+  `460,156 msg/s`; the coalesced shape measured `491,462`, `450,933`, and
+  `468,951 msg/s`. Reusing scratch vectors did not make it stable, with samples
+  at `457,544` and `441,875 msg/s`. The added completion-splitting complexity
+  is not justified by these results.
 - The batcher currently has more API surface than active use justifies. Consider
   either removing it or simplifying it around the concrete writer-loop use case
   before spending more time on micro-optimizations inside it.
