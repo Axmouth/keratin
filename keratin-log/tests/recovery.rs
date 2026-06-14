@@ -1,5 +1,6 @@
 use keratin_log::*;
 use std::fs::OpenOptions;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::Path;
 
 fn manifest_clean_flag(root: &Path) -> bool {
@@ -12,6 +13,20 @@ fn force_scan_config() -> KeratinConfig {
     KeratinConfig {
         force_recovery_scan: true,
         ..KeratinConfig::test_default()
+    }
+}
+
+fn message(payload: impl Into<Vec<u8>>) -> Message {
+    Message {
+        payload: payload.into(),
+        flags: 0,
+        headers: vec![],
+    }
+}
+
+fn assert_contiguous_offsets(records: &[OwnedRecord]) {
+    for (i, record) in records.iter().enumerate() {
+        assert_eq!(record.offset as usize, i);
     }
 }
 
@@ -76,9 +91,7 @@ async fn wal_crash_recovery_truncated_tail() {
     let msgs = k.reader().scan_from(0, 10_000).unwrap();
 
     // Must be monotonic and gap-free
-    for (i, r) in msgs.iter().enumerate() {
-        assert_eq!(r.offset as usize, i);
-    }
+    assert_contiguous_offsets(&msgs);
 }
 
 #[tokio::test]
@@ -109,9 +122,7 @@ async fn wal_truncates_partial_tail() {
     let got = k.reader().scan_from(0, 10_000).unwrap();
 
     assert!(got.len() < 1000);
-    for (i, r) in got.iter().enumerate() {
-        assert_eq!(r.offset as usize, i);
-    }
+    assert_contiguous_offsets(&got);
 }
 
 #[tokio::test]
@@ -140,9 +151,90 @@ async fn forced_recovery_scan_repairs_tail_even_after_clean_shutdown() {
     let got = k.reader().scan_from(0, 10_000).unwrap();
 
     assert!(got.len() < 100);
-    for (i, r) in got.iter().enumerate() {
-        assert_eq!(r.offset as usize, i);
+    assert_contiguous_offsets(&got);
+}
+
+#[tokio::test]
+async fn recovery_uses_verified_tail_before_next_append() {
+    let dir = test_dir!("recovery_verified_tail_next_append");
+    let cfg = KeratinConfig::test_default();
+
+    let k = Keratin::open(&dir.root, cfg).await.unwrap();
+    let mut batch = Vec::new();
+    for i in 0..100 {
+        batch.push(message(vec![i as u8; 64]));
     }
+    k.append_batch(batch, None).await.unwrap();
+    k.shutdown().await.unwrap();
+
+    let seg = util::latest_segment(&dir.root).unwrap();
+    let mut f = OpenOptions::new().read(true).write(true).open(seg).unwrap();
+    let last = f.metadata().unwrap().len() - 1;
+    let mut byte = [0u8; 1];
+    f.seek(SeekFrom::Start(last)).unwrap();
+    f.read_exact(&mut byte).unwrap();
+    f.seek(SeekFrom::Start(last)).unwrap();
+    f.write_all(&[byte[0] ^ 0xff]).unwrap();
+    f.sync_all().unwrap();
+
+    let k = Keratin::open(&dir.root, force_scan_config()).await.unwrap();
+    let repaired = k.reader().scan_from(0, 10_000).unwrap();
+    assert_eq!(repaired.len(), 99);
+    assert_contiguous_offsets(&repaired);
+
+    let appended = k
+        .append(message(b"after-repair".to_vec()), None)
+        .await
+        .unwrap();
+    assert_eq!(appended.base_offset, 99);
+
+    let got = k.reader().scan_from(0, 10_000).unwrap();
+    assert_eq!(got.len(), 100);
+    assert_contiguous_offsets(&got);
+    assert_eq!(got.last().unwrap().payload, b"after-repair");
+}
+
+#[tokio::test]
+async fn recovery_truncates_garbage_tail_before_next_append() {
+    let dir = test_dir!("recovery_garbage_tail_next_append");
+    let cfg = KeratinConfig {
+        segment_max_bytes: 512,
+        force_recovery_scan: true,
+        ..KeratinConfig::test_default()
+    };
+
+    let k = Keratin::open(&dir.root, cfg).await.unwrap();
+    for i in 0..20 {
+        k.append(message(vec![i as u8; 128]), None).await.unwrap();
+    }
+    k.shutdown().await.unwrap();
+
+    let before_segments = util::all_segments(&dir.root);
+    assert!(
+        before_segments.len() > 1,
+        "test setup should cross at least one segment boundary"
+    );
+
+    let latest = util::latest_segment(&dir.root).unwrap();
+    let mut f = OpenOptions::new().append(true).open(latest).unwrap();
+    f.write_all(b"not a valid keratin record").unwrap();
+    f.sync_all().unwrap();
+
+    let k = Keratin::open(&dir.root, cfg).await.unwrap();
+    let repaired = k.reader().scan_from(0, 100).unwrap();
+    assert_eq!(repaired.len(), 20);
+    assert_contiguous_offsets(&repaired);
+
+    let appended = k
+        .append(message(b"after-garbage".to_vec()), None)
+        .await
+        .unwrap();
+    assert_eq!(appended.base_offset, 20);
+
+    let got = k.reader().scan_from(0, 100).unwrap();
+    assert_eq!(got.len(), 21);
+    assert_contiguous_offsets(&got);
+    assert_eq!(got.last().unwrap().payload, b"after-garbage");
 }
 
 #[tokio::test]
@@ -195,9 +287,7 @@ async fn wal_recovery_continuity() {
     let got = k.reader().scan_from(0, 20_000).unwrap();
     assert_eq!(got.len(), 10_000);
 
-    for (i, r) in got.iter().enumerate() {
-        assert_eq!(r.offset as usize, i);
-    }
+    assert_contiguous_offsets(&got);
 }
 
 #[tokio::test]
@@ -257,7 +347,5 @@ async fn wal_durability_fence() {
 
     // A and B must exist, C must not
     assert_eq!(got.len(), 4000);
-    for (i, r) in got.iter().enumerate() {
-        assert_eq!(r.offset as usize, i);
-    }
+    assert_contiguous_offsets(&got);
 }

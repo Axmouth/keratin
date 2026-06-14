@@ -246,13 +246,23 @@ Result:
 Correctness tests needed before splitting fsync:
 
 - Torn or corrupted active-segment tail truncates cleanly, then later good
-  writes continue from the repaired offset.
+  writes continue from the repaired offset. A regression test now covers CRC
+  corruption in the tail record, then appending after repair.
 - Corruption around a segment roll either repairs the old segment tail or moves
-  to a new segment without exposing an ambiguous middle state.
+  to a new segment without exposing an ambiguous middle state. A regression
+  test now covers garbage appended to the latest segment after crossing at
+  least one segment boundary, then appending after repair.
 - Manifest metadata cannot claim durable offsets past what recovery can prove.
+  This found a real bug: full recovery scan used
+  `computed_next.max(manifest.next_offset)`, which allowed a clean manifest to
+  keep an offset past the verified tail. Full scan now trusts the verified scan
+  result.
 - If a write-stage command fails, only the affected completions fail and later
   accepted work is either not written or is recovered from a clear durable
   boundary.
+- A true mid-write failure test still needs an explicit fault-injection seam in
+  the writer or segment layer. Filesystem tricks like chmod or unlinking are not
+  reliable once the segment file is already open.
 - The future fsync stage must release `AfterFsync` completions only for fences
   whose bytes were already written and whose relevant files were synced.
 

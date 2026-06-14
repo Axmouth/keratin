@@ -341,8 +341,10 @@ impl Log {
 
         segment_mapping.write().insert(active_base, seg_path);
 
-        // Recompute next_offset from computed_next; reconcile with manifest (prefer computed).
-        let next_offset = computed_next.max(manifest.next_offset);
+        // Full recovery scan is the source of truth. The manifest may be stale
+        // after dirty shutdown, or optimistic if a cleanly written tail is later
+        // found corrupt by forced recovery.
+        let next_offset = computed_next;
         manifest.active_base_offset = active_base;
         manifest.next_offset = next_offset;
         manifest.segment_max_bytes = segment_max_bytes;
