@@ -1166,5 +1166,5 @@ fn open_or_create_segment_pair(
         Index::open(idxf, base)?
     };
 
-    Ok((seg, idx, idx_path))
+    Ok((seg, idx, log_path))
 }
