@@ -11,10 +11,8 @@ use tokio::sync::oneshot;
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
 use crate::reader::LogReader;
 use crate::record::Message;
-use crate::writer::{AppendPayload, AppendReq, IoError, WriterHandle};
-use crate::{
-    AppendCompletion, CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig,
-};
+use crate::writer::{AppendCompletionTarget, AppendPayload, AppendReq, IoError, WriterHandle};
+use crate::{AppendCompletion, KDurability, KeratinConfig};
 
 #[derive(Debug)]
 pub struct Keratin {
@@ -185,11 +183,29 @@ impl Keratin {
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::One(payload),
                 durability,
-                completion,
+                completion: completion.into(),
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
         Ok(())
+    }
+
+    pub fn append_enqueue_receiver(
+        &self,
+        payload: Message,
+        durability: Option<KDurability>,
+    ) -> Result<oneshot::Receiver<Result<AppendResult, IoError>>, IoError> {
+        self.ensure_role(KeratinRole::Owner, "append")?;
+        let (result_tx, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::Append(AppendReq {
+                records: AppendPayload::One(payload),
+                durability,
+                completion: AppendCompletionTarget::Oneshot(result_tx),
+            }))
+            .map_err(|_| IoError::new("writer channel closed"))?;
+
+        Ok(rx)
     }
 
     pub async fn append(
@@ -197,17 +213,7 @@ impl Keratin {
         payload: Message,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
-        self.ensure_role(KeratinRole::Owner, "append")?;
-        let (completion, rx) = KeratinAppendCompletion::pair();
-
-        let req = crate::writer::AppendReq {
-            records: AppendPayload::One(payload),
-            durability,
-            completion,
-        };
-        self.tx
-            .send(WriterCmd::Append(req))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        let rx = self.append_enqueue_receiver(payload, durability)?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
@@ -223,11 +229,29 @@ impl Keratin {
             .send(WriterCmd::Append(AppendReq {
                 records: AppendPayload::Many(payloads),
                 durability,
-                completion,
+                completion: completion.into(),
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
         Ok(())
+    }
+
+    pub fn append_batch_enqueue_receiver(
+        &self,
+        payloads: Vec<Message>,
+        durability: Option<KDurability>,
+    ) -> Result<oneshot::Receiver<Result<AppendResult, IoError>>, IoError> {
+        self.ensure_role(KeratinRole::Owner, "append_batch")?;
+        let (result_tx, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::Append(AppendReq {
+                records: AppendPayload::Many(payloads),
+                durability,
+                completion: AppendCompletionTarget::Oneshot(result_tx),
+            }))
+            .map_err(|_| IoError::new("writer channel closed"))?;
+
+        Ok(rx)
     }
 
     pub async fn append_batch(
@@ -235,17 +259,7 @@ impl Keratin {
         payloads: Vec<Message>,
         durability: Option<KDurability>,
     ) -> Result<AppendResult, IoError> {
-        self.ensure_role(KeratinRole::Owner, "append_batch")?;
-        let (completion, rx) = KeratinAppendCompletion::pair();
-
-        let req = crate::writer::AppendReq {
-            records: AppendPayload::Many(payloads),
-            durability,
-            completion,
-        };
-        self.tx
-            .send(WriterCmd::Append(req))
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        let rx = self.append_batch_enqueue_receiver(payloads, durability)?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }

@@ -221,6 +221,11 @@ Investigation note:
   answered immediately and only `AfterFsync` completions enter `pending`.
   Enqueue throughput moved from `468,169 msg/s` to `471,858 msg/s` and
   `477,139 msg/s` in two post-change runs.
+- A direct oneshot completion path was added for enqueue callers that do not
+  need a boxed completion trait object. In the throughput utility,
+  `--mode enqueue` now uses the direct path, while `--mode enqueue-boxed` keeps
+  the old boxed path. With the same fsync durability settings, direct enqueue
+  measured `482,374 msg/s` and boxed enqueue measured `459,155 msg/s`.
 - Batching `AfterWrite` notifications until the end of `stage_reqs` was tested
   and reverted. It reduced notifier channel sends, but delayed immediate
   completions enough to lower write-durability enqueue throughput from

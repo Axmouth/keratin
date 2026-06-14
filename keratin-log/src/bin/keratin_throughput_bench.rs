@@ -87,6 +87,9 @@ async fn main() {
                 "enqueue" => {
                     run_enqueue(k, payload, producer_messages, confirm_window).await;
                 }
+                "enqueue-boxed" => {
+                    run_enqueue_boxed(k, payload, producer_messages, confirm_window).await;
+                }
                 "batch" => {
                     run_batches(k, payload, producer_messages, batch).await;
                 }
@@ -139,6 +142,32 @@ async fn run_batches(k: Arc<Keratin>, payload: Arc<Vec<u8>>, messages: usize, ba
 }
 
 async fn run_enqueue(
+    k: Arc<Keratin>,
+    payload: Arc<Vec<u8>>,
+    messages: usize,
+    confirm_window: usize,
+) {
+    let mut receipts = Vec::with_capacity(confirm_window.max(1));
+    for _ in 0..messages {
+        let rx = k
+            .append_enqueue_receiver(
+                Message {
+                    flags: 0,
+                    headers: Vec::new(),
+                    payload: payload.as_ref().clone(),
+                },
+                None,
+            )
+            .unwrap();
+        receipts.push(rx);
+        if receipts.len() >= confirm_window {
+            drain_receipts(&mut receipts).await;
+        }
+    }
+    drain_receipts(&mut receipts).await;
+}
+
+async fn run_enqueue_boxed(
     k: Arc<Keratin>,
     payload: Arc<Vec<u8>>,
     messages: usize,

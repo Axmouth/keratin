@@ -47,6 +47,28 @@ impl From<io::Error> for IoError {
     }
 }
 
+pub enum AppendCompletionTarget {
+    Boxed(Box<dyn AppendCompletion<IoError> + Send>),
+    Oneshot(tokio::sync::oneshot::Sender<Result<AppendResult, IoError>>),
+}
+
+impl AppendCompletionTarget {
+    fn complete(self, res: Result<AppendResult, IoError>) {
+        match self {
+            Self::Boxed(completion) => completion.complete(res),
+            Self::Oneshot(tx) => {
+                let _ = tx.send(res);
+            }
+        }
+    }
+}
+
+impl From<Box<dyn AppendCompletion<IoError> + Send>> for AppendCompletionTarget {
+    fn from(value: Box<dyn AppendCompletion<IoError> + Send>) -> Self {
+        Self::Boxed(value)
+    }
+}
+
 pub enum AppendPayload {
     One(Message),
     Many(Vec<Message>),
@@ -55,7 +77,7 @@ pub enum AppendPayload {
 pub struct AppendReq {
     pub records: AppendPayload,
     pub durability: Option<KDurability>,
-    pub completion: Box<dyn AppendCompletion<IoError> + Send>,
+    pub completion: AppendCompletionTarget,
 }
 
 impl AppendPayload {
@@ -80,7 +102,7 @@ pub struct WriterHandle {
 
 struct PendingAck {
     end_offset: u64, // inclusive
-    respond_to: Box<dyn AppendCompletion<IoError> + Send>,
+    respond_to: AppendCompletionTarget,
     result: AppendResult,
 }
 
@@ -95,7 +117,7 @@ enum NotifyMsg {
 }
 
 struct NotifyItem {
-    completion: Box<dyn AppendCompletion<IoError> + Send>,
+    completion: AppendCompletionTarget,
     result: Result<AppendResult, IoError>,
 }
 
