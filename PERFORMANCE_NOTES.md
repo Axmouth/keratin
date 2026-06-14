@@ -168,22 +168,93 @@ Current behavior:
 - The writer loop receives work, batches it, encodes records into the write
   buffer, writes/flushed buffers, fsyncs when due, then notifies completions.
 - Encoding and write/fsync scheduling are serial in one writer thread.
+- `Log` currently owns both logical append state and file handles. That is the
+  main obstacle to a real pipeline.
+
+Ownership split:
+
+- Record encoding itself is stateless.
+- Append staging is not stateless. It assigns offsets, decides segment rolls,
+  emits sparse index entries, and advances logical watermarks.
+- The safe split is to extract an ordered logical planner from `Log`, not to
+  make the whole log stateless.
+- The planner owns:
+  - next offset
+  - active segment base
+  - scheduled active segment byte position, including bytes not written yet
+  - last sparse index position
+  - segment size and index stride rules
+- The file writer owns:
+  - segment and index file handles
+  - actual `write_all`, `flush`, segment creation, and manifest persistence
+- The fsync gate owns:
+  - the last file-write fence known to be durable
+  - completion release for `AfterFsync` requests only after the matching bytes
+    have been written and synced
 
 Possible direction:
 
 - Split the pipeline into ordered stages:
-  1. encode stage builds immutable encoded batches and records completion fences
-  2. writer stage appends encoded bytes to log/index files in order
-  3. fsync stage receives durable fences when a flush/fsync boundary is due
-  4. notifier stage completes callers after the required durability point
+  1. batch/admission stage groups `AppendReq`s and preserves caller order
+  2. planner/encode stage assigns offsets, emits segment-roll commands, encoded
+     log bytes, encoded index bytes, and completion fences
+  3. file writer stage applies those commands in order
+  4. fsync stage receives durable fences when a flush/fsync boundary is due
+  5. notifier stage completes callers after the required durability point
 
 Risks:
 
 - Segment rolling and index emission must stay single-writer ordered.
-- Fsync acknowledgements must correspond exactly to bytes already written.
+- Fsync acknowledgements must correspond exactly to bytes already written. A
+  fence can be completed only after the writer has applied all commands through
+  that fence and the fsync stage has synced the relevant files.
 - The writer cannot let an encoder get ahead in ways that force invalid segment
   decisions.
 - Error handling must fail the right completions without losing later work.
+- Duplicating file handles for a separate fsync thread needs care. It may be
+  safer to first build a two-stage pipeline, then split fsync once write fences
+  are explicit and tested.
+- `AfterWrite` currently means accepted by the writer path, not necessarily
+  kernel-flushed to disk. Before a pipeline rewrite, decide whether to preserve
+  that behavior or strengthen it to mean file-write applied. Pre-0.1 lets us
+  change this, but the contract should be explicit.
+
+First refactor target:
+
+- Introduce a private logical append planner with no file handles.
+- Keep the existing single writer loop at first.
+- Make the current `Log` call the planner internally and apply the resulting
+  commands immediately.
+- Benchmark this no-pipeline refactor. If it regresses, revert before adding
+  threads.
+- Once neutral, move planner/encode work behind a channel and keep file
+  write/fsync together until fences are explicit and covered by tests.
+
+Result:
+
+- A private append-planning helper was extracted inside `Log`. It owns no file
+  handles and writes encoded records plus sparse index entries into caller-owned
+  buffers.
+- The first shape regressed direct enqueue from the prior `482,374 msg/s`
+  sample to roughly `453k msg/s`. Forced inlining of the planner helpers
+  recovered the loss, with follow-up samples at `491,775 msg/s` and
+  `475,508 msg/s`.
+- Treat this as a boundary refactor, not a throughput win. The key value is
+  that planner and file-handle responsibilities are now easier to separate
+  without adding threads yet.
+
+Correctness tests needed before splitting fsync:
+
+- Torn or corrupted active-segment tail truncates cleanly, then later good
+  writes continue from the repaired offset.
+- Corruption around a segment roll either repairs the old segment tail or moves
+  to a new segment without exposing an ambiguous middle state.
+- Manifest metadata cannot claim durable offsets past what recovery can prove.
+- If a write-stage command fails, only the affected completions fail and later
+  accepted work is either not written or is recovered from a clear durable
+  boundary.
+- The future fsync stage must release `AfterFsync` completions only for fences
+  whose bytes were already written and whose relevant files were synced.
 
 Benchmark target:
 

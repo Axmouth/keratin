@@ -112,6 +112,20 @@ pub struct Log {
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
 }
 
+struct AppendPlanState {
+    active_base_offset: u64,
+    active_bytes_written: u64,
+    index_stride_bytes: u32,
+    next_offset: u64,
+    last_index_at_log_pos: u64,
+}
+
+struct AppendPlanOutcome {
+    base_offset: u64,
+    end_offset: u64,
+    count: u32,
+}
+
 #[derive(Default)]
 pub struct IoStats {
     pub encode: Duration,
@@ -137,6 +151,53 @@ impl IoStats {
             bytes: 0u64,
         }
     }
+}
+
+#[inline(always)]
+fn encode_append_payloads_into(
+    state: &mut AppendPlanState,
+    payloads: &[Message],
+    now_ms: u64,
+    write_buf: &mut Vec<u8>,
+    idx_buf: &mut Vec<u8>,
+) -> io::Result<AppendPlanOutcome> {
+    debug_assert!(!payloads.is_empty());
+
+    let base_offset = state.next_offset;
+
+    for payload in payloads {
+        let offset = state.next_offset;
+        let record = Record {
+            flags: payload.flags,
+            timestamp_ms: now_ms,
+            offset,
+            headers: &payload.headers,
+            payload: &payload.payload,
+        };
+
+        let record_start_pos = state.active_bytes_written + write_buf.len() as u64;
+
+        encode_record(write_buf, &record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        if (record_start_pos - state.last_index_at_log_pos) >= state.index_stride_bytes as u64 {
+            let rel = (offset - state.active_base_offset) as u32;
+
+            idx_buf.extend_from_slice(&rel.to_be_bytes());
+            idx_buf.extend_from_slice(&0u32.to_be_bytes());
+            idx_buf.extend_from_slice(&record_start_pos.to_be_bytes());
+
+            state.last_index_at_log_pos = record_start_pos;
+        }
+
+        state.next_offset += 1;
+    }
+
+    Ok(AppendPlanOutcome {
+        base_offset,
+        end_offset: state.next_offset - 1,
+        count: payloads.len() as u32,
+    })
 }
 
 impl Log {
@@ -316,6 +377,23 @@ impl Log {
         ))
     }
 
+    #[inline(always)]
+    fn append_plan_state(&self, next_offset: u64) -> AppendPlanState {
+        AppendPlanState {
+            active_base_offset: self.active.base_offset,
+            active_bytes_written: self.active.bytes_written,
+            index_stride_bytes: self.manifest.index_stride_bytes,
+            next_offset,
+            last_index_at_log_pos: self.last_index_at_log_pos,
+        }
+    }
+
+    #[inline(always)]
+    fn sync_append_plan_state(&mut self, state: AppendPlanState) {
+        self.next_offset = state.next_offset;
+        self.last_index_at_log_pos = state.last_index_at_log_pos;
+    }
+
     pub fn stage_append_batch(
         &mut self,
         payloads: &[Message],
@@ -355,52 +433,27 @@ impl Log {
 
         let t_encode = Instant::now();
 
-        for payload in payloads {
-            let offset = self.next_offset;
-
-            let r = Record {
-                flags: payload.flags,
-                timestamp_ms: now_ms,
-                offset,
-                headers: &payload.headers,
-                payload: &payload.payload,
-            };
-
-            // record starts at: on-disk bytes + pending bytes + current buffer len
-            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
-
-            encode_record(&mut self.write_buf, &r)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-            // Maybe emit an idx entry (encode into idx_buf, not to file)
-            if (record_start_pos - self.last_index_at_log_pos)
-                >= self.manifest.index_stride_bytes as u64
-            {
-                let rel = (offset - self.active.base_offset) as u32;
-
-                // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
-                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-                self.idx_buf
-                    .extend_from_slice(&record_start_pos.to_be_bytes());
-
-                self.last_index_at_log_pos = record_start_pos;
-            }
-
-            self.next_offset += 1;
-        }
+        let mut plan_state = self.append_plan_state(base_offset);
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            payloads,
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
         self.stats.records += payloads.len() as u64;
 
-        let end_offset = self.next_offset - 1;
+        let end_offset = plan.end_offset;
         self.staged_end_offset = end_offset;
 
         Ok((
             AppendResult {
-                base_offset,
-                count: payloads.len() as u32,
+                base_offset: plan.base_offset,
+                count: plan.count,
             },
             end_offset,
         ))
@@ -551,48 +604,27 @@ impl Log {
 
         let t_encode = Instant::now();
 
-        for (idx, payload) in payloads.iter().enumerate() {
-            let offset = first_offset + idx as u64;
+        let mut plan_state = self.append_plan_state(first_offset);
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            payloads,
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        self.sync_append_plan_state(plan_state);
 
-            let r = Record {
-                flags: payload.flags,
-                timestamp_ms: now_ms,
-                offset,
-                headers: &payload.headers,
-                payload: &payload.payload,
-            };
-
-            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
-
-            encode_record(&mut self.write_buf, &r)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-            if (record_start_pos - self.last_index_at_log_pos)
-                >= self.manifest.index_stride_bytes as u64
-            {
-                let rel = (offset - self.active.base_offset) as u32;
-
-                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-                self.idx_buf
-                    .extend_from_slice(&record_start_pos.to_be_bytes());
-
-                self.last_index_at_log_pos = record_start_pos;
-            }
-        }
-
-        self.next_offset = end_offset + 1;
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
         self.stats.records += payloads.len() as u64;
-        self.staged_end_offset = end_offset;
+        self.staged_end_offset = plan.end_offset;
 
         Ok((
             ReplicatedAppendOutcome::Applied(AppendResult {
-                base_offset: first_offset,
-                count,
+                base_offset: plan.base_offset,
+                count: plan.count,
             }),
-            Some(end_offset),
+            Some(plan.end_offset),
         ))
     }
 
@@ -624,50 +656,27 @@ impl Log {
 
         let t_encode = Instant::now();
 
-        let offset = self.next_offset;
-
-        let r = Record {
-            flags: payload.flags,
-            timestamp_ms: now_ms,
-            offset,
-            headers: &payload.headers,
-            payload: &payload.payload,
-        };
-
-        // record starts at: on-disk bytes + pending bytes + current buffer len
-        let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
-
-        encode_record(&mut self.write_buf, &r)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        // Maybe emit an idx entry (encode into idx_buf, not to file)
-        if (record_start_pos - self.last_index_at_log_pos)
-            >= self.manifest.index_stride_bytes as u64
-        {
-            let rel = (offset - self.active.base_offset) as u32;
-
-            // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
-            self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-            self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-            self.idx_buf
-                .extend_from_slice(&record_start_pos.to_be_bytes());
-
-            self.last_index_at_log_pos = record_start_pos;
-        }
-
-        self.next_offset += 1;
+        let mut plan_state = self.append_plan_state(base_offset);
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            std::slice::from_ref(payload),
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payload.bytes_len() as u64;
         self.stats.records += 1;
 
-        let end_offset = self.next_offset - 1;
+        let end_offset = plan.end_offset;
         self.staged_end_offset = end_offset;
 
         Ok((
             AppendResult {
-                base_offset,
-                count: 1,
+                base_offset: plan.base_offset,
+                count: plan.count,
             },
             end_offset,
         ))
