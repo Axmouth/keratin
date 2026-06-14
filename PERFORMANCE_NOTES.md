@@ -90,6 +90,35 @@ Interpretation:
 - It still matters for sparse workloads with many queues, and for restart or
   failover paths.
 
+### Configurable Read Utility
+
+Added local utility: `keratin-log/src/bin/keratin_read_bench.rs`
+
+Representative config:
+
+```text
+--messages 1000000
+--payload 1024
+--batch 4096
+--page 4096
+--segment-mb 16
+--fetches 100000
+```
+
+| Records | Payload | Segment size | Segments | Storage | Sequential scan | Sparse fetch |
+| ---: | ---: | ---: | ---: | --- | ---: | ---: |
+| 1M | 1KB | 16MB | 82 | tmpfs | `2,140,888 msg/s` | `30,063 fetch/s` |
+
+Interpretation:
+
+- The reader API is intentionally synchronous. Higher layers can wrap larger
+  read loops in `spawn_blocking` where appropriate, without forcing Keratin to
+  expose an async facade over sync filesystem calls.
+- Sequential scan is already much faster than point lookup in this quick run.
+- Sparse fetch currently opens the index/log path and seeks per call. Treat it
+  as an optimization candidate only if message inspection or replication starts
+  depending on many isolated point reads.
+
 ## Candidate Improvements
 
 ### 1. Clean-Shutdown Fast Open
