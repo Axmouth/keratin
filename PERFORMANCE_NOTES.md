@@ -108,6 +108,7 @@ Representative config:
 | Records | Payload | Segment size | Segments | Storage | Sequential scan | Sparse fetch |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | 1M | 1KB | 16MB | 82 | tmpfs | `2,847,153 msg/s` after cursor scan | `29,556 fetch/s` |
+| 1M | 1KB | 16MB | 82 | repo disk, warm cache | `3,352,117 msg/s` after cursor scan | `28,815 fetch/s` |
 | 500k | 1KB | 1MB | 651 | tmpfs | `2,633,570 msg/s` after cursor scan | `33,250 fetch/s` after bounded segment lookup |
 
 Interpretation:
@@ -116,6 +117,9 @@ Interpretation:
   read loops in `spawn_blocking` where appropriate, without forcing Keratin to
   expose an async facade over sync filesystem calls.
 - Sequential scan is already much faster than point lookup in this quick run.
+- The repo-disk read result is page-cache-warm because the benchmark writes the
+  dataset and immediately reads it back. A colder read benchmark needs a
+  read-only mode over a prebuilt dataset, or explicit OS cache control.
 - Sparse fetch currently opens the index/log path and seeks per call. Treat it
   as an optimization candidate only if message inspection or replication starts
   depending on many isolated point reads.
@@ -234,8 +238,12 @@ Possible direction:
   82-segment sequential scan run, this improved scan from `2,103,122 msg/s` to
   `2,847,153 msg/s`. On the 651-segment run, scan improved from
   `2,044,344 msg/s` to `2,633,570 msg/s`.
-- Add a read/scan benchmark before changing this.
 - Consider lightweight per-reader segment/index caching for sequential scans.
+- Consider a sequential read-ahead mode that keeps the next segment or next slab
+  in flight while the caller decodes the current one. This should be opt-in or
+  tied to a streaming scan API, because it can waste I/O for small inspections
+  and random access.
+- Add a cold-read benchmark mode before optimizing disk read-ahead.
 
 ### 5. Shutdown Warning Noise
 
