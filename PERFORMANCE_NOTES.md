@@ -107,8 +107,8 @@ Representative config:
 
 | Records | Payload | Segment size | Segments | Storage | Sequential scan | Sparse fetch |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
-| 1M | 1KB | 16MB | 82 | tmpfs | `2,140,888 msg/s` | `30,063 fetch/s` |
-| 500k | 1KB | 1MB | 651 | tmpfs | `2,044,344 msg/s` | `33,160 fetch/s` after bounded segment lookup |
+| 1M | 1KB | 16MB | 82 | tmpfs | `2,847,153 msg/s` after cursor scan | `29,556 fetch/s` |
+| 500k | 1KB | 1MB | 651 | tmpfs | `2,633,570 msg/s` after cursor scan | `33,250 fetch/s` after bounded segment lookup |
 
 Interpretation:
 
@@ -226,7 +226,10 @@ Possible direction:
   `range(..=offset).next_back()`. On the 651-segment sparse fetch run, this
   improved point fetch from `32,467 fetch/s` to `33,160 fetch/s`. This is a
   modest cleanup, not a major bottleneck removal.
-- Replace repeated front-drain with a cursor and compact only occasionally.
+- Repeated front-drain was replaced with a cursor and compact-on-read. On the
+  82-segment sequential scan run, this improved scan from `2,103,122 msg/s` to
+  `2,847,153 msg/s`. On the 651-segment run, scan improved from
+  `2,044,344 msg/s` to `2,633,570 msg/s`.
 - Add a read/scan benchmark before changing this.
 - Consider lightweight per-reader segment/index caching for sequential scans.
 
