@@ -3,14 +3,11 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::RwLock;
 
 use crate::Message;
-use crate::record::{
-    ByteRemainder, DecodedRecord, RECORD_HEADER_LEN, decode_header_prefix, decode_record_prefix,
-};
+use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix};
 
 #[derive(Debug, Clone)]
 pub struct OwnedRecord {
@@ -303,24 +300,12 @@ impl LogReader {
     }
 
     fn find_segment_base(&self, offset: u64) -> io::Result<Option<u64>> {
-        // let mut bases = Vec::new();
-        // for e in std::fs::read_dir(self.root.join("segments"))? {
-        //     let e = e?;
-        //     if let Some(s) = e.file_name().to_str()
-        //         && let Some(stem) = s.strip_suffix(".log")
-        //         && let Ok(b) = stem.parse::<u64>()
-        //     {
-        //         bases.push(b);
-        //     }
-        // }
-        // bases.sort_unstable();
-        // Ok(bases.into_iter().rfind(|b| *b <= offset))
         Ok(self
             .segment_mapping
             .read()
-            .keys()
-            .copied()
-            .rfind(|b| *b <= offset))
+            .range(..=offset)
+            .next_back()
+            .map(|(base, _)| *base))
     }
 }
 

@@ -108,6 +108,7 @@ Representative config:
 | Records | Payload | Segment size | Segments | Storage | Sequential scan | Sparse fetch |
 | ---: | ---: | ---: | ---: | --- | ---: | ---: |
 | 1M | 1KB | 16MB | 82 | tmpfs | `2,140,888 msg/s` | `30,063 fetch/s` |
+| 500k | 1KB | 1MB | 651 | tmpfs | `2,044,344 msg/s` | `33,160 fetch/s` after bounded segment lookup |
 
 Interpretation:
 
@@ -118,6 +119,10 @@ Interpretation:
 - Sparse fetch currently opens the index/log path and seeks per call. Treat it
   as an optimization candidate only if message inspection or replication starts
   depending on many isolated point reads.
+- For higher-level inspection paths, prefer filtering the target offsets first
+  and then reading the smallest useful ranges. Many isolated point fetches are
+  usually the wrong shape when the caller can ask state for relevant offsets up
+  front.
 
 ## Candidate Improvements
 
@@ -211,13 +216,16 @@ Investigation note:
 
 Current behavior:
 
-- `find_segment_base` iterates keys and uses `rfind`.
+- `find_segment_base` uses a bounded `BTreeMap` lookup.
 - `scan_forward_exact` drains from the front of a `Vec` per decoded record.
 - `fetch` and `scan_from` open index/log files per call.
 
 Possible direction:
 
-- Use `range(..=offset).next_back()` for segment lookup.
+- Segment lookup was changed from reverse key iteration to
+  `range(..=offset).next_back()`. On the 651-segment sparse fetch run, this
+  improved point fetch from `32,467 fetch/s` to `33,160 fetch/s`. This is a
+  modest cleanup, not a major bottleneck removal.
 - Replace repeated front-drain with a cursor and compact only occasionally.
 - Add a read/scan benchmark before changing this.
 - Consider lightweight per-reader segment/index caching for sequential scans.
