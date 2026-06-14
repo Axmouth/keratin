@@ -435,7 +435,10 @@ impl Drop for Keratin {
         } else {
             let started = std::time::Instant::now();
             while let Err(e) = notify_rx.try_recv() {
-                tracing::warn!("Failed to receive shutdown notification from writer: {}", e);
+                if e == tokio::sync::oneshot::error::TryRecvError::Closed {
+                    tracing::warn!("Keratin writer shutdown notification channel closed");
+                    return;
+                }
                 if started.elapsed() >= std::time::Duration::from_secs(5) {
                     tracing::warn!(
                         "timed out waiting for Keratin writer shutdown notification for {}",

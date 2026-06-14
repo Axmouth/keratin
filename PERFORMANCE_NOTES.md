@@ -197,12 +197,12 @@ Possible direction:
 
 Current behavior:
 
-- `Drop` logs a warning while polling for the writer shutdown notification.
-- This can warn during normal shutdown latency.
+- `Drop` waits briefly for the writer shutdown notification.
+- Normal "not ready yet" polling no longer emits a warning.
 
 Possible direction:
 
-- Only warn after timeout or after a meaningful delay.
+- Keep warnings for closed notification channels and timeout only.
 - Not performance-sensitive, but cleaner for benchmarks and operator logs.
 
 ### 6. Configuration Builder
