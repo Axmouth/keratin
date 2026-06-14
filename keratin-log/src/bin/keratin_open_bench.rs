@@ -29,6 +29,7 @@ async fn main() {
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 5,
         flush_target_bytes: 32 * 1024 * 1024,
+        force_recovery_scan: has_flag("--force-recovery-scan"),
     };
 
     let started = Instant::now();
@@ -75,6 +76,7 @@ async fn main() {
     println!("messages={messages}");
     println!("payload_len={payload_len}");
     println!("segment_mb={segment_mb}");
+    println!("force_recovery_scan={}", cfg.force_recovery_scan);
     println!("segments={segment_count}");
     println!("open_empty_ms={open_empty_ms:.3}");
     println!("write_ms={write_ms:.3}");
@@ -93,4 +95,8 @@ fn arg_value(name: &str) -> Option<String> {
         }
     }
     None
+}
+
+fn has_flag(name: &str) -> bool {
+    std::env::args().any(|arg| arg == name)
 }

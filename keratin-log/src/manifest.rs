@@ -8,6 +8,7 @@ use crate::util::fsync_dir;
 
 const MAN_MAGIC: &[u8; 8] = b"KERATIN\0";
 const MAN_VERSION: u16 = 2;
+const MAN_FLAG_CLEAN_SHUTDOWN: u16 = 0x0001;
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -18,6 +19,7 @@ pub struct Manifest {
     pub next_offset: u64,
     pub head_offset: u64,
     pub epoch: u64,
+    pub clean_shutdown: bool,
 }
 
 impl Manifest {
@@ -30,6 +32,7 @@ impl Manifest {
             next_offset: 0,
             head_offset: 0,
             epoch: 0,
+            clean_shutdown: true,
         }
     }
 
@@ -77,6 +80,7 @@ impl Manifest {
             ));
         }
         let ver = u16::from_be_bytes(buf[8..10].try_into().unwrap());
+        let flags = u16::from_be_bytes(buf[10..12].try_into().unwrap());
         if ver != MAN_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -127,6 +131,7 @@ impl Manifest {
             next_offset,
             head_offset,
             epoch,
+            clean_shutdown: flags & MAN_FLAG_CLEAN_SHUTDOWN != 0,
         })
     }
 
@@ -147,7 +152,12 @@ impl Manifest {
         let mut out = Vec::new();
         out.extend_from_slice(MAN_MAGIC);
         out.extend_from_slice(&MAN_VERSION.to_be_bytes());
-        out.extend_from_slice(&0u16.to_be_bytes()); // flags
+        let flags = if self.clean_shutdown {
+            MAN_FLAG_CLEAN_SHUTDOWN
+        } else {
+            0
+        };
+        out.extend_from_slice(&flags.to_be_bytes());
         out.extend_from_slice(&header_len.to_be_bytes());
 
         // payload
@@ -196,4 +206,17 @@ fn manifest_roundtrip() {
     assert_eq!(m1.segment_max_bytes, m2.segment_max_bytes);
     assert_eq!(m1.index_stride_bytes, m2.index_stride_bytes);
     assert_eq!(m1.epoch, m2.epoch);
+    assert_eq!(m1.clean_shutdown, m2.clean_shutdown);
+}
+
+#[test]
+fn manifest_dirty_flag_roundtrip() {
+    use crate::test_dir;
+
+    let dir = test_dir!("test_data/manifest_dirty_flag_roundtrip");
+    let mut m1 = Manifest::default_new(123, 4096, 128);
+    m1.clean_shutdown = false;
+    m1.store_atomic(&dir.root).unwrap();
+    let m2 = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
+    assert!(!m2.clean_shutdown);
 }

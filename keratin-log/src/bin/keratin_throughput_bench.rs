@@ -67,6 +67,7 @@ async fn main() {
         default_durability: durability,
         fsync_interval_ms: fsync_ms,
         flush_target_bytes: flush_mb * 1024 * 1024,
+        force_recovery_scan: has_flag("--force-recovery-scan"),
     };
 
     let k = Arc::new(Keratin::open(&root, cfg).await.unwrap());
@@ -118,6 +119,7 @@ async fn main() {
     println!("linger_ms={linger_ms}");
     println!("flush_mb={flush_mb}");
     println!("durability={durability:?}");
+    println!("force_recovery_scan={}", cfg.force_recovery_scan);
     println!("elapsed_secs={elapsed:.3}");
     println!("msgs_per_sec={:.0}", written as f64 / elapsed);
 

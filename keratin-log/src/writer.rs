@@ -445,12 +445,7 @@ fn writer_loop(
             }
             WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
-                // Sync changes
-                if let Err(e) = log
-                    .flush_buffers()
-                    .and_then(|_| log.flush())
-                    .and_then(|_| log.fsync())
-                {
+                if let Err(e) = log.shutdown() {
                     tracing::error!("Error during writer shutdown fsync: {e}");
                 } else {
                     tracing::info!("Writer shutdown fsync complete");

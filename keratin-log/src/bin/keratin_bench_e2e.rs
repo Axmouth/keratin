@@ -55,6 +55,7 @@ async fn main() {
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 5,
         flush_target_bytes: 128 * 1024 * 1024,
+        force_recovery_scan: false,
     };
 
     let k = Arc::new(Keratin::open(&root.root, cfg).await.unwrap());

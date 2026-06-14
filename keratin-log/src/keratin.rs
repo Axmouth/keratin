@@ -144,6 +144,7 @@ impl Keratin {
             cfg.segment_max_bytes,
             cfg.index_stride_bytes,
             cfg.flush_target_bytes,
+            cfg.force_recovery_scan,
             log_state.clone(),
         )?;
 

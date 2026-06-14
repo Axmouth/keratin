@@ -78,10 +78,13 @@ Added local utility: `keratin-log/src/bin/keratin_open_bench.rs`
 | ---: | ---: | ---: | ---: | --- | ---: |
 | 200k | 1KB | 16MB | 14 | tmpfs | `76.169 ms` |
 | 1M | 1KB | 16MB | 82 | tmpfs | `297.440 ms` |
+| 1M | 1KB | 16MB | 82 | tmpfs | `1.000 ms` after clean-fast-open |
+| 1M | 1KB | 16MB | 82 | tmpfs | `293.590 ms` with `--force-recovery-scan` |
 
 Interpretation:
 
-- Clean reopen currently scans all segments.
+- Clean-fast-open removes the scan after an orderly shutdown.
+- `force_recovery_scan=true` keeps the full scan/repair path available.
 - This is primarily a user-visible startup latency issue, not steady-state
   throughput.
 - It still matters for sparse workloads with many queues, and for restart or
@@ -93,29 +96,32 @@ Interpretation:
 
 Current behavior:
 
-- `Log::open` discovers segments and scans every segment to repair partial tails
-  and compute the true next offset.
+- `Log::open` discovers segments and scans every segment after dirty shutdown,
+  forced recovery scan, or incompatible manifest metadata.
 - The scan is required after crash or dirty shutdown.
-- After a known clean shutdown, the manifest should be able to carry enough
-  state to skip full recovery scanning.
+- After a known clean shutdown, the manifest carries enough state to skip full
+  recovery scanning.
 
 Possible direction:
 
-- Store a clean/dirty flag in the manifest.
+- Store a clean/dirty flag in the manifest. Implemented with the existing
+  manifest header flags field.
 - On open, mark the manifest dirty before returning a writable handle.
 - On clean shutdown, force-store final `next_offset`, active base, head, epoch,
   and clean=true.
 - On next open, if clean=true and manifest/config invariants match, trust the
   manifest and skip full segment scan.
-- If clean=false, manifest is missing, or validation fails, use the current full
-  scan path.
+- If clean=false, manifest is missing, validation fails, or
+  `force_recovery_scan=true`, use the current full scan path.
 
 Tests needed:
 
-- Clean shutdown skips full recovery path and still reads all records.
-- Crash or `force_close` leaves dirty state and uses full scan.
-- Truncated tail after dirty shutdown is repaired.
-- Clean fast path refuses obviously inconsistent metadata.
+- Clean shutdown manifest lifecycle is covered.
+- Forced recovery scan repairing a corrupted tail after clean shutdown is
+  covered.
+- Dirty crash recovery tests still cover truncated tails.
+- Clean fast path refusing obviously inconsistent metadata still needs a focused
+  test.
 
 ### 2. Writer Pipeline
 
@@ -188,3 +194,18 @@ Possible direction:
 
 - Only warn after timeout or after a meaningful delay.
 - Not performance-sensitive, but cleaner for benchmarks and operator logs.
+
+### 6. Configuration Builder
+
+Current behavior:
+
+- `KeratinConfig` is a public struct with many direct literal initializers in
+  tests and benchmark binaries.
+- Adding one setting requires a broad initializer sweep.
+
+Possible direction:
+
+- Add a small builder or fluent helpers for common settings.
+- Keep `Default` for simple setup, but make benchmark and application configs
+  easier to evolve.
+- Do this as an API cleanup, not as part of a specific performance experiment.

@@ -146,6 +146,7 @@ impl Log {
         segment_max_bytes: u64,
         index_stride_bytes: u32,
         flush_target_bytes: usize,
+        force_recovery_scan: bool,
         log_state: Arc<LogState>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
@@ -164,6 +165,7 @@ impl Log {
             let (seg, idx, seg_path) = create_segment_pair(&root, 0, now_ms)?;
             manifest.active_base_offset = 0;
             manifest.next_offset = 0;
+            manifest.clean_shutdown = false;
             manifest.store_atomic(&root)?;
             let next_offset: u64 = manifest.next_offset;
             let initial: u64 = next_offset.saturating_sub(1);
@@ -182,6 +184,52 @@ impl Log {
                     idx_buf: Vec::with_capacity(256 * 1024),
                     stats: IoStats::new(),
                     log_state,
+                    last_stats_dump: Instant::now(),
+                    manifest_flush_interval: Duration::from_millis(500),
+                    last_manifest_flush: Instant::now(),
+                    staged_end_offset: initial,
+                    durable_offset: initial,
+                    flush_target_bytes,
+                    segment_mapping: segment_mapping.clone(),
+                },
+                segment_mapping,
+            ));
+        }
+
+        if !force_recovery_scan
+            && manifest.clean_shutdown
+            && manifest.segment_max_bytes == segment_max_bytes
+            && manifest.index_stride_bytes == index_stride_bytes
+            && bases
+                .last()
+                .map(|(base, _)| *base == manifest.active_base_offset)
+                .unwrap_or(false)
+        {
+            let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter(bases.clone())));
+            let active_base = manifest.active_base_offset;
+            let (active, index, seg_path) =
+                open_or_create_segment_pair(&root, active_base, now_ms)?;
+            segment_mapping.write().insert(active_base, seg_path);
+
+            let next_offset = manifest.next_offset;
+            manifest.clean_shutdown = false;
+            manifest.store_atomic(&root)?;
+
+            let last_index_at_log_pos = active.bytes_written;
+            let initial = next_offset.saturating_sub(1);
+
+            return Ok((
+                Self {
+                    root,
+                    manifest,
+                    active,
+                    index,
+                    next_offset,
+                    last_index_at_log_pos,
+                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
+                    idx_buf: Vec::with_capacity(256 * 1024),
+                    log_state,
+                    stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
@@ -238,6 +286,7 @@ impl Log {
         manifest.next_offset = next_offset;
         manifest.segment_max_bytes = segment_max_bytes;
         manifest.index_stride_bytes = index_stride_bytes;
+        manifest.clean_shutdown = false;
         manifest.store_atomic(&root)?;
 
         let last_index_at_log_pos = active.bytes_written;
@@ -677,6 +726,17 @@ impl Log {
     }
 
     pub fn fsync(&mut self) -> io::Result<()> {
+        self.fsync_files_and_update_manifest()?;
+
+        // manifest is a hint; persist it on interval
+        if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
+            self.store_manifest()?;
+        }
+
+        Ok(())
+    }
+
+    fn fsync_files_and_update_manifest(&mut self) -> io::Result<()> {
         let t = Instant::now();
 
         self.active.fsync()?;
@@ -687,17 +747,17 @@ impl Log {
         // mark durable
         self.durable_offset = self.staged_end_offset;
 
-        // manifest is a hint; persist it on interval
         self.manifest.next_offset = self.next_offset;
         self.manifest.active_base_offset = self.active.base_offset;
 
-        if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
-            let t2 = Instant::now();
-            self.manifest.store_atomic(&self.root)?;
-            self.stats.manifest += t2.elapsed();
-            self.last_manifest_flush = Instant::now();
-        }
+        Ok(())
+    }
 
+    fn store_manifest(&mut self) -> io::Result<()> {
+        let t = Instant::now();
+        self.manifest.store_atomic(&self.root)?;
+        self.stats.manifest += t.elapsed();
+        self.last_manifest_flush = Instant::now();
         Ok(())
     }
 
@@ -973,7 +1033,10 @@ impl Log {
 
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.flush_buffers()?;
-        self.fsync()?;
+        self.flush()?;
+        self.fsync_files_and_update_manifest()?;
+        self.manifest.clean_shutdown = true;
+        self.store_manifest()?;
         Ok(())
     }
 

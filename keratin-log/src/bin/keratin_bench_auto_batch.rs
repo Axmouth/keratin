@@ -20,6 +20,7 @@ fn main() {
         fsync_interval_ms: 25,
         flush_target_bytes: 48 * 1024 * 1024,
         default_durability: KDurability::AfterFsync,
+        force_recovery_scan: false,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();
