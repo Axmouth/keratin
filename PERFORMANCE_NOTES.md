@@ -168,6 +168,16 @@ Possible direction:
 - Measure carefully. The disk path is fsync-limited here, but tmpfs enqueue
   numbers suggest CPU/accounting overhead matters.
 
+Investigation note:
+
+- Removing unused per-entry accounting fields from `BatcherCore` was tested as
+  a tiny enqueue-path cleanup.
+- Results were not stable enough to justify keeping it: one run improved, later
+  sequential runs regressed.
+- The batcher currently has more API surface than active use justifies. Consider
+  either removing it or simplifying it around the concrete writer-loop use case
+  before spending more time on micro-optimizations inside it.
+
 ### 4. Reader Path Cleanup
 
 Current behavior:
