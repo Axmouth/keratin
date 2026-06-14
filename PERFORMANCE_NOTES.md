@@ -221,6 +221,10 @@ Investigation note:
   answered immediately and only `AfterFsync` completions enter `pending`.
   Enqueue throughput moved from `468,169 msg/s` to `471,858 msg/s` and
   `477,139 msg/s` in two post-change runs.
+- Batching `AfterWrite` notifications until the end of `stage_reqs` was tested
+  and reverted. It reduced notifier channel sends, but delayed immediate
+  completions enough to lower write-durability enqueue throughput from
+  `447,207 msg/s` to `407,554 msg/s`.
 - The batcher currently has more API surface than active use justifies. Consider
   either removing it or simplifying it around the concrete writer-loop use case
   before spending more time on micro-optimizations inside it.
