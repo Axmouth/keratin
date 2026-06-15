@@ -410,6 +410,51 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
 }
 
 #[tokio::test]
+async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
+    let (st, _dir) = open_test_stroma("stroma_roles_follower_ingest_rejected").await;
+    st.become_queue_follower_with_epoch("topic-a", 0, None, 2)
+        .await
+        .unwrap();
+    let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
+
+    let outcome = st
+        .apply_replicated_queue_batch(
+            "topic-a",
+            0,
+            None,
+            Some(ReplicatedMessageBatch {
+                epoch: 0,
+                first_offset: 0,
+                records: vec![Message {
+                    flags: 0,
+                    headers: Vec::new(),
+                    payload: b"stale".to_vec(),
+                }],
+                durability: Some(KDurability::AfterFsync),
+            }),
+            Some(ReplicatedEventBatch {
+                epoch: 0,
+                first_offset: 0,
+                events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap();
+
+    assert!(matches!(
+        outcome.message_log,
+        Some(ReplicatedAppendOutcome::StaleEpoch {
+            current_epoch: 2,
+            attempted_epoch: 0,
+        })
+    ));
+    assert_eq!(outcome.event_log, None);
+    assert!(!qh.is_ready(0).await);
+    assert!(st.fetch_message_by_offset(&qh, 0).await.unwrap().is_none());
+}
+
+#[tokio::test]
 async fn replicated_ingest_rejects_owner_queue() {
     let (st, _dir) = open_test_stroma("stroma_roles_replicated_ingest_rejects_owner").await;
 

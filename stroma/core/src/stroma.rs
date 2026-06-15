@@ -1793,8 +1793,12 @@ impl Stroma {
             None => None,
         };
 
+        let message_append_allows_events = message_log
+            .as_ref()
+            .is_none_or(replicated_append_outcome_allows_state_apply);
+
         let event_log = match events {
-            Some(batch) => {
+            Some(batch) if message_append_allows_events => {
                 let mut records = Vec::with_capacity(batch.events.len());
                 for event in &batch.events {
                     records.push(event_msg(event)?);
@@ -1809,13 +1813,16 @@ impl Stroma {
                     )
                     .await
                     .map_err(io_err)?;
-                for (idx, event) in batch.events.into_iter().enumerate() {
-                    self.apply_event_inmem(event, &qh).await?;
-                    qh.applied_upto()
-                        .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
+                if replicated_append_outcome_allows_state_apply(&outcome) {
+                    for (idx, event) in batch.events.into_iter().enumerate() {
+                        self.apply_event_inmem(event, &qh).await?;
+                        qh.applied_upto()
+                            .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
+                    }
                 }
                 Some(outcome)
             }
+            Some(_) => None,
             None => None,
         };
 
@@ -4397,6 +4404,15 @@ impl Stroma {
         }
         Ok(())
     }
+}
+
+fn replicated_append_outcome_allows_state_apply(outcome: &ReplicatedAppendOutcome) -> bool {
+    matches!(
+        outcome,
+        ReplicatedAppendOutcome::Applied(_)
+            | ReplicatedAppendOutcome::AppliedSuffix { .. }
+            | ReplicatedAppendOutcome::AlreadyPresent { .. }
+    )
 }
 
 fn collect_parts(
