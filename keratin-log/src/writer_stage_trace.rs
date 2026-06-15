@@ -2,6 +2,10 @@ use std::{
     fs::File,
     io::{BufWriter, Write},
     path::PathBuf,
+    sync::{
+        Arc,
+        atomic::{AtomicU64, Ordering},
+    },
     time::Instant,
 };
 
@@ -16,11 +20,12 @@ struct WriterStageEvent {
     bytes: usize,
 }
 
+#[derive(Clone)]
 pub struct WriterStageTracer {
     base: Instant,
     tx: Option<Sender<WriterStageEvent>>,
-    next_id: u64,
-    dropped: u64,
+    next_id: Arc<AtomicU64>,
+    dropped: Arc<AtomicU64>,
 }
 
 impl WriterStageTracer {
@@ -64,8 +69,8 @@ impl WriterStageTracer {
         Self {
             base: Instant::now(),
             tx: Some(tx),
-            next_id: 1,
-            dropped: 0,
+            next_id: Arc::new(AtomicU64::new(1)),
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
@@ -73,22 +78,18 @@ impl WriterStageTracer {
         Self {
             base: Instant::now(),
             tx: None,
-            next_id: 1,
-            dropped: 0,
+            next_id: Arc::new(AtomicU64::new(1)),
+            dropped: Arc::new(AtomicU64::new(0)),
         }
     }
 
-    pub fn next_work_id(&mut self) -> u64 {
-        let id = self.next_id;
-        self.next_id = self.next_id.wrapping_add(1);
-        if self.next_id == 0 {
-            self.next_id = 1;
-        }
-        id
+    pub fn next_work_id(&self) -> u64 {
+        let id = self.next_id.fetch_add(1, Ordering::Relaxed);
+        if id == 0 { 1 } else { id }
     }
 
     pub fn record(
-        &mut self,
+        &self,
         id: u64,
         stage: &'static str,
         start: Instant,
@@ -110,15 +111,18 @@ impl WriterStageTracer {
         };
 
         if tx.try_send(event).is_err() {
-            self.dropped = self.dropped.saturating_add(1);
+            self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
 }
 
 impl Drop for WriterStageTracer {
     fn drop(&mut self) {
-        if self.dropped > 0 {
-            eprintln!("dropped {} Keratin writer stage trace events", self.dropped);
+        if Arc::strong_count(&self.dropped) == 1 {
+            let dropped = self.dropped.load(Ordering::Relaxed);
+            if dropped > 0 {
+                eprintln!("dropped {dropped} Keratin writer stage trace events");
+            }
         }
     }
 }

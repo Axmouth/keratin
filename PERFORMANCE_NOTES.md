@@ -364,6 +364,11 @@ Instrumentation validation result:
   another stage. The ASCII timeline uses `=` for solo activity and `#` for
   exact overlap with another stage. Those are the main signals for future
   pipeline experiments.
+- The trace also includes the notifier thread as `notify`. A 1M-message
+  `AfterFsync` enqueue trace produced 69 notify batches. `notify` was active
+  for about `17.8 ms/s`, with about `9.9 ms/s` overlapping other stages, mostly
+  `stage_reqs`. This means completion delivery already overlaps some writer
+  work, while staging/post-stage remain effectively serial.
 - Fibril's default-build baseline steady-state sweep also looked normal:
   50k/s measured `14/20/23/58ms` publish-to-deliver p50/p95/p99/max, and
   150k/s measured `12/16/24/58ms`, with zero missing messages and zero publish

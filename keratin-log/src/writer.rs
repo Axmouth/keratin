@@ -208,7 +208,15 @@ struct NotifyItem {
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
     let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(8192);
 
+    #[cfg(feature = "writer-stage-trace")]
+    let tracer = WriterStageTracer::from_env();
+    #[cfg(feature = "writer-stage-trace")]
+    let notifier_tracer = tracer.clone();
+
     std::thread::spawn(move || {
+        #[cfg(feature = "writer-stage-trace")]
+        notifier_loop(notify_rx, notifier_tracer);
+        #[cfg(not(feature = "writer-stage-trace"))]
         notifier_loop(notify_rx);
         tracing::info!("Notifier loop exited");
     });
@@ -216,6 +224,9 @@ pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> W
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(8192);
 
     std::thread::spawn(move || {
+        #[cfg(feature = "writer-stage-trace")]
+        writer_loop(&mut log, cfg, rx, state, notify_tx, tracer);
+        #[cfg(not(feature = "writer-stage-trace"))]
         writer_loop(&mut log, cfg, rx, state, notify_tx);
         tracing::info!("Writer loop exited")
     });
@@ -223,6 +234,7 @@ pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> W
     WriterHandle { tx }
 }
 
+#[cfg(not(feature = "writer-stage-trace"))]
 fn notifier_loop(rx: Receiver<NotifyMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -238,12 +250,58 @@ fn notifier_loop(rx: Receiver<NotifyMsg>) {
     }
 }
 
+#[cfg(feature = "writer-stage-trace")]
+fn notifier_loop(rx: Receiver<NotifyMsg>, tracer: WriterStageTracer) {
+    while let Ok(msg) = rx.recv() {
+        let work_id = tracer.next_work_id();
+        match msg {
+            NotifyMsg::One { item } => {
+                trace_writer_stage!(tracer, work_id, "notify", (1, 0), {
+                    item.completion.complete(item.result);
+                });
+            }
+            NotifyMsg::Batch(items) => {
+                let records = items.len();
+                trace_writer_stage!(tracer, work_id, "notify", (records, 0), {
+                    for item in items {
+                        item.completion.complete(item.result);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "writer-stage-trace"))]
 fn writer_loop(
     log: &mut Log,
     cfg: KeratinConfig,
     writes_rx: Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
+) {
+    writer_loop_inner(log, cfg, writes_rx, state, notify_tx)
+}
+
+#[cfg(feature = "writer-stage-trace")]
+fn writer_loop(
+    log: &mut Log,
+    cfg: KeratinConfig,
+    writes_rx: Receiver<WriterCmd>,
+    state: Arc<LogState>,
+    notify_tx: Sender<NotifyMsg>,
+    tracer: WriterStageTracer,
+) {
+    writer_loop_inner(log, cfg, writes_rx, state, notify_tx, tracer)
+}
+
+fn writer_loop_inner(
+    log: &mut Log,
+    cfg: KeratinConfig,
+    writes_rx: Receiver<WriterCmd>,
+    state: Arc<LogState>,
+    notify_tx: Sender<NotifyMsg>,
+    #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let mut last_fsync = Instant::now();
@@ -272,9 +330,6 @@ fn writer_loop(
             (recs, bytes)
         },
     );
-
-    #[cfg(feature = "writer-stage-trace")]
-    let mut tracer = WriterStageTracer::from_env();
 
     loop {
         // Keep linger synced with adaptive tuning.
