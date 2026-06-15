@@ -69,6 +69,11 @@ Interpretation:
 - Larger `max_batch_records=8192`, `max_batch_mb=12`, `fsync_ms=25`, and
   `linger_ms=25` did not improve the tested tmpfs runs.
 - Larger enqueue confirmation windows did not improve the tested tmpfs runs.
+- Writer-path benchmarks should use longer runs when comparing changes. Short
+  `1M` runs were useful for fast iteration but hid important batching behavior.
+- Isolated Keratin throughput is not enough to accept a writer change. Compare
+  promising writer changes against Fibril's steady-state benchmark too,
+  especially around the latency knee.
 
 ### Configurable Open Utility
 
@@ -242,6 +247,70 @@ Result:
 - Treat this as a boundary refactor, not a throughput win. The key value is
   that planner and file-handle responsibilities are now easier to separate
   without adding threads yet.
+
+Static linger experiment:
+
+- The old adaptive linger loop appears to defeat configured linger under the
+  isolated enqueue workload. With `--messages 5000000`, `--fsync-ms 20`,
+  `--linger-ms 20`, and tmpfs storage, static configured linger measured about
+  `906k-908k msg/s`. The adaptive shape measured about `446k msg/s` on the
+  same benchmark shape. Static linger also measured `974,070 msg/s` on a later
+  `10M` run.
+- The IO log showed much smaller adaptive batches, roughly `10k-12k` records
+  per batch versus roughly `25k-31k` for the static shape.
+- Small fsync windows were not inherently a writer scheduling problem on tmpfs:
+  one `10M` static-linger run measured `1,018,540 msg/s` at `fsync-ms=1`,
+  and another measured `966,478 msg/s` at `fsync-ms=20`. Tmpfs reports near
+  zero fsync time, so these numbers are mainly about batching and scheduling.
+- Disk-backed durability still pays for aggressive fsync. On the repo disk with
+  `2M` messages, `fsync-ms=1` measured `213,084 msg/s`, `fsync-ms=5` measured
+  `242,288 msg/s`, and `fsync-ms=20` measured `287,633 msg/s`. Treat this as
+  the expected operational tradeoff: smaller fsync windows reduce potential
+  loss after a crash but spend more time syncing.
+- Despite the isolated win, static linger was not kept as a global writer
+  change. Fibril's top-level `throughput-1k` steady-state benchmark regressed
+  in the low and medium rate cases: at 250k/s p95 publish-to-deliver latency
+  moved from `17ms` adaptive to `41ms` static, and at 350k/s from `800ms` to
+  `958ms`. Static was roughly tied at 400k/s and modestly better only in the
+  already-backlogged 500k/s case.
+- The next useful direction is not a blunt static/adaptive linger swap. It is a
+  measured pipeline experiment with stage overlap instrumentation, plus payload
+  size sweeps.
+
+Fibril comparison against the benchmark docs:
+
+- The June 7 docs table remains directionally useful, but current branch runs
+  should not be assumed to match it exactly. In the adaptive comparison run,
+  250k/s still looked close to the docs, but 350k/s was much worse
+  (`592/800/840ms` publish-to-deliver p50/p95/p99 instead of
+  `79/114/122ms`). That could be current branch behavior, environment variance,
+  storage state, or benchmark noise. Do not update the public docs from this
+  single WIP-branch run.
+
+Observability needed for real pipelining:
+
+- The current `KERATIN IO` line reports cumulative serial work per writer loop:
+  encode, log write, index, fsync, manifest, bytes, and records per batch.
+- That is enough to see where serial time goes, but it cannot prove overlap
+  because the current design has no overlapping stages.
+- When a pipeline is introduced, add per-stage interval metrics around:
+  admission/batch wait, planner/encode, file write, fsync, and notify release.
+  Treat each channel item as the measured work unit. Each item should carry a
+  stable work id or fence id across stages, and each stage should emit
+  `(id, stage, start, end, bytes, records)` to a collector.
+- The collector should sit off the hot path. A bounded crossbeam channel and a
+  dedicated collector thread are a reasonable first shape. If the collector
+  falls behind, prefer dropping or sampling instrumentation records over
+  blocking the writer pipeline being measured.
+- The benchmark can then report stage utilization and adjacent-stage overlap by
+  matching ids between consecutive stages. That is more useful than only
+  comparing aggregate stage totals.
+- Keep these metrics optional or sampled. Per-message timing on the hot path is
+  too expensive for the question we need answered.
+- Test pipeline experiments with larger payloads too. Tiny messages mainly
+  stress scheduling, batching, and channel overhead. Encoding and copy overlap
+  should matter more with larger payloads, so small-message wins or losses are
+  not enough to accept or reject a pipeline design.
 
 Correctness tests needed before splitting fsync:
 
