@@ -114,6 +114,20 @@ impl WriterStageTracer {
             self.dropped.fetch_add(1, Ordering::Relaxed);
         }
     }
+
+    pub fn trace<T>(
+        &self,
+        id: u64,
+        stage: &'static str,
+        records: usize,
+        bytes: usize,
+        f: impl FnOnce() -> T,
+    ) -> T {
+        let start = Instant::now();
+        let result = f();
+        self.record(id, stage, start, Instant::now(), records, bytes);
+        result
+    }
 }
 
 impl Drop for WriterStageTracer {

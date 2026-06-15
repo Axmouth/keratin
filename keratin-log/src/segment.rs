@@ -84,6 +84,10 @@ impl Segment {
         self.file.sync_data()
     }
 
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     pub fn set_len(&mut self, new_len: u64) -> io::Result<()> {
         self.file.set_len(new_len)?;
         self.bytes_written = new_len;

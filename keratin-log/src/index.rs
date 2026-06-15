@@ -107,6 +107,10 @@ impl Index {
         self.file.sync_data()
     }
 
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
+    }
+
     /// Truncate idx to last complete entry (used on recovery).
     pub fn repair_truncate_to_entries(&mut self) -> io::Result<()> {
         let len = self.file.metadata()?.len();

@@ -369,10 +369,120 @@ Instrumentation validation result:
   for about `17.8 ms/s`, with about `9.9 ms/s` overlapping other stages, mostly
   `stage_reqs`. This means completion delivery already overlaps some writer
   work, while staging/post-stage remain effectively serial.
+- The trace was then narrowed from broad `stage_reqs` / `post_stage` wrapper
+  spans to leaf spans: `encode`, `log_write`, `index_write`, `fsync`,
+  `manifest_write`, and `notify`. On a 1M-message, 1KB payload, 4-producer
+  enqueue run with CSV tracing enabled, throughput measured `528,620 msg/s`.
+  The leaf summary showed `encode` active for about `170.8 ms/s`, `log_write`
+  for about `216.2 ms/s`, and `notify` for about `18.4 ms/s`. `encode` and
+  `log_write` still had effectively no overlap because they run in the same
+  writer thread. Only `notify` overlapped materially, about `5.9ms` total
+  across the run. This confirms the next useful pipeline experiment needs to
+  split encode/planning from file write, not just improve the existing summary
+  tooling.
+- A traced payload sweep shows why storage type matters. These runs had CSV
+  tracing enabled, so use them for stage shape, not final throughput:
+
+  | Storage | Payload | Messages | Throughput | Encode active | Log write active | Fsync active |
+  | --- | ---: | ---: | ---: | ---: | ---: | ---: |
+  | tmpfs | 1KB | 1M | `591,712 msg/s` | `178.7 ms/s` | `241.0 ms/s` | `0.1 ms/s` |
+  | tmpfs | 16KB | 160k | `83,164 msg/s` | `350.7 ms/s` | `454.7 ms/s` | `0.1 ms/s` |
+  | tmpfs | 64KB | 40k | `24,123 msg/s` | `378.9 ms/s` | `507.9 ms/s` | `0.1 ms/s` |
+  | tmpfs | 256KB | 10k | `5,975 msg/s` | `352.4 ms/s` | `515.0 ms/s` | `0.1 ms/s` |
+  | repo disk | 1KB | 1M | `232,734 msg/s` | `76.8 ms/s` | `54.2 ms/s` | `594.4 ms/s` |
+  | repo disk | 64KB | 40k | `5,420 msg/s` | `93.0 ms/s` | `77.6 ms/s` | `747.7 ms/s` |
+
+  On tmpfs, larger payloads make both encode and `log_write` large serial
+  costs. Splitting encode/planning from file write could help there, but it may
+  also just move pressure onto memory bandwidth and cache behavior. On the repo
+  disk, fsync dominates. Encode/write pipelining alone will not fix the
+  disk-backed `AfterFsync` shape unless fsync fences are also explicit and can
+  be overlapped safely.
+- A first async fsync experiment added explicit `FsyncJob` fences. The writer
+  still owns staging and file writes, but after flushed bytes are written it
+  sends cloned read-only sync targets plus ready completions to a single fsync
+  worker. The worker syncs in order and returns the fence; only then does the
+  writer advance the local durable watermark and forward completions to the
+  notifier. This keeps mutation serialized while overlapping fsync wait with
+  later encode/write work.
+- Default-build quick samples after async fsync:
+
+  | Storage | Payload | Messages | Throughput |
+  | --- | ---: | ---: | ---: |
+  | tmpfs | 1KB | 1M | `577,078 msg/s` |
+  | tmpfs | 64KB | 40k | `24,374 msg/s` |
+  | repo disk | 1KB | 1M | `319,630 msg/s` |
+  | repo disk | 64KB | 40k | `6,912 msg/s` |
+
+  The tmpfs shape stayed roughly in the same band, which is expected because
+  tmpfs has near-zero fsync cost. The repo-disk shape improved substantially
+  versus the traced pre-async disk sweep, though those older numbers included
+  CSV tracing overhead. A traced repo-disk 1KB run after async fsync measured
+  `320,027 msg/s` and showed real overlap: `fsync` active for about
+  `843.3 ms/s`, with `encode` overlapping `fsync` by `240.6ms` across the run
+  and `log_write` overlapping `fsync` by `158.0ms`.
+- Keep the async fsync direction for further investigation, but do not treat it
+  as accepted until Fibril steady-state latency is checked. The isolated result
+  is exactly the expected win for disk-backed `AfterFsync`, but the top-level
+  broker benchmark is the real acceptance gate.
+- Top-level Fibril `throughput-1k` steady-state check after async fsync, using
+  `WARMUP_SECS=2` and `DURATION_SECS=5`, completed without missing messages or
+  publish errors:
+
+  | Target rate | Actual rate | publish→deliver p50 | p95 | p99 | Missing |
+  | ---: | ---: | ---: | ---: | ---: | ---: |
+  | 250k/s | `249,053/s` | `13ms` | `17ms` | `35ms` | `0` |
+  | 350k/s | `350,016/s` | `321ms` | `496ms` | `553ms` | `0` |
+  | 400k/s | `397,447/s` | `1334ms` | `1644ms` | `1704ms` | `0` |
+  | 500k/s | `492,358/s` | `3251ms` | `3555ms` | `3599ms` | `0` |
+
+  This is not a rigorous before/after because current branch state and storage
+  conditions vary, but it clears the immediate regression concern that the
+  isolated Keratin improvement might obviously break steady-state Fibril
+  behavior. The 250k/s shape remains healthy. The 350k/s and above shapes are
+  still backlog territory on this machine and branch.
 - Fibril's default-build baseline steady-state sweep also looked normal:
   50k/s measured `14/20/23/58ms` publish-to-deliver p50/p95/p99/max, and
   150k/s measured `12/16/24/58ms`, with zero missing messages and zero publish
   errors.
+- Fibril latency-focused fsync cadence sweep, 1KB payloads, unconfirmed publish,
+  10 writers, 10 readers, `WARMUP_SECS=2`, and `DURATION_SECS=5`:
+
+  | Fsync interval | Target rate | Actual rate | publish->deliver p50/p95/p99/max | server-receive->deliver p50/p95/p99/max |
+  | ---: | ---: | ---: | --- | --- |
+  | 1ms | 50k/s | `49,964/s` | `10/16/19/50ms` | `5/10/11/18ms` |
+  | 1ms | 100k/s | `100,000/s` | `7/11/12/50ms` | `4/7/8/11ms` |
+  | 1ms | 150k/s | `149,312/s` | `6/9/15/50ms` | `4/6/10/29ms` |
+  | 1ms | 200k/s | `199,296/s` | `6/8/20/51ms` | `4/5/16/34ms` |
+  | 1ms | 250k/s | `249,881/s` | `5/7/36/71ms` | `4/5/32/42ms` |
+  | 1ms | 300k/s | `299,120/s` | `6/35/56/83ms` | `5/33/49/59ms` |
+  | 1ms | 350k/s | `348,948/s` | `342/560/628/642ms` | `340/558/626/640ms` |
+  | 5ms | 200k/s | `198,730/s` | `12/15/19/57ms` | `10/13/16/40ms` |
+  | 5ms | 250k/s | `250,000/s` | `13/16/17/58ms` | `11/14/15/19ms` |
+  | 5ms | 300k/s | `298,947/s` | `15/27/57/90ms` | `13/26/46/68ms` |
+  | 5ms | 350k/s | `347,450/s` | `475/648/685/716ms` | `472/647/683/713ms` |
+
+  The latency-first setting on this machine is currently `1ms`. It keeps
+  p99 server-receive-to-deliver below `16ms` through 200k/s and below `50ms`
+  at 300k/s, then falls off sharply by 350k/s. `5ms` is a reasonable compromise
+  around 200k-250k/s, but it does not buy useful 350k/s headroom in this run.
+- Low-rate Fibril sweep, 1KB payloads, unconfirmed publish, 2 writers,
+  2 readers, `WARMUP_SECS=2`, and `DURATION_SECS=10`:
+
+  | Fsync interval | Target rate | Actual rate | publish->deliver p50/p95/p99/max | server-receive->deliver p50/p95/p99/max |
+  | ---: | ---: | ---: | --- | --- |
+  | 1ms | 1k/s | `1,000/s` | `23/38/41/49ms` | `6/8/10/12ms` |
+  | 1ms | 10k/s | `9,999/s` | `12/17/19/46ms` | `4/10/11/15ms` |
+  | 1ms | 25k/s | `24,994/s` | `6/9/11/48ms` | `4/7/8/11ms` |
+  | 2ms | 1k/s | `1,000/s` | `13/38/42/48ms` | `6/10/10/12ms` |
+  | 2ms | 10k/s | `10,000/s` | `12/18/20/25ms` | `7/11/13/16ms` |
+  | 2ms | 25k/s | `25,000/s` | `7/11/12/46ms` | `5/9/10/15ms` |
+
+  At these lower rates, end-to-end publish timestamps are visibly affected by
+  benchmark client pacing and scheduler behavior. The server-received metric is
+  the better signal for broker/storage latency. In that view, `1ms` and `2ms`
+  both stay around `10ms` p99 at 1k/s, while `1ms` is slightly better at
+  10k-25k/s.
 - The trace feature is suitable for local experiments. Do not enable it in
   production-like performance runs unless the goal is specifically to collect
   timing intervals.
