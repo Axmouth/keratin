@@ -11,6 +11,8 @@ mod recovery;
 mod segment;
 pub mod util;
 mod writer;
+#[cfg(feature = "writer-stage-trace")]
+mod writer_stage_trace;
 
 pub use config::*;
 pub use durability::KDurability;

@@ -312,6 +312,59 @@ Observability needed for real pipelining:
   should matter more with larger payloads, so small-message wins or losses are
   not enough to accept or reject a pipeline design.
 
+Current writer instrumentation plan:
+
+- Add stage timing behind a compile-time `writer-stage-trace` feature. Default
+  builds must not compile or execute tracing work in the writer hot path.
+- When enabled, write CSV trace output by setting
+  `KERATIN_WRITER_STAGE_TRACE=/path/to/trace.csv`.
+- Treat each channel item or flushed batch as the measured work unit. Assign a
+  stable id that can survive across future pipeline stages.
+- Emit stage intervals as `(id, stage, start, end, bytes, records)` to an
+  off-path collector. The collector can use a bounded channel and may drop
+  samples rather than blocking the writer being measured.
+- Keep the first implementation small: current serial writer intervals are a
+  baseline for future overlap checks, not the pipeline itself.
+- Acceptance gate for instrumentation:
+  - default build still passes `keratin-log` checks and tests
+  - default-build isolated enqueue benchmark stays within noise
+  - feature-enabled tracing is usable for experiments, but not a production
+    default
+- Acceptance gate for future pipeline changes:
+  - isolated Keratin benchmark must show the intended stage overlap or
+    throughput effect
+  - Fibril steady-state benchmark must not regress low-rate latency or the
+    practical latency knee
+  - payload sweeps must include larger messages because encode/copy overlap may
+    matter more there than in 1KB runs
+
+Instrumentation validation result:
+
+- Default `keratin-log` checks and tests passed after adding the feature-gated
+  tracing path.
+- Feature-enabled `keratin-log` checks and tests passed.
+- A traced smoke run wrote CSV rows like
+  `id,stage,start_ns,end_ns,duration_ns,records,bytes`. The 100k-message smoke
+  produced about 200k rows because the current writer often stages one
+  single-message unit plus one post-stage interval per id.
+- Default-build isolated enqueue samples with tracing disabled measured
+  `460,082 msg/s` and `474,371 msg/s`, matching the old adaptive-linger range
+  closely enough for this local check.
+- With the trace feature compiled in but `KERATIN_WRITER_STAGE_TRACE` unset, a
+  longer 1M-message enqueue sample measured `585,339 msg/s`. This is a useful
+  sanity check that the compiled-in feature path stays close to normal
+  variation when the collector is disabled.
+- With CSV tracing enabled, the matching 1M-message sample measured
+  `493,217 msg/s` and wrote about 2M rows, 95MB. That overhead is acceptable for
+  local diagnostics, but it is too invasive for normal benchmark comparisons.
+- Fibril's default-build baseline steady-state sweep also looked normal:
+  50k/s measured `14/20/23/58ms` publish-to-deliver p50/p95/p99/max, and
+  150k/s measured `12/16/24/58ms`, with zero missing messages and zero publish
+  errors.
+- The trace feature is suitable for local experiments. Do not enable it in
+  production-like performance runs unless the goal is specifically to collect
+  timing intervals.
+
 Correctness tests needed before splitting fsync:
 
 - Torn or corrupted active-segment tail truncates cleanly, then later good
@@ -334,6 +387,19 @@ Correctness tests needed before splitting fsync:
   reliable once the segment file is already open.
 - The future fsync stage must release `AfterFsync` completions only for fences
   whose bytes were already written and whose relevant files were synced.
+- The future write stage should emit explicit durable fences. A fence should
+  identify the ordered write boundary, the highest covered offset, and the
+  segment/index files that must be synced.
+- The fsync stage must not infer durability from planned bytes. It can only
+  advance a fence after the file writer confirms all commands through that fence
+  were applied in order.
+- Segment roll and manifest updates need their own fence rules. A completion
+  that depends on a newly created segment cannot be released until the log file,
+  index file, manifest, and required parent directory syncs have reached the
+  agreed durability point.
+- `AfterWrite` and `AfterFsync` contracts should be rechecked before splitting
+  fsync. Pre-0.1 lets us tighten the contract, but the public meaning should be
+  explicit before the pipeline is built around it.
 
 Benchmark target:
 

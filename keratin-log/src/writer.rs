@@ -13,6 +13,69 @@ use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAp
 use crate::record::Message;
 use crate::{AppendCompletion, KeratinConfig};
 
+#[cfg(feature = "writer-stage-trace")]
+use crate::writer_stage_trace::WriterStageTracer;
+
+#[cfg(feature = "writer-stage-trace")]
+macro_rules! trace_writer_stage {
+    ($tracer:ident, $id:expr, $stage:expr, $weight:expr, $body:block) => {{
+        let (records, bytes) = $weight;
+        let start = Instant::now();
+        let result = $body;
+        $tracer.record($id, $stage, start, Instant::now(), records, bytes);
+        result
+    }};
+}
+
+#[cfg(not(feature = "writer-stage-trace"))]
+macro_rules! trace_writer_stage {
+    ($tracer:ident, $id:expr, $stage:expr, $weight:expr, $body:block) => {{ $body }};
+}
+
+macro_rules! stage_reqs_then_post {
+    (
+        $tracer:ident,
+        $log:expr,
+        $cfg:expr,
+        $state:expr,
+        $pending:expr,
+        $reqs:expr,
+        $notify_tx:expr,
+        $durable_offset:expr,
+        $last_fsync:expr,
+        $fsync_interval:expr,
+        $linger:expr,
+        $linger_min:expr,
+        $linger_max:expr $(,)?
+    ) => {{
+        let reqs = $reqs;
+        #[cfg(feature = "writer-stage-trace")]
+        let work_id = $tracer.next_work_id();
+
+        let total_bytes =
+            trace_writer_stage!($tracer, work_id, "stage_reqs", reqs_trace_weight(&reqs), {
+                stage_reqs($log, $cfg, $state, $pending, reqs, $notify_tx)
+            });
+
+        trace_writer_stage!($tracer, work_id, "post_stage", (0, total_bytes), {
+            post_stage_commit_and_tune(
+                $log,
+                $cfg,
+                $state,
+                $pending,
+                $durable_offset,
+                $last_fsync,
+                $fsync_interval,
+                total_bytes,
+                $notify_tx,
+                $linger,
+                $linger_min,
+                $linger_max,
+            );
+        });
+    }};
+}
+
 // TODO: Tests showing guaranteed order
 // TODO: Also more tests for failures and edge cases (e.g. batch flush on shutdown, etc.)
 // TODO: More pipelining: Batch -> encode and stage buffer -> write file -> fsync -> notify awaiters (estimated possible 40%-60% gain in throughput from not waiting encoding and fsync for large payloads)
@@ -94,6 +157,27 @@ impl AppendPayload {
             AppendPayload::Many(messages) => messages.iter().map(|m| m.bytes_len()).sum::<usize>(),
         }
     }
+}
+
+#[cfg(feature = "writer-stage-trace")]
+fn reqs_trace_weight(reqs: &[AppendReq]) -> (usize, usize) {
+    reqs.iter().fold((0usize, 0usize), |(records, bytes), req| {
+        (
+            records.saturating_add(req.records.len()),
+            bytes.saturating_add(req.records.bytes_len()),
+        )
+    })
+}
+
+#[cfg(feature = "writer-stage-trace")]
+fn messages_trace_weight(messages: &[Message]) -> (usize, usize) {
+    (
+        messages.len(),
+        messages
+            .iter()
+            .map(Message::bytes_len)
+            .fold(0usize, usize::saturating_add),
+    )
 }
 
 pub struct WriterHandle {
@@ -189,6 +273,9 @@ fn writer_loop(
         },
     );
 
+    #[cfg(feature = "writer-stage-trace")]
+    let mut tracer = WriterStageTracer::from_env();
+
     loop {
         // Keep linger synced with adaptive tuning.
         batcher.set_linger(linger);
@@ -197,17 +284,17 @@ fn writer_loop(
         if let Some((FlushReason::Timeout, reqs)) = batcher.flush_if_due(Instant::now())
             && !reqs.is_empty()
         {
-            let total_bytes = stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
-            post_stage_commit_and_tune(
+            stage_reqs_then_post!(
+                tracer,
                 log,
                 &cfg,
                 &state,
                 &mut pending,
+                reqs,
+                &notify_tx,
                 &mut durable_offset,
                 &mut last_fsync,
                 fsync_interval,
-                total_bytes,
-                &notify_tx,
                 &mut linger,
                 linger_min,
                 linger_max,
@@ -296,18 +383,17 @@ fn writer_loop(
                         // nothing flushed yet
                     }
                     PushResult::One((_why, reqs)) => {
-                        let total_bytes =
-                            stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
-                        post_stage_commit_and_tune(
+                        stage_reqs_then_post!(
+                            tracer,
                             log,
                             &cfg,
                             &state,
                             &mut pending,
+                            reqs,
+                            &notify_tx,
                             &mut durable_offset,
                             &mut last_fsync,
                             fsync_interval,
-                            total_bytes,
-                            &notify_tx,
                             &mut linger,
                             linger_min,
                             linger_max,
@@ -322,28 +408,48 @@ fn writer_loop(
                     }
                     PushResult::Two((why1, reqs1), (why2, reqs2)) => {
                         // Very rare but must be lossless (stale barrier + size flush).
-                        let b1 = stage_reqs(log, &cfg, &state, &mut pending, reqs1, &notify_tx);
-                        let b2 = stage_reqs(log, &cfg, &state, &mut pending, reqs2, &notify_tx);
+                        #[cfg(feature = "writer-stage-trace")]
+                        let work_id1 = tracer.next_work_id();
+                        let b1 = trace_writer_stage!(
+                            tracer,
+                            work_id1,
+                            "stage_reqs",
+                            reqs_trace_weight(&reqs1),
+                            { stage_reqs(log, &cfg, &state, &mut pending, reqs1, &notify_tx) }
+                        );
+
+                        #[cfg(feature = "writer-stage-trace")]
+                        let work_id2 = tracer.next_work_id();
+                        let b2 = trace_writer_stage!(
+                            tracer,
+                            work_id2,
+                            "stage_reqs",
+                            reqs_trace_weight(&reqs2),
+                            { stage_reqs(log, &cfg, &state, &mut pending, reqs2, &notify_tx) }
+                        );
 
                         // Use combined bytes for tuning.
                         let total_bytes = b1.saturating_add(b2);
 
+                        trace_writer_stage!(tracer, work_id2, "post_stage", (0, total_bytes), {
+                            post_stage_commit_and_tune(
+                                log,
+                                &cfg,
+                                &state,
+                                &mut pending,
+                                &mut durable_offset,
+                                &mut last_fsync,
+                                fsync_interval,
+                                total_bytes,
+                                &notify_tx,
+                                &mut linger,
+                                linger_min,
+                                linger_max,
+                            );
+                        });
+
                         // Regardless of why, post-stage commit scheduling stays the same.
                         let _ = (why1, why2); // keep for tracing if you want
-                        post_stage_commit_and_tune(
-                            log,
-                            &cfg,
-                            &state,
-                            &mut pending,
-                            &mut durable_offset,
-                            &mut last_fsync,
-                            fsync_interval,
-                            total_bytes,
-                            &notify_tx,
-                            &mut linger,
-                            linger_min,
-                            linger_max,
-                        );
                         tracing::debug!(
                             items = batcher.len(),
                             records = batcher.total_records(),
@@ -365,32 +471,41 @@ fn writer_loop(
             } => {
                 let unstaged = batcher.flush();
                 if !unstaged.is_empty() {
-                    let total_bytes =
-                        stage_reqs(log, &cfg, &state, &mut pending, unstaged, &notify_tx);
-                    post_stage_commit_and_tune(
+                    stage_reqs_then_post!(
+                        tracer,
                         log,
                         &cfg,
                         &state,
                         &mut pending,
+                        unstaged,
+                        &notify_tx,
                         &mut durable_offset,
                         &mut last_fsync,
                         fsync_interval,
-                        total_bytes,
-                        &notify_tx,
                         &mut linger,
                         linger_min,
                         linger_max,
                     );
                 }
 
-                let res = stage_replicated_req(
-                    log,
-                    &state,
-                    epoch,
-                    first_offset,
-                    &records,
-                    mode,
-                    durability.unwrap_or(cfg.default_durability),
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                let res = trace_writer_stage!(
+                    tracer,
+                    work_id,
+                    "replicated_append",
+                    messages_trace_weight(&records),
+                    {
+                        stage_replicated_req(
+                            log,
+                            &state,
+                            epoch,
+                            first_offset,
+                            &records,
+                            mode,
+                            durability.unwrap_or(cfg.default_durability),
+                        )
+                    }
                 );
                 if let Err(_err) = respond_to.send(res) {
                     tracing::info!("Error sending replicated append response");
@@ -429,18 +544,17 @@ fn writer_loop(
             WriterCmd::AdvanceEpoch { epoch, respond_to } => {
                 let unstaged = batcher.flush();
                 if !unstaged.is_empty() {
-                    let total_bytes =
-                        stage_reqs(log, &cfg, &state, &mut pending, unstaged, &notify_tx);
-                    post_stage_commit_and_tune(
+                    stage_reqs_then_post!(
+                        tracer,
                         log,
                         &cfg,
                         &state,
                         &mut pending,
+                        unstaged,
+                        &notify_tx,
                         &mut durable_offset,
                         &mut last_fsync,
                         fsync_interval,
-                        total_bytes,
-                        &notify_tx,
                         &mut linger,
                         linger_min,
                         linger_max,
@@ -464,7 +578,11 @@ fn writer_loop(
             }
             WriterCmd::Shutdown { notify_tx } => {
                 tracing::info!("Writer received shutdown command");
-                if let Err(e) = log.shutdown() {
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                if let Err(e) = trace_writer_stage!(tracer, work_id, "shutdown_fsync", (0, 0), {
+                    log.shutdown()
+                }) {
                     tracing::error!("Error during writer shutdown fsync: {e}");
                 } else {
                     tracing::info!("Writer shutdown fsync complete");
