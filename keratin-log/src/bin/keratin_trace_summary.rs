@@ -115,7 +115,7 @@ fn main() -> Result<(), String> {
     };
 
     let summary = read_summary(&path)?;
-    print_summary(&path, &summary, options.top);
+    print_summary(&path, &summary, options.top, options.width);
     Ok(())
 }
 
@@ -123,6 +123,7 @@ fn main() -> Result<(), String> {
 struct Options {
     path: Option<String>,
     top: usize,
+    width: usize,
     help: bool,
 }
 
@@ -130,6 +131,7 @@ impl Options {
     fn parse(args: impl IntoIterator<Item = String>) -> Result<Self, String> {
         let mut path = None;
         let mut top = 10usize;
+        let mut width = 80usize;
         let mut help = false;
         let mut args = args.into_iter();
 
@@ -146,6 +148,14 @@ impl Options {
                         .parse::<usize>()
                         .map_err(|err| format!("invalid --top value {value:?}: {err}"))?;
                 }
+                "--width" => {
+                    let Some(value) = args.next() else {
+                        return Err("--width requires a value".to_string());
+                    };
+                    width = value
+                        .parse::<usize>()
+                        .map_err(|err| format!("invalid --width value {value:?}: {err}"))?;
+                }
                 _ if path.is_none() => {
                     path = Some(arg);
                 }
@@ -155,13 +165,18 @@ impl Options {
             }
         }
 
-        Ok(Self { path, top, help })
+        Ok(Self {
+            path,
+            top,
+            width,
+            help,
+        })
     }
 }
 
 fn print_usage() {
     eprintln!(
-        "usage: keratin_trace_summary [--top N] TRACE.csv\n\
+        "usage: keratin_trace_summary [--top N] [--width N] TRACE.csv\n\
          \n\
          Summarizes Keratin writer-stage traces generated with\n\
          KERATIN_WRITER_STAGE_TRACE=/path/to/trace.csv."
@@ -240,7 +255,7 @@ where
         .map_err(|err| format!("invalid {name} {field:?}: {err}"))
 }
 
-fn print_summary(path: &str, summary: &Summary, top: usize) {
+fn print_summary(path: &str, summary: &Summary, top: usize, width: usize) {
     let span_ns = summary.span_ns();
     println!("Trace: {path}");
     println!("Events: {}", summary.events);
@@ -249,48 +264,120 @@ fn print_summary(path: &str, summary: &Summary, top: usize) {
     println!("Span: {}", fmt_ms(span_ns));
 
     println!();
-    print_stage_table(summary, span_ns);
+    print_pipeline_table(summary, span_ns);
+
+    println!();
+    print_timeline(summary, width);
 
     println!();
     print_overlap_table(summary, span_ns);
 
     println!();
+    print_stage_detail_table(summary);
+
+    println!();
     print_work_table(summary, top);
 }
 
-fn print_stage_table(summary: &Summary, span_ns: u128) {
-    println!("Per-stage summary:");
+fn print_pipeline_table(summary: &Summary, span_ns: u128) {
+    println!("Pipeline utilization per elapsed second:");
     println!(
-        "{:<22} {:>10} {:>10} {:>10} {:>8} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12}",
-        "stage",
-        "events",
-        "sum",
-        "active",
-        "util",
-        "avg",
-        "p50",
-        "p95",
-        "p99",
-        "max",
-        "records",
-        "MiB"
+        "{:<22} {:>12} {:>12} {:>12} {:>9} {:>12} {:>12}",
+        "stage", "work ms/s", "active ms/s", "overlap ms/s", "overlap", "solo ms/s", "MiB/s"
+    );
+
+    for (stage, stats) in &summary.stages {
+        let stage_intervals = merged_intervals(&stats.intervals);
+        let other_intervals = merged_other_stage_intervals(summary, stage);
+        let active_ns = active_ns(&stage_intervals);
+        let overlap_ns = intersection_ns(&stage_intervals, &other_intervals);
+        let solo_ns = active_ns.saturating_sub(overlap_ns);
+        let mib_per_sec = per_second(stats.total_bytes as f64 / 1024.0 / 1024.0, span_ns);
+
+        println!(
+            "{:<22} {:>12.3} {:>12.3} {:>12.3} {:>8.2}% {:>12.3} {:>12.2}",
+            stage,
+            ns_per_second_ms(stats.total_duration_ns, span_ns),
+            ns_per_second_ms(active_ns, span_ns),
+            ns_per_second_ms(overlap_ns, span_ns),
+            percent(overlap_ns, active_ns),
+            ns_per_second_ms(solo_ns, span_ns),
+            mib_per_sec
+        );
+    }
+}
+
+fn print_timeline(summary: &Summary, width: usize) {
+    let width = width.clamp(20, 240);
+    let span_ns = summary.span_ns();
+    println!("Timeline ({width} buckets across {}):", fmt_ms(span_ns));
+    println!("legend: . idle, = active solo, # active and overlapping another stage");
+
+    for (stage, stats) in &summary.stages {
+        let stage_intervals = merged_intervals(&stats.intervals);
+        let other_intervals = merged_other_stage_intervals(summary, stage);
+        let overlap_intervals = intersection_intervals(&stage_intervals, &other_intervals);
+        let row = timeline_row(
+            &stage_intervals,
+            &overlap_intervals,
+            summary.min_start_ns,
+            span_ns,
+            width,
+        );
+        println!("{:<22} {}", stage, row);
+    }
+}
+
+fn timeline_row(
+    active_intervals: &[(u128, u128)],
+    overlap_intervals: &[(u128, u128)],
+    start_ns: u128,
+    span_ns: u128,
+    width: usize,
+) -> String {
+    if width == 0 {
+        return String::new();
+    }
+
+    let mut row = String::with_capacity(width);
+    for bucket in 0..width {
+        let bucket_start =
+            start_ns.saturating_add(span_ns.saturating_mul(bucket as u128) / width as u128);
+        let mut bucket_end =
+            start_ns.saturating_add(span_ns.saturating_mul((bucket + 1) as u128) / width as u128);
+        if bucket_end <= bucket_start {
+            bucket_end = bucket_start.saturating_add(1);
+        }
+        let bucket_interval = [(bucket_start, bucket_end)];
+
+        if intersection_ns(overlap_intervals, &bucket_interval) > 0 {
+            row.push('#');
+        } else if intersection_ns(active_intervals, &bucket_interval) > 0 {
+            row.push('=');
+        } else {
+            row.push('.');
+        }
+    }
+    row
+}
+
+fn print_stage_detail_table(summary: &Summary) {
+    println!("Stage latency details:");
+    println!(
+        "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12}",
+        "stage", "events", "avg", "p50", "p95", "p99", "max", "records", "MiB"
     );
 
     for (stage, stats) in &summary.stages {
         let mut durations = stats.durations_ns.clone();
         durations.sort_unstable();
         let avg = stats.total_duration_ns / stats.events.max(1) as u128;
-        let active_ns = merged_active_ns(&stats.intervals);
-        let util = percent(active_ns, span_ns);
         let mib = stats.total_bytes as f64 / 1024.0 / 1024.0;
 
         println!(
-            "{:<22} {:>10} {:>10} {:>10} {:>7.2}% {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12.2}",
+            "{:<22} {:>10} {:>10} {:>10} {:>10} {:>10} {:>10} {:>12} {:>12.2}",
             stage,
             stats.events,
-            fmt_ms(stats.total_duration_ns),
-            fmt_ms(active_ns),
-            util,
             fmt_us(avg),
             fmt_us(percentile(&durations, 50)),
             fmt_us(percentile(&durations, 95)),
@@ -391,10 +478,20 @@ fn merged_intervals(intervals: &[(u128, u128)]) -> Vec<(u128, u128)> {
     merged
 }
 
-fn merged_active_ns(intervals: &[(u128, u128)]) -> u128 {
-    merged_intervals(intervals)
-        .into_iter()
-        .map(|(start, end)| end.saturating_sub(start))
+fn merged_other_stage_intervals(summary: &Summary, excluded_stage: &str) -> Vec<(u128, u128)> {
+    let intervals: Vec<(u128, u128)> = summary
+        .stages
+        .iter()
+        .filter(|(stage, _)| stage.as_str() != excluded_stage)
+        .flat_map(|(_, stats)| stats.intervals.iter().copied())
+        .collect();
+    merged_intervals(&intervals)
+}
+
+fn active_ns(merged_intervals: &[(u128, u128)]) -> u128 {
+    merged_intervals
+        .iter()
+        .map(|(start, end)| end.saturating_sub(*start))
         .sum()
 }
 
@@ -418,6 +515,28 @@ fn intersection_ns(a: &[(u128, u128)], b: &[(u128, u128)]) -> u128 {
     total
 }
 
+fn intersection_intervals(a: &[(u128, u128)], b: &[(u128, u128)]) -> Vec<(u128, u128)> {
+    let mut i = 0usize;
+    let mut j = 0usize;
+    let mut intersections = Vec::new();
+
+    while i < a.len() && j < b.len() {
+        let start = a[i].0.max(b[j].0);
+        let end = a[i].1.min(b[j].1);
+        if end > start {
+            intersections.push((start, end));
+        }
+
+        if a[i].1 <= b[j].1 {
+            i += 1;
+        } else {
+            j += 1;
+        }
+    }
+
+    intersections
+}
+
 fn percentile(sorted_values: &[u128], percentile: usize) -> u128 {
     if sorted_values.is_empty() {
         return 0;
@@ -432,6 +551,18 @@ fn percent(value: u128, total: u128) -> f64 {
         0.0
     } else {
         value as f64 * 100.0 / total as f64
+    }
+}
+
+fn ns_per_second_ms(ns: u128, span_ns: u128) -> f64 {
+    per_second(ns as f64 / 1_000_000.0, span_ns)
+}
+
+fn per_second(value: f64, span_ns: u128) -> f64 {
+    if span_ns == 0 {
+        0.0
+    } else {
+        value * 1_000_000_000.0 / span_ns as f64
     }
 }
 
@@ -469,10 +600,7 @@ mod tests {
     fn merges_intervals() {
         let merged = merged_intervals(&[(10, 20), (18, 30), (35, 40), (5, 8)]);
         assert_eq!(merged, vec![(5, 8), (10, 30), (35, 40)]);
-        assert_eq!(
-            merged_active_ns(&[(10, 20), (18, 30), (35, 40), (5, 8)]),
-            28
-        );
+        assert_eq!(active_ns(&merged), 28);
     }
 
     #[test]
@@ -480,6 +608,43 @@ mod tests {
         let a = merged_intervals(&[(0, 10), (20, 30)]);
         let b = merged_intervals(&[(5, 25)]);
         assert_eq!(intersection_ns(&a, &b), 10);
+        assert_eq!(intersection_intervals(&a, &b), vec![(5, 10), (20, 25)]);
+    }
+
+    #[test]
+    fn finds_other_stage_overlap_for_primary_pipeline_metric() {
+        let mut summary = Summary::new();
+        summary.push(Event {
+            id: 1,
+            stage: "encode".to_string(),
+            start_ns: 0,
+            end_ns: 100,
+            duration_ns: 100,
+            records: 1,
+            bytes: 10,
+        });
+        summary.push(Event {
+            id: 2,
+            stage: "write".to_string(),
+            start_ns: 40,
+            end_ns: 120,
+            duration_ns: 80,
+            records: 1,
+            bytes: 10,
+        });
+
+        let encode = merged_intervals(&summary.stages["encode"].intervals);
+        let others = merged_other_stage_intervals(&summary, "encode");
+        assert_eq!(active_ns(&encode), 100);
+        assert_eq!(intersection_ns(&encode, &others), 60);
+        assert_eq!(ns_per_second_ms(100, 1_000), 100.0);
+    }
+
+    #[test]
+    fn renders_timeline_row_with_overlap_marker() {
+        let active = vec![(0, 50), (70, 100)];
+        let overlap = vec![(20, 40), (80, 90)];
+        assert_eq!(timeline_row(&active, &overlap, 0, 100, 10), "==##=..=#=");
     }
 
     #[test]

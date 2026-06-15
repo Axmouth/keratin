@@ -359,9 +359,11 @@ Instrumentation validation result:
   local diagnostics, but it is too invasive for normal benchmark comparisons.
 - Trace files can be summarized with
   `cargo run --release -p keratin-log --bin keratin_trace_summary -- /tmp/trace.csv`.
-  The summarizer reports per-stage duration percentiles, stage active time,
-  stage overlap, and slowest work ids. The overlap table is the main signal for
-  future pipeline experiments.
+  The primary table reports per elapsed second how much time each stage spends
+  working, how much wall time it is active, and how much active time overlaps
+  another stage. The ASCII timeline uses `=` for solo activity and `#` for
+  exact overlap with another stage. Those are the main signals for future
+  pipeline experiments.
 - Fibril's default-build baseline steady-state sweep also looked normal:
   50k/s measured `14/20/23/58ms` publish-to-deliver p50/p95/p99/max, and
   150k/s measured `12/16/24/58ms`, with zero missing messages and zero publish
