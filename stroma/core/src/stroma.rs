@@ -1623,8 +1623,15 @@ impl Stroma {
         let (records, batch_next_offset) = if max == 0 {
             (Vec::new(), from)
         } else {
-            let reader = log.reader();
-            let raw = reader.scan_from(from, max).map_err(io_err)?;
+            // Keratin readers are synchronous; keep replica owner scans off
+            // Tokio workers so replication polling cannot starve timers.
+            let raw = tokio::task::spawn_blocking(move || {
+                let reader = log.reader();
+                reader.scan_from(from, max)
+            })
+            .await
+            .map_err(|err| StromaError::Io(err.to_string()))?
+            .map_err(io_err)?;
             let mut expected = from;
             let mut records = Vec::with_capacity(raw.len());
             for record in raw {
@@ -1681,8 +1688,15 @@ impl Stroma {
         let (records, batch_next_offset) = if max == 0 {
             (Vec::new(), from)
         } else {
-            let reader = log.reader();
-            let raw = reader.scan_from(from, max).map_err(io_err)?;
+            // Keratin readers are synchronous; keep replica owner scans off
+            // Tokio workers so replication polling cannot starve timers.
+            let raw = tokio::task::spawn_blocking(move || {
+                let reader = log.reader();
+                reader.scan_from(from, max)
+            })
+            .await
+            .map_err(|err| StromaError::Io(err.to_string()))?
+            .map_err(io_err)?;
             let mut expected = from;
             let mut records = Vec::with_capacity(raw.len());
             for record in raw {

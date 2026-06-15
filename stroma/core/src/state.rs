@@ -2526,6 +2526,9 @@ impl QueueInternalState {
             .min(min_pending)
             .min(min_delayed_enq)
             .min(min_delayed_retry);
+        if result == u64::MAX {
+            return self.settled_until;
+        }
         if result == 0 {
             return self.settled_until;
         }
@@ -5133,6 +5136,19 @@ mod tests {
         s.ack(11);
 
         assert!(s.safe_message_truncate_before() <= 5);
+    }
+
+    #[test]
+    fn safe_truncate_without_retained_offsets_uses_frontier() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+
+        assert_eq!(s.safe_message_truncate_before(), 0);
+
+        s.ack(0);
+        s.ack(1);
+
+        assert_eq!(s.settled_until(), 2);
+        assert_eq!(s.safe_message_truncate_before(), 2);
     }
 
     #[test]
