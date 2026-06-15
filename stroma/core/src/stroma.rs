@@ -5,7 +5,7 @@ use std::{
     path::{Path, PathBuf},
     pin::Pin,
     sync::{
-        Arc,
+        Arc, Mutex,
         atomic::{AtomicBool, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
@@ -34,6 +34,9 @@ use crate::{
     global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome},
     group,
     metrics::StromaMetrics,
+    replication_cache::{
+        RecentReplicationCache, ReplicationCacheKey, ReplicationCacheMutation, ReplicationCacheRead,
+    },
     state::{
         CustomDLQ, InspectMode, NackOutcome, Offset, OwnerOperationLease, QueueCommand,
         QueueDebugInfo, QueueHandle, QueueInspectionSnapshot, QueueInspectionState,
@@ -104,6 +107,50 @@ pub enum OwnerReplicationRead<T> {
         head_offset: Offset,
         next_offset: Offset,
     },
+}
+
+fn owner_replication_checkpoint_required<T>(
+    log: &Keratin,
+    requested_offset: Offset,
+) -> OwnerReplicationRead<T> {
+    owner_replication_checkpoint_required_with_head(log, requested_offset, log.head_offset())
+}
+
+fn owner_replication_checkpoint_required_with_head<T>(
+    log: &Keratin,
+    requested_offset: Offset,
+    head_offset: Offset,
+) -> OwnerReplicationRead<T> {
+    OwnerReplicationRead::CheckpointRequired {
+        epoch: log.current_epoch(),
+        requested_offset,
+        head_offset: log.head_offset().max(head_offset),
+        next_offset: log.next_offset(),
+    }
+}
+
+fn owner_replication_gap<T>(
+    stream: &'static str,
+    log: &Keratin,
+    requested_offset: Offset,
+    expected_offset: Offset,
+    got_offset: Offset,
+) -> Result<OwnerReplicationRead<T>> {
+    let head_offset = log.head_offset();
+    if expected_offset < head_offset {
+        return Ok(owner_replication_checkpoint_required(log, requested_offset));
+    }
+    if expected_offset == requested_offset && got_offset > expected_offset {
+        return Ok(owner_replication_checkpoint_required_with_head(
+            log,
+            requested_offset,
+            got_offset,
+        ));
+    }
+
+    Err(StromaError::Corruption(format!(
+        "{stream} log gap while reading owner records: expected offset {expected_offset}, got {got_offset}",
+    )))
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -201,6 +248,36 @@ impl Default for SnapshotConfig {
             every_events: 500_000,
         }
     }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ReplicationCacheConfig {
+    pub max_bytes: usize,
+}
+
+impl ReplicationCacheConfig {
+    pub const fn disabled() -> Self {
+        Self { max_bytes: 0 }
+    }
+
+    pub const fn enabled(max_bytes: usize) -> Self {
+        Self { max_bytes }
+    }
+
+    pub const fn is_enabled(&self) -> bool {
+        self.max_bytes > 0
+    }
+}
+
+impl Default for ReplicationCacheConfig {
+    fn default() -> Self {
+        Self::disabled()
+    }
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct StromaOptions {
+    pub replication_cache: ReplicationCacheConfig,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -355,7 +432,7 @@ impl AppendCompletion<IoError> for ApplyThenComplete {
                         // let _ = tx.send(Ok(ar));
                         self.qh
                             .applied_upto()
-                            .fetch_max(ar.base_offset + ar.count as u64, Ordering::Relaxed);
+                            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
                         inner.complete(Ok(ar));
                     }
                     Err(e) => inner.complete(Err(IoError::new(e.to_string()))),
@@ -397,6 +474,7 @@ struct CompletionItem {
 struct MsgBatchCompletion {
     stroma: Stroma,
     items: Vec<CompletionItem>,
+    cache_messages: Vec<Message>,
     durability: KDurability,
     runtime: tokio::runtime::Handle,
     qh: QueueHandle,
@@ -407,6 +485,7 @@ impl MsgBatchCompletion {
     fn new(
         stroma: Stroma,
         items: Vec<CompletionItem>,
+        cache_messages: Vec<Message>,
         durability: KDurability,
         qh: QueueHandle,
         owner_operation: OwnerOperationLease,
@@ -414,6 +493,7 @@ impl MsgBatchCompletion {
         Box::new(Self {
             stroma,
             items,
+            cache_messages,
             durability,
             runtime: tokio::runtime::Handle::current(),
             qh,
@@ -427,6 +507,7 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
         let Self {
             stroma,
             items,
+            cache_messages,
             durability,
             runtime,
             qh,
@@ -487,10 +568,11 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
         // The completion thread should not block, we hand off to the runtime
         runtime.spawn(async move {
             match stroma
-                .append_events_durable_leased(qh, events, durability, owner_operation)
+                .append_events_durable_leased(qh.clone(), events, durability, owner_operation)
                 .await
             {
                 Ok(_) => {
+                    stroma.cache_owner_messages(&qh, base, cache_messages);
                     for (
                         i,
                         CompletionItem {
@@ -839,6 +921,7 @@ pub struct Stroma {
     pub(crate) event_count: Arc<AtomicU64>,
 
     pub(crate) metrics: Arc<StromaMetrics>,
+    pub(crate) replication_cache: Option<Arc<Mutex<RecentReplicationCache>>>,
 
     earliest_pending_deadline_sender: tokio::sync::watch::Sender<Option<UnixMillis>>,
     earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
@@ -857,6 +940,15 @@ impl Stroma {
         root: impl AsRef<Path>,
         keratin_cfg: StromaKeratinConfig,
         snap_cfg: SnapshotConfig,
+    ) -> Result<Self> {
+        Self::open_with_options(root, keratin_cfg, snap_cfg, StromaOptions::default()).await
+    }
+
+    pub async fn open_with_options(
+        root: impl AsRef<Path>,
+        keratin_cfg: StromaKeratinConfig,
+        snap_cfg: SnapshotConfig,
+        options: StromaOptions,
     ) -> Result<Self> {
         let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
@@ -885,6 +977,11 @@ impl Stroma {
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
             metrics: metrics.clone(),
+            replication_cache: options.replication_cache.is_enabled().then(|| {
+                Arc::new(Mutex::new(RecentReplicationCache::new(
+                    options.replication_cache.max_bytes,
+                )))
+            }),
             earliest_pending_deadline_sender,
             earliest_pending_deadline_receiver,
             deadline_waker: Arc::new(Notify::new()),
@@ -939,6 +1036,110 @@ impl Stroma {
 
     pub fn metrics(&self) -> Arc<StromaMetrics> {
         self.metrics.clone()
+    }
+
+    fn replication_cache_key_for(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> ReplicationCacheKey {
+        ReplicationCacheKey::from_parts(topic, part, group)
+    }
+
+    fn replication_cache_key_for_handle(&self, qh: &QueueHandle) -> ReplicationCacheKey {
+        self.replication_cache_key_for(qh.topic(), qh.partition(), qh.group())
+    }
+
+    fn record_replication_cache_mutation(&self, mutation: ReplicationCacheMutation) {
+        self.metrics
+            .replication_cache
+            .set_retained_bytes(mutation.retained_bytes);
+        self.metrics
+            .replication_cache
+            .record_evicted_records(mutation.evicted_records);
+    }
+
+    fn cache_owner_messages(&self, qh: &QueueHandle, first_offset: Offset, messages: Vec<Message>) {
+        if messages.is_empty() {
+            return;
+        }
+        let Some(replication_cache) = &self.replication_cache else {
+            return;
+        };
+
+        let key = self.replication_cache_key_for_handle(qh);
+        let mutation = match replication_cache.lock() {
+            Ok(mut cache) => cache.insert_messages(&key, first_offset, messages),
+            Err(err) => {
+                tracing::error!("replication cache lock poisoned while inserting messages: {err}");
+                return;
+            }
+        };
+        self.record_replication_cache_mutation(mutation);
+    }
+
+    fn cache_owner_events(&self, qh: &QueueHandle, first_offset: Offset, events: Vec<StromaEvent>) {
+        if events.is_empty() {
+            return;
+        }
+        let Some(replication_cache) = &self.replication_cache else {
+            return;
+        };
+
+        let key = self.replication_cache_key_for_handle(qh);
+        let mutation = match replication_cache.lock() {
+            Ok(mut cache) => cache.insert_events(&key, first_offset, events),
+            Err(err) => {
+                tracing::error!("replication cache lock poisoned while inserting events: {err}");
+                return;
+            }
+        };
+        self.record_replication_cache_mutation(mutation);
+    }
+
+    fn read_cached_owner_messages(
+        &self,
+        key: &ReplicationCacheKey,
+        from: Offset,
+        max: usize,
+    ) -> Option<ReplicationCacheRead<Message>> {
+        let Some(replication_cache) = &self.replication_cache else {
+            return None;
+        };
+        let read = match replication_cache.lock() {
+            Ok(cache) => cache.read_messages(key, from, max),
+            Err(err) => {
+                tracing::error!("replication cache lock poisoned while reading messages: {err}");
+                None
+            }
+        };
+        self.metrics
+            .replication_cache
+            .record_message_read(read.is_some());
+        read
+    }
+
+    fn read_cached_owner_events(
+        &self,
+        key: &ReplicationCacheKey,
+        from: Offset,
+        max: usize,
+    ) -> Option<ReplicationCacheRead<StromaEvent>> {
+        let Some(replication_cache) = &self.replication_cache else {
+            return None;
+        };
+        let read = match replication_cache.lock() {
+            Ok(cache) => cache.read_events(key, from, max),
+            Err(err) => {
+                tracing::error!("replication cache lock poisoned while reading events: {err}");
+                None
+            }
+        };
+        self.metrics
+            .replication_cache
+            .record_event_read(read.is_some());
+        read
     }
 
     pub async fn global_store(&self) -> Result<Arc<GlobalStore>> {
@@ -1608,16 +1809,21 @@ impl Stroma {
         }
 
         let log = qh.msg_log();
-        let epoch = log.current_epoch();
         let head_offset = log.head_offset();
-        let next_offset = log.next_offset();
         if from < head_offset {
-            return Ok(OwnerReplicationRead::CheckpointRequired {
-                epoch,
-                requested_offset: from,
-                head_offset,
-                next_offset,
-            });
+            return Ok(owner_replication_checkpoint_required(&log, from));
+        }
+
+        if max > 0 {
+            let cache_key = self.replication_cache_key_for(topic, part, group);
+            if let Some(read) = self.read_cached_owner_messages(&cache_key, from, max) {
+                return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+                    epoch: log.current_epoch(),
+                    requested_offset: read.requested_offset,
+                    next_offset: read.next_offset,
+                    records: read.records,
+                }));
+            }
         }
 
         let (records, batch_next_offset) = if max == 0 {
@@ -1625,8 +1831,9 @@ impl Stroma {
         } else {
             // Keratin readers are synchronous; keep replica owner scans off
             // Tokio workers so replication polling cannot starve timers.
+            let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
-                let reader = log.reader();
+                let reader = read_log.reader();
                 reader.scan_from(from, max)
             })
             .await
@@ -1636,10 +1843,7 @@ impl Stroma {
             let mut records = Vec::with_capacity(raw.len());
             for record in raw {
                 if record.offset != expected {
-                    return Err(StromaError::Corruption(format!(
-                        "message log gap while reading owner records: expected offset {expected}, got {}",
-                        record.offset
-                    )));
+                    return owner_replication_gap("message", &log, from, expected, record.offset);
                 }
                 expected = record.offset + 1;
                 records.push((record.offset, record.to_message()));
@@ -1648,7 +1852,7 @@ impl Stroma {
         };
 
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch,
+            epoch: log.current_epoch(),
             requested_offset: from,
             next_offset: batch_next_offset,
             records,
@@ -1673,16 +1877,21 @@ impl Stroma {
         }
 
         let log = qh.event_log();
-        let epoch = log.current_epoch();
         let head_offset = log.head_offset();
-        let next_offset = log.next_offset();
         if from < head_offset {
-            return Ok(OwnerReplicationRead::CheckpointRequired {
-                epoch,
-                requested_offset: from,
-                head_offset,
-                next_offset,
-            });
+            return Ok(owner_replication_checkpoint_required(&log, from));
+        }
+
+        if max > 0 {
+            let cache_key = self.replication_cache_key_for(topic, part, group);
+            if let Some(read) = self.read_cached_owner_events(&cache_key, from, max) {
+                return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+                    epoch: log.current_epoch(),
+                    requested_offset: read.requested_offset,
+                    next_offset: read.next_offset,
+                    records: read.records,
+                }));
+            }
         }
 
         let (records, batch_next_offset) = if max == 0 {
@@ -1690,8 +1899,9 @@ impl Stroma {
         } else {
             // Keratin readers are synchronous; keep replica owner scans off
             // Tokio workers so replication polling cannot starve timers.
+            let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
-                let reader = log.reader();
+                let reader = read_log.reader();
                 reader.scan_from(from, max)
             })
             .await
@@ -1701,10 +1911,7 @@ impl Stroma {
             let mut records = Vec::with_capacity(raw.len());
             for record in raw {
                 if record.offset != expected {
-                    return Err(StromaError::Corruption(format!(
-                        "event log gap while reading owner records: expected offset {expected}, got {}",
-                        record.offset
-                    )));
+                    return owner_replication_gap("event", &log, from, expected, record.offset);
                 }
                 expected = record.offset + 1;
                 let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
@@ -1714,7 +1921,7 @@ impl Stroma {
         };
 
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch,
+            epoch: log.current_epoch(),
             requested_offset: from,
             next_offset: batch_next_offset,
             records,
@@ -1736,17 +1943,14 @@ impl Stroma {
             });
         }
 
-        qh.freeze_owner_and_wait_operations().await?;
-        qh.msg_log().freeze();
-        qh.event_log().freeze();
+        let _pause = qh.pause_owner_operations_and_wait().await?;
 
-        let result = async {
-            let message_checkpoint_offset = qh.lowest_not_acked_offset().await;
+        async {
             let message_next_offset = qh.msg_log().next_offset();
             let event_next_offset = qh.event_log().next_offset();
             let applied_event_offset = event_next_offset.saturating_sub(1);
-            let state_snapshot = qh
-                .force_encode_snapshot(applied_event_offset)
+            let state_checkpoint = qh
+                .export_state_checkpoint_snapshot(applied_event_offset)
                 .await
                 .map_err(|err| {
                     StromaError::Io(format!(
@@ -1757,20 +1961,14 @@ impl Stroma {
             Ok(OwnerStateCheckpoint {
                 message_epoch: qh.msg_log().current_epoch(),
                 event_epoch: qh.event_log().current_epoch(),
-                message_checkpoint_offset,
+                message_checkpoint_offset: state_checkpoint.message_checkpoint_offset,
                 message_next_offset,
                 event_next_offset,
                 applied_event_offset,
-                state_snapshot,
+                state_snapshot: state_checkpoint.state_snapshot,
             })
         }
-        .await;
-
-        qh.become_owner();
-        qh.msg_log().become_owner();
-        qh.event_log().become_owner();
-
-        result
+        .await
     }
 
     pub async fn apply_replicated_queue_batch(
@@ -2351,7 +2549,7 @@ impl Stroma {
 
         // let _timer = Timer::new(&self.metrics.event_log_appends.batches.latency);
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
 
         self.append_events_durable_leased(qh, evs, durability, owner_operation)
             .await
@@ -2387,9 +2585,11 @@ impl Stroma {
         qh.set_dirty_snapshot(true);
 
         // Apply in memory after durable accept.
+        let cache_events = evs.clone();
         for ev in evs.into_iter() {
             self.apply_event_inmem(ev, &qh).await?;
         }
+        self.cache_owner_events(&qh, ar.base_offset, cache_events);
 
         // Update applied watermark:
         let new_upto = event_log.head_offset();
@@ -3322,6 +3522,7 @@ impl Stroma {
             snapshot_metrics: self.metrics.snapshot.snapshot(),
             recovery_metrics: self.metrics.recovery.snapshot(),
             log_metrics: self.metrics.log_snapshot(),
+            replication_cache_metrics: self.metrics.replication_cache.snapshot(),
             command_metrics: self.metrics.command_snapshot(),
             uptime_seconds: self.start_time.elapsed().as_secs(),
         })
@@ -3403,12 +3604,13 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let msg_log = qh.msg_log();
 
         // Build msg_log batch and extract per client completions.
         // Per message header encode failures fail just that one completion.
         let mut messages = Vec::with_capacity(items.len());
+        let mut cache_messages = Vec::with_capacity(items.len());
         let mut completion_items = Vec::with_capacity(items.len());
         for item in items {
             let PublishItem {
@@ -3428,11 +3630,13 @@ impl Stroma {
                     continue;
                 }
             };
-            messages.push(Message {
+            let message = Message {
                 flags: 0,
                 headers: header_bytes,
                 payload,
-            });
+            };
+            cache_messages.push(message.clone());
+            messages.push(message);
             completion_items.push(CompletionItem {
                 meta: ItemMeta { not_before },
                 completion,
@@ -3451,6 +3655,7 @@ impl Stroma {
         let msg_completion = MsgBatchCompletion::new(
             stroma,
             completion_items,
+            cache_messages,
             self.keratin_cfg_msg.default_durability,
             qh,
             owner_operation,
@@ -3492,18 +3697,16 @@ impl Stroma {
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let msg_log = qh.msg_log();
+        let message = Message {
+            flags: 0,
+            headers: headers.encode()?,
+            payload,
+        };
+        let cache_message = message.clone();
         msg_log
-            .append_enqueue(
-                Message {
-                    flags: 0,
-                    headers: headers.encode()?,
-                    payload,
-                },
-                None,
-                msg_completion,
-            )
+            .append_enqueue(message, None, msg_completion)
             .map_err(io_err)?;
         let stroma = self.clone();
         tokio::spawn(async move {
@@ -3532,11 +3735,12 @@ impl Stroma {
             let durability = stroma.keratin_cfg_msg.default_durability;
 
             let event_res = stroma
-                .append_events_durable_leased(qh, vec![ev], durability, owner_operation)
+                .append_events_durable_leased(qh.clone(), vec![ev], durability, owner_operation)
                 .await;
 
             match event_res {
                 Ok(_event_offset) => {
+                    stroma.cache_owner_messages(&qh, msg_offset, vec![cache_message]);
                     event_completion.complete(Ok(AppendResult {
                         base_offset: msg_offset,
                         count: 1,
@@ -3563,7 +3767,7 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
         let outter_completion =
@@ -3589,7 +3793,7 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let event_log = qh.event_log();
         let event_msg = event_msg(&ev)?;
         let outter_completion =
@@ -3636,7 +3840,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let event_log = qh.event_log();
 
         let event = StromaEvent::ReleaseInflightMany { reqs: reqs.clone() };
@@ -3667,7 +3871,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         let event_log = qh.event_log();
 
         // Phase 1: durable Nack write
@@ -3969,7 +4173,7 @@ impl Stroma {
     }
 
     async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) -> Result<()> {
-        let owner_operation = qh.begin_owner_operation()?;
+        let owner_operation = qh.begin_owner_operation().await?;
         self.commit_dlq_event_leased(qh, offs, owner_operation)
             .await
     }
@@ -4823,6 +5027,105 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_replication_reads_use_recent_cache_and_fall_back_at_tail() {
+        let dir = test_dir!("owner_replication_cache_hits");
+        let stroma = Stroma::open_with_options(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+            StromaOptions {
+                replication_cache: ReplicationCacheConfig::enabled(64 * 1024),
+            },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(messages) = messages else {
+            panic!("expected message batch");
+        };
+        assert_eq!(messages.records.len(), 1);
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(events) = events else {
+            panic!("expected event batch");
+        };
+        assert_eq!(events.records.len(), 1);
+
+        let cache_metrics = stroma.metrics.replication_cache.snapshot();
+        assert_eq!(cache_metrics.message_hits, 1);
+        assert_eq!(cache_metrics.message_misses, 0);
+        assert_eq!(cache_metrics.event_hits, 1);
+        assert_eq!(cache_metrics.event_misses, 0);
+        assert!(cache_metrics.retained_bytes > 0);
+
+        let tail = stroma
+            .read_owner_message_records("topic", 0, None, 1, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(tail) = tail else {
+            panic!("expected message batch");
+        };
+        assert!(tail.records.is_empty());
+        assert_eq!(tail.next_offset, 1);
+
+        let cache_metrics = stroma.metrics.replication_cache.snapshot();
+        assert_eq!(cache_metrics.message_hits, 1);
+        assert_eq!(cache_metrics.message_misses, 1);
+
+        shutdown_stroma("owner_replication_cache_hits", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_cache_is_disabled_by_default() {
+        let dir = test_dir!("owner_replication_cache_disabled");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+
+        let messages = stroma
+            .read_owner_message_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(messages) = messages else {
+            panic!("expected message batch");
+        };
+        assert_eq!(messages.records.len(), 1);
+
+        let events = stroma
+            .read_owner_event_records("topic", 0, None, 0, 10)
+            .await
+            .unwrap();
+        let OwnerReplicationRead::Batch(events) = events else {
+            panic!("expected event batch");
+        };
+        assert_eq!(events.records.len(), 1);
+
+        let cache_metrics = stroma.metrics.replication_cache.snapshot();
+        assert_eq!(cache_metrics.message_hits, 0);
+        assert_eq!(cache_metrics.message_misses, 0);
+        assert_eq!(cache_metrics.event_hits, 0);
+        assert_eq!(cache_metrics.event_misses, 0);
+        assert_eq!(cache_metrics.retained_bytes, 0);
+
+        shutdown_stroma("owner_replication_cache_disabled", &stroma).await;
+    }
+
+    #[tokio::test]
     async fn owner_replication_read_next_offset_tracks_returned_batch() {
         let dir = test_dir!("owner_replication_read_bounded_next_offset");
         let stroma = Stroma::open(
@@ -4963,6 +5266,97 @@ mod tests {
         ));
 
         shutdown_stroma("stopped_follower_rejects_replicated_ingest", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_gap_after_head_advance_requires_checkpoint() {
+        let dir = test_dir!("owner_replication_gap_after_head_advance");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        qh.msg_log().become_follower();
+        qh.msg_log()
+            .destructive_reset_to_checkpoint(7)
+            .await
+            .unwrap();
+        qh.msg_log().become_owner();
+
+        let read = owner_replication_gap::<Message>("message", &qh.msg_log(), 5, 5, 7).unwrap();
+        let OwnerReplicationRead::CheckpointRequired {
+            epoch,
+            requested_offset,
+            head_offset,
+            next_offset,
+        } = read
+        else {
+            panic!("expected checkpoint requirement");
+        };
+        assert_eq!(epoch, 0);
+        assert_eq!(requested_offset, 5);
+        assert_eq!(head_offset, 7);
+        assert_eq!(next_offset, 7);
+
+        shutdown_stroma("owner_replication_gap_after_head_advance", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_initial_gap_requires_checkpoint() {
+        let dir = test_dir!("owner_replication_initial_gap");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        for _ in 0..10 {
+            publish_one(&stroma, "topic", 0, None).await;
+        }
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+
+        let read = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 0, 7).unwrap();
+        let OwnerReplicationRead::CheckpointRequired {
+            epoch,
+            requested_offset,
+            head_offset,
+            next_offset,
+        } = read
+        else {
+            panic!("expected checkpoint requirement");
+        };
+        assert_eq!(epoch, 0);
+        assert_eq!(requested_offset, 0);
+        assert_eq!(head_offset, 7);
+        assert_eq!(next_offset, 10);
+
+        shutdown_stroma("owner_replication_initial_gap", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn owner_replication_gap_without_head_advance_is_corruption() {
+        let dir = test_dir!("owner_replication_gap_without_head_advance");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let err = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 3, 7).unwrap_err();
+        assert!(matches!(err, StromaError::Corruption(_)));
+
+        shutdown_stroma("owner_replication_gap_without_head_advance", &stroma).await;
     }
 
     #[tokio::test]
@@ -5285,6 +5679,85 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ack_snapshot_offset_tracks_last_applied_event_not_next_offset() {
+        let dir = test_dir!("ack_snapshot_offset_tracks_last_event");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let message_offset = publish_one(&stroma, "topic", 0, None).await;
+        let (cmp, rx) = KeratinAppendCompletion::pair();
+        stroma
+            .ack_enqueue("topic", 0, None, message_offset, cmp)
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let event_next_offset = qh.event_log().next_offset();
+        assert_eq!(event_next_offset, 2);
+
+        let applied_event_offset = qh.applied_upto().load(Ordering::Acquire);
+        assert_eq!(applied_event_offset, event_next_offset - 1);
+
+        let snapshot = qh
+            .force_encode_snapshot(applied_event_offset)
+            .await
+            .unwrap();
+        let mut state = QueueInternalState::new("topic".to_string(), 0);
+        let snapshot_meta = state.load_snapshot(&snapshot).unwrap();
+        assert_eq!(snapshot_meta.last_snapshot_event_offset, 1);
+
+        shutdown_stroma("ack_snapshot_offset_tracks_last_event", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn checkpoint_pause_waits_without_changing_owner_role() {
+        let dir = test_dir!("checkpoint_pause_waits_without_role_change");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let generation = qh.role_generation();
+
+        let pause = qh.pause_owner_operations_and_wait().await.unwrap();
+        assert_eq!(qh.role(), QueueRole::Owner);
+        assert_eq!(qh.role_generation(), generation);
+
+        let qh_for_owner_op = qh.clone();
+        let (started_tx, started_rx) = tokio::sync::oneshot::channel();
+        let join = tokio::spawn(async move {
+            let _ = started_tx.send(());
+            qh_for_owner_op
+                .begin_owner_operation()
+                .await
+                .map(|_lease| ())
+        });
+
+        started_rx.await.unwrap();
+        for _ in 0..3 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !join.is_finished(),
+            "new owner operations should wait while checkpoint export is paused"
+        );
+
+        drop(pause);
+        join.await.unwrap().unwrap();
+
+        shutdown_stroma("checkpoint_pause_waits_without_role_change", &stroma).await;
+    }
+
+    #[tokio::test]
     async fn owner_state_checkpoint_export_installs_on_follower_then_messages_catch_up() {
         let owner_dir = test_dir!("owner_state_checkpoint_export_owner");
         let owner = Stroma::open(
@@ -5305,6 +5778,8 @@ mod tests {
 
         publish_one(&owner, "topic", 0, None).await;
         publish_one(&owner, "topic", 0, None).await;
+        let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
+        let owner_role_generation = owner_qh.role_generation();
 
         let checkpoint = owner
             .export_owner_state_checkpoint("topic", 0, None)
@@ -5314,6 +5789,8 @@ mod tests {
         assert_eq!(checkpoint.message_next_offset, 2);
         assert_eq!(checkpoint.event_next_offset, 2);
         assert_eq!(checkpoint.applied_event_offset, 1);
+        assert_eq!(owner_qh.role(), QueueRole::Owner);
+        assert_eq!(owner_qh.role_generation(), owner_role_generation);
 
         let repeated_checkpoint = owner
             .export_owner_state_checkpoint("topic", 0, None)
@@ -5323,6 +5800,8 @@ mod tests {
         assert_eq!(repeated_checkpoint.message_next_offset, 2);
         assert_eq!(repeated_checkpoint.event_next_offset, 2);
         assert_eq!(repeated_checkpoint.applied_event_offset, 1);
+        assert_eq!(owner_qh.role(), QueueRole::Owner);
+        assert_eq!(owner_qh.role_generation(), owner_role_generation);
 
         let owner_read_after_export = owner
             .read_owner_message_records("topic", 0, None, 0, 10)

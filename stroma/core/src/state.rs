@@ -19,8 +19,8 @@ use crate::event::{
     EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta,
 };
 use crate::metrics::{
-    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
-    StromaMetrics,
+    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot,
+    ReplicationCacheMetricsSnapshot, SnapshotMetricsSnapshot, StromaMetrics,
 };
 use crate::stroma::{GlobalDLQ, TaskGroup};
 
@@ -81,6 +81,12 @@ pub struct OwnerOperationLease {
     drained: Arc<Notify>,
 }
 
+#[derive(Debug)]
+pub struct OwnerOperationPauseGuard {
+    paused: Arc<AtomicBool>,
+    resumed: Arc<Notify>,
+}
+
 impl OwnerOperationLease {
     pub(crate) fn clone_for_continuation(&self) -> Self {
         self.active.fetch_add(1, Ordering::AcqRel);
@@ -88,6 +94,13 @@ impl OwnerOperationLease {
             active: self.active.clone(),
             drained: self.drained.clone(),
         }
+    }
+}
+
+impl Drop for OwnerOperationPauseGuard {
+    fn drop(&mut self) {
+        self.paused.store(false, Ordering::Release);
+        self.resumed.notify_waiters();
     }
 }
 
@@ -476,6 +489,10 @@ pub enum QueueCommand {
         force: bool,
         response: Option<oneshot::Sender<Option<Vec<u8>>>>,
     },
+    ExportStateCheckpoint {
+        last_snapshot_event_offset: u64,
+        response: Option<oneshot::Sender<QueueStateCheckpointSnapshot>>,
+    },
     LoadSnapshot {
         data: Vec<u8>,
         response: Option<oneshot::Sender<std::io::Result<SnapshotMeta>>>,
@@ -561,6 +578,12 @@ pub enum QueueCommand {
     },
 }
 
+#[derive(Debug)]
+pub struct QueueStateCheckpointSnapshot {
+    pub message_checkpoint_offset: Offset,
+    pub state_snapshot: Vec<u8>,
+}
+
 impl QueueCommand {
     pub fn prio(&self) -> CommandPrio {
         match self {
@@ -634,6 +657,7 @@ impl QueueCommand {
             // This assumes snapshot encoding can tolerate being delayed under load.
             // If you need snapshots to run on schedule regardless of load, raise this.
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
+            QueueCommand::ExportStateCheckpoint { .. } => CommandPrio::SuperLow,
             // SuperLow: shutdown drains all queued commands before exiting. Each queued
             // command may have a oneshot response sender that callers are awaiting, if
             // shutdown jumped ahead (Express), those callers would see their rx future
@@ -668,6 +692,7 @@ impl QueueCommand {
             QueueCommand::SetAckWindow { .. } => "SetAckWindow",
             QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
+            QueueCommand::ExportStateCheckpoint { .. } => "ExportStateCheckpoint",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
             QueueCommand::InstallSnapshotState { .. } => "InstallSnapshotState",
             QueueCommand::IsAcked { .. } => "IsAcked",
@@ -977,6 +1002,8 @@ pub struct QueueHandle {
     role_generation: Arc<AtomicU64>,
     owner_operations: Arc<AtomicU64>,
     owner_operations_drained: Arc<Notify>,
+    owner_operations_paused: Arc<AtomicBool>,
+    owner_operations_resumed: Arc<Notify>,
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
@@ -1019,6 +1046,8 @@ impl QueueHandle {
         let role_generation = Arc::new(AtomicU64::new(0));
         let owner_operations = Arc::new(AtomicU64::new(0));
         let owner_operations_drained = Arc::new(Notify::new());
+        let owner_operations_paused = Arc::new(AtomicBool::new(false));
+        let owner_operations_resumed = Arc::new(Notify::new());
 
         let task_group_clone = task_group.clone();
 
@@ -1043,6 +1072,8 @@ impl QueueHandle {
             role_generation,
             owner_operations,
             owner_operations_drained,
+            owner_operations_paused,
+            owner_operations_resumed,
             task_group,
             global_dlq,
             metrics,
@@ -1157,20 +1188,87 @@ impl QueueHandle {
         })
     }
 
-    pub fn begin_owner_operation(&self) -> Result<OwnerOperationLease, QueueHandleError> {
+    pub async fn begin_owner_operation(&self) -> Result<OwnerOperationLease, QueueHandleError> {
+        loop {
+            self.ensure_owner()?;
+
+            while self.owner_operations_paused.load(Ordering::Acquire) {
+                let resumed = self.owner_operations_resumed.notified();
+                if !self.owner_operations_paused.load(Ordering::Acquire) {
+                    break;
+                }
+                resumed.await;
+                self.ensure_owner()?;
+            }
+
+            self.ensure_owner()?;
+            if self.owner_operations_paused.load(Ordering::Acquire) {
+                continue;
+            }
+
+            self.owner_operations.fetch_add(1, Ordering::AcqRel);
+
+            if let Err(err) = self.ensure_owner() {
+                if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.owner_operations_drained.notify_waiters();
+                }
+                return Err(err);
+            }
+
+            if self.owner_operations_paused.load(Ordering::Acquire) {
+                if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.owner_operations_drained.notify_waiters();
+                }
+                continue;
+            }
+
+            return Ok(OwnerOperationLease {
+                active: self.owner_operations.clone(),
+                drained: self.owner_operations_drained.clone(),
+            });
+        }
+    }
+
+    pub async fn pause_owner_operations_and_wait(
+        &self,
+    ) -> Result<OwnerOperationPauseGuard, QueueHandleError> {
         self.ensure_owner()?;
-        self.owner_operations.fetch_add(1, Ordering::AcqRel);
+        loop {
+            match self.owner_operations_paused.compare_exchange(
+                false,
+                true,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(_) => {
+                    let resumed = self.owner_operations_resumed.notified();
+                    if !self.owner_operations_paused.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    resumed.await;
+                    self.ensure_owner()?;
+                }
+            }
+        }
 
         if let Err(err) = self.ensure_owner() {
-            if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
-                self.owner_operations_drained.notify_waiters();
-            }
+            self.owner_operations_paused.store(false, Ordering::Release);
+            self.owner_operations_resumed.notify_waiters();
             return Err(err);
         }
 
-        Ok(OwnerOperationLease {
-            active: self.owner_operations.clone(),
-            drained: self.owner_operations_drained.clone(),
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
+
+        Ok(OwnerOperationPauseGuard {
+            paused: self.owner_operations_paused.clone(),
+            resumed: self.owner_operations_resumed.clone(),
         })
     }
 
@@ -1538,6 +1636,52 @@ impl QueueHandle {
                     }
                 });
             }
+            QueueCommand::ExportStateCheckpoint {
+                last_snapshot_event_offset,
+                response,
+            } => {
+                let trigger_time = Instant::now();
+                handle.metrics.snapshot.attempts.incr();
+
+                state.last_snapshot_event_offset = last_snapshot_event_offset;
+                state.last_snapshot_timestamp = unix_millis();
+
+                let message_checkpoint_offset = state.lowest_not_acked_offset();
+                let clone_start = Instant::now();
+                let state_clone = state.clone();
+                let clone_duration = clone_start.elapsed();
+                handle
+                    .metrics
+                    .snapshot
+                    .clone_latency
+                    .observe(clone_duration);
+
+                let metrics_bg = handle.metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    let encode_start = Instant::now();
+                    let blob = state_clone.encode_snapshot(last_snapshot_event_offset);
+                    let encode_duration = encode_start.elapsed();
+                    metrics_bg.snapshot.encode_latency.observe(encode_duration);
+                    metrics_bg
+                        .snapshot
+                        .bytes_written
+                        .fetch_add(blob.len() as u64, Ordering::Relaxed);
+                    metrics_bg
+                        .snapshot
+                        .last_snapshot_size_bytes
+                        .store(blob.len() as u64, Ordering::Relaxed);
+
+                    let total = trigger_time.elapsed();
+                    metrics_bg.snapshot.total_latency.observe(total);
+
+                    if let Some(r) = response {
+                        let _ = r.send(QueueStateCheckpointSnapshot {
+                            message_checkpoint_offset,
+                            state_snapshot: blob,
+                        });
+                    }
+                });
+            }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
                 if let Some(r) = response {
@@ -1667,7 +1811,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1683,7 +1827,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1702,7 +1846,7 @@ impl QueueHandle {
         offset: Offset,
         not_before: UnixMillis,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1721,7 +1865,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<EnqueueDelayedEventMeta>,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1740,7 +1884,7 @@ impl QueueHandle {
         offset: Offset,
         deadline: UnixMillis,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
@@ -1758,7 +1902,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<MarkInflightEventMeta>,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
@@ -1772,7 +1916,7 @@ impl QueueHandle {
     }
 
     pub async fn ack(&self, offset: Offset) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
@@ -1785,7 +1929,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
@@ -1801,7 +1945,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<AckEventMeta>,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::ReleaseInflightMany {
@@ -1819,7 +1963,7 @@ impl QueueHandle {
         offset: Offset,
         requeue: bool,
     ) -> Result<NackOutcome, QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
@@ -1840,7 +1984,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<NackEventMeta>,
     ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
@@ -1859,7 +2003,7 @@ impl QueueHandle {
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DeadLetterCommit {
@@ -1885,7 +2029,7 @@ impl QueueHandle {
     }
 
     pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DiscardPendingDlq {
@@ -1898,7 +2042,7 @@ impl QueueHandle {
     }
 
     pub async fn declare(&self, meta: DeclareMeta) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Declare {
@@ -1945,7 +2089,7 @@ impl QueueHandle {
         &self,
         offsets: Vec<Offset>,
     ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkPendingDlq {
@@ -1958,7 +2102,7 @@ impl QueueHandle {
     }
 
     pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
@@ -1968,7 +2112,7 @@ impl QueueHandle {
     }
 
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
@@ -2061,6 +2205,31 @@ impl QueueHandle {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         res.map_err(|_| QueueHandleError::ActorGone)?
             .ok_or_else(|| QueueHandleError::SnapshotNotCreated)
+    }
+
+    pub async fn export_state_checkpoint_snapshot(
+        &self,
+        last_snapshot_event_offset: u64,
+    ) -> Result<QueueStateCheckpointSnapshot, QueueHandleError> {
+        self.creating_snapshot
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::ExportStateCheckpoint {
+                last_snapshot_event_offset,
+                response: Some(tx),
+            })
+            .await;
+        let res = rx.await;
+        self.last_snapshot_event_offset.store(
+            last_snapshot_event_offset,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.last_snapshot_timestamp
+            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.creating_snapshot
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        res.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn load_snapshot(&self, data: Vec<u8>) -> Result<SnapshotMeta, QueueHandleError> {
@@ -2197,7 +2366,7 @@ impl QueueHandle {
         max: usize,
         lease_deadline: UnixMillis,
     ) -> Result<Vec<(Offset, u32)>, QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::PollReadyAndMark {
@@ -2291,7 +2460,7 @@ impl QueueHandle {
         now: UnixMillis,
         max: usize,
     ) -> Result<Vec<Offset>, QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation()?;
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::CollectExpired {
@@ -3711,6 +3880,7 @@ pub struct StromaDebugSnapshot {
     pub snapshot_metrics: SnapshotMetricsSnapshot,
     pub recovery_metrics: RecoveryMetricsSnapshot,
     pub log_metrics: LogMetricsSnapshot,
+    pub replication_cache_metrics: ReplicationCacheMetricsSnapshot,
     pub command_metrics: CommandMetricsSnapshot,
     pub uptime_seconds: u64,
 }

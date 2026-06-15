@@ -118,7 +118,7 @@ async fn expiry_scan_skips_follower_queues() {
 async fn freeze_waits_for_active_owner_operation_before_role_swap() {
     let (st, _dir) = open_test_stroma("stroma_roles_freeze_waits_for_owner_operation").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
-    let owner_operation = qh.begin_owner_operation().unwrap();
+    let owner_operation = qh.begin_owner_operation().await.unwrap();
 
     let freezer = {
         let st = st.clone();

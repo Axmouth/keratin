@@ -227,6 +227,31 @@ async fn replicated_suffix_overlap_rejects_mismatched_prefix() {
 }
 
 #[tokio::test]
+async fn replicated_append_rejects_mismatched_already_present_batch() {
+    let dir = test_dir!("replicated_already_present_mismatch");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    k.become_follower();
+
+    k.append_replicated_batch(0, 0, vec![msg("a"), msg("b")], None)
+        .await
+        .unwrap();
+
+    let err = k
+        .append_replicated_batch(0, 0, vec![msg("a"), msg("different")], None)
+        .await
+        .expect_err("already-present replicated ranges must match existing records");
+
+    assert!(err.to_string().contains("replicated overlap mismatch"));
+    assert_eq!(k.next_offset(), 2);
+    let got = k.reader().scan_from(0, 10).unwrap();
+    assert_eq!(got.len(), 2);
+    assert_eq!(got[0].payload, b"a");
+    assert_eq!(got[1].payload, b"b");
+}
+
+#[tokio::test]
 async fn replicated_append_persists_new_epoch_and_rejects_stale_epoch() {
     let dir = test_dir!("replicated_epoch");
 

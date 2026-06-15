@@ -1,6 +1,8 @@
 mod event;
 mod global;
 mod metrics;
+#[allow(dead_code)]
+mod replication_cache;
 mod state;
 mod stroma;
 
@@ -27,8 +29,8 @@ pub use stroma::{
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     OwnerStateCheckpoint, PublishItem, QueueDemotionOutcome, QueuePromotionOutcome,
-    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, SnapshotConfig,
-    Stroma, StromaKeratinConfig, TaskGroup,
+    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome,
+    ReplicationCacheConfig, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;

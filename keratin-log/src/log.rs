@@ -596,6 +596,7 @@ impl Log {
 
         if first_offset < current_next {
             if end_offset < current_next {
+                self.verify_existing_prefix(first_offset, payloads)?;
                 return Ok((
                     ReplicatedAppendOutcome::AlreadyPresent {
                         first_offset,
