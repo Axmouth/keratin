@@ -4,7 +4,6 @@ use std::{
     time::{SystemTime, UNIX_EPOCH},
 };
 
-use anyhow::Context;
 use tracing_subscriber::{EnvFilter, layer::SubscriberExt, util::SubscriberInitExt};
 
 /// Milliseconds since UNIX epoch
@@ -74,11 +73,26 @@ pub(crate) fn fsync_dir(_path: &Path) -> io::Result<()> {
     Ok(())
 }
 
-pub fn latest_segment(root: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
+#[derive(Debug, thiserror::Error)]
+pub enum LatestSegmentError {
+    #[error("failed to read segment directory {path}: {source}")]
+    ReadDir {
+        path: PathBuf,
+        #[source]
+        source: io::Error,
+    },
+    #[error("no segments exist in {path}")]
+    NoSegments { path: PathBuf },
+}
+
+pub fn latest_segment(root: impl AsRef<Path>) -> Result<PathBuf, LatestSegmentError> {
     let seg_dir = root.as_ref().join("segments");
 
     let mut bases: Vec<u64> = std::fs::read_dir(&seg_dir)
-        .unwrap()
+        .map_err(|source| LatestSegmentError::ReadDir {
+            path: seg_dir.clone(),
+            source,
+        })?
         .filter_map(|e| {
             let e = e.ok()?;
             let name = e.file_name();
@@ -92,7 +106,9 @@ pub fn latest_segment(root: impl AsRef<Path>) -> anyhow::Result<PathBuf> {
         .collect();
 
     bases.sort_unstable();
-    let base = bases.last().context("no segments exist")?;
+    let base = bases.last().ok_or_else(|| LatestSegmentError::NoSegments {
+        path: seg_dir.clone(),
+    })?;
 
     Ok(seg_dir.join(format!("{:020}.log", base)))
 }

@@ -1286,8 +1286,22 @@ impl Log {
             return Ok(());
         }
 
+        let head_offset = self.manifest.head_offset;
+        let readable_first_offset = first_offset.max(head_offset);
+        let skip =
+            usize::try_from(readable_first_offset.saturating_sub(first_offset)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replicated overlap skip overflow",
+                )
+            })?;
+        if skip >= payloads.len() {
+            return Ok(());
+        }
+        let payloads = &payloads[skip..];
+
         let reader = LogReader::new(&self.root, self.segment_mapping.clone());
-        let got = reader.scan_from(first_offset, payloads.len())?;
+        let got = reader.scan_from(readable_first_offset, payloads.len())?;
         if got.len() != payloads.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -1296,7 +1310,7 @@ impl Log {
         }
 
         for (idx, (existing, incoming)) in got.iter().zip(payloads).enumerate() {
-            let expected_offset = first_offset + idx as u64;
+            let expected_offset = readable_first_offset + idx as u64;
             if existing.offset != expected_offset
                 || existing.flags != incoming.flags
                 || existing.headers != incoming.headers
