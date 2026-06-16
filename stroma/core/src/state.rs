@@ -3526,7 +3526,7 @@ impl QueueInternalState {
 
         // snapshot meta
         out.extend_from_slice(&self.last_snapshot_timestamp.to_be_bytes());
-        out.extend_from_slice(&self.last_snapshot_event_offset.to_be_bytes());
+        out.extend_from_slice(&last_snapshot_event_offset.to_be_bytes());
 
         // acked_until
         out.extend_from_slice(&self.settled_until.to_be_bytes());
@@ -4562,6 +4562,18 @@ mod tests {
         s2.load_snapshot(&snap).unwrap();
 
         assert_eq!(s.canonical(), s2.canonical());
+    }
+
+    #[test]
+    fn snapshot_records_supplied_event_offset() {
+        let s = QueueInternalState::new("test".into(), 0);
+        let snap = s.encode_snapshot(42);
+
+        let mut loaded = QueueInternalState::new("test".into(), 0);
+        let meta = loaded.load_snapshot(&snap).unwrap();
+
+        assert_eq!(meta.last_snapshot_event_offset, 42);
+        assert_eq!(loaded.last_snapshot_event_offset, 42);
     }
 
     #[test]

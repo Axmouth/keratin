@@ -932,6 +932,9 @@ pub struct Stroma {
     lazy_recoveries_started: Arc<AtomicU64>,
 
     #[cfg(test)]
+    recovery_event_scan_starts: Arc<Mutex<Vec<u64>>>,
+
+    #[cfg(test)]
     snapshot_worker_ticks: Arc<Notify>,
 }
 
@@ -988,6 +991,8 @@ impl Stroma {
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
             #[cfg(test)]
             lazy_recoveries_started: Arc::new(AtomicU64::new(0)),
+            #[cfg(test)]
+            recovery_event_scan_starts: Arc::new(Mutex::new(Vec::new())),
             #[cfg(test)]
             snapshot_worker_ticks: Arc::new(Notify::new()),
         };
@@ -2865,8 +2870,8 @@ impl Stroma {
     /// - durable event log = Keratin partition log
     /// - snapshot per (tp,part): { last_applied_event_offset, queue_state_blob }
     ///
-    /// Recovery loads snapshots, then replays events AFTER the minimum snapshot offset,
-    /// skipping events already covered by each queue's snapshot.
+    /// Recovery loads snapshots, then starts event replay after the snapshot
+    /// offset so events already covered by the snapshot are not read again.
     async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
         if qh.creating_snapshot() {
             tracing::info!("Snapshot already in progress, skipping..");
@@ -3170,15 +3175,16 @@ impl Stroma {
             }
 
             for rec in batch {
-                cur = rec.offset + 1;
+                let offset = rec.offset;
+                cur = offset + 1;
                 let ev = StromaEvent::decode(&rec.payload).map_err(|err| {
                     StromaError::Decode(format!(
                         "event log decode failed at offset {}: {err}",
-                        rec.offset
+                        offset
                     ))
                 })?;
                 events.push(ev);
-                applied_upto.store(cur, Ordering::Release);
+                applied_upto.store(offset, Ordering::Release);
                 events_count += 1;
             }
         }
@@ -3220,7 +3226,7 @@ impl Stroma {
                 ))
             })?;
             qh.applied_upto().store(applied_upto, Ordering::Release);
-            cur = applied_upto;
+            cur = applied_upto.saturating_add(1);
         }
 
         let tail = event_log.next_offset();
@@ -3232,6 +3238,13 @@ impl Stroma {
             .observe(snap_load_start.elapsed());
 
         let replay_start = Instant::now();
+
+        #[cfg(test)]
+        {
+            if let Ok(mut starts) = self.recovery_event_scan_starts.lock() {
+                starts.push(cur);
+            }
+        }
 
         let (events, events_count) = tokio::task::spawn_blocking(move || {
             Self::recover_events_from_log(event_log, cur, tail, applied_upto)
@@ -6318,6 +6331,80 @@ mod tests {
             .unwrap()
             .unwrap()
             .base_offset
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_only_events_after_snapshot_offset() {
+        let dir = test_dir!("snapshot_recovery_replay_start");
+
+        {
+            let stroma = Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap();
+
+            let first = publish_one(&stroma, "topic-a", 0, None).await;
+            stroma
+                .nack_one("topic-a", 0, None, first, true)
+                .await
+                .unwrap();
+
+            stroma.snapshot_partition("topic-a", 0, None).await.unwrap();
+
+            let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            assert_eq!(qh.applied_upto().load(Ordering::Acquire), 1);
+
+            let second = publish_one(&stroma, "topic-a", 0, None).await;
+            assert_eq!(second, 1);
+            let third = publish_one(&stroma, "topic-a", 0, None).await;
+            assert_eq!(third, 2);
+
+            shutdown_stroma("snapshot_recovery_replay_start/write", &stroma).await;
+        }
+
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        assert!(qh.recovery_complete());
+        assert_eq!(qh.applied_upto().load(Ordering::Acquire), 3);
+        let scan_starts = stroma.recovery_event_scan_starts.lock().unwrap().clone();
+        assert_eq!(scan_starts, vec![2]);
+
+        let page = stroma
+            .inspect_messages("topic-a", 0, None, 0, 10, InspectMode::ActiveOnly, false, 0)
+            .await
+            .unwrap();
+        assert_eq!(page.items.len(), 3);
+
+        let first = page
+            .items
+            .iter()
+            .find(|item| item.state.offset == 0)
+            .expect("offset 0 should be present after recovery");
+        let second = page
+            .items
+            .iter()
+            .find(|item| item.state.offset == 1)
+            .expect("offset 1 should be present after recovery");
+        let third = page
+            .items
+            .iter()
+            .find(|item| item.state.offset == 2)
+            .expect("offset 2 should be present after recovery");
+
+        assert_eq!(first.state.retry_count, 1);
+        assert_eq!(second.state.retry_count, 0);
+        assert_eq!(third.state.retry_count, 0);
+
+        shutdown_stroma("snapshot_recovery_replay_start/read", &stroma).await;
     }
 
     #[tokio::test]
