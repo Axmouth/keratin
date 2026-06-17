@@ -536,8 +536,9 @@ pub enum QueueCommand {
     PollReadyAndMark {
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
         response: Option<oneshot::Sender<Vec<(Offset, u32)>>>,
-    }, // max, lease_deadline
+    }, // max, lease_deadline, upper (exclusive deliverable ceiling)
     GetLowestUnacked {
         response: Option<oneshot::Sender<Offset>>,
     },
@@ -1717,9 +1718,10 @@ impl QueueHandle {
             QueueCommand::PollReadyAndMark {
                 max,
                 lease_deadline,
+                upper,
                 response,
             } => {
-                let result = state.poll_ready_and_mark(max, lease_deadline);
+                let result = state.poll_ready_and_mark(max, lease_deadline, upper);
                 dirty = !result.is_empty();
                 if let Some(r) = response {
                     let _ = r.send(result);
@@ -2365,6 +2367,7 @@ impl QueueHandle {
         &self,
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
     ) -> Result<Vec<(Offset, u32)>, QueueHandleError> {
         let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
@@ -2372,6 +2375,7 @@ impl QueueHandle {
             .command_enqueue(QueueCommand::PollReadyAndMark {
                 max,
                 lease_deadline,
+                upper,
                 response: Some(tx),
             })
             .await;
@@ -2723,21 +2727,28 @@ impl QueueInternalState {
         &mut self,
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
     ) -> Vec<(Offset, u32)> {
         tracing::debug!(
-            "Polling ready for ({}, {}), settled_until={}",
+            "Polling ready for ({}, {}), settled_until={}, upper={}",
             self.topic,
             self.partition,
-            self.settled_until()
+            self.settled_until(),
+            upper,
         );
         let mut offs = Vec::with_capacity(max);
         let from = self.settled_until();
-        let range = from..u64::MAX;
-        // Iterate overlapping ranges from `from` onwards, flatten to individual offsets
+        // `upper` is an exclusive deliverable ceiling: a replica-durable queue
+        // passes its committed-replicated watermark so consumers never see an
+        // offset that is not yet durable on enough replicas. u64::MAX disables it.
+        let range = from..upper;
+        // Iterate overlapping ranges from `from` onwards, flatten to individual
+        // offsets, capping each interval's end at `upper` (a ready interval can
+        // extend past the deliverable ceiling).
         let iter = self
             .ready
             .overlapping(&range)
-            .flat_map(|range| range.start.max(from)..range.end);
+            .flat_map(|range| range.start.max(from)..range.end.min(upper));
         for off in iter {
             if offs.len() >= max {
                 break;
@@ -5115,7 +5126,7 @@ mod tests {
         s.mark_inflight(1, 100);
         s.nack(1, false); // 1 -> pending_dlq
 
-        let polled = s.poll_ready_and_mark(10, 200);
+        let polled = s.poll_ready_and_mark(10, 200, u64::MAX);
         let offsets: Vec<_> = polled.iter().map(|(o, _)| *o).collect();
 
         assert!(!offsets.contains(&1));

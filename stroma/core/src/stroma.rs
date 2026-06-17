@@ -4422,11 +4422,14 @@ impl Stroma {
         group: Option<&str>,
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
     ) -> Result<Vec<(Offset, MessageHeaders, Vec<u8>, u32)>> {
         let qs = self.queue_handle(tp, part, group).await?;
 
-        // Offsets are now already marked inflight inside queue
-        let offs = qs.poll_ready_and_mark(max, lease_deadline).await?;
+        // Offsets are now already marked inflight inside queue. `upper` is the
+        // exclusive deliverable ceiling (replica-durable committed watermark);
+        // u64::MAX disables it for local-durable queues.
+        let offs = qs.poll_ready_and_mark(max, lease_deadline, upper).await?;
 
         if offs.is_empty() {
             return Ok(Vec::new());
@@ -5820,7 +5823,7 @@ mod tests {
         );
 
         let delivered = follower
-            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000)
+            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000, u64::MAX)
             .await
             .unwrap();
         assert_eq!(delivered.len(), 2);
@@ -6164,7 +6167,7 @@ mod tests {
         );
 
         let delivered = follower
-            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000)
+            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000, u64::MAX)
             .await
             .unwrap();
         assert_eq!(delivered.len(), 2);

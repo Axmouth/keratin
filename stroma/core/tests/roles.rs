@@ -82,7 +82,7 @@ async fn follower_handle_rejects_owner_operations() {
 
     assert_wrong_role(qh.enqueue(1, 0).await, QueueRole::Follower);
     assert_wrong_role(qh.ack(0).await, QueueRole::Follower);
-    assert_wrong_role(qh.poll_ready_and_mark(1, 1_000).await, QueueRole::Follower);
+    assert_wrong_role(qh.poll_ready_and_mark(1, 1_000, u64::MAX).await, QueueRole::Follower);
 }
 
 #[tokio::test]
