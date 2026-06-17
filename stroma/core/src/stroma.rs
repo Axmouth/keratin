@@ -6822,6 +6822,127 @@ mod tests {
         shutdown_stroma("destroy_partition_removes_index_entry_and_on_disk_storage", &stroma).await;
     }
 
+    // Adversarial: hammer destroy and materialize against the same partition
+    // concurrently, many times. Proves the low-level invariant the cluster
+    // layer relies on: a materialize never opens a dir mid-deletion and a
+    // destroy never leaves a half-built incarnation. After each round a clean
+    // re-materialize must see a FRESH dir (never the destroyed round's marker),
+    // and no `.trash-` tree may leak.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn destroy_and_materialize_race_never_corrupts_or_leaks() {
+        let dir = test_dir!("destroy_materialize_race");
+
+        let stroma = Arc::new(
+            Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap(),
+        );
+
+        let msg_dir = stroma.msg_tp_part_dir("orders", 5, None);
+        let parent = msg_dir.parent().unwrap().to_path_buf();
+
+        for round in 0..200u32 {
+            // Establish an incarnation with a round-stamped marker on disk.
+            stroma.materialize("orders", 5, None).await.unwrap();
+            let marker = msg_dir.join(format!("marker-{round}.proof"));
+            // The dir may be mid-recreate from the previous round's racing
+            // materialize; retry the marker write briefly until it lands.
+            loop {
+                if fs::create_dir_all(&msg_dir).is_ok() && fs::write(&marker, b"x").is_ok() {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+
+            // Race a destroy against a fresh materialize of the same partition.
+            let s1 = stroma.clone();
+            let s2 = stroma.clone();
+            let destroyer =
+                tokio::spawn(async move { s1.destroy_partition("orders", 5, None).await });
+            let materializer = tokio::spawn(async move { s2.materialize("orders", 5, None).await });
+
+            destroyer.await.unwrap().unwrap();
+            materializer.await.unwrap().unwrap();
+
+            // Drain to a known clean state, then prove the recreate is fresh.
+            stroma.destroy_partition("orders", 5, None).await.unwrap();
+            stroma.materialize("orders", 5, None).await.unwrap();
+
+            // The freshly materialized incarnation must not carry this round's
+            // marker (its storage was actually freed, not merely unindexed).
+            assert!(
+                !marker.exists(),
+                "round {round}: recreated partition still sees the destroyed marker"
+            );
+
+            // No `.trash-` siblings may linger: destroy deletes them before it
+            // returns.
+            if parent.exists() {
+                for entry in fs::read_dir(&parent).unwrap() {
+                    let name = entry.unwrap().file_name();
+                    let name = name.to_string_lossy();
+                    assert!(
+                        !name.contains(".trash-"),
+                        "round {round}: leaked trash dir {name}"
+                    );
+                }
+            }
+
+            // Exactly one (or zero) registry entry for the key: never duplicated.
+            assert!(stroma.indexed_queue_count() <= 1, "round {round}: duplicate slot");
+        }
+
+        shutdown_stroma("destroy_and_materialize_race_never_corrupts_or_leaks", &stroma).await;
+    }
+
+    // Adversarial: many concurrent destroyers and materializers of the same
+    // partition must not panic, deadlock, or leave the engine wedged.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_destroyers_and_materializers_stay_consistent() {
+        let dir = test_dir!("destroy_materialize_storm");
+
+        let stroma = Arc::new(
+            Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap(),
+        );
+
+        let mut joins = Vec::new();
+        for i in 0..32 {
+            let s = stroma.clone();
+            joins.push(tokio::spawn(async move {
+                if i % 2 == 0 {
+                    let _ = s.destroy_partition("orders", 0, None).await;
+                } else {
+                    let _ = s.materialize("orders", 0, None).await;
+                }
+            }));
+        }
+        for join in joins {
+            join.await.unwrap();
+        }
+
+        // The engine is still usable: a final materialize succeeds and yields a
+        // working handle.
+        let qh = test_step(
+            "storm/final-materialize",
+            stroma.queue_handle("orders", 0, None),
+        )
+        .await
+        .unwrap();
+        assert!(qh.recovery_complete());
+
+        shutdown_stroma("concurrent_destroyers_and_materializers_stay_consistent", &stroma).await;
+    }
+
     #[tokio::test]
     async fn destroy_partition_absent_is_a_noop() {
         let dir = test_dir!("destroy_partition_absent");
