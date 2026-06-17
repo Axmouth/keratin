@@ -853,6 +853,24 @@ fn writer_loop_inner(
                     tracing::info!("Error sending advance-epoch response");
                 }
             }
+            WriterCmd::Sync { respond_to } => {
+                // Make everything staged so far durable. Used by callers that
+                // stage with AfterWrite and fsync separately (e.g. two logs in
+                // parallel). flush_buffers + flush move staged bytes to the file;
+                // fsync makes them durable; then advance the durable watermark.
+                let res = log
+                    .flush_buffers()
+                    .and_then(|_| log.flush())
+                    .and_then(|_| log.fsync())
+                    .map(|_| {
+                        let durable = log.durable_watermark();
+                        state.durable.store(durable, Ordering::Release);
+                        durable_offset = durable;
+                    });
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending sync response");
+                }
+            }
             WriterCmd::Shutdown {
                 notify_tx: shutdown_tx,
             } => {

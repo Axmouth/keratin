@@ -349,3 +349,35 @@ async fn wal_durability_fence() {
     assert_eq!(got.len(), 4000);
     assert_contiguous_offsets(&got);
 }
+
+#[tokio::test]
+async fn sync_makes_after_write_durable() {
+    let dir = test_dir!("sync_makes_after_write_durable");
+    let cfg = KeratinConfig::test_default();
+    let k = Keratin::open(&dir.root, cfg).await.unwrap();
+
+    // AfterWrite stages + writes to the OS but does not fsync, so the durable
+    // watermark must not advance yet.
+    k.append_batch(
+        vec![message("a"), message("b"), message("c")],
+        Some(KDurability::AfterWrite),
+    )
+    .await
+    .unwrap();
+    let before = k.durable_offset();
+
+    // sync() fsyncs the staged data and advances the durable watermark.
+    k.sync().await.unwrap();
+    let after = k.durable_offset();
+    assert!(
+        after > before,
+        "sync must advance the durable watermark: {before} -> {after}"
+    );
+
+    // And the data survives a reopen.
+    k.shutdown().await.unwrap();
+    let k = Keratin::open(&dir.root, cfg).await.unwrap();
+    let got = k.reader().scan_from(0, 10).unwrap();
+    assert_eq!(got.len(), 3);
+    k.shutdown().await.unwrap();
+}

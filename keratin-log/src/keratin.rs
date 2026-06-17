@@ -97,6 +97,12 @@ pub enum WriterCmd {
         epoch: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
     },
+    /// Make everything staged so far durable (fsync now) without appending.
+    /// Lets a caller stage with `AfterWrite` and fsync separately, e.g. to fsync
+    /// two logs concurrently after staging both.
+    Sync {
+        respond_to: oneshot::Sender<io::Result<()>>,
+    },
     Shutdown {
         notify_tx: oneshot::Sender<()>,
     },
@@ -284,6 +290,17 @@ impl Keratin {
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::AdvanceEpoch { epoch, respond_to })
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    /// Make everything staged so far durable (fsync). Pair with `AfterWrite`
+    /// appends to fsync separately (e.g. two logs concurrently).
+    pub async fn sync(&self) -> std::io::Result<()> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::Sync { respond_to })
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
