@@ -25,7 +25,8 @@ pub use state::{
     StromaDebugSnapshot,
 };
 pub use stroma::{
-    EvictOutcome, FollowerStateCheckpointInstall, FollowerStateCheckpointInstallOutcome, GlobalDLQ,
+    DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,
+    FollowerStateCheckpointInstallOutcome, GlobalDLQ,
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     OwnerStateCheckpoint, PublishItem, QueueDemotionOutcome, QueuePromotionOutcome,

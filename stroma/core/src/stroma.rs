@@ -770,6 +770,16 @@ pub enum EvictOutcome {
     Evicted,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DestroyOutcome {
+    /// The partition's registry entry and on-disk storage are gone (or were
+    /// already absent). A subsequent materialize starts from an empty dir.
+    Destroyed,
+    /// The partition still had inflight (leased, un-acked) work. Nothing was
+    /// removed. Callers must drain before destroying.
+    HasInflight,
+}
+
 #[derive(Debug)]
 struct EvictionGuard {
     state: Arc<EvictionState>,
@@ -1363,85 +1373,123 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<QueueHandle> {
         let group = normalize_group(group);
-        let slot = loop {
-            let outcome = {
-                let current = self.queue_handles.load();
-                if let Some(slot) = slot_lookup_no_alloc(&current, tp, part, group) {
-                    Ok(slot.clone())
-                } else {
-                    let new_slot = Arc::new(QueueSlot {
-                        handle: OnceCell::new(),
-                        exists_on_disk: false,
-                        eviction_state: Arc::new(EvictionState::new()),
-                    });
-                    let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
-                    let mut next = (**current).clone();
-                    next.insert(key, new_slot.clone());
-
-                    tracing::debug!(
-                        "Attempting to insert queue handle for ({tp}, {part}, {group:?})..."
-                    );
-                    // swap in the new map only if snapshot is still current
-                    let prev = self
-                        .queue_handles
-                        .compare_and_swap(&current, Arc::new(next));
-                    tracing::debug!(
-                        "compare_and_swap result for ({tp}, {part}, {group:?}): {}",
-                        if Arc::ptr_eq(&prev, &current) {
-                            "success"
-                        } else {
-                            "failure"
-                        }
-                    );
-                    if Arc::ptr_eq(&prev, &current) {
-                        Ok(new_slot)
+        loop {
+            let slot = loop {
+                let outcome = {
+                    let current = self.queue_handles.load();
+                    if let Some(slot) = slot_lookup_no_alloc(&current, tp, part, group) {
+                        Ok(slot.clone())
                     } else {
-                        // lost race; retry
+                        let new_slot = Arc::new(QueueSlot {
+                            handle: OnceCell::new(),
+                            exists_on_disk: false,
+                            eviction_state: Arc::new(EvictionState::new()),
+                        });
+                        let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+                        let mut next = (**current).clone();
+                        next.insert(key, new_slot.clone());
+
                         tracing::debug!(
-                            "Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying..."
+                            "Attempting to insert queue handle for ({tp}, {part}, {group:?})..."
                         );
-                        Err(()) // retry
+                        // swap in the new map only if snapshot is still current
+                        let prev = self
+                            .queue_handles
+                            .compare_and_swap(&current, Arc::new(next));
+                        tracing::debug!(
+                            "compare_and_swap result for ({tp}, {part}, {group:?}): {}",
+                            if Arc::ptr_eq(&prev, &current) {
+                                "success"
+                            } else {
+                                "failure"
+                            }
+                        );
+                        if Arc::ptr_eq(&prev, &current) {
+                            Ok(new_slot)
+                        } else {
+                            // lost race; retry
+                            tracing::debug!(
+                                "Lost race to insert queue handle for ({tp}, {part}, {group:?}), retrying..."
+                            );
+                            Err(()) // retry
+                        }
                     }
+                };
+                match outcome {
+                    Ok(slot) => break slot,
+                    Err(()) => tokio::task::yield_now().await,
                 }
             };
-            match outcome {
-                Ok(slot) => break slot,
-                Err(()) => tokio::task::yield_now().await,
+
+            // Fast path: a live handle that is not mid-eviction.
+            if let Some(handle) = slot.handle.get()
+                && !slot.is_evicting()
+            {
+                return Ok(handle.clone());
             }
-        };
 
-        let qh = slot
-            .handle
-            .get_or_try_init(|| async {
-                slot.wait_until_not_evicting().await;
-                let msg_log = self.msg_log_init(tp, part, group).await?;
-                let event_log = self.event_log_init(tp, part, group).await?;
+            // Slow path. Park until any eviction (or a concurrent destroy)
+            // clears, then revalidate that our slot is still the one the
+            // registry holds. destroy_partition swaps in a tombstone slot
+            // (evicting), renames the partition dir aside, then removes the
+            // tombstone. A stale slot here means a destroy moved that dir out
+            // from under us, so we must re-acquire and open a fresh empty dir
+            // rather than the tree being deleted.
+            slot.wait_until_not_evicting().await;
+            if !self.slot_is_current(tp, part, group, &slot) {
+                tokio::task::yield_now().await;
+                continue;
+            }
 
-                let bundle = QueueSharedBundle {
-                    event_log: event_log.clone(),
-                    msg_log,
-                    task_group: self.task_group.clone(),
-                    metrics: self.metrics.clone(),
-                    global_dlq: self.global_dlq.clone(),
-                    deadline_waker: self.deadline_waker.clone(),
-                };
+            let qh = slot
+                .handle
+                .get_or_try_init(|| async {
+                    let msg_log = self.msg_log_init(tp, part, group).await?;
+                    let event_log = self.event_log_init(tp, part, group).await?;
 
-                let qh = QueueHandle::init(tp.into(), part, group.map(|s| s.into()), bundle);
+                    let bundle = QueueSharedBundle {
+                        event_log: event_log.clone(),
+                        msg_log,
+                        task_group: self.task_group.clone(),
+                        metrics: self.metrics.clone(),
+                        global_dlq: self.global_dlq.clone(),
+                        deadline_waker: self.deadline_waker.clone(),
+                    };
 
-                self.periodic_snapshot(qh.clone());
+                    let qh = QueueHandle::init(tp.into(), part, group.map(|s| s.into()), bundle);
 
-                if slot.exists_on_disk {
-                    self.recover_one_log_with_handle(&qh, tp, part, group, event_log)
-                        .await?;
-                }
+                    self.periodic_snapshot(qh.clone());
 
-                qh.mark_recovery_complete();
+                    if slot.exists_on_disk {
+                        self.recover_one_log_with_handle(&qh, tp, part, group, event_log)
+                            .await?;
+                    }
 
-                Ok::<_, StromaError>(qh)
-            })
-            .await?;
+                    qh.mark_recovery_complete();
 
-        Ok(qh.clone())
+                    Ok::<_, StromaError>(qh)
+                })
+                .await?;
+
+            return Ok(qh.clone());
+        }
+    }
+
+    /// True when `slot` is still the registry's slot for `(tp, part, group)`.
+    /// Used after parking on eviction to detect a slot a concurrent destroy
+    /// (or evict) has swapped out.
+    fn slot_is_current(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        slot: &Arc<QueueSlot>,
+    ) -> bool {
+        let current = self.queue_handles.load();
+        matches!(
+            slot_lookup_no_alloc(&current, tp, part, group),
+            Some(s) if Arc::ptr_eq(s, slot)
+        )
     }
 
     fn swap_slot(
@@ -1537,6 +1585,128 @@ impl Stroma {
     pub async fn materialize(&self, topic: &str, part: u32, group: Option<&str>) -> Result<()> {
         self.queue_handle(topic, part, group).await?;
         Ok(())
+    }
+
+    /// Fully remove a partition: drop it from the in-memory registry and delete
+    /// its on-disk storage (message, event, and snapshot dirs).
+    ///
+    /// This is stronger than [`Self::unmaterialize`] / [`Self::evict`], which
+    /// only close the in-memory handle and leave the data on disk. It is meant
+    /// for partitions that a repartition has retired: already deregistered from
+    /// coordination, drained, and no longer routed to.
+    ///
+    /// Airtightness against a concurrent recreate: a destroying tombstone slot
+    /// (marked evicting) is swapped into the registry first, so any in-flight or
+    /// fresh materialize parks in [`Self::queue_handle`] rather than reopening
+    /// the dir. The dir is then renamed aside (an atomic, O(1) sibling rename)
+    /// before the tombstone is removed. A recreate that arrives afterwards
+    /// creates a brand-new empty dir at the original path, while the unhurried
+    /// `remove_dir_all` only ever walks the renamed-aside tree. The two never
+    /// share a path, so a recreate cannot collide with the delete.
+    ///
+    /// Returns [`DestroyOutcome::HasInflight`] without removing anything if the
+    /// partition still has leased, un-acked work.
+    pub async fn destroy_partition(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<DestroyOutcome> {
+        let group = normalize_group(group);
+
+        // 1. Install a destroying tombstone (evicting) so concurrent materialize
+        //    parks instead of reopening the dir. Capture the slot we displaced.
+        let tombstone = Arc::new(QueueSlot {
+            handle: OnceCell::new(),
+            exists_on_disk: true,
+            eviction_state: Arc::new(EvictionState {
+                evicting: AtomicBool::new(true),
+                done: Notify::new(),
+            }),
+        });
+
+        let prev = loop {
+            let current = self.queue_handles.load();
+            let existing = slot_lookup_no_alloc(&current, topic, part, group).cloned();
+
+            // Guard: never discard inflight (leased, un-acked) work. The
+            // repartition caller only destroys drained partitions; this keeps
+            // the primitive safe if it is ever called on a live one.
+            if let Some(slot) = &existing
+                && let Some(qh) = slot.handle.get()
+                && qh.inflight_len().await > 0
+            {
+                return Ok(DestroyOutcome::HasInflight);
+            }
+
+            let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
+            let mut next = (**current).clone();
+            next.insert(key, tombstone.clone());
+            let prevmap = self
+                .queue_handles
+                .compare_and_swap(&current, Arc::new(next));
+            if Arc::ptr_eq(&prevmap, &current) {
+                break existing;
+            }
+            tokio::task::yield_now().await;
+        };
+
+        // 2. Shut down the displaced live handle, if any. The dir is now
+        //    quiescent and the tombstone holds off any reopen.
+        if let Some(slot) = &prev
+            && let Some(qh) = slot.handle.get()
+        {
+            qh.cancel_background_tasks();
+            qh.shutdown().await;
+            qh.event_log().shutdown().await.map_err(io_err)?;
+            qh.msg_log().shutdown().await.map_err(io_err)?;
+        }
+
+        // 3. Rename the dirs aside while the tombstone still blocks reopen, then
+        //    drop the tombstone and wake any parked materializers (they
+        //    revalidate, find no slot, and recreate over a fresh empty dir).
+        let trashed = self.rename_partition_dirs_to_trash(topic, part, group)?;
+        self.remove_queue(topic, part, group);
+        tombstone.eviction_state.finish_eviction();
+
+        // 4. Delete the renamed trees unhurried; they share no path with any
+        //    live or recreated incarnation.
+        for dir in trashed {
+            if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
+                tracing::warn!("destroy_partition: failed to delete {dir:?}: {err}");
+            }
+        }
+
+        Ok(DestroyOutcome::Destroyed)
+    }
+
+    /// Atomically rename a partition's message, event, and snapshot dirs to
+    /// `<dir>.trash-<uuid>` siblings. Returns the trash paths that were created
+    /// (dirs that did not exist are skipped). The rename targets sit in the same
+    /// parent as the source, so the rename is a same-filesystem O(1) op.
+    fn rename_partition_dirs_to_trash(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<Vec<PathBuf>> {
+        let suffix = uuid::Uuid::now_v7();
+        let mut trashed = Vec::new();
+        for dir in [
+            self.msg_tp_part_dir(topic, part, group),
+            self.tp_part_dir(topic, part, group),
+            self.snap_dir(topic, part, group),
+        ] {
+            if !dir.exists() {
+                continue;
+            }
+            let mut trash = dir.clone().into_os_string();
+            trash.push(format!(".trash-{suffix}"));
+            let trash = PathBuf::from(trash);
+            fs::rename(&dir, &trash).map_err(io_err)?;
+            trashed.push(trash);
+        }
+        Ok(trashed)
     }
 
     pub async fn freeze_queue_for_transition(
@@ -6592,6 +6762,86 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn destroy_partition_removes_index_entry_and_on_disk_storage() {
+        let dir = test_dir!("destroy_partition_frees_storage");
+
+        let stroma = test_step(
+            "destroy_partition/open",
+            Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            ),
+        )
+        .await
+        .unwrap();
+
+        test_step("destroy_partition/materialize", stroma.materialize("orders", 3, None))
+            .await
+            .unwrap();
+        assert_eq!(stroma.indexed_queue_count(), 1);
+
+        let msg_dir = stroma.msg_tp_part_dir("orders", 3, None);
+        let event_dir = stroma.tp_part_dir("orders", 3, None);
+        assert!(msg_dir.exists(), "message dir should exist after materialize");
+        assert!(event_dir.exists(), "event dir should exist after materialize");
+
+        // Drop a marker into the on-disk tree so we can prove the storage is
+        // actually deleted (not just unindexed) and a recreate starts fresh.
+        let marker = msg_dir.join("marker.proof");
+        fs::write(&marker, b"present").unwrap();
+
+        let outcome = test_step(
+            "destroy_partition/destroy",
+            stroma.destroy_partition("orders", 3, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(outcome, DestroyOutcome::Destroyed);
+        assert_eq!(stroma.indexed_queue_count(), 0);
+        assert!(!msg_dir.exists(), "message dir should be deleted after destroy");
+        assert!(!event_dir.exists(), "event dir should be deleted after destroy");
+
+        // A recreate (later grow reusing the index) starts from empty storage.
+        test_step(
+            "destroy_partition/rematerialize",
+            stroma.materialize("orders", 3, None),
+        )
+        .await
+        .unwrap();
+        assert_eq!(stroma.indexed_queue_count(), 1);
+        assert!(msg_dir.exists(), "message dir should be recreated on materialize");
+        assert!(
+            !marker.exists(),
+            "recreated partition must not see the destroyed partition's files"
+        );
+
+        shutdown_stroma("destroy_partition_removes_index_entry_and_on_disk_storage", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn destroy_partition_absent_is_a_noop() {
+        let dir = test_dir!("destroy_partition_absent");
+
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+
+        let outcome = stroma
+            .destroy_partition("never-existed", 7, Some("g"))
+            .await
+            .unwrap();
+        assert_eq!(outcome, DestroyOutcome::Destroyed);
+        assert_eq!(stroma.indexed_queue_count(), 0);
+
+        shutdown_stroma("destroy_partition_absent_is_a_noop", &stroma).await;
     }
 
     #[tokio::test]
