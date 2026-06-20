@@ -191,4 +191,10 @@ The map only grows per DISTINCT (topic,part,group) EVER seen - recreating the sa
 partitions reuses keys (bounded). So the only real exposure is unbounded distinct-key
 churn (e.g. ever-growing unique topic names); for normal workloads it is trivial. Prune
 a key's entry on destroy when no waiter holds it, IF it ever shows up. Not urgent.
+  BENCH TODO (do when this is picked up): a minimal benchmark that populates
+  lifecycle_locks with millions of distinct keys (e.g. 1M / 5M / 10M) and measures (a)
+  actual process memory delta (RSS) vs the ~150-200B/entry estimate, and (b) lookup +
+  acquire latency at that size vs near-empty (to confirm O(1) - speed should be flat).
+  An #[ignore]'d test or a small criterion bench is enough. The numbers decide whether
+  pruning is ever worth it.
 ================================================================================
