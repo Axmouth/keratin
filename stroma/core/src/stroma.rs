@@ -809,7 +809,7 @@ fn slot_lookup_no_alloc<'a>(
 
 /// Why a partition is quarantined, and what a repair would do. Surfaced to
 /// operators (admin/health) so the issue is clear and actionable.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Serialize)]
 pub struct QuarantineInfo {
     pub topic: String,
     pub partition: u32,
