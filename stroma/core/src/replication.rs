@@ -631,6 +631,16 @@ impl Stroma {
                     .await
                     .map_err(io_err)?;
                 if replicated_append_outcome_allows_state_apply(&outcome) {
+                    // NOTE: we intentionally do NOT fail here if an event
+                    // references a message offset not yet received. Ship order is
+                    // message-batch then event-batch, but a follower may briefly
+                    // hold events ahead of their messages DURING CATCH-UP - the
+                    // plan allows this transient. The steady-state invariant
+                    // (events never reference unreceived messages) is enforced
+                    // where consistency is actually required: at recovery
+                    // (persisted-log scan -> quarantine) and at promotion
+                    // (follower_promotion_refuses_partial_replication), not on the
+                    // transient catch-up apply path.
                     for (idx, event) in batch.events.into_iter().enumerate() {
                         self.apply_event_inmem(event, &qh).await?;
                         qh.applied_upto()

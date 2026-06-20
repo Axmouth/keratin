@@ -500,6 +500,12 @@ pub struct RecoveryMetrics {
     pub snapshot_load_latency: LatencyStats,
     pub events_replayed: AtomicU64,
     pub replay_duration: LatencyStats,
+    /// Partitions currently quarantined (recovery found a dangling event->message
+    /// reference or a corrupt event record). A gauge: up on quarantine, down on
+    /// repair.
+    pub quarantined: AtomicU64,
+    /// Total times a partition has been quarantined since start (monotonic).
+    pub quarantines_total: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -511,6 +517,8 @@ pub struct RecoveryMetricsSnapshot {
     pub max_replay_ms: Option<f64>,
     pub total_events_replayed: u64,
     pub queues_recovered: u64,
+    pub quarantined: u64,
+    pub quarantines_total: u64,
 }
 impl RecoveryMetrics {
     pub fn new() -> Self {
@@ -529,6 +537,8 @@ impl RecoveryMetrics {
             max_replay_ms: self.replay_duration.max_micros().map(|v| v as f64 / 1000.0),
             total_events_replayed: self.events_replayed.load(Ordering::Relaxed),
             queues_recovered: self.startup_duration.count.load(Ordering::Relaxed),
+            quarantined: self.quarantined.load(Ordering::Relaxed),
+            quarantines_total: self.quarantines_total.load(Ordering::Relaxed),
         }
     }
 }

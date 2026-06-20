@@ -1396,7 +1396,12 @@ impl Stroma {
         reset?;
         event_log.shutdown().await.map_err(io_err)?;
 
-        self.quarantined.remove(&key);
+        if self.quarantined.remove(&key).is_some() {
+            self.metrics
+                .recovery
+                .quarantined
+                .fetch_sub(1, Ordering::Relaxed);
+        }
         tracing::warn!(
             "repaired quarantined partition {tp}/{part}/{group:?}: truncated event log to {} \
              (dropped the dangling suffix); it will re-recover on next access",
@@ -3105,20 +3110,33 @@ impl Stroma {
                     tracing::error!(
                         "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
                     );
-                    self.quarantined.insert(
-                        (
-                            Box::<str>::from(tp),
-                            part,
-                            normalize_group(group).map(Box::<str>::from),
-                        ),
-                        QuarantineInfo {
-                            topic: tp.to_string(),
-                            partition: part,
-                            group: group.map(|g| g.to_string()),
-                            reason: reason.clone(),
-                            truncate_event_offset: m.event_offset,
-                        },
-                    );
+                    let was_present = self
+                        .quarantined
+                        .insert(
+                            (
+                                Box::<str>::from(tp),
+                                part,
+                                normalize_group(group).map(Box::<str>::from),
+                            ),
+                            QuarantineInfo {
+                                topic: tp.to_string(),
+                                partition: part,
+                                group: group.map(|g| g.to_string()),
+                                reason: reason.clone(),
+                                truncate_event_offset: m.event_offset,
+                            },
+                        )
+                        .is_some();
+                    if !was_present {
+                        self.metrics
+                            .recovery
+                            .quarantined
+                            .fetch_add(1, Ordering::Relaxed);
+                    }
+                    self.metrics
+                        .recovery
+                        .quarantines_total
+                        .fetch_add(1, Ordering::Relaxed);
                     return Err(StromaError::RecoveryMismatch {
                         topic: tp.to_string(),
                         partition: part,
@@ -7099,10 +7117,22 @@ mod tests {
             StromaError::QueueQuarantined { .. }
         ));
         assert_eq!(stroma.quarantined_partitions().len(), 1);
+        // Metric: gauge up, monotonic counter incremented.
+        assert_eq!(stroma.metrics.recovery.quarantined.load(Ordering::Relaxed), 1);
+        assert_eq!(
+            stroma.metrics.recovery.quarantines_total.load(Ordering::Relaxed),
+            1
+        );
 
         // Repair (truncate-to-valid) clears the quarantine.
         stroma.repair_partition("t", 0, None).await.unwrap();
         assert!(!stroma.is_quarantined("t", 0, None));
+        // Metric: gauge back to zero (counter stays).
+        assert_eq!(stroma.metrics.recovery.quarantined.load(Ordering::Relaxed), 0);
+        assert_eq!(
+            stroma.metrics.recovery.quarantines_total.load(Ordering::Relaxed),
+            1
+        );
 
         // It now recovers cleanly (the dangling suffix was dropped) and works.
         let qh = stroma.queue_handle("t", 0, None).await.unwrap();
