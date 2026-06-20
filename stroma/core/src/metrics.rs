@@ -13,7 +13,7 @@ fn current_epoch_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is set before the UNIX epoch")
         .as_secs()
 }
 

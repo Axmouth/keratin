@@ -79,8 +79,8 @@ impl Manifest {
                 "bad manifest magic",
             ));
         }
-        let ver = u16::from_be_bytes(buf[8..10].try_into().unwrap());
-        let flags = u16::from_be_bytes(buf[10..12].try_into().unwrap());
+        let ver = u16::from_be_bytes(buf[8..10].try_into().expect("exact-length slice"));
+        let flags = u16::from_be_bytes(buf[10..12].try_into().expect("exact-length slice"));
         if ver != MAN_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -89,14 +89,14 @@ impl Manifest {
                 ),
             ));
         }
-        let header_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
+        let header_len = u32::from_be_bytes(buf[12..16].try_into().expect("exact-length slice")) as usize;
         if header_len != 8 + 2 + 2 + 4 + 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "unexpected manifest header_len",
             ));
         }
-        let stored_crc = u32::from_be_bytes(buf[16..20].try_into().unwrap());
+        let stored_crc = u32::from_be_bytes(buf[16..20].try_into().expect("exact-length slice"));
         let payload = &buf[20..];
         let crc = crc32c(payload);
         if crc != stored_crc {
@@ -115,13 +115,13 @@ impl Manifest {
                 "manifest payload len mismatch",
             ));
         }
-        let created_ts_ms = u64::from_be_bytes(payload[0..8].try_into().unwrap());
-        let segment_max_bytes = u64::from_be_bytes(payload[8..16].try_into().unwrap());
-        let index_stride_bytes = u32::from_be_bytes(payload[16..20].try_into().unwrap());
-        let active_base_offset = u64::from_be_bytes(payload[24..32].try_into().unwrap());
-        let next_offset = u64::from_be_bytes(payload[32..40].try_into().unwrap());
-        let head_offset = u64::from_be_bytes(payload[40..48].try_into().unwrap());
-        let epoch = u64::from_be_bytes(payload[48..56].try_into().unwrap());
+        let created_ts_ms = u64::from_be_bytes(payload[0..8].try_into().expect("exact-length slice"));
+        let segment_max_bytes = u64::from_be_bytes(payload[8..16].try_into().expect("exact-length slice"));
+        let index_stride_bytes = u32::from_be_bytes(payload[16..20].try_into().expect("exact-length slice"));
+        let active_base_offset = u64::from_be_bytes(payload[24..32].try_into().expect("exact-length slice"));
+        let next_offset = u64::from_be_bytes(payload[32..40].try_into().expect("exact-length slice"));
+        let head_offset = u64::from_be_bytes(payload[40..48].try_into().expect("exact-length slice"));
+        let epoch = u64::from_be_bytes(payload[48..56].try_into().expect("exact-length slice"));
 
         Ok(Self {
             created_ts_ms,

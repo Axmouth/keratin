@@ -95,10 +95,10 @@ pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usi
 
     let flags = u16::from_be_bytes([buf[4], buf[5]]);
     // reserved0 at [6..8]
-    let header_len = u32::from_be_bytes(buf[8..12].try_into().unwrap()) as usize;
-    let payload_len = u32::from_be_bytes(buf[12..16].try_into().unwrap()) as usize;
-    let timestamp_ms = u64::from_be_bytes(buf[16..24].try_into().unwrap());
-    let offset = u64::from_be_bytes(buf[24..32].try_into().unwrap());
+    let header_len = u32::from_be_bytes(buf[8..12].try_into().expect("exact-length slice")) as usize;
+    let payload_len = u32::from_be_bytes(buf[12..16].try_into().expect("exact-length slice")) as usize;
+    let timestamp_ms = u64::from_be_bytes(buf[16..24].try_into().expect("exact-length slice"));
+    let offset = u64::from_be_bytes(buf[24..32].try_into().expect("exact-length slice"));
 
     let var_total = header_len
         .checked_add(payload_len)
@@ -120,7 +120,7 @@ pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usi
     let headers = &buf[headers_start..headers_end];
     let payload = &buf[headers_end..payload_end];
 
-    let stored_crc = u32::from_be_bytes(buf[payload_end..payload_end + 4].try_into().unwrap());
+    let stored_crc = u32::from_be_bytes(buf[payload_end..payload_end + 4].try_into().expect("exact-length slice"));
 
     // CRC covers bytes from version to end of payload.
     let crc = crc32c(&buf[2..payload_end]);

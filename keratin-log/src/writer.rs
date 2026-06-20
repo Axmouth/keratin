@@ -1368,7 +1368,9 @@ fn commit(
 
     while let Some(front) = pending.front() {
         if front.end_offset <= through_offset {
-            let p = pending.pop_front().unwrap();
+            let p = pending
+                .pop_front()
+                .expect("front() returned Some on the previous line");
             ready.push(NotifyItem {
                 completion: p.respond_to,
                 result: Ok(p.result),

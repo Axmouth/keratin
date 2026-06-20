@@ -74,6 +74,7 @@ pub enum QueueHandleError {
     LoadSnapshotFailed(String),
     SnapshotNotCreated,
     SnapshotLoadFailed(String),
+    Internal(String),
 }
 
 #[derive(Debug)]
@@ -130,6 +131,7 @@ impl std::fmt::Display for QueueHandleError {
             QueueHandleError::SnapshotLoadFailed(reason) => {
                 write!(f, "snapshot load failed: {reason}")
             }
+            QueueHandleError::Internal(reason) => write!(f, "internal queue error: {reason}"),
         }
     }
 }
@@ -146,6 +148,7 @@ impl From<QueueHandleError> for StromaError {
                 StromaError::Internal("snapshot not created".to_string())
             }
             QueueHandleError::SnapshotLoadFailed(reason) => StromaError::Internal(reason),
+            QueueHandleError::Internal(reason) => StromaError::Internal(reason),
         }
     }
 }
@@ -2256,7 +2259,9 @@ impl QueueHandleInner {
                 response: Some(tx),
             })
             .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?.unwrap();
+        rx.await
+            .map_err(|_| QueueHandleError::ActorGone)?
+            .map_err(|error| QueueHandleError::Internal(error.to_string()))?;
         Ok(())
     }
 
@@ -3690,7 +3695,7 @@ impl QueueInternalState {
             }
             let (a, rest) = b.split_at(N);
             *b = rest;
-            Ok(a.try_into().unwrap())
+            Ok(a.try_into().expect("exact-length slice"))
         }
 
         // Version

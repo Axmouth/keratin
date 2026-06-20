@@ -47,14 +47,14 @@ impl Index {
         if &hdr[0..8] != IDX_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad idx magic"));
         }
-        let version = u16::from_be_bytes(hdr[8..10].try_into().unwrap());
+        let version = u16::from_be_bytes(hdr[8..10].try_into().expect("exact-length slice"));
         if version != IDX_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad idx version",
             ));
         }
-        let base = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+        let base = u64::from_be_bytes(hdr[16..24].try_into().expect("exact-length slice"));
         if base != expected_base {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

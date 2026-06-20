@@ -309,7 +309,7 @@ fn rd_u16(b: &[u8], i: &mut usize) -> io::Result<u16> {
     if *i + 2 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u16"));
     }
-    let v = u16::from_be_bytes(b[*i..*i + 2].try_into().unwrap());
+    let v = u16::from_be_bytes(b[*i..*i + 2].try_into().expect("exact-length slice"));
     *i += 2;
     Ok(v)
 }
@@ -317,7 +317,7 @@ fn rd_u32(b: &[u8], i: &mut usize) -> io::Result<u32> {
     if *i + 4 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u32"));
     }
-    let v = u32::from_be_bytes(b[*i..*i + 4].try_into().unwrap());
+    let v = u32::from_be_bytes(b[*i..*i + 4].try_into().expect("exact-length slice"));
     *i += 4;
     Ok(v)
 }
@@ -325,7 +325,7 @@ fn rd_u64(b: &[u8], i: &mut usize) -> io::Result<u64> {
     if *i + 8 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u64"));
     }
-    let v = u64::from_be_bytes(b[*i..*i + 8].try_into().unwrap());
+    let v = u64::from_be_bytes(b[*i..*i + 8].try_into().expect("exact-length slice"));
     *i += 8;
     Ok(v)
 }

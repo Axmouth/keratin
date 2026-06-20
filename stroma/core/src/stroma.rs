@@ -2761,20 +2761,20 @@ impl Stroma {
         }
 
         // crc check
-        let want = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().unwrap());
+        let want = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().expect("exact-length slice"));
         let payload = &bytes[8..bytes.len() - 4];
         let got = crc32c::crc32c(payload);
         if got != want {
             return Err(StromaError::Decode("snapshot crc mismatch".into()));
         }
 
-        let ver = u16::from_be_bytes(payload[0..2].try_into().unwrap());
+        let ver = u16::from_be_bytes(payload[0..2].try_into().expect("exact-length slice"));
         if ver != VER {
             return Err(StromaError::Decode("snapshot version mismatch".into()));
         }
 
-        let last_applied = u64::from_be_bytes(payload[4..12].try_into().unwrap());
-        let blob_len = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+        let last_applied = u64::from_be_bytes(payload[4..12].try_into().expect("exact-length slice"));
+        let blob_len = u32::from_be_bytes(payload[12..16].try_into().expect("exact-length slice")) as usize;
 
         if 16 + blob_len > payload.len() {
             return Err(StromaError::Decode("snapshot blob truncated".into()));
@@ -3377,40 +3377,40 @@ impl Stroma {
         let mut out = String::new();
         use std::fmt::Write;
 
-        writeln!(out, "=== Stroma debug report ===").unwrap();
-        writeln!(out, "Uptime: {}s", snap.uptime_seconds).unwrap();
-        writeln!(out, "Indexed queues: {}", snap.queue_count).unwrap();
+        writeln!(out, "=== Stroma debug report ===").expect("writing to an in-memory String never fails");
+        writeln!(out, "Uptime: {}s", snap.uptime_seconds).expect("writing to an in-memory String never fails");
+        writeln!(out, "Indexed queues: {}", snap.queue_count).expect("writing to an in-memory String never fails");
         writeln!(
             out,
             "Materialized queues: {}",
             snap.materialized_queue_count
         )
-        .unwrap();
-        writeln!(out).unwrap();
+        .expect("writing to an in-memory String never fails");
+        writeln!(out).expect("writing to an in-memory String never fails");
 
-        writeln!(out, "Command queue depths:").unwrap();
+        writeln!(out, "Command queue depths:").expect("writing to an in-memory String never fails");
         for (lane, depth) in &snap.cmd_queue_depths {
-            writeln!(out, "  {}: {}", lane, depth).unwrap();
+            writeln!(out, "  {}: {}", lane, depth).expect("writing to an in-memory String never fails");
         }
-        writeln!(out).unwrap();
+        writeln!(out).expect("writing to an in-memory String never fails");
 
-        writeln!(out, "Snapshots:").unwrap();
-        writeln!(out, "  attempts: {}", snap.snapshot_metrics.attempts_total).unwrap();
+        writeln!(out, "Snapshots:").expect("writing to an in-memory String never fails");
+        writeln!(out, "  attempts: {}", snap.snapshot_metrics.attempts_total).expect("writing to an in-memory String never fails");
         writeln!(
             out,
             "  skipped (not dirty): {}",
             snap.snapshot_metrics.skipped_not_dirty
         )
-        .unwrap();
+        .expect("writing to an in-memory String never fails");
         if let Some(avg) = snap.snapshot_metrics.avg_clone_ms {
-            writeln!(out, "  avg clone: {:.1}ms", avg).unwrap();
+            writeln!(out, "  avg clone: {:.1}ms", avg).expect("writing to an in-memory String never fails");
         }
         if let Some(avg) = snap.snapshot_metrics.avg_total_ms {
-            writeln!(out, "  avg total: {:.1}ms", avg).unwrap();
+            writeln!(out, "  avg total: {:.1}ms", avg).expect("writing to an in-memory String never fails");
         }
-        writeln!(out).unwrap();
+        writeln!(out).expect("writing to an in-memory String never fails");
 
-        writeln!(out, "Queues:").unwrap();
+        writeln!(out, "Queues:").expect("writing to an in-memory String never fails");
         for q in &snap.queues {
             let g = q.group.as_deref().unwrap_or("Default");
             writeln!(
@@ -3425,7 +3425,7 @@ impl Stroma {
                 q.state.settled_until,
                 q.dirty_since_snapshot
             )
-            .unwrap();
+            .expect("writing to an in-memory String never fails");
         }
 
         Ok(out)

@@ -140,8 +140,8 @@ impl LogReader {
             idx.seek(SeekFrom::Start(off))?;
             idx.read_exact(&mut buf)?;
 
-            let rel = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-            let pos = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+            let rel = u32::from_be_bytes(buf[0..4].try_into().expect("exact-length slice"));
+            let pos = u64::from_be_bytes(buf[8..16].try_into().expect("exact-length slice"));
 
             if rel <= target_rel {
                 best_pos = pos;

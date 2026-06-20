@@ -209,7 +209,7 @@ async fn recovery_truncates_garbage_tail_before_next_append() {
     }
     k.shutdown().await.unwrap();
 
-    let before_segments = util::all_segments(&dir.root);
+    let before_segments = util::all_segments(&dir.root).unwrap();
     assert!(
         before_segments.len() > 1,
         "test setup should cross at least one segment boundary"

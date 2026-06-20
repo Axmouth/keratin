@@ -113,11 +113,10 @@ pub fn latest_segment(root: impl AsRef<Path>) -> Result<PathBuf, LatestSegmentEr
     Ok(seg_dir.join(format!("{:020}.log", base)))
 }
 
-pub fn all_segments(root: impl AsRef<Path>) -> Vec<PathBuf> {
+pub fn all_segments(root: impl AsRef<Path>) -> std::io::Result<Vec<PathBuf>> {
     let seg_dir = root.as_ref().join("segments");
 
-    let mut bases: Vec<u64> = std::fs::read_dir(&seg_dir)
-        .unwrap()
+    let mut bases: Vec<u64> = std::fs::read_dir(&seg_dir)?
         .filter_map(|e| {
             let e = e.ok()?;
             let name = e.file_name();
@@ -131,10 +130,10 @@ pub fn all_segments(root: impl AsRef<Path>) -> Vec<PathBuf> {
         .collect();
 
     bases.sort_unstable();
-    bases
+    Ok(bases
         .into_iter()
         .map(|b| seg_dir.join(format!("{:020}.log", b)))
-        .collect()
+        .collect())
 }
 
 pub fn init_tracing() {

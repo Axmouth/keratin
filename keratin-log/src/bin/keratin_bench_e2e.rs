@@ -23,8 +23,8 @@ fn make_record(pid: u32, seq: u64) -> Vec<u8> {
 }
 
 fn decode_record(v: &[u8]) -> (u32, u64) {
-    let pid = u32::from_be_bytes(v[..4].try_into().unwrap());
-    let seq = u64::from_be_bytes(v[4..12].try_into().unwrap());
+    let pid = u32::from_be_bytes(v[..4].try_into().expect("exact-length slice"));
+    let seq = u64::from_be_bytes(v[4..12].try_into().expect("exact-length slice"));
     let p = String::from_utf8_lossy(&v[12..]);
     if p.trim().as_bytes() != b"Le String" {
         assert_eq!(p, "Le String");
