@@ -6,7 +6,7 @@ use std::{
     pin::Pin,
     sync::{
         Arc, Mutex,
-        atomic::{AtomicBool, AtomicU64, Ordering},
+        atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering},
     },
     time::{Duration, Instant},
 };
@@ -15,7 +15,8 @@ use arc_swap::ArcSwap;
 use dashmap::DashMap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
-    KeratinAppendCompletion, KeratinConfig, Message, ReplicatedAppendOutcome,
+    KeratinAppendCompletion, KeratinConfig, KeratinReplicaExt, KeratinRole, Message,
+    ReplicatedAppendOutcome,
     util::unix_millis,
 };
 use serde::{Deserialize, Serialize};
@@ -27,7 +28,7 @@ use tokio::{
 use tokio_util::sync::CancellationToken;
 
 use crate::{
-    DeclareMeta, Result, StromaError,
+    DeclareMeta, RecoveryMismatchPolicy, Result, StromaError,
     event::{
         AckEventMeta, DeadLetterMeta, DeadLetterReason, EnqueueDelayedEventMeta, EnqueueEventMeta,
         NackEventMeta, StromaEvent,
@@ -806,6 +807,39 @@ fn slot_lookup_no_alloc<'a>(
         .map(|(_, v)| v)
 }
 
+/// Why a partition is quarantined, and what a repair would do. Surfaced to
+/// operators (admin/health) so the issue is clear and actionable.
+#[derive(Debug, Clone)]
+pub struct QuarantineInfo {
+    pub topic: String,
+    pub partition: u32,
+    pub group: Option<String>,
+    pub reason: String,
+    /// The message offset an event referenced that the message log did not have.
+    pub dangling_offset: u64,
+    /// The message log's durable tail at detection time.
+    pub msg_tail: u64,
+    /// Repair truncates the event log to this offset (drops the dangling suffix).
+    pub truncate_event_offset: u64,
+}
+
+/// A dangling event->message reference found during the event-log scan.
+#[derive(Debug, Clone, Copy)]
+struct RecoveryMismatchFound {
+    /// Event-log offset of the first offending event (the truncation point).
+    event_offset: u64,
+    /// The message offset it referenced that the message log did not have.
+    dangling_msg_offset: u64,
+}
+
+/// Result of scanning the event log during recovery: the valid prefix of events
+/// (up to but excluding the first dangling reference, if any) plus the mismatch.
+struct RecoveryScanOutcome {
+    events: Vec<StromaEvent>,
+    events_count: u64,
+    mismatch: Option<RecoveryMismatchFound>,
+}
+
 #[derive(Debug, Clone)]
 pub struct Stroma {
     pub(crate) start_time: Instant,
@@ -846,6 +880,18 @@ pub struct Stroma {
     earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
     pub(crate) deadline_waker: Arc<Notify>,
     initial_recovery_complete: Arc<AtomicBool>,
+
+    /// Partitions parked because recovery found a dangling event->message
+    /// reference (the event log references a message the message log has not
+    /// durably accepted). Keyed by the stable partition key. `queue_handle`
+    /// checks this first, so a quarantined partition errors loudly instead of
+    /// serving corrupt state; `repair_partition` clears it. Default policy keeps
+    /// the rest of the broker running (blast radius = the one queue).
+    quarantined: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), QuarantineInfo>>,
+
+    /// `RecoveryMismatchPolicy` (Quarantine default / Refuse / Ignore), settable
+    /// at startup. Shared so a clone observes a runtime change.
+    recovery_mismatch_policy: Arc<AtomicU8>,
 
     #[cfg(test)]
     lazy_recoveries_started: Arc<AtomicU64>,
@@ -909,6 +955,10 @@ impl Stroma {
             earliest_pending_deadline_receiver,
             deadline_waker: Arc::new(Notify::new()),
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
+            quarantined: Arc::new(DashMap::new()),
+            recovery_mismatch_policy: Arc::new(AtomicU8::new(
+                RecoveryMismatchPolicy::default().as_u8(),
+            )),
             #[cfg(test)]
             lazy_recoveries_started: Arc::new(AtomicU64::new(0)),
             #[cfg(test)]
@@ -1276,6 +1326,75 @@ impl Stroma {
         self.deadline_waker.clone()
     }
 
+    /// Set the policy for recovery dangling event->message mismatches. Startup
+    /// config; shared across clones.
+    pub fn set_recovery_mismatch_policy(&self, policy: RecoveryMismatchPolicy) {
+        self.recovery_mismatch_policy
+            .store(policy.as_u8(), Ordering::Release);
+    }
+
+    pub fn recovery_mismatch_policy(&self) -> RecoveryMismatchPolicy {
+        RecoveryMismatchPolicy::from_u8(self.recovery_mismatch_policy.load(Ordering::Acquire))
+    }
+
+    /// Snapshot of all currently-quarantined partitions (for health/admin).
+    pub fn quarantined_partitions(&self) -> Vec<QuarantineInfo> {
+        self.quarantined.iter().map(|e| e.value().clone()).collect()
+    }
+
+    pub fn is_quarantined(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
+        let group = normalize_group(group);
+        self.quarantined.contains_key(&(
+            Box::<str>::from(tp),
+            part,
+            group.map(Box::<str>::from),
+        ))
+    }
+
+    /// Repair a quarantined partition: truncate the event log's unresolvable
+    /// suffix (truncate-to-valid), then clear the quarantine so the next access
+    /// re-recovers the valid prefix. Operator-triggered (admin) - this drops the
+    /// dangling events (possible data loss), but it is an explicit decision, not
+    /// auto-heal. Errors if the partition is not quarantined.
+    pub async fn repair_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
+        let group = normalize_group(group);
+        let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+        let info = match self.quarantined.get(&key) {
+            Some(i) => i.value().clone(),
+            None => {
+                return Err(StromaError::NotFound(format!(
+                    "partition {tp}/{part}/{group:?} is not quarantined"
+                )));
+            }
+        };
+
+        // Serialize against concurrent open/close of this partition, then open
+        // the event log just to truncate its suffix and close it again. The next
+        // queue_handle re-opens and recovers the now-valid log.
+        let _lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
+        let event_log = self.event_log_init(tp, part, group).await?;
+        let prev_role = event_log.role();
+        event_log.become_follower();
+        let reset = event_log
+            .destructive_reset_to_checkpoint(info.truncate_event_offset)
+            .await
+            .map_err(io_err);
+        match prev_role {
+            KeratinRole::Owner => event_log.become_owner(),
+            _ => event_log.become_follower(),
+        }
+        reset?;
+        event_log.shutdown().await.map_err(io_err)?;
+
+        self.quarantined.remove(&key);
+        tracing::warn!(
+            "repaired quarantined partition {tp}/{part}/{group:?}: truncated event log to {} \
+             (dropped the dangling suffix); it will re-recover on next access",
+            info.truncate_event_offset
+        );
+        Ok(())
+    }
+
     /// Acquire the per-partition lifecycle lock (see `lifecycle_locks`). Held
     /// around operations that open/close a partition's Keratin logs so they never
     /// race on the same dir. NOTE: do not call anything that re-acquires this lock
@@ -1318,6 +1437,23 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<QueueHandle> {
         let group = normalize_group(group);
+
+        // A quarantined partition (recovery found a dangling event->message
+        // reference) does not serve: fail loud instead of materializing corrupt
+        // state. An operator clears this via `repair_partition`.
+        if let Some(info) = self.quarantined.get(&(
+            Box::<str>::from(tp),
+            part,
+            group.map(Box::<str>::from),
+        )) {
+            return Err(StromaError::QueueQuarantined {
+                topic: tp.to_string(),
+                partition: part,
+                group: group.map(|g| g.to_string()),
+                reason: info.reason.clone(),
+            });
+        }
+
         loop {
             let slot = loop {
                 let outcome = {
@@ -2759,18 +2895,44 @@ impl Stroma {
             .await
     }
 
+    /// Drop the event-log suffix from `next_offset` onward - the unresolvable
+    /// tail found during recovery (truncate-to-valid). `destructive_reset_to_
+    /// checkpoint` is follower-gated (a follower resetting its tail to match the
+    /// owner); here we drop our OWN corrupt suffix, so briefly assume the
+    /// follower role around the reset and restore the prior role.
+    async fn truncate_event_log_tail(
+        &self,
+        h: &QueueHandleInner,
+        next_offset: u64,
+    ) -> Result<()> {
+        let event_log = h.event_log();
+        let prev_role = event_log.role();
+        event_log.become_follower();
+        let res = event_log
+            .destructive_reset_to_checkpoint(next_offset)
+            .await
+            .map_err(io_err);
+        match prev_role {
+            KeratinRole::Owner => event_log.become_owner(),
+            _ => event_log.become_follower(),
+        }
+        res
+    }
+
     fn recover_events_from_log(
         event_log: Arc<Keratin>,
         mut cur: u64,
         tail: u64,
         applied_upto: Arc<AtomicU64>,
-    ) -> Result<(Vec<StromaEvent>, u64)> {
+        msg_tail: u64,
+    ) -> Result<RecoveryScanOutcome> {
         let reader = event_log.reader();
 
         let mut events = Vec::new();
         let mut events_count = 0;
+        let mut mismatch = None;
 
-        while cur < tail {
+        'scan: while cur < tail {
             let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
             if batch.is_empty() {
                 break;
@@ -2785,13 +2947,33 @@ impl Stroma {
                         offset
                     ))
                 })?;
+
+                // Verify the event does not reference a message the message log
+                // has not durably accepted (a dangling forward reference). The
+                // first such event marks the truncation point: everything from
+                // here is unresolvable, so stop and report it rather than
+                // applying a reference to a message that does not exist.
+                if let Some(max_ref) = ev.max_referenced_msg_offset()
+                    && max_ref >= msg_tail
+                {
+                    mismatch = Some(RecoveryMismatchFound {
+                        event_offset: offset,
+                        dangling_msg_offset: max_ref,
+                    });
+                    break 'scan;
+                }
+
                 events.push(ev);
                 applied_upto.store(offset, Ordering::Release);
                 events_count += 1;
             }
         }
 
-        Ok((events, events_count))
+        Ok(RecoveryScanOutcome {
+            events,
+            events_count,
+            mismatch,
+        })
     }
 
     async fn recover_one_log_with_handle(
@@ -2837,6 +3019,9 @@ impl Stroma {
 
         let tail = event_log.next_offset();
         let applied_upto = h.applied_upto();
+        // The message log's durable tail: an event may not reference a message
+        // offset at or beyond this (the message is not durable -> dangling ref).
+        let msg_tail = h.msg_log().next_offset();
 
         self.metrics
             .recovery
@@ -2852,11 +3037,70 @@ impl Stroma {
             }
         }
 
-        let (events, events_count) = tokio::task::spawn_blocking(move || {
-            Self::recover_events_from_log(event_log, cur, tail, applied_upto)
+        let RecoveryScanOutcome {
+            events,
+            events_count,
+            mismatch,
+        } = tokio::task::spawn_blocking(move || {
+            Self::recover_events_from_log(event_log, cur, tail, applied_upto, msg_tail)
         })
         .await
         .map_err(|err| StromaError::Io(err.to_string()))??;
+
+        if let Some(m) = mismatch {
+            let policy = RecoveryMismatchPolicy::from_u8(
+                self.recovery_mismatch_policy.load(Ordering::Acquire),
+            );
+            match policy {
+                RecoveryMismatchPolicy::Ignore => {
+                    tracing::error!(
+                        "recovery: dangling event->message reference in {tp}/{part}/{group:?} \
+                         (event@{} references message {} but durable tail is {}); \
+                         on_mismatch=Ignore -> truncating the event log to {} and continuing \
+                         (POSSIBLE DATA LOSS)",
+                        m.event_offset,
+                        m.dangling_msg_offset,
+                        msg_tail,
+                        m.event_offset
+                    );
+                    self.truncate_event_log_tail(&h, m.event_offset).await?;
+                    // fall through and apply only the valid prefix in `events`
+                }
+                RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
+                    let reason = format!(
+                        "event log references message offset {} but the message log is only \
+                         durable up to {} (repair drops the event-log suffix from offset {})",
+                        m.dangling_msg_offset, msg_tail, m.event_offset
+                    );
+                    tracing::error!(
+                        "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
+                    );
+                    self.quarantined.insert(
+                        (
+                            Box::<str>::from(tp),
+                            part,
+                            normalize_group(group).map(Box::<str>::from),
+                        ),
+                        QuarantineInfo {
+                            topic: tp.to_string(),
+                            partition: part,
+                            group: group.map(|g| g.to_string()),
+                            reason,
+                            dangling_offset: m.dangling_msg_offset,
+                            msg_tail,
+                            truncate_event_offset: m.event_offset,
+                        },
+                    );
+                    return Err(StromaError::RecoveryMismatch {
+                        topic: tp.to_string(),
+                        partition: part,
+                        group: group.map(|g| g.to_string()),
+                        dangling_offset: m.dangling_msg_offset,
+                        msg_tail,
+                    });
+                }
+            }
+        }
 
         for ev in events {
             self.apply_event_inmem(ev, &h).await?;
@@ -6780,5 +7024,99 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+
+    /// Recovery must FAIL LOUD (not silently apply) when the event log references
+    /// a message the message log never durably accepted, default to quarantining
+    /// just that partition (broker stays usable), and be repairable.
+    #[tokio::test]
+    async fn recovery_quarantines_and_repairs_dangling_event_reference() {
+        let dir = test_dir!("recovery_dangling_event_ref");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+
+        // Materialize an empty partition, then inject an event referencing a
+        // message offset that does not exist (the message log is empty), as a
+        // crash that lost the message tail would leave behind.
+        {
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
+            let bogus = StromaEvent::Enqueue { off: 0, retries: 0 };
+            qh.event_log()
+                .append_batch(vec![event_msg(&bogus).unwrap()], None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stroma.unmaterialize("t", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+
+        // A different partition stays healthy: blast radius is the one queue.
+        stroma.queue_handle("healthy", 0, None).await.unwrap();
+
+        // Re-recovery detects the dangling reference and fails loud.
+        let err = stroma.queue_handle("t", 0, None).await.unwrap_err();
+        assert!(
+            matches!(err, StromaError::RecoveryMismatch { .. }),
+            "expected RecoveryMismatch, got {err:?}"
+        );
+        assert!(stroma.is_quarantined("t", 0, None));
+        // The healthy partition is unaffected.
+        assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
+
+        // Subsequent access reports the partition as quarantined.
+        assert!(matches!(
+            stroma.queue_handle("t", 0, None).await.unwrap_err(),
+            StromaError::QueueQuarantined { .. }
+        ));
+        assert_eq!(stroma.quarantined_partitions().len(), 1);
+
+        // Repair (truncate-to-valid) clears the quarantine.
+        stroma.repair_partition("t", 0, None).await.unwrap();
+        assert!(!stroma.is_quarantined("t", 0, None));
+
+        // It now recovers cleanly (the dangling suffix was dropped) and works.
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        assert!(qh.recovery_complete());
+
+        shutdown_stroma("recovery_quarantines_and_repairs_dangling_event_reference", &stroma)
+            .await;
+    }
+
+    /// With on_mismatch=Ignore, recovery auto-truncates the dangling suffix and
+    /// continues (no quarantine), with the loss accepted by the operator.
+    #[tokio::test]
+    async fn recovery_ignore_policy_auto_truncates_and_continues() {
+        let dir = test_dir!("recovery_dangling_ignore");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        stroma.set_recovery_mismatch_policy(RecoveryMismatchPolicy::Ignore);
+
+        {
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
+            let bogus = StromaEvent::Enqueue { off: 0, retries: 0 };
+            qh.event_log()
+                .append_batch(vec![event_msg(&bogus).unwrap()], None)
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stroma.unmaterialize("t", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+
+        // Ignore -> auto-repair + continue, so queue_handle succeeds and nothing
+        // is quarantined.
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        assert!(qh.recovery_complete());
+        assert!(!stroma.is_quarantined("t", 0, None));
+
+        shutdown_stroma("recovery_ignore_policy_auto_truncates_and_continues", &stroma).await;
     }
 }

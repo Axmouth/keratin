@@ -30,7 +30,7 @@ pub use stroma::{
     FollowerStateCheckpointInstallOutcome, GlobalDLQ,
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
-    OwnerStateCheckpoint, PublishItem, QueueDemotionOutcome, QueuePromotionOutcome,
+    OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
     ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome,
     ReplicationCacheConfig, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
@@ -87,8 +87,65 @@ pub enum StromaError {
         actual: QueueRole,
     },
 
+    #[error(
+        "recovery mismatch for {topic}/{partition}/{group:?}: event log references message \
+         offset {dangling_offset} but the message log is only durable up to {msg_tail}"
+    )]
+    RecoveryMismatch {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
+        dangling_offset: u64,
+        msg_tail: u64,
+    },
+
+    #[error("queue {topic}/{partition}/{group:?} is quarantined: {reason}")]
+    QueueQuarantined {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
+        reason: String,
+    },
+
     #[error("internal: {0}")]
     Internal(String),
+}
+
+/// What to do when recovery finds the event log references a message the message
+/// log has not durably accepted (a dangling event->message reference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecoveryMismatchPolicy {
+    /// Default: park the affected partition (it does not serve) and keep the rest
+    /// of the broker running. The partition is surfaced as quarantined for an
+    /// operator to repair. Blast radius is the one queue.
+    #[default]
+    Quarantine,
+    /// Louder: treat the mismatch as fatal. Stroma still quarantines the
+    /// partition and returns the error; the caller (broker) escalates - e.g.
+    /// refuses to serve / exits - so the failure cannot be missed.
+    Refuse,
+    /// "Screw it, continue": auto-apply the truncate-to-valid repair (drop the
+    /// dangling event-log suffix) and carry on, with a loud warning. Never the
+    /// default; for operators who accept the potential data loss.
+    Ignore,
+}
+
+impl RecoveryMismatchPolicy {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            RecoveryMismatchPolicy::Quarantine => 0,
+            RecoveryMismatchPolicy::Refuse => 1,
+            RecoveryMismatchPolicy::Ignore => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RecoveryMismatchPolicy::Refuse,
+            2 => RecoveryMismatchPolicy::Ignore,
+            _ => RecoveryMismatchPolicy::Quarantine,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StromaError>;

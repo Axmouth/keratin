@@ -345,6 +345,35 @@ fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
 }
 
 impl StromaEvent {
+    /// The highest message-log offset this event references, if any.
+    ///
+    /// Used by recovery to verify the event log does not reference messages the
+    /// message log has not (yet) durably accepted (a dangling forward reference,
+    /// e.g. after the event log was fsynced ahead of the message log and a crash
+    /// lost the message tail). `None` for events that carry no message offset
+    /// (Declare / ResetQueue / Snapshot).
+    pub fn max_referenced_msg_offset(&self) -> Option<Offset> {
+        match self {
+            StromaEvent::Enqueue { off, .. }
+            | StromaEvent::EnqueueDelayed { off, .. }
+            | StromaEvent::MarkInflight { off, .. }
+            | StromaEvent::Ack { off }
+            | StromaEvent::Nack { off, .. } => Some(*off),
+            StromaEvent::EnqueueMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::EnqueueDelayedMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::MarkInflightMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::AckMany { reqs } | StromaEvent::ReleaseInflightMany { reqs } => {
+                reqs.iter().map(|r| r.off).max()
+            }
+            StromaEvent::NackMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::DeadLetter { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::DeadLetterCommit { offs } => offs.iter().copied().max(),
+            StromaEvent::Declare(_)
+            | StromaEvent::ResetQueue { .. }
+            | StromaEvent::Snapshot { .. } => None,
+        }
+    }
+
     /// Encodes an event into bytes to be stored as Keratin record payload.
     /// (CRC is already handled by Keratin record framing, so no double-CRC here.)
     pub fn encode(&self) -> io::Result<Vec<u8>> {
