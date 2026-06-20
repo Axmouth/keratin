@@ -106,7 +106,7 @@ impl LogState {
 
 pub struct Log {
     // buffers
-    write_buf: Vec<u8>, // 16–64MB ideally
+    write_buf: Vec<u8>, // 16-64MB ideally
     idx_buf: Vec<u8>,   // sparse index buffer
 
     // watermarks (inclusive)

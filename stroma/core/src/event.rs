@@ -49,9 +49,9 @@ pub struct AckEventMeta {
 // Reserved vocabulary for the client-REQUESTED nack action (what the consumer
 // asks to happen), as opposed to NackOutcome which is the RESULT the queue
 // computed. The live event encoding currently carries the simpler
-// (requeue, not_before) pair on NackEventMeta; NackType is kept for expanding
+// (requeue, not_before) pair on NackEventMeta. NackType is kept for expanding
 // nack semantics with more explicit action variants (discard vs retry-in-place
-// vs requeue, now vs later) without overloading two flags.
+// vs requeue, now vs later) without overloading the two flags.
 #[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum NackType {
@@ -247,7 +247,7 @@ pub enum StromaEvent {
         group: Option<Box<str>>,
     },
     /// Snapshot is a complete state image for a single (tp,part).
-    /// It’s OK if it’s “big”; it happens rarely.
+    /// It is OK if it is "big". It happens rarely.
     Snapshot {
         tp: Box<str>,
         part: u32,
