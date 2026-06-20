@@ -148,6 +148,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<QueueDemotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         qh.freeze_owner_and_wait_operations().await?;
         qh.msg_log().freeze();
         qh.event_log().freeze();
@@ -178,6 +179,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         qh.become_follower();
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
@@ -191,6 +193,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -212,6 +215,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
@@ -232,6 +236,7 @@ impl Stroma {
         epoch: u64,
     ) -> Result<u64> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
         qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
         Ok(epoch)
@@ -271,6 +276,7 @@ impl Stroma {
         expected_event_next_offset: Offset,
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -345,6 +351,7 @@ impl Stroma {
         epoch: u64,
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -394,6 +401,7 @@ impl Stroma {
         max: usize,
     ) -> Result<OwnerReplicationRead<Message>> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Owner {
             return Err(StromaError::WrongQueueRole {
@@ -462,6 +470,7 @@ impl Stroma {
         max: usize,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Owner {
             return Err(StromaError::WrongQueueRole {
@@ -529,6 +538,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<OwnerStateCheckpoint> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Owner {
             return Err(StromaError::WrongQueueRole {
@@ -574,6 +584,7 @@ impl Stroma {
         events: Option<ReplicatedEventBatch>,
     ) -> Result<ReplicatedQueueApplyOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -672,6 +683,7 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {

@@ -43,6 +43,7 @@ pub async fn append_one(
 async fn out_of_order_acks_never_skip_frontier() {
     let (st, _test_dir) = open_test_stroma().await;
     let q = st.queue_handle("test", 0, None).await.unwrap();
+    let q = q.resolve().unwrap();
 
     for i in 0..1000 {
         q.mark_inflight(i, 0).await.unwrap();
@@ -130,6 +131,7 @@ async fn expiry_respects_max_retries() {
     assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 
     let qh = st.queue_handle("t", 0, None).await.unwrap();
+    let qh = qh.resolve().unwrap();
 
     qh.dead_letter_commit(vec![off]).await.unwrap();
 

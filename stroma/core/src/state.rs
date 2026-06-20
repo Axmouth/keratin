@@ -1,7 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::marker::PhantomData;
 use std::sync::Arc;
+use std::sync::Weak;
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+
+use arc_swap::ArcSwap;
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
@@ -22,7 +26,7 @@ use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot,
     ReplicationCacheMetricsSnapshot, SnapshotMetricsSnapshot, StromaMetrics,
 };
-use crate::stroma::{GlobalDLQ, TaskGroup};
+use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
 pub type ClientId = Uuid;
 pub type ConsumerId = u64;
@@ -974,8 +978,8 @@ pub struct QueueSharedBundle {
     pub deadline_waker: Arc<Notify>,
 }
 
-#[derive(Debug, Clone)]
-pub struct QueueHandle {
+#[derive(Debug)]
+pub struct QueueHandleInner {
     command_sender: CommandSender,
 
     pub(crate) task_group: Arc<TaskGroup>,
@@ -1012,14 +1016,113 @@ pub struct QueueHandle {
     deadline_waker: Arc<Notify>,
 }
 
+/// Handed-out handle to a queue partition: a TICKET, not the state itself.
+///
+/// The log-owning `QueueHandleInner` lives only in the registry slot (held
+/// strong there). A `QueueHandle` holds a `Weak` to the current incarnation
+/// plus the registry ref and key, so it can re-resolve. This means a handed-out
+/// handle (or a long-lived task that clones it) can NEVER pin a dead incarnation
+/// alive: when the slot drops the `Inner`, the logs close and the flock releases
+/// even if tickets still exist. Resolution upgrades the `Weak`; if the
+/// incarnation has rotated (destroy then recreate) it re-looks-up the live slot
+/// by key, so a stale ticket transparently rebinds to the current incarnation.
+#[derive(Debug, Clone)]
+pub struct QueueHandle {
+    registry: Arc<ArcSwap<Registry>>,
+    key: QueueKey,
+    incarnation: Weak<QueueHandleInner>,
+}
+
 impl QueueHandle {
+    /// Build a ticket pointing at `inner` (the slot's strong incarnation).
+    pub(crate) fn from_inner(
+        registry: Arc<ArcSwap<Registry>>,
+        key: QueueKey,
+        inner: &Arc<QueueHandleInner>,
+    ) -> Self {
+        Self {
+            registry,
+            key,
+            incarnation: Arc::downgrade(inner),
+        }
+    }
+
+    /// Resolve the ticket to the live incarnation for the duration of one
+    /// operation. Cheap on the common path (one `Weak::upgrade`). On a
+    /// rotated/gone incarnation it re-looks-up the slot by key (cold path),
+    /// returning the current incarnation or `ActorGone` if the partition no
+    /// longer exists.
+    ///
+    /// The returned [`Resolved`] borrows the ticket, so it cannot be moved into
+    /// a `'static` task nor stashed in a longer-lived struct: a resolved handle
+    /// cannot outlive the ticket it came from, which makes "park a strong handle
+    /// somewhere and pin the logs forever" a COMPILE error rather than a latent
+    /// leak. Resolve once per operation/batch scope and let it drop.
+    pub fn resolve(&self) -> Result<Resolved<'_>, QueueHandleError> {
+        let inner = if let Some(inner) = self.incarnation.upgrade() {
+            inner
+        } else {
+            let current = self.registry.load();
+            match current
+                .get(&self.key)
+                .and_then(|slot| slot.handle.get().cloned())
+            {
+                Some(inner) => inner,
+                None => return Err(QueueHandleError::ActorGone),
+            }
+        };
+        Ok(Resolved {
+            inner,
+            _ticket: PhantomData,
+        })
+    }
+
+    /// Resolve and run `f` against the live incarnation. The borrow cannot
+    /// escape, so callers cannot accidentally pin the incarnation.
+    pub fn with<R>(&self, f: impl FnOnce(&QueueHandleInner) -> R) -> Result<R, QueueHandleError> {
+        let inner = self.resolve()?;
+        Ok(f(&inner))
+    }
+
+    /// Identity, served from the key without resolving.
+    pub fn topic(&self) -> &str {
+        &self.key.0
+    }
+
+    pub fn partition(&self) -> u32 {
+        self.key.1
+    }
+
+    pub fn group(&self) -> Option<&str> {
+        self.key.2.as_deref()
+    }
+}
+
+/// A ticket resolved to its live incarnation for the span of one operation.
+///
+/// Holds a strong `Arc<QueueHandleInner>` (so the incarnation cannot vanish
+/// mid-operation) but is lifetime-bound to the originating [`QueueHandle`], so
+/// it cannot escape into a `'static` task or a longer-lived field. Deref gives
+/// the full `QueueHandleInner` API. Drop it promptly (one per op/batch scope).
+pub struct Resolved<'a> {
+    inner: Arc<QueueHandleInner>,
+    _ticket: PhantomData<&'a QueueHandle>,
+}
+
+impl std::ops::Deref for Resolved<'_> {
+    type Target = QueueHandleInner;
+    fn deref(&self) -> &QueueHandleInner {
+        &self.inner
+    }
+}
+
+impl QueueHandleInner {
     pub fn init(
         topic: String,
         partition: u32,
         group: Option<String>,
         bundle: QueueSharedBundle,
-    ) -> Self {
-        let bundle_clone = bundle.clone();
+    ) -> Arc<QueueHandleInner> {
         let QueueSharedBundle {
             msg_log,
             event_log,
@@ -1053,7 +1156,7 @@ impl QueueHandle {
         let task_group_clone = task_group.clone();
 
         let waker_for_state = deadline_waker.clone();
-        let result = Self {
+        let result = Arc::new(QueueHandleInner {
             command_sender: tx,
             topic,
             partition,
@@ -1079,9 +1182,14 @@ impl QueueHandle {
             global_dlq,
             metrics,
             deadline_waker,
-        };
+        });
 
-        let handle = result.clone();
+        // The control task holds only a Weak to the Inner, never a strong clone:
+        // the command `tx` lives in the Inner, so while the Inner is alive (held
+        // strong by the registry slot) `recv()` yields and the upgrade succeeds.
+        // When the slot drops the Inner, `tx` drops, `recv()` returns None, and
+        // the loop exits, so the task never pins a retired incarnation.
+        let weak = Arc::downgrade(&result);
 
         task_group_clone.spawn("queue control", async move {
             let mut state: QueueInternalState =
@@ -1089,7 +1197,12 @@ impl QueueHandle {
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
-                let (processed, dirty) = Self::process_command(&mut state, cmd, &handle);
+                let Some(handle) = weak.upgrade() else {
+                    break;
+                };
+                let (processed, dirty) =
+                    QueueHandleInner::process_command(&mut state, cmd, &handle);
+                drop(handle);
                 let _old_val =
                     dirty_since_snapshot_loop.fetch_or(dirty, std::sync::atomic::Ordering::Relaxed);
 
@@ -1102,7 +1215,9 @@ impl QueueHandle {
 
         result
     }
+}
 
+impl QueueHandleInner {
     pub async fn full_debug_info(&self) -> QueueDebugInfo {
         let state = self.debug_info().await;
 
@@ -1317,7 +1432,7 @@ impl QueueHandle {
     fn process_command(
         state: &mut QueueInternalState,
         cmd: QueueCommand,
-        handle: &QueueHandle,
+        handle: &QueueHandleInner,
     ) -> (Option<bool>, bool) {
         let mut dirty = false;
         let start = Instant::now();

@@ -22,8 +22,8 @@ pub use metrics::StromaMetrics;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
     MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
-    QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole, SnapshotMeta,
-    StromaDebugSnapshot,
+    QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
+    Resolved, SnapshotMeta, StromaDebugSnapshot,
 };
 pub use stroma::{
     DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,

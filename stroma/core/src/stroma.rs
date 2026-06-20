@@ -40,7 +40,7 @@ use crate::{
     },
     state::{
         CustomDLQ, InspectMode, NackOutcome, Offset, OwnerOperationLease, QueueCommand,
-        QueueDebugInfo, QueueHandle, QueueInspectionSnapshot, QueueInspectionState,
+        QueueDebugInfo, QueueHandle, QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState,
         QueueInternalDebugInfo, QueueRole, QueueSharedBundle,
         QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
@@ -311,11 +311,18 @@ impl AppendCompletion<IoError> for ApplyThenComplete {
                 let ev = self.ev.clone();
                 let inner = self.inner;
 
-                match stroma.enqueue_event_inmem(ev, &self.qh) {
+                let qh = match self.qh.resolve() {
+                    Ok(qh) => qh,
+                    Err(e) => {
+                        inner.complete(Err(IoError::new(e.to_string())));
+                        return;
+                    }
+                };
+
+                match stroma.enqueue_event_inmem(ev, &qh) {
                     Ok(()) => {
                         // let _ = tx.send(Ok(ar));
-                        self.qh
-                            .applied_upto()
+                        qh.applied_upto()
                             .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
                         inner.complete(Ok(ar));
                     }
@@ -456,7 +463,9 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
                 .await
             {
                 Ok(_) => {
-                    stroma.cache_owner_messages(&qh, base, cache_messages);
+                    if let Ok(qh) = qh.resolve() {
+                        stroma.cache_owner_messages(&qh, base, cache_messages);
+                    }
                     for (
                         i,
                         CompletionItem {
@@ -633,8 +642,10 @@ fn validate_user_message_headers(headers: &MessageHeaders) -> Result<()> {
 }
 
 #[derive(Debug)]
-struct QueueSlot {
-    handle: OnceCell<QueueHandle>,
+pub(crate) struct QueueSlot {
+    /// The strong, log-owning incarnation. The registry slot is the SOLE strong
+    /// owner; handed-out `QueueHandle` tickets hold only a `Weak` to this.
+    pub(crate) handle: OnceCell<Arc<QueueHandleInner>>,
     exists_on_disk: bool,
     eviction_state: Arc<EvictionState>,
 }
@@ -746,7 +757,7 @@ impl QueueSlot {
         }
     }
 
-    pub fn wait_until_ready(&self) -> impl Future<Output = QueueHandle> + '_ {
+    pub fn wait_until_ready(&self) -> impl Future<Output = Arc<QueueHandleInner>> + '_ {
         async {
             loop {
                 if let Some(handle) = self.handle.get() {
@@ -770,7 +781,10 @@ impl QueueSlot {
     }
 }
 
-type Registry = hashbrown::HashMap<(Box<str>, u32, Option<Box<str>>), Arc<QueueSlot>>;
+/// Registry key: (topic, partition, group). `None` group is the default group.
+pub(crate) type QueueKey = (Box<str>, u32, Option<Box<str>>);
+
+pub(crate) type Registry = hashbrown::HashMap<QueueKey, Arc<QueueSlot>>;
 
 fn slot_lookup_no_alloc<'a>(
     map: &'a Registry,
@@ -958,7 +972,7 @@ impl Stroma {
         ReplicationCacheKey::from_parts(topic, part, group)
     }
 
-    fn replication_cache_key_for_handle(&self, qh: &QueueHandle) -> ReplicationCacheKey {
+    fn replication_cache_key_for_handle(&self, qh: &QueueHandleInner) -> ReplicationCacheKey {
         self.replication_cache_key_for(qh.topic(), qh.partition(), qh.group())
     }
 
@@ -971,7 +985,7 @@ impl Stroma {
             .record_evicted_records(mutation.evicted_records);
     }
 
-    fn cache_owner_messages(&self, qh: &QueueHandle, first_offset: Offset, messages: Vec<Message>) {
+    fn cache_owner_messages(&self, qh: &QueueHandleInner, first_offset: Offset, messages: Vec<Message>) {
         if messages.is_empty() {
             return;
         }
@@ -990,7 +1004,7 @@ impl Stroma {
         self.record_replication_cache_mutation(mutation);
     }
 
-    fn cache_owner_events(&self, qh: &QueueHandle, first_offset: Offset, events: Vec<StromaEvent>) {
+    fn cache_owner_events(&self, qh: &QueueHandleInner, first_offset: Offset, events: Vec<StromaEvent>) {
         if events.is_empty() {
             return;
         }
@@ -1283,6 +1297,20 @@ impl Stroma {
         lock.lock_owned().await
     }
 
+    /// Build a handed-out ticket for `inner` (the slot's strong incarnation),
+    /// carrying the registry ref + key so it can re-resolve.
+    fn ticket_for(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        inner: &Arc<QueueHandleInner>,
+    ) -> QueueHandle {
+        let group = normalize_group(group);
+        let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+        QueueHandle::from_inner(self.queue_handles.clone(), key, inner)
+    }
+
     pub async fn queue_handle(
         &self,
         tp: &str,
@@ -1339,10 +1367,10 @@ impl Stroma {
             };
 
             // Fast path: a live handle that is not mid-eviction.
-            if let Some(handle) = slot.handle.get()
+            if let Some(inner) = slot.handle.get()
                 && !slot.is_evicting()
             {
-                return Ok(handle.clone());
+                return Ok(self.ticket_for(tp, part, group, inner));
             }
 
             // Slow path. Park until any eviction (or a concurrent destroy)
@@ -1385,22 +1413,31 @@ impl Stroma {
                         deadline_waker: self.deadline_waker.clone(),
                     };
 
-                    let qh = QueueHandle::init(tp.into(), part, group.map(|s| s.into()), bundle);
+                    let inner =
+                        QueueHandleInner::init(tp.into(), part, group.map(|s| s.into()), bundle);
 
-                    self.periodic_snapshot(qh.clone());
+                    // The snapshot task gets a TICKET (Weak), so it never pins
+                    // this incarnation once the slot drops it.
+                    self.periodic_snapshot(self.ticket_for(tp, part, group, &inner));
 
                     if slot.exists_on_disk {
-                        self.recover_one_log_with_handle(&qh, tp, part, group, event_log)
-                            .await?;
+                        self.recover_one_log_with_handle(
+                            &self.ticket_for(tp, part, group, &inner),
+                            tp,
+                            part,
+                            group,
+                            event_log,
+                        )
+                        .await?;
                     }
 
-                    qh.mark_recovery_complete();
+                    inner.mark_recovery_complete();
 
-                    Ok::<_, StromaError>(qh)
+                    Ok::<_, StromaError>(inner)
                 })
                 .await?;
 
-            return Ok(qh.clone());
+            return Ok(self.ticket_for(tp, part, group, qh));
         }
     }
 
@@ -1469,7 +1506,7 @@ impl Stroma {
         // touch queue lookup paths, and those must not wait on the eviction
         // guard that this same task is responsible for clearing.
         if qh.dirty_snapshot() {
-            Self::periodic_snapshot_step(self, &qh).await?;
+            Self::periodic_snapshot_step(self, &self.ticket_for(topic, part, group, &qh)).await?;
         }
 
         // Serialize the swap + shutdown against concurrent build/destroy of this
@@ -1654,6 +1691,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
         qh.freeze_owner_and_wait_operations().await?;
         qh.msg_log().freeze();
         qh.event_log().freeze();
@@ -1700,6 +1738,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<Arc<AtomicU64>> {
         let queue = self.queue_handle(tp, part, group).await?;
+        let queue = queue.resolve()?;
         Ok(queue.applied_upto())
     }
 
@@ -1723,13 +1762,14 @@ impl Stroma {
                 ),
             )
         })?;
-        cell.handle
+        let inner = cell
+            .handle
             .get()
-            .cloned()
-            .ok_or_else(|| io::Error::other("queue handle not initialized"))
+            .ok_or_else(|| io::Error::other("queue handle not initialized"))?;
+        Ok(self.ticket_for(tp, part, group, inner))
     }
 
-    fn enqueue_event_inmem(&self, ev: StromaEvent, qh: &QueueHandle) -> std::io::Result<()> {
+    fn enqueue_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> std::io::Result<()> {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue { off, retries } => {
@@ -1870,7 +1910,7 @@ impl Stroma {
         Ok(())
     }
 
-    pub(crate) async fn apply_event_inmem(&self, ev: StromaEvent, qh: &QueueHandle) -> Result<()> {
+    pub(crate) async fn apply_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> Result<()> {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue { off, retries } => {
@@ -2074,7 +2114,7 @@ impl Stroma {
 
         // let _timer = Timer::new(&self.metrics.event_log_appends.batches.latency);
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
+        let owner_operation = qh.resolve()?.begin_owner_operation().await?;
 
         self.append_events_durable_leased(qh, evs, durability, owner_operation)
             .await
@@ -2087,6 +2127,9 @@ impl Stroma {
         durability: KDurability,
         _owner_operation: OwnerOperationLease,
     ) -> Result<Offset> {
+        // Resolve once for the whole batch (hot path): reuse the live incarnation
+        // for every per-record apply rather than re-resolving per record.
+        let qh = qh.resolve()?;
         let start = Instant::now();
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
@@ -2217,6 +2260,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<Offset> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.lowest_unacked_offset().await)
     }
 
@@ -2228,6 +2272,7 @@ impl Stroma {
         off: Offset,
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.is_inflight_or_acked(off).await)
     }
 
@@ -2239,6 +2284,7 @@ impl Stroma {
         off: Offset,
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.is_ready(off).await)
     }
 
@@ -2250,6 +2296,7 @@ impl Stroma {
         items: Vec<(Offset, Vec<u8>)>,
     ) -> Result<Vec<(Offset, Vec<u8>)>> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.filter_not_enqueued(items).await)
     }
 
@@ -2273,6 +2320,7 @@ impl Stroma {
         let keys = self.queue_keys_snapshot();
         for (t, p, g) in keys {
             let qh = self.queue_handle(&t, p, g.as_deref()).await?;
+            let qh = qh.resolve()?;
             if qh.role() != QueueRole::Owner {
                 continue;
             }
@@ -2296,6 +2344,7 @@ impl Stroma {
         upper: u64,
     ) -> Result<Option<Offset>> {
         let q = self.queue_handle(topic, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.next_deliverable(from, upper).await)
     }
 
@@ -2319,6 +2368,7 @@ impl Stroma {
         for key in keys {
             let (tp, part, group) = key;
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let qh = qh.resolve()?;
             if qh.role() != QueueRole::Owner {
                 continue;
             }
@@ -2393,6 +2443,7 @@ impl Stroma {
     /// Recovery loads snapshots, then starts event replay after the snapshot
     /// offset so events already covered by the snapshot are not read again.
     async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
+        let qh = qh.resolve()?;
         if qh.creating_snapshot() {
             tracing::info!("Snapshot already in progress, skipping..");
             return Ok::<(), StromaError>(());
@@ -2419,7 +2470,7 @@ impl Stroma {
         let group = qh.group();
         tracing::info!("Writing log snapshot until {applied_upto}..");
         stroma
-            .write_snapshots_for_partition(qh.clone(), applied_upto)
+            .write_snapshots_for_partition(tp, part, group, applied_upto)
             .await?;
         let event_log = qh.event_log();
         let event_head = event_log
@@ -2451,15 +2502,25 @@ impl Stroma {
     }
 
     fn periodic_snapshot(&self, qh: QueueHandle) {
-        if !qh.try_start_snapshot_task() {
-            return;
-        }
+        // `qh` is a TICKET (Weak): this task never pins the incarnation. It
+        // resolves per tick and exits once the incarnation is gone.
+        let background_tasks = {
+            let Ok(h) = qh.resolve() else {
+                return;
+            };
+            if !h.try_start_snapshot_task() {
+                return;
+            }
+            h.background_cancellation_token()
+        };
 
         let stroma = self.clone();
-        let background_tasks = qh.background_cancellation_token();
 
         self.task_group.spawn("periodic snapshot", async move {
-            qh.wait_recovery_complete().await;
+            match qh.resolve() {
+                Ok(h) => h.wait_recovery_complete().await,
+                Err(_) => return,
+            }
 
             tracing::info!(
                 "Starting periodic snapshot service for tp={} part={} group={}",
@@ -2477,6 +2538,12 @@ impl Stroma {
                     _ = ticker.tick() => {}
                 }
 
+                // Self-exit if the incarnation is gone (orphaned task): we hold
+                // only a Weak, so there is nothing to keep alive.
+                if qh.resolve().is_err() {
+                    break;
+                }
+
                 let res = Self::periodic_snapshot_step(&stroma, &qh).await;
                 #[cfg(test)]
                 stroma.snapshot_worker_ticks.notify_waiters();
@@ -2489,13 +2556,13 @@ impl Stroma {
 
     async fn write_snapshots_for_partition(
         &self,
-        qh: QueueHandle,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
         applied_upto: Offset,
     ) -> Result<()> {
-        let tp = qh.topic();
-        let part = qh.partition();
-        let group = qh.group();
-        let qh: QueueHandle = self.queue_handle(tp, part, group).await?;
+        let qh = self.queue_handle(tp, part, group).await?;
+        let qh = qh.resolve()?;
         let blob = if let Ok(blob) = qh.encode_snapshot(applied_upto).await {
             blob
         } else {
@@ -2645,6 +2712,7 @@ impl Stroma {
                     .map_err(|err| StromaError::Io(err.to_string()))?;
 
                 let qh = stroma.queue_handle(&tp, part, group.as_deref()).await?;
+                let qh = qh.resolve()?;
                 let event_log = qh.event_log();
 
                 stroma
@@ -2721,6 +2789,10 @@ impl Stroma {
         event_log: Arc<Keratin>,
     ) -> Result<()> {
         let start = Instant::now();
+        // The incarnation is alive for the whole build/recovery (the build closure
+        // holds the strong Arc), so resolve once and reuse. `qh` (the ticket) is
+        // kept for cloning into the spawned DLQ-recovery tasks (non-pinning).
+        let h = qh.resolve()?;
 
         tracing::info!(
             "Recovering log tp: {tp}, partition: {part}, group: {}",
@@ -2740,17 +2812,17 @@ impl Stroma {
         if let Some((applied_upto, blob)) =
             self.read_queue_snapshot(&self.snap_file(tp, part, group))?
         {
-            qh.load_snapshot(blob).await.map_err(|err| {
+            h.load_snapshot(blob).await.map_err(|err| {
                 StromaError::Io(format!(
                     "snapshot load failed for tp={tp} part={part} group={group:?}: {err}"
                 ))
             })?;
-            qh.applied_upto().store(applied_upto, Ordering::Release);
+            h.applied_upto().store(applied_upto, Ordering::Release);
             cur = applied_upto.saturating_add(1);
         }
 
         let tail = event_log.next_offset();
-        let applied_upto = qh.applied_upto();
+        let applied_upto = h.applied_upto();
 
         self.metrics
             .recovery
@@ -2773,14 +2845,14 @@ impl Stroma {
         .map_err(|err| StromaError::Io(err.to_string()))??;
 
         for ev in events {
-            self.apply_event_inmem(ev, &qh).await?;
+            self.apply_event_inmem(ev, &h).await?;
         }
 
-        let pending = qh.pending_dlq().await?;
+        let pending = h.pending_dlq().await?;
         let source_tp = tp;
         let source_part = part;
         let source_group = group;
-        let target = qh.get_dlq_target().await?;
+        let target = h.get_dlq_target().await?;
         let src = (
             source_tp.to_string(),
             source_part,
@@ -3137,8 +3209,10 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
-        let msg_log = qh.msg_log();
+        let (owner_operation, msg_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.msg_log())
+        };
 
         // Build msg_log batch and extract per client completions.
         // Per message header encode failures fail just that one completion.
@@ -3230,8 +3304,10 @@ impl Stroma {
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
-        let msg_log = qh.msg_log();
+        let (owner_operation, msg_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.msg_log())
+        };
         let message = Message {
             flags: 0,
             headers: headers.encode()?,
@@ -3273,7 +3349,9 @@ impl Stroma {
 
             match event_res {
                 Ok(_event_offset) => {
-                    stroma.cache_owner_messages(&qh, msg_offset, vec![cache_message]);
+                    if let Ok(qh) = qh.resolve() {
+                        stroma.cache_owner_messages(&qh, msg_offset, vec![cache_message]);
+                    }
                     event_completion.complete(Ok(AppendResult {
                         base_offset: msg_offset,
                         count: 1,
@@ -3300,8 +3378,10 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
-        let event_log = qh.event_log();
+        let (owner_operation, event_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.event_log())
+        };
         let event_msg = event_msg(&ev)?;
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
@@ -3326,8 +3406,10 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
-        let event_log = qh.event_log();
+        let (owner_operation, event_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.event_log())
+        };
         let event_msg = event_msg(&ev)?;
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
@@ -3373,6 +3455,7 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
+        let qh = qh.resolve()?;
         let owner_operation = qh.begin_owner_operation().await?;
         let event_log = qh.event_log();
 
@@ -3404,8 +3487,9 @@ impl Stroma {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
-        let owner_operation = qh.begin_owner_operation().await?;
-        let event_log = qh.event_log();
+        let h = qh.resolve()?;
+        let owner_operation = h.begin_owner_operation().await?;
+        let event_log = h.event_log();
 
         // Phase 1: durable Nack write
         let nack_event = StromaEvent::NackMany { reqs: reqs.clone() };
@@ -3414,14 +3498,14 @@ impl Stroma {
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
             .await
             .map_err(io_err)?;
-        qh.applied_upto()
+        h.applied_upto()
             .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
-        qh.set_dirty_snapshot(true);
+        h.set_dirty_snapshot(true);
 
         // Apply -> get outcomes
         let outcomes = {
             let (tx, rx) = tokio::sync::oneshot::channel();
-            qh.command_enqueue(QueueCommand::NackMany {
+            h.command_enqueue(QueueCommand::NackMany {
                 reqs,
                 response: Some(tx),
             })
@@ -3446,7 +3530,7 @@ impl Stroma {
         }
 
         // Phase 2: resolve policy, decide per-offset
-        let (to_dlq, to_discard) = self.resolve_dlq_targets(&qh, &dl_requests).await?;
+        let (to_dlq, to_discard) = self.resolve_dlq_targets(&h, &dl_requests).await?;
 
         // Discards: ack-locally directly, no DLQ event needed.
         if !to_discard.is_empty() {
@@ -3460,7 +3544,7 @@ impl Stroma {
                 .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
                 .await
                 .map_err(io_err)?;
-            qh.discard_pending_dlq(to_discard).await?;
+            h.discard_pending_dlq(to_discard).await?;
         }
 
         // DLQ-bound: emit DeadLetter event with resolved targets.
@@ -3535,7 +3619,7 @@ impl Stroma {
 
     async fn resolve_dlq_targets(
         &self,
-        qh: &QueueHandle,
+        qh: &QueueHandleInner,
         requests: &[(Offset, u32, DeadLetterReason)],
     ) -> Result<(Vec<DeadLetterMeta>, Vec<Offset>)> {
         let resolved = match qh.get_dlq_target().await {
@@ -3587,6 +3671,9 @@ impl Stroma {
         Box::pin(async move {
             const MAX_ATTEMPTS: u32 = 5;
             let (src_tp, src_part, src_group) = src;
+            // Resolve once for this copy operation (the owner lease / teardown
+            // contract keeps the source alive for its duration).
+            let src_qh = src_qh.resolve()?;
 
             // Fetch source message.
             let msg = match self.fetch_message_by_offset(&src_qh, meta.off).await {
@@ -3705,7 +3792,7 @@ impl Stroma {
         })
     }
 
-    async fn commit_dlq_event(&self, qh: &QueueHandle, offs: Vec<Offset>) -> Result<()> {
+    async fn commit_dlq_event(&self, qh: &QueueHandleInner, offs: Vec<Offset>) -> Result<()> {
         let owner_operation = qh.begin_owner_operation().await?;
         self.commit_dlq_event_leased(qh, offs, owner_operation)
             .await
@@ -3713,7 +3800,7 @@ impl Stroma {
 
     async fn commit_dlq_event_with_optional_lease(
         &self,
-        qh: &QueueHandle,
+        qh: &QueueHandleInner,
         offs: Vec<Offset>,
         owner_operation: Option<OwnerOperationLease>,
     ) -> Result<()> {
@@ -3728,7 +3815,7 @@ impl Stroma {
 
     async fn commit_dlq_event_leased(
         &self,
-        qh: &QueueHandle,
+        qh: &QueueHandleInner,
         offs: Vec<Offset>,
         _owner_operation: OwnerOperationLease,
     ) -> Result<()> {
@@ -3756,7 +3843,7 @@ impl Stroma {
 
     pub async fn fetch_message_by_offset(
         &self,
-        qh: &QueueHandle,
+        qh: &QueueHandleInner,
         off: Offset,
     ) -> Result<Option<Message>> {
         let log = qh.msg_log();
@@ -3775,6 +3862,7 @@ impl Stroma {
         upper: Offset,
     ) -> Result<Vec<(Offset, MessageHeaders, Vec<u8>, u32)>> {
         let qs = self.queue_handle(tp, part, group).await?;
+        let qs = qs.resolve()?;
 
         // Offsets are now already marked inflight inside queue. `upper` is the
         // exclusive deliverable ceiling (replica-durable committed watermark);
@@ -3806,8 +3894,9 @@ impl Stroma {
                     }
 
                     // ---- batch fetch ----
+                    let h = qh.resolve()?;
                     let batch: Vec<(u64, Vec<u8>, MessageHeaders)> =
-                        stroma.scan_messages_from(&qh, start, len)?;
+                        stroma.scan_messages_from(&h, start, len)?;
 
                     // ---- fast path: perfect match ----
                     if batch.len() == len {
@@ -3855,7 +3944,7 @@ impl Stroma {
 
     pub fn scan_messages_from(
         &self,
-        qh: &QueueHandle,
+        qh: &QueueHandleInner,
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
@@ -3879,6 +3968,7 @@ impl Stroma {
         payload_limit_bytes: usize,
     ) -> Result<MessageInspectionPage> {
         let qh = self.queue_handle(tp, part, group).await?;
+        let qh = qh.resolve()?;
         let snapshot: QueueInspectionSnapshot = qh.inspect_offsets(from, limit, mode).await;
         if snapshot.items.is_empty() {
             return Ok(MessageInspectionPage {
@@ -3933,7 +4023,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        let msg_log = self.queue_handle(tp, part, group).await?.resolve()?.msg_log();
         Ok(msg_log.next_offset())
     }
 
@@ -3945,7 +4035,7 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let msg_log = self.queue_handle(tp, part, group).await?.msg_log();
+        let msg_log = self.queue_handle(tp, part, group).await?.resolve()?.msg_log();
         msg_log.truncate_before(before).await.map_err(io_err)
     }
 
@@ -3975,6 +4065,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<Offset> {
         let qh = self.queue_handle(tp, part, group).await?;
+        let qh = qh.resolve()?;
         let settled_until = qh.settled_until().await;
         let min = settled_until.min(qh.lowest_not_acked_offset().await);
 
@@ -3999,11 +4090,13 @@ impl Stroma {
         off: Offset,
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.is_acked(off).await)
     }
 
     pub async fn count_inflight(&self, tp: &str, part: u32, group: Option<&str>) -> Result<usize> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(q.inflight_len().await)
     }
 
@@ -4025,6 +4118,7 @@ impl Stroma {
         let keys = self.queue_keys_snapshot();
         for (tp, part, group) in keys {
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let qh = qh.resolve()?;
             total += qh.event_log().estimate_disk_used().await.map_err(io_err)?;
             total += qh.msg_log().estimate_disk_used().await.map_err(io_err)?;
         }
@@ -4037,6 +4131,7 @@ impl Stroma {
         let mut stats = HashMap::new();
         for (tp, part, group) in self.queue_keys_snapshot() {
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let qh = qh.resolve()?;
             let status = qh.status_report().await.map_err(io_err)?;
             stats.insert((tp, group), status);
         }
@@ -4088,8 +4183,7 @@ impl Stroma {
             .applied_upto_entry(tp, part, group)
             .await?
             .load(Ordering::Acquire);
-        let qh = self.queue_handle(tp, part, group).await?;
-        self.write_snapshots_for_partition(qh, upto).await
+        self.write_snapshots_for_partition(tp, part, group, upto).await
     }
 
     pub async fn truncate_partition_log(
@@ -4097,6 +4191,7 @@ impl Stroma {
         qh: QueueHandle,
         before_event: Offset,
     ) -> Result<u64> {
+        let qh = qh.resolve()?;
         let tp = qh.topic();
         let part = qh.partition();
         let group = qh.group();
@@ -4139,6 +4234,7 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<String> {
         let q = self.queue_handle(tp, part, group).await?;
+        let q = q.resolve()?;
         Ok(format!("{:#?}", q.canonical().await))
     }
 
@@ -4146,6 +4242,7 @@ impl Stroma {
         let keys = self.queue_keys_snapshot();
         for (k_tp, k_part, k_group) in keys {
             let qh = self.queue_handle(&k_tp, k_part, k_group.as_deref()).await?;
+            let qh = qh.resolve()?;
             for (off, _) in qh.dump_inflight().await {
                 if off < qh.settled_until().await {
                     return Err(StromaError::Decode("inflight < ack frontier".into()));
@@ -4476,6 +4573,43 @@ mod tests {
         shutdown_stroma("append_message_rejects_user_stroma_headers", &stroma).await;
     }
 
+    /// Microbench for the ticket/re-resolve overhead. Run with:
+    ///   cargo test -p stroma-core --lib --release ticket_resolve_overhead_bench -- --ignored --nocapture
+    /// Measures the per-op cost added by the ticket design: `resolve()` (one
+    /// `Weak::upgrade`) on the hot path, vs. the full `queue_handle()` lookup.
+    #[tokio::test]
+    #[ignore]
+    async fn ticket_resolve_overhead_bench() {
+        let dir = test_dir!("ticket_resolve_overhead_bench");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        let ticket = stroma.queue_handle("topic", 0, None).await.unwrap();
+
+        const N: u32 = 20_000_000;
+
+        // resolve() in isolation: the per-batch cost added to hot paths.
+        let start = std::time::Instant::now();
+        let mut sink = 0u64;
+        for _ in 0..N {
+            let h = ticket.resolve().unwrap();
+            sink = sink.wrapping_add(h.partition() as u64);
+            std::hint::black_box(&sink);
+        }
+        let resolve_ns = start.elapsed().as_nanos() as f64 / N as f64;
+
+        // Full queue_handle() lookup (registry load + key alloc + ticket build).
+        let start = std::time::Instant::now();
+        for _ in 0..(N / 20) {
+            let t = stroma.queue_handle("topic", 0, None).await.unwrap();
+            std::hint::black_box(&t);
+        }
+        let qh_ns = start.elapsed().as_nanos() as f64 / (N / 20) as f64;
+
+        println!("resolve(): {resolve_ns:.1} ns/op    queue_handle(): {qh_ns:.1} ns/op");
+        shutdown_stroma("ticket_resolve_overhead_bench", &stroma).await;
+    }
+
     #[tokio::test]
     async fn inspect_messages_skips_offsets_without_log_records() {
         let dir = test_dir!("inspect_messages_missing_log_records");
@@ -4487,6 +4621,7 @@ mod tests {
         .await
         .unwrap();
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         qh.enqueue(0, 0).await.unwrap();
 
         let page = stroma
@@ -4818,6 +4953,7 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         qh.msg_log().become_follower();
         qh.msg_log()
             .destructive_reset_to_checkpoint(7)
@@ -4858,6 +4994,7 @@ mod tests {
             publish_one(&stroma, "topic", 0, None).await;
         }
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
 
         let read = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 0, 7).unwrap();
         let OwnerReplicationRead::CheckpointRequired {
@@ -4890,6 +5027,7 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         let err = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 3, 7).unwrap_err();
         assert!(matches!(err, StromaError::Corruption(_)));
 
@@ -4909,6 +5047,7 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
         qh.msg_log()
@@ -4970,6 +5109,7 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         let snapshot = qh.encode_snapshot(0).await.unwrap();
 
         let err = stroma
@@ -5010,6 +5150,7 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         let snapshot = qh.encode_snapshot(0).await.unwrap();
         stroma
             .become_queue_follower("topic", 0, None)
@@ -5049,6 +5190,7 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         let snapshot = qh.encode_snapshot(1).await.unwrap();
         stroma
             .become_queue_follower("topic", 0, None)
@@ -5096,6 +5238,7 @@ mod tests {
         publish_one(&owner, "topic", 0, None).await;
         publish_one(&owner, "topic", 0, None).await;
         let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
+        let owner_qh = owner_qh.resolve().unwrap();
         let state_snapshot = owner_qh.encode_snapshot(1).await.unwrap();
 
         follower
@@ -5235,6 +5378,7 @@ mod tests {
         rx.await.unwrap().unwrap();
 
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         let event_next_offset = qh.event_log().next_offset();
         assert_eq!(event_next_offset, 2);
 
@@ -5263,17 +5407,20 @@ mod tests {
         .await
         .unwrap();
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
-        let generation = qh.role_generation();
+        let h = qh.resolve().unwrap();
+        let generation = h.role_generation();
 
-        let pause = qh.pause_owner_operations_and_wait().await.unwrap();
-        assert_eq!(qh.role(), QueueRole::Owner);
-        assert_eq!(qh.role_generation(), generation);
+        let pause = h.pause_owner_operations_and_wait().await.unwrap();
+        assert_eq!(h.role(), QueueRole::Owner);
+        assert_eq!(h.role_generation(), generation);
 
         let qh_for_owner_op = qh.clone();
         let (started_tx, started_rx) = tokio::sync::oneshot::channel();
         let join = tokio::spawn(async move {
             let _ = started_tx.send(());
             qh_for_owner_op
+                .resolve()
+                .unwrap()
                 .begin_owner_operation()
                 .await
                 .map(|_lease| ())
@@ -5316,6 +5463,7 @@ mod tests {
         publish_one(&owner, "topic", 0, None).await;
         publish_one(&owner, "topic", 0, None).await;
         let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
+        let owner_qh = owner_qh.resolve().unwrap();
         let owner_role_generation = owner_qh.role_generation();
 
         let checkpoint = owner
@@ -5695,13 +5843,14 @@ mod tests {
         .unwrap();
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+        let h = qh.resolve().unwrap();
 
-        assert!(qh.snapshot_task_started());
-        assert!(qh.recovery_complete());
+        assert!(h.snapshot_task_started());
+        assert!(h.recovery_complete());
 
         stroma.periodic_snapshot(qh.clone());
 
-        assert!(qh.snapshot_task_started());
+        assert!(h.snapshot_task_started());
 
         shutdown_stroma("queue_handle_starts_snapshot_task_once", &stroma).await;
     }
@@ -5721,6 +5870,7 @@ mod tests {
         assert!(stroma.initial_recovery_complete.load(Ordering::Acquire));
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
 
         assert!(qh.recovery_complete());
         assert!(qh.snapshot_task_started());
@@ -5745,19 +5895,18 @@ mod tests {
         .unwrap();
 
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
-
-        qh.recovery_complete.store(false, Ordering::Release);
+        qh.resolve().unwrap().recovery_complete.store(false, Ordering::Release);
 
         let qh_waiter = qh.clone();
         let waiter = tokio::spawn(async move {
-            qh_waiter.wait_recovery_complete().await;
+            qh_waiter.resolve().unwrap().wait_recovery_complete().await;
         });
 
         stroma.mark_all_queue_recoveries_complete();
 
         waiter.await.unwrap();
 
-        assert!(qh.recovery_complete());
+        assert!(qh.resolve().unwrap().recovery_complete());
 
         shutdown_stroma(
             "mark_all_queue_recoveries_completes_existing_waiters",
@@ -5780,6 +5929,7 @@ mod tests {
         let notified = stroma.snapshot_worker_ticks.notified();
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
 
         qh.enqueue(0, 0).await.unwrap();
 
@@ -5805,6 +5955,7 @@ mod tests {
             .unwrap();
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
             qh.enqueue(0, 0).await.unwrap();
 
             shutdown_stroma(
@@ -5879,6 +6030,7 @@ mod tests {
             stroma.snapshot_partition("topic-a", 0, None).await.unwrap();
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
             assert_eq!(qh.applied_upto().load(Ordering::Acquire), 1);
 
             let second = publish_one(&stroma, "topic-a", 0, None).await;
@@ -5897,6 +6049,7 @@ mod tests {
         .await
         .unwrap();
         let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         assert!(qh.recovery_complete());
         assert_eq!(qh.applied_upto().load(Ordering::Acquire), 3);
         let scan_starts = stroma.recovery_event_scan_starts.lock().unwrap().clone();
@@ -5970,6 +6123,7 @@ mod tests {
             )
             .await
             .unwrap();
+            let qh = qh.resolve().unwrap();
             assert!(qh.recovery_complete());
             for &off in &expected {
                 assert!(
@@ -6008,6 +6162,7 @@ mod tests {
         assert_eq!(stroma.materialized_queue_count(), 0);
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
 
         assert!(qh.recovery_complete());
         assert!(qh.snapshot_task_started());
@@ -6034,6 +6189,7 @@ mod tests {
             .unwrap();
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
             qh.enqueue(0, 0).await.unwrap();
 
             shutdown_stroma("concurrent_first_access_recovers_only_once/setup", &stroma).await;
@@ -6060,6 +6216,7 @@ mod tests {
 
         for join in joins {
             let qh = join.await.unwrap();
+            let qh = qh.resolve().unwrap();
             assert!(qh.recovery_complete());
         }
 
@@ -6278,10 +6435,15 @@ mod tests {
                                     "round {round}: queue_handle raced a destroy and failed: {e:?}"
                                 )
                             });
-                            assert!(
-                                qh.recovery_complete(),
-                                "round {round}: handle not recovered"
-                            );
+                            // The ticket may be retired by a concurrent destroy
+                            // immediately after we got it; that race is allowed.
+                            // If it still resolves, it must be fully recovered.
+                            if let Ok(h) = qh.resolve() {
+                                assert!(
+                                    h.recovery_complete(),
+                                    "round {round}: handle not recovered"
+                                );
+                            }
                         }
                     }
                 }));
@@ -6297,6 +6459,7 @@ mod tests {
 
         // The engine is still usable after the storm.
         let qh = stroma.queue_handle("orders", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
         assert!(qh.recovery_complete());
     }
 
@@ -6368,7 +6531,10 @@ mod tests {
         .await
         .unwrap();
 
-        let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        let ticket = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        // A resolved handle held across the teardown keeps the displaced
+        // incarnation alive (and its control task shut down by evict).
+        let qh = ticket.resolve().unwrap();
         assert_eq!(
             stroma.unmaterialize("topic-a", 0, None).await.unwrap(),
             EvictOutcome::Evicted
@@ -6384,17 +6550,30 @@ mod tests {
             .expect_err("displaced async queue handle should reject commands");
         assert_eq!(async_err.kind(), std::io::ErrorKind::BrokenPipe);
 
+        // The TICKET is movable cross-thread (it is `'static`); the `Resolved`
+        // guard above is not (it cannot escape this scope - by construction). The
+        // thread re-resolves the still-held displaced incarnation and sees its
+        // shut-down control task reject the blocking command.
+        let ticket_for_thread = ticket.clone();
         let blocking_err = std::thread::spawn(move || {
-            qh.blocking_command_enqueue(QueueCommand::Enqueue {
-                offset: 2,
-                retries: 0,
-                response: None,
-            })
-            .expect_err("displaced blocking queue handle should reject commands")
+            ticket_for_thread
+                .resolve()
+                .expect("displaced incarnation still resolvable while a handle is held")
+                .blocking_command_enqueue(QueueCommand::Enqueue {
+                    offset: 2,
+                    retries: 0,
+                    response: None,
+                })
+                .expect_err("displaced blocking queue handle should reject commands")
         })
         .join()
         .expect("blocking enqueue thread panicked");
         assert_eq!(blocking_err.kind(), std::io::ErrorKind::BrokenPipe);
+
+        // Once every resolved handle is dropped, the ticket no longer resolves:
+        // the partition was unmaterialized.
+        drop(qh);
+        assert!(ticket.resolve().is_err());
 
         shutdown_stroma("displaced_queue_handle_rejects_commands", &stroma).await;
     }
@@ -6438,6 +6617,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let qh = qh.resolve().unwrap();
         assert!(
             test_step(
                 format!("materialize_after_unmaterialize_recovers_messages/is_ready/{off}"),
