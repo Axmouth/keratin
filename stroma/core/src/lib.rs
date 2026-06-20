@@ -87,16 +87,12 @@ pub enum StromaError {
         actual: QueueRole,
     },
 
-    #[error(
-        "recovery mismatch for {topic}/{partition}/{group:?}: event log references message \
-         offset {dangling_offset} but the message log is only durable up to {msg_tail}"
-    )]
+    #[error("recovery mismatch for {topic}/{partition}/{group:?}: {reason}")]
     RecoveryMismatch {
         topic: String,
         partition: u32,
         group: Option<String>,
-        dangling_offset: u64,
-        msg_tail: u64,
+        reason: String,
     },
 
     #[error("queue {topic}/{partition}/{group:?} is quarantined: {reason}")]

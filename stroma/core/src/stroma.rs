@@ -814,22 +814,32 @@ pub struct QuarantineInfo {
     pub topic: String,
     pub partition: u32,
     pub group: Option<String>,
+    /// Human-readable description of the problem (covers both a dangling
+    /// event->message reference and a corrupt event record).
     pub reason: String,
-    /// The message offset an event referenced that the message log did not have.
-    pub dangling_offset: u64,
-    /// The message log's durable tail at detection time.
-    pub msg_tail: u64,
-    /// Repair truncates the event log to this offset (drops the dangling suffix).
+    /// Repair truncates the event log to this offset (drops the bad suffix).
     pub truncate_event_offset: u64,
 }
 
-/// A dangling event->message reference found during the event-log scan.
-#[derive(Debug, Clone, Copy)]
+/// What recovery found wrong with the event log at `event_offset`.
+#[derive(Debug, Clone)]
+enum RecoveryMismatchKind {
+    /// An event references a message offset the message log has not durably
+    /// accepted (a dangling forward reference - only possible as a lost-tail
+    /// suffix, since events are written after their messages).
+    DanglingReference { msg_offset: u64, msg_tail: u64 },
+    /// An event record failed to decode (corruption). Unlike a dangling ref this
+    /// is the genuinely mid-log failure; the safe repair is the same - truncate
+    /// at the bad record (skipping it would drop a state transition).
+    CorruptRecord { detail: String },
+}
+
+/// A bad event found during the event-log scan: the first offending record.
+#[derive(Debug, Clone)]
 struct RecoveryMismatchFound {
-    /// Event-log offset of the first offending event (the truncation point).
+    /// Event-log offset of the first offending record (the truncation point).
     event_offset: u64,
-    /// The message offset it referenced that the message log did not have.
-    dangling_msg_offset: u64,
+    kind: RecoveryMismatchKind,
 }
 
 /// Result of scanning the event log during recovery: the valid prefix of events
@@ -2941,12 +2951,22 @@ impl Stroma {
             for rec in batch {
                 let offset = rec.offset;
                 cur = offset + 1;
-                let ev = StromaEvent::decode(&rec.payload).map_err(|err| {
-                    StromaError::Decode(format!(
-                        "event log decode failed at offset {}: {err}",
-                        offset
-                    ))
-                })?;
+
+                // A corrupt event record is the first bad offset: stop here. Same
+                // repair as a dangling ref (truncate at this offset); skipping it
+                // and continuing would silently drop a state transition.
+                let ev = match StromaEvent::decode(&rec.payload) {
+                    Ok(ev) => ev,
+                    Err(err) => {
+                        mismatch = Some(RecoveryMismatchFound {
+                            event_offset: offset,
+                            kind: RecoveryMismatchKind::CorruptRecord {
+                                detail: err.to_string(),
+                            },
+                        });
+                        break 'scan;
+                    }
+                };
 
                 // Verify the event does not reference a message the message log
                 // has not durably accepted (a dangling forward reference). The
@@ -2958,7 +2978,10 @@ impl Stroma {
                 {
                     mismatch = Some(RecoveryMismatchFound {
                         event_offset: offset,
-                        dangling_msg_offset: max_ref,
+                        kind: RecoveryMismatchKind::DanglingReference {
+                            msg_offset: max_ref,
+                            msg_tail,
+                        },
                     });
                     break 'scan;
                 }
@@ -3048,30 +3071,37 @@ impl Stroma {
         .map_err(|err| StromaError::Io(err.to_string()))??;
 
         if let Some(m) = mismatch {
+            let reason = match &m.kind {
+                RecoveryMismatchKind::DanglingReference {
+                    msg_offset,
+                    msg_tail,
+                } => format!(
+                    "event log references message offset {msg_offset} but the message log is \
+                     only durable up to {msg_tail} (repair drops the event-log suffix from \
+                     offset {})",
+                    m.event_offset
+                ),
+                RecoveryMismatchKind::CorruptRecord { detail } => format!(
+                    "corrupt event record at offset {}: {detail} (repair drops the event-log \
+                     suffix from offset {})",
+                    m.event_offset, m.event_offset
+                ),
+            };
+
             let policy = RecoveryMismatchPolicy::from_u8(
                 self.recovery_mismatch_policy.load(Ordering::Acquire),
             );
             match policy {
                 RecoveryMismatchPolicy::Ignore => {
                     tracing::error!(
-                        "recovery: dangling event->message reference in {tp}/{part}/{group:?} \
-                         (event@{} references message {} but durable tail is {}); \
-                         on_mismatch=Ignore -> truncating the event log to {} and continuing \
-                         (POSSIBLE DATA LOSS)",
-                        m.event_offset,
-                        m.dangling_msg_offset,
-                        msg_tail,
+                        "recovery: {tp}/{part}/{group:?}: {reason}; on_mismatch=Ignore -> \
+                         truncating the event log to {} and continuing (POSSIBLE DATA LOSS)",
                         m.event_offset
                     );
                     self.truncate_event_log_tail(&h, m.event_offset).await?;
                     // fall through and apply only the valid prefix in `events`
                 }
                 RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
-                    let reason = format!(
-                        "event log references message offset {} but the message log is only \
-                         durable up to {} (repair drops the event-log suffix from offset {})",
-                        m.dangling_msg_offset, msg_tail, m.event_offset
-                    );
                     tracing::error!(
                         "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
                     );
@@ -3085,9 +3115,7 @@ impl Stroma {
                             topic: tp.to_string(),
                             partition: part,
                             group: group.map(|g| g.to_string()),
-                            reason,
-                            dangling_offset: m.dangling_msg_offset,
-                            msg_tail,
+                            reason: reason.clone(),
                             truncate_event_offset: m.event_offset,
                         },
                     );
@@ -3095,8 +3123,7 @@ impl Stroma {
                         topic: tp.to_string(),
                         partition: part,
                         group: group.map(|g| g.to_string()),
-                        dangling_offset: m.dangling_msg_offset,
-                        msg_tail,
+                        reason,
                     });
                 }
             }
@@ -7084,6 +7111,48 @@ mod tests {
 
         shutdown_stroma("recovery_quarantines_and_repairs_dangling_event_reference", &stroma)
             .await;
+    }
+
+    /// A corrupt (undecodable) event record is the genuinely mid-log failure and
+    /// goes through the SAME quarantine+truncate machinery as a dangling ref.
+    #[tokio::test]
+    async fn recovery_quarantines_and_repairs_corrupt_event_record() {
+        let dir = test_dir!("recovery_corrupt_event_record");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+
+        // Inject a record whose payload is not a valid encoded StromaEvent.
+        {
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
+            let garbage = Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![0xFF, 0xFF, 0xFF, 0xFF],
+            };
+            qh.event_log().append_batch(vec![garbage], None).await.unwrap();
+        }
+        assert_eq!(
+            stroma.unmaterialize("t", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+
+        let err = stroma.queue_handle("t", 0, None).await.unwrap_err();
+        assert!(
+            matches!(err, StromaError::RecoveryMismatch { .. }),
+            "expected RecoveryMismatch (corrupt record), got {err:?}"
+        );
+        assert!(stroma.is_quarantined("t", 0, None));
+
+        stroma.repair_partition("t", 0, None).await.unwrap();
+        assert!(!stroma.is_quarantined("t", 0, None));
+
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        assert!(qh.recovery_complete());
+
+        shutdown_stroma("recovery_quarantines_and_repairs_corrupt_event_record", &stroma).await;
     }
 
     /// With on_mismatch=Ignore, recovery auto-truncates the dangling suffix and
