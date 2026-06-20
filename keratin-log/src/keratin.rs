@@ -395,7 +395,7 @@ impl Keratin {
             lock.sync_all()?;
         }
 
-        std::mem::forget(self); // 💀 Drop will NOT run
+        std::mem::forget(self); // skip Drop: the lock was already released above
         Ok(())
     }
 }

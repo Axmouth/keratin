@@ -265,7 +265,7 @@ mod tests {
     #[tokio::test]
     async fn put_get_and_recover_global_value() {
         let dir = test_dir!("global_store_recover");
-        let key = GlobalKey::new("fibril.runtime", "idle_queue_cleanup").unwrap();
+        let key = GlobalKey::new("app.runtime", "idle_queue_cleanup").unwrap();
 
         let store = GlobalStore::open(&dir.root, KeratinConfig::test_default())
             .await
@@ -389,7 +389,7 @@ mod tests {
     #[tokio::test]
     async fn stroma_exposes_and_recovers_global_store() {
         let dir = test_dir!("stroma_global_store_recover");
-        let key = GlobalKey::new("fibril.runtime", "settings").unwrap();
+        let key = GlobalKey::new("app.runtime", "settings").unwrap();
 
         let stroma = crate::Stroma::open(
             &dir.root,

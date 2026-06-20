@@ -106,7 +106,7 @@ where
         }
 
         match last.checked_add(self.cfg.linger) {
-            None => Deadline::DueNow, // overflow => due immediately (per your policy)
+            None => Deadline::DueNow, // Instant overflow: treat as due immediately
             Some(deadline) => {
                 if now >= deadline {
                     Deadline::DueNow

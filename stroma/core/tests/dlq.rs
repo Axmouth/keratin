@@ -425,8 +425,8 @@ async fn declare_settings_survive_restart() {
 async fn pending_dlq_blocks_msg_truncation_watermark() {
     // Weak test: it can race with the background DLQ-copy task. The strong
     // claim is the *invariant*: at no observable moment is a pending-DLQ offset
-    // below the truncation watermark. A real stall-test needs a hook we agreed
-    // not to add yet.
+    // below the truncation watermark. A deterministic stall-test would need a
+    // dedicated test hook that does not exist yet.
     let (st, _d) = open_test_stroma().await;
     declare_dlq_custom(&st, "src", 0, None, "dlq", 0, None, 0).await;
 
