@@ -101,3 +101,27 @@ becomes a redundant safety net.
   around open/close (not recovery) with care, or make recovery not re-enter
   queue_handle. The ticket redesign + this lifecycle lock are complementary:
   lifecycle lock kills the open/close race; the ticket kills the orphan-pin leak.
+
+## Experiments tried (2026-06-20) - captured before reverting for a clean trace
+All UNCOMMITTED and reverted to baseline for clean observation. None fully greened
+the mouse test; the failure stayed "Keratin already open" with a flock apparently
+held on the SAME inode for >1s (a lingering holder I could not derive by reasoning -
+hence the decision to trace). Keep these ideas; they are likely part of the final fix:
+  1. Event-driven orphan cleanup: a Stroma-level `queue_retired: Arc<Notify>` fired
+     on destroy + evict; the periodic_snapshot loop pre-arms `queue_retired.notified()`
+     and `select!`s on it (+ background_tasks cancel + ticker), and a
+     `handle_is_current_incarnation(qh)` check (compare the registry slot's live handle
+     msg_log Arc::ptr_eq vs qh's) so an orphaned snapshot task exits promptly instead
+     of pinning logs. (Replaces a coarse 10s poll - event-driven, no hardcoded wait.)
+  2. shutdown-on-build-failure: in queue_handle's build closure, if event_log_init or
+     recovery fails AFTER msg_log opened, `shutdown().await` the opened log(s) (release
+     the flock synchronously) before returning Err, instead of a lazy Drop. Also moved
+     periodic_snapshot to AFTER recovery so a failed build never spawns an orphan
+     snapshot task.
+  3. Bounded Stroma-level retry: queue_handle retries the build on transient error
+     (re-acquire slot, short sleep), bounded. (Made the test SLOW (8-16s) without
+     greening it - which is itself a clue: the holder persists >1s.)
+  4. (earlier, reverted) Dekker begin_init/wait_init_done serialization (not airtight -
+     registry CAS is ArcSwap Acquire/AcqRel, not SeqCst) and queue_handle self-clean.
+LIKELY FINAL FIX: per-key lifecycle mutex (serialize build/destroy/evict open+close)
++ keep (1) and (2). But TRACE FIRST to confirm the actual >1s holder before building it.
