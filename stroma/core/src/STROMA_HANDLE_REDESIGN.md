@@ -186,7 +186,7 @@ Arc<tokio::sync::Mutex<()>> heap alloc (~55-80B; tokio Mutex wraps a batch-semap
 not a bare futex) + the key's Box<str> topic/group heap (~30B) ~= ~150-200B/entry ->
 ~150-200MB at 1M DISTINCT keys. Lookup speed is NOT a concern: hashbrown/DashMap stays
 O(1) as it grows (resizes to keep load factor); size costs memory, not speed, and
-DashMap contention is about concurrent-access spread across shards, not entry count.
+DashMap contention is about concurrent-access spread across shards, not entry count. (Shard contention is set by the shard count (~4x ncpu) + the hash spread of keys ACCESSED CONCURRENTLY, not by total stored entries; 1M entries just means more entries per shard, still O(1) and zero added contention. And lifecycle_locks is touched only on COLD paths - build/destroy/evict - never hot publish/consume - so access frequency is low regardless.)
 The map only grows per DISTINCT (topic,part,group) EVER seen - recreating the same
 partitions reuses keys (bounded). So the only real exposure is unbounded distinct-key
 churn (e.g. ever-growing unique topic names); for normal workloads it is trivial. Prune
