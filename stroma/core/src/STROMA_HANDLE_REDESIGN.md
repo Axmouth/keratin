@@ -76,3 +76,28 @@ hold a ticket/Weak, resolve per tick, and exit when the incarnation is gone. Tha
 land as an early, mostly-isolated step of the redesign (the snapshot task already
 takes qh.clone(); give it a weak/ticket + a per-tick resolve), and it removes the
 permanent leak even before the full ticket conversion of the op methods.
+
+## Crux (2026-06-20, user): no in-memory serialization of the Keratin lifecycle
+The persistent "Keratin already open" is NOT fixed by the ticket redesign (that fixes
+the orphan-PINNING leak) nor by retry/event-driven cleanup alone. Root cause: the
+filesystem flock on `<dir>/.keratin.lock` is the ONLY coordination between Keratin
+opens, and it is advisory + fail-fast - it cannot WAIT for or coordinate with an
+in-flight open/close. The in-memory registry (slot + get_or_try_init + tombstone)
+serializes the HANDLE but NOT the underlying Keratin open/close lifecycle across the
+destroy -> recreate -> failed-build-retry boundary. So a build's `open` collides with
+a prior incarnation's not-yet-finished release and just errors.
+
+FIX (targeted, likely smaller than the full ticket refactor; do this for the bug):
+Add an explicit per-partition-key LIFECYCLE MUTEX in Stroma (e.g.
+DashMap<Key, Arc<tokio::sync::Mutex<()>>>). Acquire it around the operations that
+open/close a partition's Keratin: queue_handle's BUILD (cold path only - the
+materialized fast path skips it), destroy_partition, and evict. With it held, the
+prior incarnation's Keratin is fully shut down + unlocked (and the dir renamed)
+before the next build opens -> no flock collision, deterministically. The flock
+becomes a redundant safety net.
+  Watch out: avoid reentrancy deadlock - the build path (recover_one_log_with_handle,
+  periodic_snapshot -> write_snapshots_for_partition -> queue_handle) must not
+  re-acquire the same key's lifecycle mutex while held. Either hold the lock only
+  around open/close (not recovery) with care, or make recovery not re-enter
+  queue_handle. The ticket redesign + this lifecycle lock are complementary:
+  lifecycle lock kills the open/close race; the ticket kills the orphan-pin leak.
