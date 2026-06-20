@@ -147,3 +147,42 @@ and evict acquire it around the open/close, so no two ever race on the same dir.
     retrying). Full stroma-core suite green.
 This was the targeted fix; the broader ticket/re-resolve redesign (orphan-pin leak) and
 the per-key lifecycle-mutex unbounded-growth pruning remain as separate future items.
+
+================================================================================
+## RESUME HERE (post-compaction, 2026-06-20): start the ticket/re-resolve redesign
+
+CURRENT STATE (all committed, tree green):
+  - The concurrent destroy/create race is FIXED (keratin 7dd6c18) via the per-key
+    lifecycle mutex (Stroma.lifecycle_locks, cold paths only: queue_handle build /
+    destroy_partition / evict; hot path untouched; flock kept as safety net).
+  - Tests: mouse 10/10 + bear 3/3 deterministic; full keratin workspace 285 passed
+    (exit 0); fibril builds across the boundary. fibril docs updated (048caf1).
+
+NEXT TASK = the ticket/re-resolve redesign (the SEPARATE, lower-urgency architectural
+item: handles must not PIN logs; the lifecycle mutex did NOT address this, it fixed
+the open/close race). Plan + design are in the sections above ("PROPER FIX",
+"## Crux", "## Experiments tried"). Summary to execute:
+  - Split QueueHandle (state.rs:978, Clone bundle-of-Arcs, ~84 refs there + ~31 in
+    stroma.rs + replication.rs + tests/roles.rs) into a TICKET {Arc<ArcSwap<Registry>>
+    + key + Weak<Inner>} and an Inner that lives ONLY in the registry slot.
+  - Resolve per op: `resolve() -> Option<Inner>` (Weak upgrade, ergonomic) AND a
+    `with(|inner| ...)` closure form. Ops re-resolve; a stale ticket -> current
+    incarnation or "gone", never pins dead logs.
+  - Contained to stroma-core (broker/fibril/ganglion never touch QueueHandle).
+  - NO clean partial-compile checkpoint for the struct split -> needs one focused pass
+    with budget headroom. Optional beachhead first: QueueHandle(Arc<QueueHandleInner>)
+    + Deref (pure indirection, compiles green) to de-risk, then the resolve conversion.
+
+PERFORMANCE (must verify; user flagged - expected fine but check):
+  - Per-resolve cost = one ArcSwap::load (lock-free) + one hashbrown lookup. Cheap, but
+    "per op" on hot paths (append/ack) adds up.
+  - MITIGATION: resolve ONCE per operation/batch scope (resolve at the top of an
+    append/ack batch, reuse Inner within it) - not per record.
+  - BENCH: append + ack throughput before/after the conversion; confirm no regression.
+
+FUTURE ITEM (low priority, user-assessed trivial): lifecycle_locks map pruning. Memory
+is a non-issue (even ~1M partition keys is on the order of ~10MB of tiny mutexes). The
+only conceivable concern is map slowdown under heavy churn, but with well-spread key
+hashing and similar access concurrency it likely doesn't matter. Prune a key's entry on
+destroy when no waiter holds it, IF it ever shows up. Not urgent.
+================================================================================
