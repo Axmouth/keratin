@@ -15,7 +15,6 @@ use serde::Serialize;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::StromaError;
 use crate::event::{
@@ -28,8 +27,6 @@ use crate::metrics::{
 };
 use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
-pub type ClientId = Uuid;
-pub type ConsumerId = u64;
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -149,40 +146,6 @@ impl From<QueueHandleError> for StromaError {
                 StromaError::Internal("snapshot not created".to_string())
             }
             QueueHandleError::SnapshotLoadFailed(reason) => StromaError::Internal(reason),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
-pub enum ExpiryDeadlineOutcome {
-    Updated(UnixMillis),
-    NoChange,
-}
-
-impl ExpiryDeadlineOutcome {
-    pub fn is_updated(&self) -> bool {
-        matches!(self, ExpiryDeadlineOutcome::Updated(_))
-    }
-
-    pub fn deadline(&self) -> Option<UnixMillis> {
-        match self {
-            ExpiryDeadlineOutcome::Updated(ts) => Some(*ts),
-            ExpiryDeadlineOutcome::NoChange => None,
-        }
-    }
-
-    pub fn min(a: Self, b: Self) -> Self {
-        match (a, b) {
-            (ExpiryDeadlineOutcome::Updated(ts_a), ExpiryDeadlineOutcome::Updated(ts_b)) => {
-                ExpiryDeadlineOutcome::Updated(ts_a.min(ts_b))
-            }
-            (ExpiryDeadlineOutcome::Updated(ts), ExpiryDeadlineOutcome::NoChange)
-            | (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::Updated(ts)) => {
-                ExpiryDeadlineOutcome::Updated(ts)
-            }
-            (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::NoChange) => {
-                ExpiryDeadlineOutcome::NoChange
-            }
         }
     }
 }
@@ -982,8 +945,6 @@ pub struct QueueSharedBundle {
 pub struct QueueHandleInner {
     command_sender: CommandSender,
 
-    pub(crate) task_group: Arc<TaskGroup>,
-
     topic: String,
     partition: u32,
     group: Option<String>,
@@ -1178,7 +1139,6 @@ impl QueueHandleInner {
             owner_operations_drained,
             owner_operations_paused,
             owner_operations_resumed,
-            task_group,
             global_dlq,
             metrics,
             deadline_waker,
@@ -2686,35 +2646,6 @@ impl QueueHandleInner {
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InflightEntry {
-    pub deadline_ts: UnixMillis,
-    pub epoch: u32, // optional; ok to keep at 0 for now
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExpiryItem {
-    deadline_rev: Reverse<UnixMillis>,
-    offset: Offset,
-    epoch: u32,
-}
-
-impl Ord for ExpiryItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap is max-heap; we want min-deadline => compare Reverse(deadline) first.
-        self.deadline_rev
-            .cmp(&other.deadline_rev)
-            // tie-breakers to make ordering total/deterministic
-            .then_with(|| self.offset.cmp(&other.offset))
-            .then_with(|| self.epoch.cmp(&other.epoch))
-    }
-}
-impl PartialOrd for ExpiryItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum AckOutcome {
     NoopAlreadyAcked,
     Applied, // advanced frontier or set bit
@@ -3478,6 +3409,8 @@ impl QueueInternalState {
     /// Returns true iff this offset ever entered the delivery lifecycle
     /// (i.e. enqueue or inflight).
     /// Terminal-only operations (ack/reject without enqueue) do NOT create history.
+    /// Only used as a test probe for the ready/inflight/retries history semantics.
+    #[cfg(test)]
     #[inline]
     fn has_history(&self, offset: Offset) -> bool {
         self.ready.contains(&offset)
@@ -3486,17 +3419,18 @@ impl QueueInternalState {
     }
 
     /// Walk heap until we find a valid inflight entry, rebuild if heap fully stale.
-    fn recompute_hint_if_needed(&mut self) -> ExpiryDeadlineOutcome {
+    /// Keeps `min_deadline_hint` in sync with the live inflight set.
+    fn recompute_hint_if_needed(&mut self) {
         if self.inflight.is_empty() {
             self.min_deadline_hint = None;
-            return ExpiryDeadlineOutcome::NoChange;
+            return;
         }
 
         while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
             match self.inflight.get(&off).copied() {
                 Some(cur) if cur == ts => {
                     self.min_deadline_hint = Some(ts);
-                    return ExpiryDeadlineOutcome::Updated(ts);
+                    return;
                 }
                 _ => {
                     self.expiry_heap.pop(); // stale
@@ -3511,46 +3445,9 @@ impl QueueInternalState {
             self.expiry_heap.push((Reverse(deadline), off));
             min = Some(min.map_or(deadline, |m| m.min(deadline)));
         }
-        let new_min = if self.min_deadline_hint > min {
-            if let Some(m) = min {
-                ExpiryDeadlineOutcome::Updated(m)
-            } else {
-                ExpiryDeadlineOutcome::NoChange
-            }
-        } else {
-            ExpiryDeadlineOutcome::NoChange
-        };
-        self.min_deadline_hint = min;
-        new_min
-    }
-
-    fn recompute_hint_full(&mut self) {
-        while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
-            match self.inflight.get(&off).copied() {
-                Some(cur) if cur == ts => {
-                    self.min_deadline_hint = Some(ts);
-                    return;
-                }
-                _ => {
-                    self.expiry_heap.pop(); // stale
-                }
-            }
-        }
-
-        if self.inflight.is_empty() {
-            self.min_deadline_hint = None;
-            return;
-        }
-
-        // rebuild heap from inflight
-        self.expiry_heap.clear();
-        let mut min = None;
-        for (&off, &deadline) in self.inflight.iter() {
-            self.expiry_heap.push((Reverse(deadline), off));
-            min = Some(min.map_or(deadline, |m: u64| m.min(deadline)));
-        }
         self.min_deadline_hint = min;
     }
+
 
     // ---------------- Delivery helper ----------------
 

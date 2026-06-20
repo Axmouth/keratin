@@ -3,6 +3,12 @@ name = "stroma-core"
 version = "0.1.0"
 edition = "2024"
 
+# tokio_unstable is an opt-in tokio flag (set via RUSTFLAGS="--cfg tokio_unstable")
+# that enables named tasks for tokio-console. Register it so the conditional
+# compilation does not trip the unexpected-cfg lint.
+[lints.rust]
+unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
+
 [dependencies]
 keratin-log ={ path = "../../keratin-log" }
 stroma-common = { path = "../common" }

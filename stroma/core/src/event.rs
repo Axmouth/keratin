@@ -2,8 +2,6 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::ConsumerId;
-
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -48,6 +46,13 @@ pub struct AckEventMeta {
     pub off: Offset,
 }
 
+// Reserved vocabulary for the client-REQUESTED nack action (what the consumer
+// asks to happen), as opposed to NackOutcome which is the RESULT the queue
+// computed. The live event encoding currently carries the simpler
+// (requeue, not_before) pair on NackEventMeta; NackType is kept for expanding
+// nack semantics with more explicit action variants (discard vs retry-in-place
+// vs requeue, now vs later) without overloading two flags.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum NackType {
     Discard,
@@ -57,6 +62,7 @@ pub enum NackType {
     RequeueLater { not_before: UnixMillis },
 }
 
+#[allow(dead_code)]
 impl NackType {
     pub fn write_bytes(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
         match self {
@@ -81,7 +87,7 @@ impl NackType {
         Ok(())
     }
 
-    pub fn read_from_bytes(&self, input: &[u8]) -> Result<Self, io::Error> {
+    pub fn read_from_bytes(input: &[u8]) -> Result<Self, io::Error> {
         let mut i = 0;
 
         let tag = rd_u8(input, &mut i)?;
@@ -323,16 +329,6 @@ fn rd_u64(b: &[u8], i: &mut usize) -> io::Result<u64> {
     *i += 8;
     Ok(v)
 }
-fn rd_str(b: &[u8], i: &mut usize) -> io::Result<String> {
-    let len = rd_u16(b, i)? as usize;
-    if *i + len > b.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "str"));
-    }
-    let s = std::str::from_utf8(&b[*i..*i + len])
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8"))?;
-    *i += len;
-    Ok(s.to_string())
-}
 fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
     let len = rd_u16(b, i)? as usize;
     if *i + len > b.len() {
@@ -523,7 +519,7 @@ impl StromaEvent {
                             put_u8(&mut out, 2);
                             put_str(&mut out, tp)?;
                             put_u32(&mut out, *part);
-                            put_str(&mut out, &group.as_deref().unwrap_or_default());
+                            put_str(&mut out, group.as_deref().unwrap_or_default())?;
                         }
                     }
                 }

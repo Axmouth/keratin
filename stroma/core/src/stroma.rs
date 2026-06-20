@@ -727,10 +727,6 @@ impl EvictionState {
         }
     }
 
-    pub fn start_eviction(&self) {
-        self.evicting.store(true, Ordering::Release);
-    }
-
     pub fn finish_eviction(&self) {
         self.evicting.store(false, Ordering::Release);
         self.done.notify_waiters();
@@ -742,37 +738,6 @@ impl EvictionState {
 }
 
 impl QueueSlot {
-    pub fn new() -> Self {
-        Self {
-            handle: OnceCell::new(),
-            exists_on_disk: false,
-            eviction_state: Arc::new(EvictionState::new()),
-        }
-    }
-
-    pub fn new_existing() -> Self {
-        Self {
-            handle: OnceCell::new(),
-            exists_on_disk: true,
-            eviction_state: Arc::new(EvictionState::new()),
-        }
-    }
-
-    pub fn wait_until_ready(&self) -> impl Future<Output = Arc<QueueHandleInner>> + '_ {
-        async {
-            loop {
-                if let Some(handle) = self.handle.get() {
-                    return handle.clone();
-                }
-                self.eviction_state.done.notified().await;
-            }
-        }
-    }
-
-    pub fn start_eviction(&self) {
-        self.eviction_state.start_eviction();
-    }
-
     fn is_evicting(&self) -> bool {
         self.eviction_state.is_evicting()
     }
@@ -856,6 +821,14 @@ pub struct Stroma {
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg_msg: KeratinConfig,
     pub(crate) keratin_cfg_event: KeratinConfig,
+    // FIXME: snapshot cadence. snap_cfg.every_events is not wired yet - the gate
+    // in periodic_snapshot_step is commented out, so snapshots currently fire on
+    // every periodic tick when the partition is dirty. The plan is to make
+    // every_events an ADDITIONAL cadence knob alongside the time/dirty trigger (an
+    // events-since-last-snapshot threshold), not a replacement. The
+    // last_snapshot_event_offset tracking needed to honor it is already maintained,
+    // so wiring is low-risk.
+    #[allow(dead_code)]
     pub(crate) snap_cfg: SnapshotConfig,
     pub(crate) global_store: Arc<OnceCell<Arc<GlobalStore>>>,
 
@@ -879,15 +852,9 @@ pub struct Stroma {
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
 
-    pub(crate) msg_count: Arc<AtomicU64>,
-
-    pub(crate) event_count: Arc<AtomicU64>,
-
     pub(crate) metrics: Arc<StromaMetrics>,
     pub(crate) replication_cache: Option<Arc<Mutex<RecentReplicationCache>>>,
 
-    earliest_pending_deadline_sender: tokio::sync::watch::Sender<Option<UnixMillis>>,
-    earliest_pending_deadline_receiver: tokio::sync::watch::Receiver<Option<UnixMillis>>,
     pub(crate) deadline_waker: Arc<Notify>,
     initial_recovery_complete: Arc<AtomicBool>,
 
@@ -939,9 +906,6 @@ impl Stroma {
         let keratin_cfg_msg = keratin_cfg.message_log;
         let keratin_cfg_event = keratin_cfg.event_log;
 
-        let (earliest_pending_deadline_sender, earliest_pending_deadline_receiver) =
-            tokio::sync::watch::channel(None);
-
         let st = Self {
             start_time,
             root,
@@ -953,16 +917,12 @@ impl Stroma {
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
             global_dlq: Arc::new(RwLock::new(None)),
-            msg_count: Arc::new(AtomicU64::new(0)),
-            event_count: Arc::new(AtomicU64::new(0)),
             metrics: metrics.clone(),
             replication_cache: options.replication_cache.is_enabled().then(|| {
                 Arc::new(Mutex::new(RecentReplicationCache::new(
                     options.replication_cache.max_bytes,
                 )))
             }),
-            earliest_pending_deadline_sender,
-            earliest_pending_deadline_receiver,
             deadline_waker: Arc::new(Notify::new()),
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
             quarantined: Arc::new(DashMap::new()),
@@ -1886,6 +1846,10 @@ impl Stroma {
         Ok(())
     }
 
+    // Companion to recover_all (eager startup recovery, not yet wired): once the
+    // whole disk is recovered, flips every materialized handle to recovery-done.
+    // Has a unit test, so it is compiled in but not yet called on any prod path.
+    #[allow(dead_code)]
     fn mark_all_queue_recoveries_complete(&self) {
         let current = self.queue_handles.load();
 
@@ -1908,31 +1872,6 @@ impl Stroma {
     }
 
     // ---------------- Event apply rules ----------------
-
-    fn queue_handle_sync(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> std::io::Result<QueueHandle> {
-        let group = normalize_group(group);
-        let current = self.queue_handles.load();
-        let key = (tp.into(), part, group.map(|s| s.into()));
-        let cell = current.get(&key).ok_or_else(|| {
-            io::Error::new(
-                io::ErrorKind::NotFound,
-                format!(
-                    "queue not found for event: tp={} part={} group={:?}",
-                    tp, part, group
-                ),
-            )
-        })?;
-        let inner = cell
-            .handle
-            .get()
-            .ok_or_else(|| io::Error::other("queue handle not initialized"))?;
-        Ok(self.ticket_for(tp, part, group, inner))
-    }
 
     fn enqueue_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> std::io::Result<()> {
         tracing::debug!("Applying event: {ev:?}");
@@ -2513,15 +2452,6 @@ impl Stroma {
         Ok(q.next_deliverable(from, upper).await)
     }
 
-    fn signal_earlier_deadline(&self, deadline_ms: UnixMillis) {
-        self.earliest_pending_deadline_sender
-            .send_replace(Some(deadline_ms));
-    }
-
-    async fn wait_for_earlier_deadline(&mut self) -> Result<Option<UnixMillis>> {
-        Ok(*self.earliest_pending_deadline_receiver.borrow_and_update())
-    }
-
     pub async fn collect_expired(
         &self,
         now: UnixMillis,
@@ -2855,7 +2785,11 @@ impl Stroma {
 
     // ---------------- Recovery ----------------
 
-    // TODO: Reuse once we define opt in eager queues to load early, vs ones that are loaded on demand
+    // Eager whole-disk recovery at boot. Recovery is lazy by default (per
+    // queue_handle on first use), so this is unused until an opt-in config wires
+    // eager startup recovery. Kept because that is the original design and the
+    // only way recovery.on_mismatch=refuse becomes a literal refuse-to-start.
+    #[allow(dead_code)]
     async fn recover_all(&self) -> Result<()> {
         let partitions = self.discover_partitions()?; // decoded names
         let max_parallel = std::thread::available_parallelism()
@@ -2897,6 +2831,8 @@ impl Stroma {
         Ok(())
     }
 
+    // Companion to recover_all (eager startup recovery, not yet wired).
+    #[allow(dead_code)]
     async fn recover_one_log(
         &self,
         tp: &str,
@@ -4567,29 +4503,6 @@ pub(crate) fn replicated_append_outcome_allows_state_apply(outcome: &ReplicatedA
             | ReplicatedAppendOutcome::AppliedSuffix { .. }
             | ReplicatedAppendOutcome::AlreadyPresent { .. }
     )
-}
-
-fn collect_parts(
-    group: Option<String>,
-    tp_enc: String,
-    tp_dir: &Path,
-    out: &mut Vec<(Option<String>, String, u32)>,
-) -> Result<()> {
-    for part_ent in fs::read_dir(tp_dir).map_err(io_err)? {
-        let part_ent = part_ent.map_err(io_err)?;
-        if !part_ent.file_type().map_err(io_err)?.is_dir() {
-            continue;
-        }
-
-        let part_str = part_ent.file_name().to_string_lossy().to_string();
-        let part = part_str
-            .parse::<u32>()
-            .map_err(|_| StromaError::Decode(format!("bad partition dir: {part_str}")))?;
-
-        out.push((group.clone(), tp_enc.clone(), part));
-    }
-
-    Ok(())
 }
 
 fn collect_parts_decoded(
