@@ -1416,10 +1416,6 @@ impl Stroma {
                     let inner =
                         QueueHandleInner::init(tp.into(), part, group.map(|s| s.into()), bundle);
 
-                    // The snapshot task gets a TICKET (Weak), so it never pins
-                    // this incarnation once the slot drops it.
-                    self.periodic_snapshot(self.ticket_for(tp, part, group, &inner));
-
                     if slot.exists_on_disk {
                         self.recover_one_log_with_handle(
                             &self.ticket_for(tp, part, group, &inner),
@@ -1432,6 +1428,14 @@ impl Stroma {
                     }
 
                     inner.mark_recovery_complete();
+
+                    // Spawn the snapshot task only AFTER recovery completes. The
+                    // task gets a TICKET (Weak), so it never pins this incarnation
+                    // once the slot drops it. Spawning post-recovery also means a
+                    // failed build (the `?` above) never leaves an orphan task
+                    // parked in wait_recovery_complete on a notify that will never
+                    // fire (which would hold the incarnation alive forever).
+                    self.periodic_snapshot(self.ticket_for(tp, part, group, &inner));
 
                     Ok::<_, StromaError>(inner)
                 })
