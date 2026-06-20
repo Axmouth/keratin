@@ -12,6 +12,7 @@ use std::{
 };
 
 use arc_swap::ArcSwap;
+use dashmap::DashMap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
     KeratinAppendCompletion, KeratinConfig, Message, ReplicatedAppendOutcome,
@@ -20,7 +21,7 @@ use keratin_log::{
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
 use tokio::{
-    sync::{Notify, OnceCell, RwLock, Semaphore},
+    sync::{Mutex as AsyncMutex, Notify, OnceCell, RwLock, Semaphore},
     task::JoinSet,
 };
 use tokio_util::sync::CancellationToken;
@@ -805,6 +806,17 @@ pub struct Stroma {
     // Materialized queue state
     queue_handles: Arc<ArcSwap<Registry>>,
 
+    /// Per-partition-key lifecycle lock. Serializes the operations that OPEN or
+    /// CLOSE a partition's Keratin logs - building a handle (queue_handle cold
+    /// path), destroy_partition, and evict - so two never race on the same dir.
+    /// Without it, a build whose slot was retired mid-flight (or two churning
+    /// builds) both `create_dir_all` + open the same path and collide on the
+    /// `.keratin.lock` flock ("Keratin already open"). The flock stays as a
+    /// redundant safety net; this is the real in-process serialization. Keyed by
+    /// the stable partition key (survives slot churn); entries are tiny and the
+    /// partition set is bounded.
+    lifecycle_locks: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), Arc<AsyncMutex<()>>>>,
+
     // TODO: Consider using parking lot
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
@@ -869,6 +881,7 @@ impl Stroma {
             global_store: Arc::new(OnceCell::new()),
             task_group: Arc::new(TaskGroup::new()),
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
+            lifecycle_locks: Arc::new(DashMap::new()),
             global_dlq: Arc::new(RwLock::new(None)),
             msg_count: Arc::new(AtomicU64::new(0)),
             event_count: Arc::new(AtomicU64::new(0)),
@@ -1249,6 +1262,27 @@ impl Stroma {
         self.deadline_waker.clone()
     }
 
+    /// Acquire the per-partition lifecycle lock (see `lifecycle_locks`). Held
+    /// around operations that open/close a partition's Keratin logs so they never
+    /// race on the same dir. NOTE: do not call anything that re-acquires this lock
+    /// for the same key while holding it (e.g. evict's pre-swap snapshot calls
+    /// queue_handle, so it must take its snapshot BEFORE acquiring this lock).
+    async fn lock_partition_lifecycle(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> tokio::sync::OwnedMutexGuard<()> {
+        let group = normalize_group(group);
+        let key = (Box::<str>::from(tp), part, group.map(Box::<str>::from));
+        let lock = self
+            .lifecycle_locks
+            .entry(key)
+            .or_insert_with(|| Arc::new(AsyncMutex::new(())))
+            .clone();
+        lock.lock_owned().await
+    }
+
     pub async fn queue_handle(
         &self,
         tp: &str,
@@ -1319,7 +1353,19 @@ impl Stroma {
             // from under us, so we must re-acquire and open a fresh empty dir
             // rather than the tree being deleted.
             slot.wait_until_not_evicting().await;
+
+            // Serialize the BUILD against any concurrent destroy/evict (and other
+            // builds) of this partition, so we never open/recreate its dir while
+            // another incarnation is opening or tearing it down. Acquired after the
+            // eviction wait (so a destroy in progress finishes first) and held
+            // through the open + recovery below.
+            let _lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
+
+            // Re-validate AFTER taking the lock: a destroy may have retired our
+            // slot while we waited for it. A stale slot means the dir was moved out
+            // from under us, so re-acquire a fresh one rather than building here.
             if !self.slot_is_current(tp, part, group, &slot) {
+                drop(_lifecycle);
                 tokio::task::yield_now().await;
                 continue;
             }
@@ -1426,6 +1472,11 @@ impl Stroma {
             Self::periodic_snapshot_step(self, &qh).await?;
         }
 
+        // Serialize the swap + shutdown against concurrent build/destroy of this
+        // partition. Acquired AFTER the pre-swap snapshot above, which calls
+        // queue_handle (re-acquires this same lock) - taking it earlier deadlocks.
+        let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+
         // Build replacement slot, marked evicting.
         let new_eviction_state = Arc::new(EvictionState {
             evicting: AtomicBool::new(true),
@@ -1496,6 +1547,10 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<DestroyOutcome> {
         let group = normalize_group(group);
+
+        // Serialize against concurrent build/evict of this partition so the
+        // shutdown + rename below cannot overlap an in-flight open of the same dir.
+        let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
 
         // 1. Install a destroying tombstone (evicting) so concurrent materialize
         //    parks instead of reopening the dir. Capture the slot we displaced.
@@ -6198,12 +6253,57 @@ mod tests {
         shutdown_stroma("destroy_and_materialize_race_never_corrupts_or_leaks", &stroma).await;
     }
 
-    // Adversarial: many concurrent destroyers and materializers of the same
-    // partition must not panic, deadlock, or leave the engine wedged.
+    // One trip-wire, two scales (mouse / bear): a storm of concurrent destroyers,
+    // materializers, and queue_handle "reader" victims on the same partition. The
+    // readers must NEVER spuriously fail - queue_handle lazily (re)creates over a
+    // fresh dir, so a destroy that retires the dir mid-build must be ridden out,
+    // not surfaced as an error - and the engine must stay consistent and never
+    // wedge, no matter how intense the storm.
+    async fn destroy_materialize_storm(stroma: Arc<Stroma>, rounds: usize, tasks: usize) {
+        for round in 0..rounds {
+            let mut joins = Vec::new();
+            for i in 0..tasks {
+                let s = stroma.clone();
+                joins.push(tokio::spawn(async move {
+                    match i % 3 {
+                        0 => {
+                            let _ = s.destroy_partition("orders", 0, None).await;
+                        }
+                        1 => {
+                            let _ = s.materialize("orders", 0, None).await;
+                        }
+                        _ => {
+                            let qh = s.queue_handle("orders", 0, None).await.unwrap_or_else(|e| {
+                                panic!(
+                                    "round {round}: queue_handle raced a destroy and failed: {e:?}"
+                                )
+                            });
+                            assert!(
+                                qh.recovery_complete(),
+                                "round {round}: handle not recovered"
+                            );
+                        }
+                    }
+                }));
+            }
+            for join in joins {
+                join.await.unwrap();
+            }
+            assert!(
+                stroma.indexed_queue_count() <= 1,
+                "round {round}: duplicate slot"
+            );
+        }
+
+        // The engine is still usable after the storm.
+        let qh = stroma.queue_handle("orders", 0, None).await.unwrap();
+        assert!(qh.recovery_complete());
+    }
+
+    // mouse: small + fast, the everyday trip-wire.
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn concurrent_destroyers_and_materializers_stay_consistent() {
-        let dir = test_dir!("destroy_materialize_storm");
-
+        let dir = test_dir!("destroy_materialize_storm_mouse");
         let stroma = Arc::new(
             Stroma::open(
                 &dir.root,
@@ -6213,33 +6313,25 @@ mod tests {
             .await
             .unwrap(),
         );
+        destroy_materialize_storm(stroma.clone(), 8, 24).await;
+        shutdown_stroma("destroy_materialize_storm_mouse", &stroma).await;
+    }
 
-        let mut joins = Vec::new();
-        for i in 0..32 {
-            let s = stroma.clone();
-            joins.push(tokio::spawn(async move {
-                if i % 2 == 0 {
-                    let _ = s.destroy_partition("orders", 0, None).await;
-                } else {
-                    let _ = s.materialize("orders", 0, None).await;
-                }
-            }));
-        }
-        for join in joins {
-            join.await.unwrap();
-        }
-
-        // The engine is still usable: a final materialize succeeds and yields a
-        // working handle.
-        let qh = test_step(
-            "storm/final-materialize",
-            stroma.queue_handle("orders", 0, None),
-        )
-        .await
-        .unwrap();
-        assert!(qh.recovery_complete());
-
-        shutdown_stroma("concurrent_destroyers_and_materializers_stay_consistent", &stroma).await;
+    // bear: heavy, exposes deadlocks/leaks under pathological concurrency.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+    async fn concurrent_destroyers_and_materializers_stay_consistent_bear() {
+        let dir = test_dir!("destroy_materialize_storm_bear");
+        let stroma = Arc::new(
+            Stroma::open(
+                &dir.root,
+                test_keratin_config(),
+                SnapshotConfig { every_events: 1 },
+            )
+            .await
+            .unwrap(),
+        );
+        destroy_materialize_storm(stroma.clone(), 40, 96).await;
+        shutdown_stroma("destroy_materialize_storm_bear", &stroma).await;
     }
 
     #[tokio::test]

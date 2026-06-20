@@ -125,3 +125,25 @@ hence the decision to trace). Keep these ideas; they are likely part of the fina
      registry CAS is ArcSwap Acquire/AcqRel, not SeqCst) and queue_handle self-clean.
 LIKELY FINAL FIX: per-key lifecycle mutex (serialize build/destroy/evict open+close)
 + keep (1) and (2). But TRACE FIRST to confirm the actual >1s holder before building it.
+
+## RESOLVED (2026-06-20): per-key lifecycle mutex
+Tracing (eprintln on Keratin open/lock/fail/unlock/drop + the destroy rename) finally
+showed the mechanism: after a destroy renames the dir, TWO builds run concurrently and
+both `create_dir_all` + open the SAME path - one locks the fresh inode, the other hits
+"Keratin already open". `msg_log_init` recreates+opens the dir regardless of slot state,
+so a build whose slot was retired mid-flight (or a churning second build) collides.
+i.e. exactly the missing in-memory serialization.
+
+FIX (landed): a per-partition-key lifecycle mutex (`Stroma.lifecycle_locks:
+DashMap<key, Arc<tokio::Mutex<()>>>`). queue_handle's BUILD slow-path, destroy_partition,
+and evict acquire it around the open/close, so no two ever race on the same dir. Notes:
+  - HOT PATH UNTOUCHED: queue_handle's fast path (materialized handle) returns before
+    taking the lock; only the cold build/destroy/evict paths lock.
+  - Reentrancy avoided: recover_one_log_with_handle does not re-enter queue_handle;
+    evict takes the lock AFTER its pre-swap snapshot (that snapshot calls queue_handle).
+  - The flock stays as a redundant safety net.
+  - Result: mouse 10/10 and bear 3/3 deterministically green (the bear DEADLOCK is gone
+    too - it was a cascade of the same concurrent-open chaos); mouse ~0.2s (no slow
+    retrying). Full stroma-core suite green.
+This was the targeted fix; the broader ticket/re-resolve redesign (orphan-pin leak) and
+the per-key lifecycle-mutex unbounded-growth pruning remain as separate future items.
