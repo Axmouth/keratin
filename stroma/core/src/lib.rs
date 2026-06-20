@@ -1,6 +1,7 @@
 mod event;
 mod global;
 mod metrics;
+mod replication;
 #[allow(dead_code)]
 mod replication_cache;
 mod state;
