@@ -1,5 +1,4 @@
 use keratin_log::*;
-use std::path::PathBuf;
 
 fn main() {
     let temp_dir = test_dir!("keratin-test");

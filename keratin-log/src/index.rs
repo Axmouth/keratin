@@ -6,16 +6,8 @@ pub const IDX_VERSION: u16 = 1;
 pub const IDX_HEADER_LEN: u32 = 8 + 2 + 2 + 4 + 8 + 8 + 2 + 2 + 32 + 4;
 pub const IDX_ENTRY_LEN: usize = 16;
 
-#[derive(Debug, Clone, Copy)]
-pub struct IdxEntry {
-    pub rel_offset: u32,
-    pub file_pos: u64,
-}
-
 pub struct Index {
-    pub base_offset: u64,
     file: File,
-    pub last_rel_offset: Option<u32>,
 }
 
 impl Index {
@@ -44,11 +36,7 @@ impl Index {
         file.seek(SeekFrom::Start(end))?;
         file.sync_all()?;
 
-        Ok(Self {
-            base_offset,
-            file,
-            last_rel_offset: None,
-        })
+        Ok(Self { file })
     }
 
     pub fn open(mut file: File, expected_base: u64) -> io::Result<Self> {
@@ -77,30 +65,7 @@ impl Index {
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
 
-        Ok(Self {
-            base_offset: base,
-            file,
-            last_rel_offset: None,
-        })
-    }
-
-    pub fn append_entry(&mut self, e: IdxEntry) -> io::Result<()> {
-        if let Some(last) = self.last_rel_offset
-            && e.rel_offset < last
-        {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "idx rel_offset not monotonic",
-            ));
-        }
-        let mut buf = [0u8; 16];
-        buf[0..4].copy_from_slice(&e.rel_offset.to_be_bytes());
-        buf[4..8].copy_from_slice(&0u32.to_be_bytes()); // reserved0
-        buf[8..16].copy_from_slice(&e.file_pos.to_be_bytes());
-        self.file.seek(SeekFrom::End(0))?;
-        self.file.write_all(&buf)?;
-        self.last_rel_offset = Some(e.rel_offset);
-        Ok(())
+        Ok(Self { file })
     }
 
     pub fn fsync(&self) -> io::Result<()> {

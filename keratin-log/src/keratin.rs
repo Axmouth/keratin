@@ -54,6 +54,10 @@ impl KeratinRole {
     }
 }
 
+// Internal single-impl extension trait. We deliberately use async fn in the
+// trait. We do not need the explicit Send-bound flexibility that the desugared
+// form would give, so the lint does not apply here.
+#[allow(async_fn_in_trait)]
 pub trait KeratinReplicaExt {
     async fn append_replicated_batch(
         &self,

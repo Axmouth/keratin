@@ -11,17 +11,7 @@ use std::{
 const PAYLOAD_SIZE: usize = 256 * 4 * 512;
 const BATCH: usize = 256;
 const PRODUCERS: u32 = 8;
-const CONSUMERS: u32 = PRODUCERS;
 const RUN_SECS: u64 = 10;
-
-pub const FLAG_EOS: u16 = 0x0001;
-
-fn eos_record(pid: u32) -> Vec<u8> {
-    let mut v = make_record(pid, u64::MAX);
-    let p = b"KERATIN_EOS";
-    v[12..12 + p.len()].copy_from_slice(b"KERATIN_EOS");
-    v
-}
 
 fn make_record(pid: u32, seq: u64) -> Vec<u8> {
     let mut v = vec![32u8; 16 + PAYLOAD_SIZE];
@@ -62,7 +52,6 @@ async fn main() {
 
     let produced = Arc::new(AtomicU64::new(0));
     let consumed = Arc::new(AtomicU64::new(0));
-    let seen_eos = Arc::new(AtomicU64::new(0));
 
     let now = Instant::now();
 

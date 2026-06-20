@@ -24,12 +24,6 @@ pub enum PushResult<T> {
     Two((FlushReason, Vec<T>), (FlushReason, Vec<T>)),
 }
 
-struct Entry<T> {
-    item: T,
-    records: usize,
-    bytes: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deadline {
     None,         // no active batch
@@ -64,7 +58,7 @@ where
     cfg: BatcherConfig,
     weight: W,
 
-    items: Vec<Entry<T>>,
+    items: Vec<T>,
     total_records: usize,
     total_bytes: usize,
     last_arrival: Option<Instant>,
@@ -83,10 +77,6 @@ where
             total_bytes: 0,
             last_arrival: None,
         }
-    }
-
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
     }
 
     pub fn len(&self) -> usize {
@@ -162,11 +152,7 @@ where
             "weight() returned (0,0) with unbounded max_items: batch may grow without bound"
         );
 
-        self.items.push(Entry {
-            item,
-            records: r,
-            bytes: b,
-        });
+        self.items.push(item);
         self.total_records = self.total_records.saturating_add(r);
         self.total_bytes = self.total_bytes.saturating_add(b);
         self.last_arrival = Some(now);
@@ -188,11 +174,7 @@ where
         self.total_bytes = 0;
         self.last_arrival = None;
 
-        let mut out = Vec::with_capacity(self.items.len());
-        for e in self.items.drain(..) {
-            out.push(e.item);
-        }
-        out
+        self.items.drain(..).collect()
     }
 }
 
@@ -209,6 +191,7 @@ mod tests {
         ($($t:ty),*) => {$(
             impl Ms for $t {
                 #[inline]
+                #[allow(unused_comparisons)] // assert is a real guard for the signed types in the list
                 fn ms(self) -> Duration {
                     assert!(self >= 0, "negative duration literal");
                     Duration::from_millis(self as u64)
@@ -379,7 +362,7 @@ mod tests {
         let final_now = base + Duration::from_millis(16 + 7);
         if let Some((_r, b)) = c.flush_if_due(final_now) {
             out.push(b);
-        } else if !c.is_empty() {
+        } else if c.len() > 0 {
             out.push(c.flush());
         }
 

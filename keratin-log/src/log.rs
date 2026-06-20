@@ -1052,14 +1052,6 @@ impl Log {
         self.durable_offset
     }
 
-    pub fn readable_watermark(&self) -> u64 {
-        self.durable_offset
-    }
-
-    pub fn flushed_watermark(&self) -> u64 {
-        self.durable_offset
-    }
-
     pub fn next_offset(&self) -> u64 {
         self.next_offset
     }
@@ -1137,8 +1129,6 @@ impl Log {
         self.flush_buffers()?;
         self.fsync()?;
 
-        let seg_dir = self.root.join("segments");
-        // let mut bases = list_segment_bases(&seg_dir)?;
         let mut bases = self
             .segment_mapping
             .read()
@@ -1323,12 +1313,6 @@ impl Log {
             }
         }
 
-        Ok(())
-    }
-
-    fn cleanup_orphans(seg_dir: &Path) -> io::Result<()> {
-        // remove .idx with no .log and vice versa
-        // optional: keep it conservative
         Ok(())
     }
 
