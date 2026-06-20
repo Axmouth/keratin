@@ -1400,6 +1400,26 @@ impl QueueHandleInner {
         Ok(())
     }
 
+    /// Quiesce the queue for teardown (evict/destroy): stop admitting new owner
+    /// operations and wait for any in-flight ones to finish before the logs are
+    /// shut down. Role-agnostic and hang-free:
+    /// - If Owner, freeze first (best-effort) so new `begin_owner_operation`
+    ///   calls return `WrongRole` rather than blocking on a resume that will
+    ///   never come (which `pause` would risk during teardown).
+    /// - For Follower/Frozen there are no owner operations (begin requires
+    ///   Owner), so `active_owner_operations` is already 0 and this returns at
+    ///   once.
+    pub async fn quiesce_for_teardown(&self) {
+        let _ = self.try_freeze_owner();
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
+    }
+
     pub fn recovery_complete(&self) -> bool {
         self.recovery_complete.load(Ordering::Acquire)
     }

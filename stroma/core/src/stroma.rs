@@ -1535,6 +1535,13 @@ impl Stroma {
         }
         let guard = EvictionGuard::new(new_eviction_state);
 
+        // Drain in-flight owner operations before tearing the logs down, so a
+        // durable-but-not-yet-applied append cannot be cut off mid-flight. New
+        // owner ops are frozen (they error rather than block), so this cannot
+        // hang. This makes the teardown contract self-enforced rather than
+        // relying on the caller having quiesced the partition first.
+        qh.quiesce_for_teardown().await;
+
         qh.cancel_background_tasks();
 
         // Shut down old handle. Pending writes flush; logs close.
@@ -1635,6 +1642,9 @@ impl Stroma {
         if let Some(slot) = &prev
             && let Some(qh) = slot.handle.get()
         {
+            // Drain in-flight owner operations before teardown (frozen -> new
+            // ops error, no hang), so an append in progress is not cut off.
+            qh.quiesce_for_teardown().await;
             qh.cancel_background_tasks();
             qh.shutdown().await;
             qh.event_log().shutdown().await.map_err(io_err)?;
@@ -6722,6 +6732,51 @@ mod tests {
 
         shutdown_stroma(
             "unmaterialize_refuses_queue_with_inflight_messages",
+            &stroma,
+        )
+        .await;
+    }
+
+    /// Teardown (evict/destroy) must drain in-flight owner operations before
+    /// shutting the logs down, so a durable-but-not-yet-applied append is never
+    /// cut off mid-flight. `unmaterialize` and `destroy_partition` share the
+    /// same `quiesce_for_teardown` path, so this covers both.
+    #[tokio::test]
+    async fn unmaterialize_waits_for_in_flight_owner_operation_to_drain() {
+        let dir = test_dir!("evict_waits_for_owner_op_drain");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+
+        let ticket = stroma.queue_handle("topic-a", 0, None).await.unwrap();
+        // Hold an owner-operation lease: stands in for an append in progress.
+        // The lease is self-contained, so it outlives the `Resolved` temporary.
+        let lease = ticket
+            .resolve()
+            .unwrap()
+            .begin_owner_operation()
+            .await
+            .unwrap();
+
+        let stroma2 = stroma.clone();
+        let evict = tokio::spawn(async move { stroma2.unmaterialize("topic-a", 0, None).await });
+
+        // Teardown must not complete while an owner operation is in flight.
+        for _ in 0..8 {
+            tokio::task::yield_now().await;
+        }
+        assert!(
+            !evict.is_finished(),
+            "evict must wait for the in-flight owner operation to drain"
+        );
+
+        // Once the operation finishes, teardown proceeds.
+        drop(lease);
+        let outcome = evict.await.unwrap().unwrap();
+        assert_eq!(outcome, EvictOutcome::Evicted);
+
+        shutdown_stroma(
+            "unmaterialize_waits_for_in_flight_owner_operation_to_drain",
             &stroma,
         )
         .await;
