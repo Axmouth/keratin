@@ -180,9 +180,15 @@ PERFORMANCE (must verify; user flagged - expected fine but check):
     append/ack batch, reuse Inner within it) - not per record.
   - BENCH: append + ack throughput before/after the conversion; confirm no regression.
 
-FUTURE ITEM (low priority, user-assessed trivial): lifecycle_locks map pruning. Memory
-is a non-issue (even ~1M partition keys is on the order of ~10MB of tiny mutexes). The
-only conceivable concern is map slowdown under heavy churn, but with well-spread key
-hashing and similar access concurrency it likely doesn't matter. Prune a key's entry on
-destroy when no waiter holds it, IF it ever shows up. Not urgent.
+FUTURE ITEM (low priority): lifecycle_locks map pruning. CORRECTED estimate (the prior
+"~10MB at 1M keys" was ~10-15x too low): each entry is a DashMap slot (~55B) + an
+Arc<tokio::sync::Mutex<()>> heap alloc (~55-80B; tokio Mutex wraps a batch-semaphore,
+not a bare futex) + the key's Box<str> topic/group heap (~30B) ~= ~150-200B/entry ->
+~150-200MB at 1M DISTINCT keys. Lookup speed is NOT a concern: hashbrown/DashMap stays
+O(1) as it grows (resizes to keep load factor); size costs memory, not speed, and
+DashMap contention is about concurrent-access spread across shards, not entry count.
+The map only grows per DISTINCT (topic,part,group) EVER seen - recreating the same
+partitions reuses keys (bounded). So the only real exposure is unbounded distinct-key
+churn (e.g. ever-growing unique topic names); for normal workloads it is trivial. Prune
+a key's entry on destroy when no waiter holds it, IF it ever shows up. Not urgent.
 ================================================================================
