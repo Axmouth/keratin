@@ -1883,11 +1883,12 @@ impl Stroma {
             StromaEvent::Enqueue {
                 off,
                 retries,
-                expire_at: _,
+                expire_at,
             } => {
                 let command = QueueCommand::Enqueue {
                     offset: off,
                     retries,
+                    expire_at,
                     response: None,
                 };
                 qh.blocking_command_enqueue(command)?;
@@ -2028,12 +2029,13 @@ impl Stroma {
             StromaEvent::Enqueue {
                 off,
                 retries,
-                expire_at: _,
+                expire_at,
             } => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::Enqueue {
                     offset: off,
                     retries,
+                    expire_at,
                     response: Some(tx),
                 })
                 .await
@@ -2539,6 +2541,74 @@ impl Stroma {
         }
 
         Ok(expired_set)
+    }
+
+    /// Drop ready messages whose TTL has passed across all owned queues. Routes
+    /// through the terminal-nack/DLQ pipeline with `DeadLetterReason::Expired`, so
+    /// it honors the queue's dlq_policy: discard when no DLQ is configured (the
+    /// usual TTL case), dead-letter when one is. Inflight work is never dropped.
+    /// Returns the set of dropped (tp, part, group, offset).
+    pub async fn drop_ttl_expired(
+        &self,
+        now: UnixMillis,
+        max: usize,
+    ) -> Result<HashSet<(String, u32, Option<String>, u64)>> {
+        let mut dropped = HashSet::new();
+        let mut reqs_per_queue =
+            HashMap::<(String, u32, Option<String>), Vec<NackEventMeta>>::new();
+
+        let keys = self.queue_keys_snapshot();
+        for (tp, part, group) in keys {
+            if dropped.len() >= max {
+                break;
+            }
+            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+            let qh = qh.resolve()?;
+            if qh.role() != QueueRole::Owner {
+                continue;
+            }
+            let want = max - dropped.len();
+            let expired = qh.collect_ttl_expired(now, want).await?;
+            if expired.is_empty() {
+                continue;
+            }
+            let entry = reqs_per_queue
+                .entry((tp.to_string(), part, group.clone().map(|s| s.to_string())))
+                .or_default();
+            for off in expired {
+                // requeue=false routes through the DLQ/discard pipeline.
+                entry.push(NackEventMeta {
+                    off,
+                    requeue: false,
+                    not_before: None,
+                });
+                dropped.insert((tp.to_string(), part, group.clone().map(|s| s.to_string()), off));
+            }
+        }
+
+        let mut awaiters = Vec::new();
+        for ((tp, part, group), reqs) in reqs_per_queue {
+            let (completion, rx) = KeratinAppendCompletion::pair();
+            self.nack_enqueue_many_with_reason(
+                &tp,
+                part,
+                group.as_deref(),
+                reqs,
+                Some(DeadLetterReason::Expired),
+                completion,
+            )
+            .await?;
+            awaiters.push(rx);
+        }
+
+        for awaiter in awaiters {
+            awaiter
+                .await
+                .map_err(|_err| StromaError::Io("Broken pipe".into()))?
+                .map_err(|err| StromaError::Io(err.to_string()))?;
+        }
+
+        Ok(dropped)
     }
 
     /// ---------------- Snapshotting ----------------
@@ -3738,6 +3808,23 @@ impl Stroma {
         reqs: Vec<NackEventMeta>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
+        self.nack_enqueue_many_with_reason(tp, part, group, reqs, None, completion)
+            .await
+    }
+
+    /// Like `nack_enqueue_many`, but `reason_override` replaces the dead-letter
+    /// reason the in-memory transition computed. Used by the TTL drop path to
+    /// label drops `Expired` while reusing the same terminal-nack/DLQ pipeline
+    /// (discard when no DLQ is configured, dead-letter when one is).
+    pub async fn nack_enqueue_many_with_reason(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<NackEventMeta>,
+        reason_override: Option<DeadLetterReason>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+    ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
         let h = qh.resolve()?;
         let owner_operation = h.begin_owner_operation().await?;
@@ -3771,7 +3858,7 @@ impl Stroma {
                 NackOutcome::DeadLetterRequested {
                     retry_count,
                     reason,
-                } => Some((*o, *retry_count, *reason)),
+                } => Some((*o, *retry_count, reason_override.unwrap_or(*reason))),
                 _ => None,
             })
             .collect();
@@ -6773,6 +6860,7 @@ mod tests {
             .command_enqueue(QueueCommand::Enqueue {
                 offset: 1,
                 retries: 0,
+                expire_at: None,
                 response: None,
             })
             .await
@@ -6791,6 +6879,7 @@ mod tests {
                 .blocking_command_enqueue(QueueCommand::Enqueue {
                     offset: 2,
                     retries: 0,
+                    expire_at: None,
                     response: None,
                 })
                 .expect_err("displaced blocking queue handle should reject commands")

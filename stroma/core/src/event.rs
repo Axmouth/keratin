@@ -135,6 +135,8 @@ pub enum DeadLetterReason {
     RetriesExhausted,
     TerminalNack,
     PendingRecovery,
+    /// Dropped because its message TTL elapsed before it was consumed.
+    Expired,
 }
 
 impl DeadLetterReason {
@@ -143,6 +145,7 @@ impl DeadLetterReason {
             DeadLetterReason::RetriesExhausted => "retries_exhausted",
             DeadLetterReason::TerminalNack => "terminal_nack",
             DeadLetterReason::PendingRecovery => "pending_recovery",
+            DeadLetterReason::Expired => "expired",
         }
     }
 
@@ -151,6 +154,7 @@ impl DeadLetterReason {
             DeadLetterReason::RetriesExhausted => 0,
             DeadLetterReason::TerminalNack => 1,
             DeadLetterReason::PendingRecovery => 2,
+            DeadLetterReason::Expired => 3,
         }
     }
 
@@ -159,6 +163,7 @@ impl DeadLetterReason {
             0 => Ok(DeadLetterReason::RetriesExhausted),
             1 => Ok(DeadLetterReason::TerminalNack),
             2 => Ok(DeadLetterReason::PendingRecovery),
+            3 => Ok(DeadLetterReason::Expired),
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "invalid dead letter reason tag",

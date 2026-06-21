@@ -10,7 +10,7 @@ use arc_swap::ArcSwap;
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
 use keratin_log::util::unix_millis;
-use rangemap::RangeSet;
+use rangemap::{RangeMap, RangeSet};
 use serde::Serialize;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::Instant;
@@ -32,7 +32,7 @@ pub type UnixMillis = u64;
 
 pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
-pub const FORMAT_VERSION: u64 = 2;
+pub const FORMAT_VERSION: u64 = 3;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -329,6 +329,14 @@ pub struct QueueInternalState {
     ready: RangeSet<Offset>,       // readiness only
     retries: HashMap<Offset, u32>, // retry metadata only
 
+    // Per-message drop deadline (message TTL), keyed by offset. Offset-keyed (not
+    // deadline-keyed) so it persists across ready->inflight->ready and is removed
+    // only on terminal settle. Contiguous same-deadline spans collapse into one
+    // entry, so a uniform/queue-default TTL stays compact even for a large
+    // backlog. Consulted reactively (skip-and-drop at delivery) and proactively
+    // (the expiry worker drops expired ready offsets).
+    ttl_deadlines: RangeMap<Offset, UnixMillis>,
+
     // min-heap via Reverse(deadline), contains stale entries, validated against inflight map
     expiry_heap: BinaryHeap<(Reverse<UnixMillis>, Offset)>,
 
@@ -359,8 +367,9 @@ pub enum QueueCommand {
     Enqueue {
         offset: Offset,
         retries: u32,
+        expire_at: Option<UnixMillis>,
         response: Option<oneshot::Sender<()>>,
-    }, // offset, retries
+    }, // offset, retries, drop deadline
     EnqueueMany {
         reqs: Vec<EnqueueEventMeta>,
         response: Option<oneshot::Sender<()>>,
@@ -544,6 +553,12 @@ pub enum QueueCommand {
         response: Option<oneshot::Sender<Vec<Offset>>>,
     }, // now, max
 
+    CollectTtlExpired {
+        now: UnixMillis,
+        max: usize,
+        response: Option<oneshot::Sender<Vec<Offset>>>,
+    }, // now, max - ready offsets past their message-TTL deadline
+
     DumpInflight {
         response: Option<oneshot::Sender<Vec<(Offset, UnixMillis)>>>,
     },
@@ -622,6 +637,7 @@ impl QueueCommand {
 
             // === Background maintenance — wait for quiet periods ===
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
+            QueueCommand::CollectTtlExpired { .. } => CommandPrio::Low,
             QueueCommand::AdvanceFrontier { .. } => CommandPrio::Low,
 
             // === Snapshots — lowest priority, run only when other work is drained ===
@@ -685,6 +701,7 @@ impl QueueCommand {
             QueueCommand::GetStatusReport { .. } => "GetStatusReport",
             QueueCommand::InspectOffsets { .. } => "InspectOffsets",
             QueueCommand::CollectExpired { .. } => "CollectExpired",
+            QueueCommand::CollectTtlExpired { .. } => "CollectTtlExpired",
             QueueCommand::DumpInflight { .. } => "DumpInflight",
             QueueCommand::GetDebugInfo { .. } => "GetDebugInfo",
             QueueCommand::DeadLetterCommit { .. } => "DeadLetterCommit",
@@ -1441,9 +1458,10 @@ impl QueueHandleInner {
             QueueCommand::Enqueue {
                 offset,
                 retries,
+                expire_at,
                 response,
             } => {
-                state.enqueue(offset, retries);
+                state.enqueue(offset, retries, expire_at);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
@@ -1642,6 +1660,13 @@ impl QueueHandleInner {
             QueueCommand::CollectExpired { now, max, response } => {
                 let result = state.collect_expired(now, max);
                 dirty = !result.is_empty();
+                if let Some(r) = response {
+                    let _ = r.send(result);
+                }
+            }
+            QueueCommand::CollectTtlExpired { now, max, response } => {
+                // Read-only: the durable drop is an Ack emitted by the caller.
+                let result = state.collect_ttl_expired(now, max);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -1927,6 +1952,7 @@ impl QueueHandleInner {
             .command_enqueue(QueueCommand::Enqueue {
                 offset,
                 retries,
+                expire_at: None,
                 response: Some(tx),
             })
             .await;
@@ -2585,6 +2611,23 @@ impl QueueHandleInner {
         rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
+    pub async fn collect_ttl_expired(
+        &self,
+        now: UnixMillis,
+        max: usize,
+    ) -> Result<Vec<Offset>, QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::CollectTtlExpired {
+                now,
+                max,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -2679,6 +2722,7 @@ impl QueueInternalState {
             pending_dlq: BTreeMap::new(),
             ready: RangeSet::new(),
             retries: HashMap::new(),
+            ttl_deadlines: RangeMap::new(),
             expiry_heap: BinaryHeap::new(),
             delayed_enqueue_heap: BinaryHeap::new(),
             delayed_retry_heap: BinaryHeap::new(),
@@ -2702,6 +2746,7 @@ impl QueueInternalState {
             pending_dlq: BTreeMap::new(),
             ready: RangeSet::new(),
             retries: HashMap::new(),
+            ttl_deadlines: RangeMap::new(),
             expiry_heap: BinaryHeap::new(),
             delayed_enqueue_heap: BinaryHeap::new(),
             delayed_retry_heap: BinaryHeap::new(),
@@ -2888,6 +2933,7 @@ impl QueueInternalState {
         let removed = self.inflight.remove(&offset);
         self.ready.remove(offset..offset + 1);
         self.retries.remove(&offset);
+        self.ttl_deadlines.remove(offset..offset + 1);
         if removed.is_some() {
             // heap can have stale entries now
             self.recompute_hint_if_needed();
@@ -2957,6 +3003,7 @@ impl QueueInternalState {
             // discard_pending_dlq depending on policy.
             self.ready.remove(offset..offset + 1);
             self.retries.remove(&offset);
+            self.ttl_deadlines.remove(offset..offset + 1);
             self.pending_dlq.insert(offset, None);
             self.recompute_hint_if_needed();
             // if let DLQDiscardPolicy::Discard = self.dlq_policy {
@@ -2973,6 +3020,7 @@ impl QueueInternalState {
             let retry_count = *retries;
             self.ready.remove(offset..offset + 1);
             self.retries.remove(&offset);
+            self.ttl_deadlines.remove(offset..offset + 1);
             self.pending_dlq.insert(offset, None);
             self.recompute_hint_if_needed();
             return NackOutcome::DeadLetterRequested {
@@ -3007,6 +3055,7 @@ impl QueueInternalState {
             self.inflight.remove(&o);
             self.ready.remove(o..o + 1);
             self.retries.remove(&o);
+            self.ttl_deadlines.remove(o..o + 1);
             self.pending_dlq.entry(o).or_insert(None);
         }
         self.recompute_hint_if_needed();
@@ -3231,7 +3280,7 @@ impl QueueInternalState {
         self.retries.get(&offset).copied().unwrap_or(0)
     }
 
-    pub fn enqueue(&mut self, offset: Offset, retries: u32) {
+    pub fn enqueue(&mut self, offset: Offset, retries: u32, expire_at: Option<UnixMillis>) {
         // We assume it is only used on messages that have been properly stored earlier
         // TODO: possibly use different checks as ack window has limited trust
         if self.is_acked(offset) {
@@ -3242,12 +3291,58 @@ impl QueueInternalState {
         if retries > 0 {
             self.retries.insert(offset, retries);
         }
+        // Only set on the original enqueue. The requeue paths pass None so a
+        // message keeps its first deadline across ready->inflight->ready.
+        if let Some(deadline) = expire_at {
+            self.set_ttl_deadline(offset, deadline);
+        }
     }
 
     pub fn enqueue_many(&mut self, reqs: &[EnqueueEventMeta]) {
         for req in reqs {
-            self.enqueue(req.off, req.retries);
+            self.enqueue(req.off, req.retries, req.expire_at);
         }
+    }
+
+    /// Record a message's drop deadline (message TTL) and wake the deadline
+    /// worker if this is the new earliest deadline.
+    fn set_ttl_deadline(&mut self, offset: Offset, deadline: UnixMillis) {
+        if self.is_acked(offset) {
+            return;
+        }
+        let was_earlier_or_empty = self.min_ttl_deadline().is_none_or(|d| deadline < d);
+        self.ttl_deadlines.insert(offset..offset + 1, deadline);
+        if was_earlier_or_empty {
+            self.deadline_waker.notify_one();
+        }
+    }
+
+    /// Earliest TTL deadline across all tracked offsets, or `None` if no message
+    /// carries a TTL.
+    fn min_ttl_deadline(&self) -> Option<UnixMillis> {
+        self.ttl_deadlines.iter().map(|(_, &d)| d).min()
+    }
+
+    /// Ready offsets whose drop deadline has passed (`deadline <= now`), up to
+    /// `max`. Pure query - the durable drop is an Ack emitted by the caller,
+    /// which clears the entry via `ack`. Inflight/acked offsets are skipped so we
+    /// never drop work in flight.
+    pub fn collect_ttl_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
+        let mut out = Vec::new();
+        for (range, &deadline) in self.ttl_deadlines.iter() {
+            if deadline > now {
+                continue;
+            }
+            for off in range.clone() {
+                if out.len() >= max {
+                    return out;
+                }
+                if self.ready.contains(&off) && !self.inflight.contains_key(&off) {
+                    out.push(off);
+                }
+            }
+        }
+        out
     }
 
     pub fn enqueue_delayed(&mut self, offset: Offset, not_before: u64) {
@@ -3354,7 +3449,8 @@ impl QueueInternalState {
         let inflight_min = self.min_deadline_hint;
         let delayed_enq_min = self.delayed_enqueue_heap.peek().map(|(Reverse(d), _)| *d);
         let delayed_retry_min = self.delayed_retry_heap.peek().map(|(Reverse(d), _)| *d);
-        [inflight_min, delayed_enq_min, delayed_retry_min]
+        let ttl_min = self.min_ttl_deadline();
+        [inflight_min, delayed_enq_min, delayed_retry_min, ttl_min]
             .into_iter()
             .flatten()
             .min()
@@ -3633,6 +3729,17 @@ impl QueueInternalState {
             out.extend_from_slice(&range.end.to_be_bytes());
         }
 
+        // ttl deadlines (message TTL): offset ranges -> absolute drop deadline.
+        // Snapshots compact away the Enqueue events that would otherwise rebuild
+        // this, so it has to round-trip here.
+        let ttl_ranges: Vec<_> = self.ttl_deadlines.iter().collect();
+        out.extend_from_slice(&(ttl_ranges.len() as u64).to_be_bytes());
+        for (range, &deadline) in ttl_ranges {
+            out.extend_from_slice(&range.start.to_be_bytes());
+            out.extend_from_slice(&range.end.to_be_bytes());
+            out.extend_from_slice(&deadline.to_be_bytes());
+        }
+
         // pending dlq
         out.extend_from_slice(&(self.pending_dlq.len() as u64).to_be_bytes());
         for (off, target) in &self.pending_dlq {
@@ -3777,6 +3884,15 @@ impl QueueInternalState {
             let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
             let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
             self.ready.insert(start..end);
+        }
+
+        // ttl deadlines (message TTL)
+        let ttl_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        for _ in 0..ttl_len {
+            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.ttl_deadlines.insert(start..end, deadline);
         }
 
         // pending dlq
@@ -4022,7 +4138,7 @@ mod tests {
 
         assert_eq!(s.next_deliverable(0, 10), 10);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         assert_eq!(s.next_deliverable(0, 10), 5);
     }
 
@@ -4030,13 +4146,13 @@ mod tests {
     fn inspect_offsets_active_only_returns_tracked_messages() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
-        s.enqueue(2, 2);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 2, None);
         s.mark_inflight(2, 500);
         s.enqueue_delayed(3, 700);
-        s.enqueue(4, 1);
+        s.enqueue(4, 1, None);
         s.mark_pending_dlq_many(&[4]);
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.ack(5);
 
         let snapshot = s.inspect_offsets(0, 8, InspectMode::ActiveOnly);
@@ -4064,8 +4180,8 @@ mod tests {
     fn inspect_offsets_can_include_settled_records() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
-        s.enqueue(2, 0);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 0, None);
 
         let snapshot = s.inspect_offsets(0, 4, InspectMode::IncludeSettled);
         let statuses: Vec<_> = snapshot
@@ -4089,7 +4205,7 @@ mod tests {
     fn nack_after_ack_is_noop() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
         s.ack(1);
 
@@ -4125,7 +4241,7 @@ mod tests {
         assert!(!s.has_history(5));
 
         // ACK dominates future enqueue
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         assert!(!s.has_history(5));
     }
 
@@ -4133,7 +4249,7 @@ mod tests {
     fn enqueue_creates_history_if_not_acked() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         assert!(s.has_history(5));
 
         s.mark_inflight(5, 10);
@@ -4160,7 +4276,7 @@ mod tests {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         s.ack(3);
-        s.enqueue(3, 0);
+        s.enqueue(3, 0, None);
 
         assert!(s.is_acked(3));
         assert!(!s.is_ready(3));
@@ -4177,8 +4293,8 @@ mod tests {
 
         assert_eq!(s.settled_until(), 3);
 
-        s.enqueue(1, 0);
-        s.enqueue(2, 0);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 0, None);
 
         assert!(!s.is_ready(1));
         assert!(!s.is_ready(2));
@@ -4199,7 +4315,7 @@ mod tests {
     fn inflight_update_does_not_make_offset_ready() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
         s.mark_inflight(1, 20);
 
@@ -4211,7 +4327,7 @@ mod tests {
     fn expiry_makes_offset_ready() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(3, 0);
+        s.enqueue(3, 0, None);
         s.mark_inflight(3, 10);
         s.collect_expired(10, 10);
 
@@ -4225,7 +4341,7 @@ mod tests {
 
         assert_eq!(s.next_deliverable(0, 10), 10);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         assert_eq!(s.next_deliverable(0, 10), 5);
     }
 
@@ -4233,7 +4349,7 @@ mod tests {
     fn nack_hits_dlq_at_max_retries() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
         for _ in 0..s.dlq_discard_max_retries {
             s.nack(1, true);
@@ -4293,7 +4409,7 @@ mod tests {
     fn release_inflight_returns_ready_without_retry_accounting() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 2);
+        s.enqueue(1, 2, None);
         s.mark_inflight(1, 100);
         assert!(s.release_inflight(1));
 
@@ -4306,7 +4422,7 @@ mod tests {
     fn expired_then_nacked_is_still_not_acked() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(2, 0);
+        s.enqueue(2, 0, None);
         s.mark_inflight(2, 10);
         s.collect_expired(10, 10);
         s.nack(2, true);
@@ -4319,7 +4435,7 @@ mod tests {
     fn nack_requeue_increments_retry() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
         s.nack(1, true);
         assert_eq!(s.get_retries(1), 1);
@@ -4333,7 +4449,7 @@ mod tests {
     fn nack_allows_redelivery() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 100);
         s.nack(0, true);
 
@@ -4356,7 +4472,7 @@ mod tests {
     fn expiry_never_acks() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.mark_inflight(5, 10);
         assert!(!s.is_acked(5));
 
@@ -4380,7 +4496,7 @@ mod tests {
     fn expired_offset_delivered_after_frontier_advances() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.mark_inflight(5, 10);
         s.collect_expired(10, 10);
 
@@ -4429,9 +4545,9 @@ mod tests {
     fn expiry_does_not_interact_with_ack_window() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.ack(1); // out of order
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 10);
 
         let ex = s.collect_expired(10, 10);
@@ -4461,11 +4577,11 @@ mod tests {
     fn next_deliverable_progresses_after_expiry() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(10, 0);
+        s.enqueue(10, 0, None);
         s.mark_inflight(0, 10);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
-        s.enqueue(12, 0);
+        s.enqueue(12, 0, None);
         s.mark_inflight(2, 10);
 
         s.collect_expired(10, 10);
@@ -4504,7 +4620,7 @@ mod tests {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
-            s.enqueue(i, 0);
+            s.enqueue(i, 0, None);
             s.mark_inflight(i, 100);
         }
 
@@ -4520,7 +4636,7 @@ mod tests {
     fn updating_inflight_deadline_does_not_expire_early() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
         s.mark_inflight(1, 100); // update
 
@@ -4560,7 +4676,7 @@ mod tests {
     fn offset_not_in_multiple_states() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.mark_inflight(5, 10);
 
         assert!(s.is_inflight(5));
@@ -4661,8 +4777,8 @@ mod tests {
     fn snapshot_rebuilds_expiry_heap() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 5);
-        s.enqueue(2, 5);
+        s.enqueue(1, 5, None);
+        s.enqueue(2, 5, None);
         s.mark_inflight(1, 100);
         s.mark_inflight(2, 50);
 
@@ -4708,7 +4824,7 @@ mod tests {
     fn snapshot_truncated_fails() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
 
         let snap = s.encode_snapshot(0);
@@ -4772,7 +4888,7 @@ mod tests {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
-            s.enqueue(i, 0);
+            s.enqueue(i, 0, None);
             s.mark_inflight(i, i + 100);
             s.mark_inflight(i, i + 200); // create stale heap entries
         }
@@ -4819,7 +4935,7 @@ mod tests {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..100 {
-            s.enqueue(i, i as u32);
+            s.enqueue(i, i as u32, None);
             s.mark_inflight(i, i + 100);
         }
 
@@ -4869,7 +4985,7 @@ mod tests {
     fn ack_removes_inflight() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(10, 0);
+        s.enqueue(10, 0, None);
         s.mark_inflight(10, 1000);
         assert!(s.is_inflight_or_acked(10));
         assert!(!s.is_acked(10));
@@ -4889,9 +5005,9 @@ mod tests {
         s.ack_many(&[0, 1, 2, 3, 4].map(|off| AckEventMeta { off }));
         assert_eq!(s.settled_until(), 5);
 
-        s.enqueue(2, 0);
+        s.enqueue(2, 0, None);
         s.mark_inflight(2, 123);
-        s.enqueue(4, 0);
+        s.enqueue(4, 0, None);
         s.mark_inflight(4, 123);
         assert_eq!(s.inflight_len(), 0);
     }
@@ -4900,11 +5016,11 @@ mod tests {
     fn expiry_hint_tracks_min_deadline_and_handles_updates() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(10, 0);
+        s.enqueue(10, 0, None);
         s.mark_inflight(10, 500);
         assert_eq!(s.next_expiry_hint(), Some(500));
 
-        s.enqueue(11, 0);
+        s.enqueue(11, 0, None);
         s.mark_inflight(11, 400);
         assert_eq!(s.next_expiry_hint(), Some(400));
 
@@ -4920,7 +5036,7 @@ mod tests {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         for i in 0..1000 {
-            s.enqueue(i, 0);
+            s.enqueue(i, 0, None);
             s.mark_inflight(i, 100);
         }
 
@@ -4936,9 +5052,9 @@ mod tests {
     fn clear_inflight_removes_and_hint_updates() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 10);
-        s.enqueue(2, 0);
+        s.enqueue(2, 0, None);
         s.mark_inflight(2, 20);
         assert_eq!(s.next_expiry_hint(), Some(10));
 
@@ -4955,7 +5071,7 @@ mod tests {
     fn is_inflight_or_acked_behaves() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.mark_inflight(5, 100);
         assert!(s.is_inflight_or_acked(5));
         assert!(!s.is_acked(5));
@@ -4991,7 +5107,7 @@ mod tests {
     #[test]
     fn nack_requeue_under_max_returns_requeued() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
 
         let out = s.nack(1, true);
@@ -5005,7 +5121,7 @@ mod tests {
     #[test]
     fn nack_requeue_later_waits_until_deadline() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
 
         let out = s.nack_at(1, true, Some(500));
@@ -5027,7 +5143,7 @@ mod tests {
     fn nack_requeue_at_max_returns_dead_letter() {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.dlq_discard_max_retries = 2;
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
 
         s.mark_inflight(1, 100);
         assert_eq!(s.nack(1, true), NackOutcome::Requeued); // retries=1
@@ -5052,7 +5168,7 @@ mod tests {
     #[test]
     fn nack_no_requeue_goes_to_pending_dlq() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
 
         let out = s.nack(1, false);
@@ -5093,7 +5209,7 @@ mod tests {
     #[test]
     fn commit_dlq_acks_locally_and_advances_frontier() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 100);
         assert_eq!(
             s.nack(0, false),
@@ -5121,7 +5237,7 @@ mod tests {
     #[test]
     fn commit_dlq_twice_is_idempotent() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 100);
         s.nack(0, false);
 
@@ -5135,7 +5251,7 @@ mod tests {
     #[test]
     fn discard_pending_dlq_acks_locally() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 100);
         s.nack(0, false);
 
@@ -5148,7 +5264,7 @@ mod tests {
     #[test]
     fn pending_dlq_blocks_msg_truncation() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(5, 0);
+        s.enqueue(5, 0, None);
         s.mark_inflight(5, 100);
         s.nack(5, false); // pending_dlq = {5}
 
@@ -5160,7 +5276,7 @@ mod tests {
     #[test]
     fn pending_dlq_does_not_count_as_ready() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(3, 0);
+        s.enqueue(3, 0, None);
         s.mark_inflight(3, 100);
         s.nack(3, false);
 
@@ -5171,9 +5287,9 @@ mod tests {
     #[test]
     fn poll_ready_skips_pending_dlq() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(0, 0);
-        s.enqueue(1, 0);
-        s.enqueue(2, 0);
+        s.enqueue(0, 0, None);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 0, None);
         s.mark_inflight(1, 100);
         s.nack(1, false); // 1 -> pending_dlq
 
@@ -5187,8 +5303,8 @@ mod tests {
     #[test]
     fn mark_pending_dlq_many_clears_other_states() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
-        s.enqueue(2, 0);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 0, None);
         s.mark_inflight(1, 100); // 1 inflight, 2 ready
 
         s.mark_pending_dlq_many(&[1, 2]);
@@ -5291,8 +5407,8 @@ mod tests {
     #[test]
     fn snapshot_roundtrips_pending_dlq() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
-        s.enqueue(2, 0);
+        s.enqueue(1, 0, None);
+        s.enqueue(2, 0, None);
         s.mark_inflight(1, 100);
         s.nack(1, false);
         s.nack(2, false);
@@ -5327,7 +5443,7 @@ mod tests {
     #[test]
     fn nack_after_dead_letter_requested_is_noop() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(0, 0);
+        s.enqueue(0, 0, None);
         s.mark_inflight(0, 100);
         s.nack(0, false); // -> pending_dlq
 
@@ -5356,7 +5472,7 @@ mod tests {
     #[test]
     fn next_expiry_hint_considers_all_heaps() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 500); // inflight expiry
         s.enqueue_delayed(2, 300); // delayed enqueue
         // (when delayed_retry exists, add one at 400 too)
@@ -5367,7 +5483,7 @@ mod tests {
     #[test]
     fn next_expiry_hint_when_inflight_is_earliest() {
         let mut s = QueueInternalState::new("t".into(), 0);
-        s.enqueue(1, 0);
+        s.enqueue(1, 0, None);
         s.mark_inflight(1, 100);
         s.enqueue_delayed(2, 500);
 
@@ -5411,5 +5527,66 @@ mod tests {
         let _ = s2.collect_expired(1_500_000, 10);
         assert!(s2.is_ready(5));
         assert!(!s2.is_ready(6));
+    }
+
+    #[test]
+    fn ttl_collects_ready_offsets_past_deadline() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0, Some(100));
+        s.enqueue(1, 0, Some(200));
+        s.enqueue(2, 0, None); // no TTL, never collected
+
+        assert_eq!(s.collect_ttl_expired(50, 10), Vec::<u64>::new());
+        assert_eq!(s.collect_ttl_expired(150, 10), vec![0]);
+        assert_eq!(s.collect_ttl_expired(250, 10), vec![0, 1]);
+    }
+
+    #[test]
+    fn ttl_never_drops_inflight() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0, Some(100));
+        assert!(s.mark_inflight(0, 5_000));
+        // Past its deadline but leased - must not be collected for drop.
+        assert_eq!(s.collect_ttl_expired(1_000, 10), Vec::<u64>::new());
+    }
+
+    #[test]
+    fn ttl_deadline_cleared_on_ack() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0, Some(100));
+        s.ack(0);
+        assert_eq!(s.collect_ttl_expired(1_000, 10), Vec::<u64>::new());
+        assert!(s.ttl_deadlines.is_empty());
+    }
+
+    #[test]
+    fn ttl_respects_max_bound() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        for off in 0..5 {
+            s.enqueue(off, 0, Some(100));
+        }
+        assert_eq!(s.collect_ttl_expired(150, 2), vec![0, 1]);
+    }
+
+    #[test]
+    fn ttl_feeds_next_expiry_hint() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0, Some(300));
+        s.enqueue(1, 0, Some(120));
+        assert_eq!(s.next_expiry_hint(), Some(120));
+    }
+
+    #[test]
+    fn ttl_deadlines_survive_snapshot_round_trip() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue(0, 0, Some(100));
+        s.enqueue(1, 0, Some(100));
+        s.enqueue(2, 0, Some(500));
+        let snap = s.encode_snapshot(0);
+
+        let mut restored = QueueInternalState::new("t".into(), 0);
+        restored.load_snapshot(&snap).unwrap();
+        assert_eq!(restored.collect_ttl_expired(150, 10), vec![0, 1]);
+        assert_eq!(restored.collect_ttl_expired(600, 10), vec![0, 1, 2]);
     }
 }
