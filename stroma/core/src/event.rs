@@ -2,8 +2,6 @@ use std::io;
 
 use serde::{Deserialize, Serialize};
 
-use crate::state::ConsumerId;
-
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -21,6 +19,7 @@ pub enum EventType {
     MarkInflightMany = 11,
     Ack = 20,
     AckMany = 21,
+    ReleaseInflightMany = 22,
     Nack = 30,
     NackMany = 31,
     DeadLetter = 40,
@@ -47,6 +46,13 @@ pub struct AckEventMeta {
     pub off: Offset,
 }
 
+// Reserved vocabulary for the client-REQUESTED nack action (what the consumer
+// asks to happen), as opposed to NackOutcome which is the RESULT the queue
+// computed. The live event encoding currently carries the simpler
+// (requeue, not_before) pair on NackEventMeta. NackType is kept for expanding
+// nack semantics with more explicit action variants (discard vs retry-in-place
+// vs requeue, now vs later) without overloading the two flags.
+#[allow(dead_code)]
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub enum NackType {
     Discard,
@@ -56,6 +62,7 @@ pub enum NackType {
     RequeueLater { not_before: UnixMillis },
 }
 
+#[allow(dead_code)]
 impl NackType {
     pub fn write_bytes(&self, out: &mut Vec<u8>) -> Result<(), io::Error> {
         match self {
@@ -80,7 +87,7 @@ impl NackType {
         Ok(())
     }
 
-    pub fn read_from_bytes(&self, input: &[u8]) -> Result<Self, io::Error> {
+    pub fn read_from_bytes(input: &[u8]) -> Result<Self, io::Error> {
         let mut i = 0;
 
         let tag = rd_u8(input, &mut i)?;
@@ -217,6 +224,9 @@ pub enum StromaEvent {
     AckMany {
         reqs: Vec<AckEventMeta>,
     },
+    ReleaseInflightMany {
+        reqs: Vec<AckEventMeta>,
+    },
     Nack {
         off: Offset,
         requeue: bool,
@@ -237,7 +247,7 @@ pub enum StromaEvent {
         group: Option<Box<str>>,
     },
     /// Snapshot is a complete state image for a single (tp,part).
-    /// It’s OK if it’s “big”; it happens rarely.
+    /// It is OK if it is "big". It happens rarely.
     Snapshot {
         tp: Box<str>,
         part: u32,
@@ -299,7 +309,7 @@ fn rd_u16(b: &[u8], i: &mut usize) -> io::Result<u16> {
     if *i + 2 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u16"));
     }
-    let v = u16::from_be_bytes(b[*i..*i + 2].try_into().unwrap());
+    let v = u16::from_be_bytes(b[*i..*i + 2].try_into().expect("exact-length slice"));
     *i += 2;
     Ok(v)
 }
@@ -307,7 +317,7 @@ fn rd_u32(b: &[u8], i: &mut usize) -> io::Result<u32> {
     if *i + 4 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u32"));
     }
-    let v = u32::from_be_bytes(b[*i..*i + 4].try_into().unwrap());
+    let v = u32::from_be_bytes(b[*i..*i + 4].try_into().expect("exact-length slice"));
     *i += 4;
     Ok(v)
 }
@@ -315,19 +325,9 @@ fn rd_u64(b: &[u8], i: &mut usize) -> io::Result<u64> {
     if *i + 8 > b.len() {
         return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "u64"));
     }
-    let v = u64::from_be_bytes(b[*i..*i + 8].try_into().unwrap());
+    let v = u64::from_be_bytes(b[*i..*i + 8].try_into().expect("exact-length slice"));
     *i += 8;
     Ok(v)
-}
-fn rd_str(b: &[u8], i: &mut usize) -> io::Result<String> {
-    let len = rd_u16(b, i)? as usize;
-    if *i + len > b.len() {
-        return Err(io::Error::new(io::ErrorKind::UnexpectedEof, "str"));
-    }
-    let s = std::str::from_utf8(&b[*i..*i + len])
-        .map_err(|_| io::Error::new(io::ErrorKind::InvalidData, "utf8"))?;
-    *i += len;
-    Ok(s.to_string())
 }
 fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
     let len = rd_u16(b, i)? as usize;
@@ -341,6 +341,35 @@ fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
 }
 
 impl StromaEvent {
+    /// The highest message-log offset this event references, if any.
+    ///
+    /// Used by recovery to verify the event log does not reference messages the
+    /// message log has not (yet) durably accepted (a dangling forward reference,
+    /// e.g. after the event log was fsynced ahead of the message log and a crash
+    /// lost the message tail). `None` for events that carry no message offset
+    /// (Declare / ResetQueue / Snapshot).
+    pub fn max_referenced_msg_offset(&self) -> Option<Offset> {
+        match self {
+            StromaEvent::Enqueue { off, .. }
+            | StromaEvent::EnqueueDelayed { off, .. }
+            | StromaEvent::MarkInflight { off, .. }
+            | StromaEvent::Ack { off }
+            | StromaEvent::Nack { off, .. } => Some(*off),
+            StromaEvent::EnqueueMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::EnqueueDelayedMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::MarkInflightMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::AckMany { reqs } | StromaEvent::ReleaseInflightMany { reqs } => {
+                reqs.iter().map(|r| r.off).max()
+            }
+            StromaEvent::NackMany { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::DeadLetter { reqs } => reqs.iter().map(|r| r.off).max(),
+            StromaEvent::DeadLetterCommit { offs } => offs.iter().copied().max(),
+            StromaEvent::Declare(_)
+            | StromaEvent::ResetQueue { .. }
+            | StromaEvent::Snapshot { .. } => None,
+        }
+    }
+
     /// Encodes an event into bytes to be stored as Keratin record payload.
     /// (CRC is already handled by Keratin record framing, so no double-CRC here.)
     pub fn encode(&self) -> io::Result<Vec<u8>> {
@@ -430,6 +459,13 @@ impl StromaEvent {
                     put_u64(&mut out, req.off);
                 }
             }
+            StromaEvent::ReleaseInflightMany { reqs } => {
+                put_u16(&mut out, EventType::ReleaseInflightMany as u16);
+                put_u32(&mut out, reqs.len() as u32);
+                for req in reqs {
+                    put_u64(&mut out, req.off);
+                }
+            }
             StromaEvent::NackMany { reqs } => {
                 put_u16(&mut out, EventType::NackMany as u16);
                 put_u32(&mut out, reqs.len() as u32);
@@ -483,7 +519,7 @@ impl StromaEvent {
                             put_u8(&mut out, 2);
                             put_str(&mut out, tp)?;
                             put_u32(&mut out, *part);
-                            put_str(&mut out, &group.as_deref().unwrap_or_default());
+                            put_str(&mut out, group.as_deref().unwrap_or_default())?;
                         }
                     }
                 }
@@ -612,6 +648,15 @@ impl StromaEvent {
                     reqs.push(AckEventMeta { off });
                 }
                 Ok(StromaEvent::AckMany { reqs })
+            }
+            x if x == EventType::ReleaseInflightMany as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut reqs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let off = rd_u64(bytes, &mut i)?;
+                    reqs.push(AckEventMeta { off });
+                }
+                Ok(StromaEvent::ReleaseInflightMany { reqs })
             }
             x if x == EventType::NackMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
@@ -747,6 +792,16 @@ mod tests {
     #[test]
     fn test_ack_encode_decode() {
         let event = StromaEvent::Ack { off: 300 };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_release_inflight_many_encode_decode() {
+        let event = StromaEvent::ReleaseInflightMany {
+            reqs: vec![AckEventMeta { off: 300 }, AckEventMeta { off: 301 }],
+        };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);

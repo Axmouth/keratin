@@ -45,14 +45,14 @@ impl Segment {
         if &hdr[0..8] != LOG_MAGIC {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "bad log magic"));
         }
-        let ver = u16::from_be_bytes(hdr[8..10].try_into().unwrap());
+        let ver = u16::from_be_bytes(hdr[8..10].try_into().expect("exact-length slice"));
         if ver != LOG_VERSION {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
                 "bad log version",
             ));
         }
-        let base = u64::from_be_bytes(hdr[16..24].try_into().unwrap());
+        let base = u64::from_be_bytes(hdr[16..24].try_into().expect("exact-length slice"));
         if base != expected_base {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -82,6 +82,10 @@ impl Segment {
 
     pub fn fsync(&self) -> io::Result<()> {
         self.file.sync_data()
+    }
+
+    pub fn try_clone_file(&self) -> io::Result<File> {
+        self.file.try_clone()
     }
 
     pub fn set_len(&mut self, new_len: u64) -> io::Result<()> {

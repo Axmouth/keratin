@@ -459,7 +459,6 @@ dependencies = [
 name = "keratin-log"
 version = "0.1.0"
 dependencies = [
- "anyhow",
  "byteorder",
  "crc32c",
  "crossbeam-channel",
@@ -820,6 +819,13 @@ dependencies = [
 ]
 
 [[package]]
+name = "stroma-common"
+version = "0.1.0"
+dependencies = [
+ "serde",
+]
+
+[[package]]
 name = "stroma-core"
 version = "0.1.0"
 dependencies = [
@@ -839,6 +845,7 @@ dependencies = [
  "rmp-serde",
  "serde",
  "similar-asserts",
+ "stroma-common",
  "thiserror",
  "tokio",
  "tokio-util",

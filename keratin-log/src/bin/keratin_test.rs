@@ -1,5 +1,4 @@
 use keratin_log::*;
-use std::path::PathBuf;
 
 fn main() {
     let temp_dir = test_dir!("keratin-test");
@@ -13,6 +12,7 @@ fn main() {
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 1,
         flush_target_bytes: 16 * 1024 * 1024,
+        force_recovery_scan: false,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

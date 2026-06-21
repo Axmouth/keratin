@@ -11,17 +11,7 @@ use std::{
 const PAYLOAD_SIZE: usize = 256 * 4 * 512;
 const BATCH: usize = 256;
 const PRODUCERS: u32 = 8;
-const CONSUMERS: u32 = PRODUCERS;
 const RUN_SECS: u64 = 10;
-
-pub const FLAG_EOS: u16 = 0x0001;
-
-fn eos_record(pid: u32) -> Vec<u8> {
-    let mut v = make_record(pid, u64::MAX);
-    let p = b"KERATIN_EOS";
-    v[12..12 + p.len()].copy_from_slice(b"KERATIN_EOS");
-    v
-}
 
 fn make_record(pid: u32, seq: u64) -> Vec<u8> {
     let mut v = vec![32u8; 16 + PAYLOAD_SIZE];
@@ -33,8 +23,8 @@ fn make_record(pid: u32, seq: u64) -> Vec<u8> {
 }
 
 fn decode_record(v: &[u8]) -> (u32, u64) {
-    let pid = u32::from_be_bytes(v[..4].try_into().unwrap());
-    let seq = u64::from_be_bytes(v[4..12].try_into().unwrap());
+    let pid = u32::from_be_bytes(v[..4].try_into().expect("exact-length slice"));
+    let seq = u64::from_be_bytes(v[4..12].try_into().expect("exact-length slice"));
     let p = String::from_utf8_lossy(&v[12..]);
     if p.trim().as_bytes() != b"Le String" {
         assert_eq!(p, "Le String");
@@ -55,13 +45,13 @@ async fn main() {
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 5,
         flush_target_bytes: 128 * 1024 * 1024,
+        force_recovery_scan: false,
     };
 
     let k = Arc::new(Keratin::open(&root.root, cfg).await.unwrap());
 
     let produced = Arc::new(AtomicU64::new(0));
     let consumed = Arc::new(AtomicU64::new(0));
-    let seen_eos = Arc::new(AtomicU64::new(0));
 
     let now = Instant::now();
 

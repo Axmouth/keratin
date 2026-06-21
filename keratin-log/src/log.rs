@@ -1,6 +1,6 @@
 use std::{
     collections::BTreeMap,
-    fs::{self, OpenOptions},
+    fs::{self, File, OpenOptions},
     io,
     path::{Path, PathBuf},
     sync::{
@@ -12,12 +12,16 @@ use std::{
 
 use parking_lot::RwLock;
 
+#[cfg(feature = "writer-stage-trace")]
+use crate::writer_stage_trace::WriterStageTracer;
 use crate::{
     index::Index,
     manifest::Manifest,
+    reader::LogReader,
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
     segment::Segment,
+    util::fsync_dir,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -26,11 +30,67 @@ pub struct AppendResult {
     pub count: u32,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicatedAppendOutcome {
+    Applied(AppendResult),
+    AppliedSuffix {
+        requested_first_offset: u64,
+        skipped_count: u32,
+        result: AppendResult,
+    },
+    AlreadyPresent {
+        first_offset: u64,
+        count: u32,
+        next_offset: u64,
+    },
+    Overlap {
+        first_offset: u64,
+        count: u32,
+        next_offset: u64,
+    },
+    Gap {
+        expected_offset: u64,
+        first_offset: u64,
+    },
+    StaleEpoch {
+        current_epoch: u64,
+        attempted_epoch: u64,
+    },
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReplicatedAppendMode {
+    ExactFit,
+    AppendSuffixAfterKnownPrefix,
+}
+
 #[derive(Debug, Clone)]
 pub struct LogState {
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
-    pub durable: Arc<AtomicU64>, // inclusive; last fsynced offset (u64::MAX if none)
+    // Inclusive last fsynced offset. Empty logs currently report 0, matching
+    // existing public behavior rather than using a nullable/sentinel value.
+    pub durable: Arc<AtomicU64>,
+    pub epoch: Arc<AtomicU64>,
+}
+
+pub(crate) struct FsyncJob {
+    through_offset: u64,
+    active: File,
+    index: File,
+}
+
+impl FsyncJob {
+    pub(crate) fn through_offset(&self) -> u64 {
+        self.through_offset
+    }
+
+    pub(crate) fn sync(&self) -> io::Result<Duration> {
+        let started = Instant::now();
+        self.active.sync_data()?;
+        self.index.sync_data()?;
+        Ok(started.elapsed())
+    }
 }
 
 impl LogState {
@@ -39,18 +99,19 @@ impl LogState {
             head: Arc::new(AtomicU64::new(head)),
             tail: Arc::new(AtomicU64::new(tail)),
             durable: Arc::new(AtomicU64::new(durable)),
+            epoch: Arc::new(AtomicU64::new(0)),
         }
     }
 }
 
 pub struct Log {
     // buffers
-    write_buf: Vec<u8>, // 16–64MB ideally
+    write_buf: Vec<u8>, // 16-64MB ideally
     idx_buf: Vec<u8>,   // sparse index buffer
 
     // watermarks (inclusive)
     staged_end_offset: u64, // last offset staged into buffers
-    durable_offset: u64,    // last offset fsynced (inclusive)
+    durable_offset: u64,    // inclusive last fsynced offset, 0 for an empty log
 
     root: PathBuf,
     pub manifest: Manifest,
@@ -70,6 +131,20 @@ pub struct Log {
     pub flush_target_bytes: usize, // e.g. 16MB
 
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+}
+
+struct AppendPlanState {
+    active_base_offset: u64,
+    active_bytes_written: u64,
+    index_stride_bytes: u32,
+    next_offset: u64,
+    last_index_at_log_pos: u64,
+}
+
+struct AppendPlanOutcome {
+    base_offset: u64,
+    end_offset: u64,
+    count: u32,
 }
 
 #[derive(Default)]
@@ -99,6 +174,53 @@ impl IoStats {
     }
 }
 
+#[inline(always)]
+fn encode_append_payloads_into(
+    state: &mut AppendPlanState,
+    payloads: &[Message],
+    now_ms: u64,
+    write_buf: &mut Vec<u8>,
+    idx_buf: &mut Vec<u8>,
+) -> io::Result<AppendPlanOutcome> {
+    debug_assert!(!payloads.is_empty());
+
+    let base_offset = state.next_offset;
+
+    for payload in payloads {
+        let offset = state.next_offset;
+        let record = Record {
+            flags: payload.flags,
+            timestamp_ms: now_ms,
+            offset,
+            headers: &payload.headers,
+            payload: &payload.payload,
+        };
+
+        let record_start_pos = state.active_bytes_written + write_buf.len() as u64;
+
+        encode_record(write_buf, &record)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
+
+        if (record_start_pos - state.last_index_at_log_pos) >= state.index_stride_bytes as u64 {
+            let rel = (offset - state.active_base_offset) as u32;
+
+            idx_buf.extend_from_slice(&rel.to_be_bytes());
+            idx_buf.extend_from_slice(&0u32.to_be_bytes());
+            idx_buf.extend_from_slice(&record_start_pos.to_be_bytes());
+
+            state.last_index_at_log_pos = record_start_pos;
+        }
+
+        state.next_offset += 1;
+    }
+
+    Ok(AppendPlanOutcome {
+        base_offset,
+        end_offset: state.next_offset - 1,
+        count: payloads.len() as u32,
+    })
+}
+
 impl Log {
     pub fn open(
         root: impl AsRef<Path>,
@@ -106,6 +228,7 @@ impl Log {
         segment_max_bytes: u64,
         index_stride_bytes: u32,
         flush_target_bytes: usize,
+        force_recovery_scan: bool,
         log_state: Arc<LogState>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
@@ -124,6 +247,7 @@ impl Log {
             let (seg, idx, seg_path) = create_segment_pair(&root, 0, now_ms)?;
             manifest.active_base_offset = 0;
             manifest.next_offset = 0;
+            manifest.clean_shutdown = false;
             manifest.store_atomic(&root)?;
             let next_offset: u64 = manifest.next_offset;
             let initial: u64 = next_offset.saturating_sub(1);
@@ -142,6 +266,52 @@ impl Log {
                     idx_buf: Vec::with_capacity(256 * 1024),
                     stats: IoStats::new(),
                     log_state,
+                    last_stats_dump: Instant::now(),
+                    manifest_flush_interval: Duration::from_millis(500),
+                    last_manifest_flush: Instant::now(),
+                    staged_end_offset: initial,
+                    durable_offset: initial,
+                    flush_target_bytes,
+                    segment_mapping: segment_mapping.clone(),
+                },
+                segment_mapping,
+            ));
+        }
+
+        if !force_recovery_scan
+            && manifest.clean_shutdown
+            && manifest.segment_max_bytes == segment_max_bytes
+            && manifest.index_stride_bytes == index_stride_bytes
+            && bases
+                .last()
+                .map(|(base, _)| *base == manifest.active_base_offset)
+                .unwrap_or(false)
+        {
+            let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter(bases.clone())));
+            let active_base = manifest.active_base_offset;
+            let (active, index, seg_path) =
+                open_or_create_segment_pair(&root, active_base, now_ms)?;
+            segment_mapping.write().insert(active_base, seg_path);
+
+            let next_offset = manifest.next_offset;
+            manifest.clean_shutdown = false;
+            manifest.store_atomic(&root)?;
+
+            let last_index_at_log_pos = active.bytes_written;
+            let initial = next_offset.saturating_sub(1);
+
+            return Ok((
+                Self {
+                    root,
+                    manifest,
+                    active,
+                    index,
+                    next_offset,
+                    last_index_at_log_pos,
+                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
+                    idx_buf: Vec::with_capacity(256 * 1024),
+                    log_state,
+                    stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
@@ -192,12 +362,15 @@ impl Log {
 
         segment_mapping.write().insert(active_base, seg_path);
 
-        // Recompute next_offset from computed_next; reconcile with manifest (prefer computed).
-        let next_offset = computed_next.max(manifest.next_offset);
+        // Full recovery scan is the source of truth. The manifest may be stale
+        // after dirty shutdown, or optimistic if a cleanly written tail is later
+        // found corrupt by forced recovery.
+        let next_offset = computed_next;
         manifest.active_base_offset = active_base;
         manifest.next_offset = next_offset;
         manifest.segment_max_bytes = segment_max_bytes;
         manifest.index_stride_bytes = index_stride_bytes;
+        manifest.clean_shutdown = false;
         manifest.store_atomic(&root)?;
 
         let last_index_at_log_pos = active.bytes_written;
@@ -227,10 +400,53 @@ impl Log {
         ))
     }
 
+    #[inline(always)]
+    fn append_plan_state(&self, next_offset: u64) -> AppendPlanState {
+        AppendPlanState {
+            active_base_offset: self.active.base_offset,
+            active_bytes_written: self.active.bytes_written,
+            index_stride_bytes: self.manifest.index_stride_bytes,
+            next_offset,
+            last_index_at_log_pos: self.last_index_at_log_pos,
+        }
+    }
+
+    #[inline(always)]
+    fn sync_append_plan_state(&mut self, state: AppendPlanState) {
+        self.next_offset = state.next_offset;
+        self.last_index_at_log_pos = state.last_index_at_log_pos;
+    }
+
+    #[cfg_attr(feature = "writer-stage-trace", allow(dead_code))]
     pub fn stage_append_batch(
         &mut self,
         payloads: &[Message],
         now_ms: u64,
+    ) -> io::Result<(AppendResult, u64)> {
+        self.stage_append_batch_inner(
+            payloads,
+            now_ms,
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub fn stage_append_batch_traced(
+        &mut self,
+        payloads: &[Message],
+        now_ms: u64,
+        tracer: &WriterStageTracer,
+        work_id: u64,
+    ) -> io::Result<(AppendResult, u64)> {
+        self.stage_append_batch_inner(payloads, now_ms, Some((tracer, work_id)))
+    }
+
+    fn stage_append_batch_inner(
+        &mut self,
+        payloads: &[Message],
+        now_ms: u64,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<(AppendResult, u64)> {
         if payloads.is_empty() {
             let end = self.next_offset.saturating_sub(1);
@@ -266,61 +482,253 @@ impl Log {
 
         let t_encode = Instant::now();
 
-        for payload in payloads {
-            let offset = self.next_offset;
-
-            let r = Record {
-                flags: payload.flags,
-                timestamp_ms: now_ms,
-                offset,
-                headers: &payload.headers,
-                payload: &payload.payload,
-            };
-
-            // record starts at: on-disk bytes + pending bytes + current buffer len
-            let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
-
-            encode_record(&mut self.write_buf, &r)
-                .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-            // Maybe emit an idx entry (encode into idx_buf, not to file)
-            if (record_start_pos - self.last_index_at_log_pos)
-                >= self.manifest.index_stride_bytes as u64
-            {
-                let rel = (offset - self.active.base_offset) as u32;
-
-                // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
-                self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-                self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-                self.idx_buf
-                    .extend_from_slice(&record_start_pos.to_be_bytes());
-
-                self.last_index_at_log_pos = record_start_pos;
-            }
-
-            self.next_offset += 1;
-        }
+        let mut plan_state = self.append_plan_state(base_offset);
+        #[cfg(not(feature = "writer-stage-trace"))]
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            payloads,
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        #[cfg(feature = "writer-stage-trace")]
+        let plan = if let Some((tracer, work_id)) = tracer {
+            tracer.trace(work_id, "encode", payloads.len(), estimated, || {
+                encode_append_payloads_into(
+                    &mut plan_state,
+                    payloads,
+                    now_ms,
+                    &mut self.write_buf,
+                    &mut self.idx_buf,
+                )
+            })?
+        } else {
+            encode_append_payloads_into(
+                &mut plan_state,
+                payloads,
+                now_ms,
+                &mut self.write_buf,
+                &mut self.idx_buf,
+            )?
+        };
+        self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
         self.stats.records += payloads.len() as u64;
 
-        let end_offset = self.next_offset - 1;
+        let end_offset = plan.end_offset;
         self.staged_end_offset = end_offset;
 
         Ok((
             AppendResult {
-                base_offset,
-                count: payloads.len() as u32,
+                base_offset: plan.base_offset,
+                count: plan.count,
             },
             end_offset,
         ))
     }
 
+    pub fn stage_replicated_append_batch(
+        &mut self,
+        epoch: u64,
+        first_offset: u64,
+        payloads: &[Message],
+        mode: ReplicatedAppendMode,
+        now_ms: u64,
+    ) -> io::Result<(ReplicatedAppendOutcome, Option<u64>)> {
+        let current_epoch = self.manifest.epoch;
+        if epoch < current_epoch {
+            return Ok((
+                ReplicatedAppendOutcome::StaleEpoch {
+                    current_epoch,
+                    attempted_epoch: epoch,
+                },
+                None,
+            ));
+        }
+        if epoch > current_epoch {
+            self.advance_epoch(epoch)?;
+        }
+
+        let count = u32::try_from(payloads.len()).map_err(|_| {
+            io::Error::new(io::ErrorKind::InvalidInput, "replicated batch too large")
+        })?;
+        let current_next = self.next_offset;
+
+        if payloads.is_empty() {
+            return Ok((
+                if first_offset == current_next {
+                    ReplicatedAppendOutcome::Applied(AppendResult {
+                        base_offset: first_offset,
+                        count,
+                    })
+                } else if first_offset < current_next {
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    }
+                } else {
+                    ReplicatedAppendOutcome::Gap {
+                        expected_offset: current_next,
+                        first_offset,
+                    }
+                },
+                None,
+            ));
+        }
+
+        if first_offset > current_next {
+            return Ok((
+                ReplicatedAppendOutcome::Gap {
+                    expected_offset: current_next,
+                    first_offset,
+                },
+                None,
+            ));
+        }
+
+        let end_offset = first_offset
+            .checked_add(payloads.len() as u64)
+            .and_then(|v| v.checked_sub(1))
+            .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "offset overflow"))?;
+
+        if first_offset < current_next {
+            if end_offset < current_next {
+                self.verify_existing_prefix(first_offset, payloads)?;
+                return Ok((
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            if end_offset == current_next.saturating_sub(1) {
+                return Ok((
+                    ReplicatedAppendOutcome::AlreadyPresent {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            if mode == ReplicatedAppendMode::ExactFit {
+                return Ok((
+                    ReplicatedAppendOutcome::Overlap {
+                        first_offset,
+                        count,
+                        next_offset: current_next,
+                    },
+                    None,
+                ));
+            }
+
+            let skip = usize::try_from(current_next - first_offset).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replicated suffix skip overflow",
+                )
+            })?;
+            self.verify_existing_prefix(first_offset, &payloads[..skip])?;
+            let suffix = &payloads[skip..];
+            let (outcome, end_offset) = self.stage_replicated_append_batch(
+                epoch,
+                current_next,
+                suffix,
+                ReplicatedAppendMode::ExactFit,
+                now_ms,
+            )?;
+
+            return Ok((
+                match outcome {
+                    ReplicatedAppendOutcome::Applied(result) => {
+                        ReplicatedAppendOutcome::AppliedSuffix {
+                            requested_first_offset: first_offset,
+                            skipped_count: skip as u32,
+                            result,
+                        }
+                    }
+                    _ => outcome,
+                },
+                end_offset,
+            ));
+        }
+
+        let estimated: usize = payloads.iter().map(|p| p.bytes_len()).sum();
+
+        let pending_bytes = self.write_buf.len() as u64;
+        if self.active.bytes_written + pending_bytes + estimated as u64
+            > self.manifest.segment_max_bytes
+        {
+            self.roll(now_ms)?;
+        }
+
+        self.write_buf.reserve(estimated);
+        self.idx_buf
+            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+
+        let t_encode = Instant::now();
+
+        let mut plan_state = self.append_plan_state(first_offset);
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            payloads,
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        self.sync_append_plan_state(plan_state);
+
+        self.stats.encode += t_encode.elapsed();
+        self.stats.bytes += payloads.iter().map(|m| m.bytes_len()).sum::<usize>() as u64;
+        self.stats.records += payloads.len() as u64;
+        self.staged_end_offset = plan.end_offset;
+
+        Ok((
+            ReplicatedAppendOutcome::Applied(AppendResult {
+                base_offset: plan.base_offset,
+                count: plan.count,
+            }),
+            Some(plan.end_offset),
+        ))
+    }
+
+    #[cfg_attr(feature = "writer-stage-trace", allow(dead_code))]
     pub fn stage_append(
         &mut self,
         payload: &Message,
         now_ms: u64,
+    ) -> io::Result<(AppendResult, u64)> {
+        self.stage_append_inner(
+            payload,
+            now_ms,
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub fn stage_append_traced(
+        &mut self,
+        payload: &Message,
+        now_ms: u64,
+        tracer: &WriterStageTracer,
+        work_id: u64,
+    ) -> io::Result<(AppendResult, u64)> {
+        self.stage_append_inner(payload, now_ms, Some((tracer, work_id)))
+    }
+
+    fn stage_append_inner(
+        &mut self,
+        payload: &Message,
+        now_ms: u64,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<(AppendResult, u64)> {
         // Ensure we have capacity for large sequential writes
         // Estimate worst-case record size; same as before
@@ -345,60 +753,88 @@ impl Log {
 
         let t_encode = Instant::now();
 
-        let offset = self.next_offset;
-
-        let r = Record {
-            flags: payload.flags,
-            timestamp_ms: now_ms,
-            offset,
-            headers: &payload.headers,
-            payload: &payload.payload,
+        let mut plan_state = self.append_plan_state(base_offset);
+        #[cfg(not(feature = "writer-stage-trace"))]
+        let plan = encode_append_payloads_into(
+            &mut plan_state,
+            std::slice::from_ref(payload),
+            now_ms,
+            &mut self.write_buf,
+            &mut self.idx_buf,
+        )?;
+        #[cfg(feature = "writer-stage-trace")]
+        let plan = if let Some((tracer, work_id)) = tracer {
+            tracer.trace(work_id, "encode", 1, estimated, || {
+                encode_append_payloads_into(
+                    &mut plan_state,
+                    std::slice::from_ref(payload),
+                    now_ms,
+                    &mut self.write_buf,
+                    &mut self.idx_buf,
+                )
+            })?
+        } else {
+            encode_append_payloads_into(
+                &mut plan_state,
+                std::slice::from_ref(payload),
+                now_ms,
+                &mut self.write_buf,
+                &mut self.idx_buf,
+            )?
         };
-
-        // record starts at: on-disk bytes + pending bytes + current buffer len
-        let record_start_pos = self.active.bytes_written + self.write_buf.len() as u64;
-
-        encode_record(&mut self.write_buf, &r)
-            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
-
-        // Maybe emit an idx entry (encode into idx_buf, not to file)
-        if (record_start_pos - self.last_index_at_log_pos)
-            >= self.manifest.index_stride_bytes as u64
-        {
-            let rel = (offset - self.active.base_offset) as u32;
-
-            // idx entry layout: rel_offset(4) reserved0(4) file_pos(8)
-            self.idx_buf.extend_from_slice(&rel.to_be_bytes());
-            self.idx_buf.extend_from_slice(&0u32.to_be_bytes());
-            self.idx_buf
-                .extend_from_slice(&record_start_pos.to_be_bytes());
-
-            self.last_index_at_log_pos = record_start_pos;
-        }
-
-        self.next_offset += 1;
+        self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
         self.stats.bytes += payload.bytes_len() as u64;
         self.stats.records += 1;
 
-        let end_offset = self.next_offset - 1;
+        let end_offset = plan.end_offset;
         self.staged_end_offset = end_offset;
 
         Ok((
             AppendResult {
-                base_offset,
-                count: 1,
+                base_offset: plan.base_offset,
+                count: plan.count,
             },
             end_offset,
         ))
     }
 
     pub fn flush_buffers(&mut self) -> io::Result<u64> {
+        self.flush_buffers_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub fn flush_buffers_traced(
+        &mut self,
+        tracer: &WriterStageTracer,
+        work_id: u64,
+    ) -> io::Result<u64> {
+        self.flush_buffers_inner(Some((tracer, work_id)))
+    }
+
+    fn flush_buffers_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<u64> {
         // write log buffer
         if !self.write_buf.is_empty() {
             let t = Instant::now();
+            #[cfg(feature = "writer-stage-trace")]
+            let bytes = self.write_buf.len();
+            #[cfg(not(feature = "writer-stage-trace"))]
             self.active.append_bytes(&self.write_buf)?;
+            #[cfg(feature = "writer-stage-trace")]
+            if let Some((tracer, work_id)) = tracer {
+                tracer.trace(work_id, "log_write", 0, bytes, || {
+                    self.active.append_bytes(&self.write_buf)
+                })?;
+            } else {
+                self.active.append_bytes(&self.write_buf)?;
+            }
             self.stats.log_write += t.elapsed();
             self.write_buf.clear();
         }
@@ -406,7 +842,18 @@ impl Log {
         // write idx buffer
         if !self.idx_buf.is_empty() {
             let t = Instant::now();
+            #[cfg(feature = "writer-stage-trace")]
+            let bytes = self.idx_buf.len();
+            #[cfg(not(feature = "writer-stage-trace"))]
             self.index.append_entries_raw(&self.idx_buf)?;
+            #[cfg(feature = "writer-stage-trace")]
+            if let Some((tracer, work_id)) = tracer {
+                tracer.trace(work_id, "index_write", 0, bytes, || {
+                    self.index.append_entries_raw(&self.idx_buf)
+                })?;
+            } else {
+                self.index.append_entries_raw(&self.idx_buf)?;
+            }
             self.stats.idx_write += t.elapsed();
             self.idx_buf.clear();
         }
@@ -446,7 +893,137 @@ impl Log {
         self.active.flush()
     }
 
+    #[cfg_attr(feature = "writer-stage-trace", allow(dead_code))]
+    pub(crate) fn prepare_fsync_job(&mut self) -> io::Result<FsyncJob> {
+        self.prepare_fsync_job_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub(crate) fn prepare_fsync_job_traced(
+        &mut self,
+        tracer: &WriterStageTracer,
+        work_id: u64,
+    ) -> io::Result<FsyncJob> {
+        self.prepare_fsync_job_inner(Some((tracer, work_id)))
+    }
+
+    fn prepare_fsync_job_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<FsyncJob> {
+        #[cfg(feature = "writer-stage-trace")]
+        self.flush_buffers_inner(tracer)?;
+        #[cfg(not(feature = "writer-stage-trace"))]
+        self.flush_buffers()?;
+
+        Ok(FsyncJob {
+            through_offset: self.staged_end_offset,
+            active: self.active.try_clone_file()?,
+            index: self.index.try_clone_file()?,
+        })
+    }
+
+    #[cfg_attr(feature = "writer-stage-trace", allow(dead_code))]
+    pub(crate) fn finish_fsync_job(
+        &mut self,
+        through_offset: u64,
+        elapsed: Duration,
+    ) -> io::Result<()> {
+        self.finish_fsync_job_inner(
+            through_offset,
+            elapsed,
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub(crate) fn finish_fsync_job_traced(
+        &mut self,
+        through_offset: u64,
+        elapsed: Duration,
+        tracer: &WriterStageTracer,
+        work_id: u64,
+    ) -> io::Result<()> {
+        self.finish_fsync_job_inner(through_offset, elapsed, Some((tracer, work_id)))
+    }
+
+    fn finish_fsync_job_inner(
+        &mut self,
+        through_offset: u64,
+        elapsed: Duration,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
+        self.stats.fsync += elapsed;
+        self.durable_offset = self.durable_offset.max(through_offset);
+        self.manifest.next_offset = self
+            .manifest
+            .next_offset
+            .max(through_offset.saturating_add(1));
+        self.manifest.active_base_offset = self.active.base_offset;
+
+        // manifest is a hint; persist it on interval
+        if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
+            #[cfg(not(feature = "writer-stage-trace"))]
+            self.store_manifest()?;
+            #[cfg(feature = "writer-stage-trace")]
+            if let Some((tracer, work_id)) = tracer {
+                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_manifest())?;
+            } else {
+                self.store_manifest()?;
+            }
+        }
+
+        Ok(())
+    }
+
     pub fn fsync(&mut self) -> io::Result<()> {
+        self.fsync_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    #[allow(dead_code)]
+    pub fn fsync_traced(&mut self, tracer: &WriterStageTracer, work_id: u64) -> io::Result<()> {
+        self.fsync_inner(Some((tracer, work_id)))
+    }
+
+    fn fsync_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
+        #[cfg(not(feature = "writer-stage-trace"))]
+        self.fsync_files_and_update_manifest()?;
+        #[cfg(feature = "writer-stage-trace")]
+        if let Some((tracer, work_id)) = tracer {
+            tracer.trace(work_id, "fsync", 0, 0, || {
+                self.fsync_files_and_update_manifest()
+            })?;
+        } else {
+            self.fsync_files_and_update_manifest()?;
+        }
+
+        // manifest is a hint; persist it on interval
+        if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
+            #[cfg(not(feature = "writer-stage-trace"))]
+            self.store_manifest()?;
+            #[cfg(feature = "writer-stage-trace")]
+            if let Some((tracer, work_id)) = tracer {
+                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_manifest())?;
+            } else {
+                self.store_manifest()?;
+            }
+        }
+
+        Ok(())
+    }
+
+    fn fsync_files_and_update_manifest(&mut self) -> io::Result<()> {
         let t = Instant::now();
 
         self.active.fsync()?;
@@ -457,17 +1034,17 @@ impl Log {
         // mark durable
         self.durable_offset = self.staged_end_offset;
 
-        // manifest is a hint; persist it on interval
         self.manifest.next_offset = self.next_offset;
         self.manifest.active_base_offset = self.active.base_offset;
 
-        if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
-            let t2 = Instant::now();
-            self.manifest.store_atomic(&self.root)?;
-            self.stats.manifest += t2.elapsed();
-            self.last_manifest_flush = Instant::now();
-        }
+        Ok(())
+    }
 
+    fn store_manifest(&mut self) -> io::Result<()> {
+        let t = Instant::now();
+        self.manifest.store_atomic(&self.root)?;
+        self.stats.manifest += t.elapsed();
+        self.last_manifest_flush = Instant::now();
         Ok(())
     }
 
@@ -475,16 +1052,37 @@ impl Log {
         self.durable_offset
     }
 
-    pub fn readable_watermark(&self) -> u64 {
-        self.durable_offset
-    }
-
-    pub fn flushed_watermark(&self) -> u64 {
-        self.durable_offset
-    }
-
     pub fn next_offset(&self) -> u64 {
         self.next_offset
+    }
+
+    pub fn current_epoch(&self) -> u64 {
+        self.manifest.epoch
+    }
+
+    pub fn advance_epoch(&mut self, epoch: u64) -> io::Result<u64> {
+        let current = self.manifest.epoch;
+        if epoch < current {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                format!("stale epoch {epoch}, current epoch is {current}"),
+            ));
+        }
+        if epoch == current {
+            return Ok(current);
+        }
+
+        self.flush_buffers()?;
+        self.flush()?;
+        self.fsync()?;
+
+        self.manifest.epoch = epoch;
+        self.manifest.next_offset = self.next_offset;
+        self.manifest.active_base_offset = self.active.base_offset;
+        self.manifest.store_atomic(&self.root)?;
+        self.log_state.epoch.store(epoch, Ordering::Release);
+
+        Ok(epoch)
     }
 
     #[inline]
@@ -531,8 +1129,6 @@ impl Log {
         self.flush_buffers()?;
         self.fsync()?;
 
-        let seg_dir = self.root.join("segments");
-        // let mut bases = list_segment_bases(&seg_dir)?;
         let mut bases = self
             .segment_mapping
             .read()
@@ -627,15 +1223,105 @@ impl Log {
         Ok(new_head)
     }
 
-    fn cleanup_orphans(seg_dir: &Path) -> io::Result<()> {
-        // remove .idx with no .log and vice versa
-        // optional: keep it conservative
+    pub fn reset_to_checkpoint(&mut self, next_offset: u64, now_ms: u64) -> io::Result<()> {
+        self.flush_buffers()?;
+        self.flush()?;
+        self.fsync()?;
+
+        let seg_dir = self.root.join("segments");
+        for ent in fs::read_dir(&seg_dir)? {
+            let ent = ent?;
+            let path = ent.path();
+            let is_log_or_idx = path
+                .extension()
+                .and_then(|ext| ext.to_str())
+                .map(|ext| ext == "log" || ext == "idx")
+                .unwrap_or(false);
+            if is_log_or_idx {
+                fs::remove_file(path)?;
+            }
+        }
+
+        self.segment_mapping.write().clear();
+
+        let (seg, idx, seg_path) = create_segment_pair(&self.root, next_offset, now_ms)?;
+        self.active = seg;
+        self.index = idx;
+        self.segment_mapping.write().insert(next_offset, seg_path);
+
+        self.write_buf.clear();
+        self.idx_buf.clear();
+        self.next_offset = next_offset;
+        self.staged_end_offset = next_offset.saturating_sub(1);
+        self.durable_offset = self.staged_end_offset;
+        self.last_index_at_log_pos = self.active.bytes_written;
+
+        self.manifest.active_base_offset = next_offset;
+        self.manifest.next_offset = next_offset;
+        self.manifest.head_offset = next_offset;
+        self.manifest.store_atomic(&self.root)?;
+        fsync_dir(&seg_dir)?;
+
+        self.log_state.head.store(next_offset, Ordering::Release);
+        self.log_state.tail.store(next_offset, Ordering::Release);
+        self.log_state
+            .durable
+            .store(self.durable_offset, Ordering::Release);
+
+        Ok(())
+    }
+
+    fn verify_existing_prefix(&self, first_offset: u64, payloads: &[Message]) -> io::Result<()> {
+        if payloads.is_empty() {
+            return Ok(());
+        }
+
+        let head_offset = self.manifest.head_offset;
+        let readable_first_offset = first_offset.max(head_offset);
+        let skip =
+            usize::try_from(readable_first_offset.saturating_sub(first_offset)).map_err(|_| {
+                io::Error::new(
+                    io::ErrorKind::InvalidInput,
+                    "replicated overlap skip overflow",
+                )
+            })?;
+        if skip >= payloads.len() {
+            return Ok(());
+        }
+        let payloads = &payloads[skip..];
+
+        let reader = LogReader::new(&self.root, self.segment_mapping.clone());
+        let got = reader.scan_from(readable_first_offset, payloads.len())?;
+        if got.len() != payloads.len() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "replicated overlap prefix is not fully readable",
+            ));
+        }
+
+        for (idx, (existing, incoming)) in got.iter().zip(payloads).enumerate() {
+            let expected_offset = readable_first_offset + idx as u64;
+            if existing.offset != expected_offset
+                || existing.flags != incoming.flags
+                || existing.headers != incoming.headers
+                || existing.payload != incoming.payload
+            {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    format!("replicated overlap mismatch at offset {expected_offset}"),
+                ));
+            }
+        }
+
         Ok(())
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
         self.flush_buffers()?;
-        self.fsync()?;
+        self.flush()?;
+        self.fsync_files_and_update_manifest()?;
+        self.manifest.clean_shutdown = true;
+        self.store_manifest()?;
         Ok(())
     }
 
@@ -754,5 +1440,5 @@ fn open_or_create_segment_pair(
         Index::open(idxf, base)?
     };
 
-    Ok((seg, idx, idx_path))
+    Ok((seg, idx, log_path))
 }

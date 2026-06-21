@@ -4,14 +4,90 @@ use std::sync::Arc;
 use std::sync::atomic::Ordering;
 use std::time::{Duration, Instant};
 
-use crossbeam_channel::{Receiver, RecvTimeoutError, Sender};
+use crossbeam_channel::{Receiver, Sender, TryRecvError};
 
 use crate::batcher::{BatcherConfig, BatcherCore, Deadline, FlushReason, PushResult};
 use crate::durability::KDurability;
 use crate::keratin::WriterCmd;
-use crate::log::{AppendResult, Log, LogState};
+use crate::log::{
+    AppendResult, FsyncJob, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome,
+};
 use crate::record::Message;
 use crate::{AppendCompletion, KeratinConfig};
+
+#[cfg(feature = "writer-stage-trace")]
+use crate::writer_stage_trace::WriterStageTracer;
+
+#[cfg(feature = "writer-stage-trace")]
+macro_rules! trace_writer_stage {
+    ($tracer:ident, $id:expr, $stage:expr, $weight:expr, $body:block) => {{
+        let (records, bytes) = $weight;
+        $tracer.trace($id, $stage, records, bytes, || $body)
+    }};
+}
+
+#[cfg(not(feature = "writer-stage-trace"))]
+macro_rules! trace_writer_stage {
+    ($tracer:ident, $id:expr, $stage:expr, $weight:expr, $body:block) => {{ $body }};
+}
+
+macro_rules! stage_reqs_then_post {
+    (
+        $tracer:ident,
+        $log:expr,
+        $cfg:expr,
+        $state:expr,
+        $pending:expr,
+        $reqs:expr,
+        $notify_tx:expr,
+        $durable_offset:expr,
+        $last_fsync:expr,
+        $fsync_interval:expr,
+        $fsync_tx:expr,
+        $inflight_fsyncs:expr,
+        $linger:expr,
+        $linger_min:expr,
+        $linger_max:expr $(,)?
+    ) => {{
+        let reqs = $reqs;
+        #[cfg(feature = "writer-stage-trace")]
+        let work_id = $tracer.next_work_id();
+
+        let total_bytes = stage_reqs(
+            $log,
+            $cfg,
+            $state,
+            $pending,
+            reqs,
+            $notify_tx,
+            #[cfg(feature = "writer-stage-trace")]
+            &$tracer,
+            #[cfg(feature = "writer-stage-trace")]
+            work_id,
+        );
+
+        post_stage_commit_and_tune(
+            $log,
+            $cfg,
+            $state,
+            $pending,
+            $durable_offset,
+            $last_fsync,
+            $fsync_interval,
+            total_bytes,
+            $notify_tx,
+            $fsync_tx,
+            $inflight_fsyncs,
+            $linger,
+            $linger_min,
+            $linger_max,
+            #[cfg(feature = "writer-stage-trace")]
+            &$tracer,
+            #[cfg(feature = "writer-stage-trace")]
+            work_id,
+        );
+    }};
+}
 
 // TODO: Tests showing guaranteed order
 // TODO: Also more tests for failures and edge cases (e.g. batch flush on shutdown, etc.)
@@ -47,6 +123,28 @@ impl From<io::Error> for IoError {
     }
 }
 
+pub enum AppendCompletionTarget {
+    Boxed(Box<dyn AppendCompletion<IoError> + Send>),
+    Oneshot(tokio::sync::oneshot::Sender<Result<AppendResult, IoError>>),
+}
+
+impl AppendCompletionTarget {
+    fn complete(self, res: Result<AppendResult, IoError>) {
+        match self {
+            Self::Boxed(completion) => completion.complete(res),
+            Self::Oneshot(tx) => {
+                let _ = tx.send(res);
+            }
+        }
+    }
+}
+
+impl From<Box<dyn AppendCompletion<IoError> + Send>> for AppendCompletionTarget {
+    fn from(value: Box<dyn AppendCompletion<IoError> + Send>) -> Self {
+        Self::Boxed(value)
+    }
+}
+
 pub enum AppendPayload {
     One(Message),
     Many(Vec<Message>),
@@ -55,7 +153,7 @@ pub enum AppendPayload {
 pub struct AppendReq {
     pub records: AppendPayload,
     pub durability: Option<KDurability>,
-    pub completion: Box<dyn AppendCompletion<IoError> + Send>,
+    pub completion: AppendCompletionTarget,
 }
 
 impl AppendPayload {
@@ -74,22 +172,30 @@ impl AppendPayload {
     }
 }
 
+#[cfg(feature = "writer-stage-trace")]
+fn messages_trace_weight(messages: &[Message]) -> (usize, usize) {
+    (
+        messages.len(),
+        messages
+            .iter()
+            .map(Message::bytes_len)
+            .fold(0usize, usize::saturating_add),
+    )
+}
+
 pub struct WriterHandle {
     pub tx: Sender<WriterCmd>,
 }
 
 struct PendingAck {
     end_offset: u64, // inclusive
-    durability: KDurability,
-    respond_to: Box<dyn AppendCompletion<IoError> + Send>,
+    respond_to: AppendCompletionTarget,
     result: AppendResult,
 }
 
 #[inline]
 fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
-    pending
-        .iter()
-        .any(|p| p.durability >= KDurability::AfterFsync)
+    !pending.is_empty()
 }
 
 enum NotifyMsg {
@@ -98,28 +204,86 @@ enum NotifyMsg {
 }
 
 struct NotifyItem {
-    completion: Box<dyn AppendCompletion<IoError> + Send>,
+    completion: AppendCompletionTarget,
     result: Result<AppendResult, IoError>,
+}
+
+struct FsyncReq {
+    job: FsyncJob,
+    ready: Vec<NotifyItem>,
+    #[cfg(feature = "writer-stage-trace")]
+    work_id: u64,
+}
+
+struct FsyncDone {
+    through_offset: u64,
+    elapsed: Duration,
+    ready: Vec<NotifyItem>,
+    error: Option<String>,
+    #[cfg(feature = "writer-stage-trace")]
+    work_id: u64,
+}
+
+enum WriterEvent {
+    Command(WriterCmd),
+    FsyncDone(FsyncDone),
+    Timeout,
+    WritesDisconnected,
+    FsyncDisconnected,
 }
 
 pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
     let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(8192);
 
+    #[cfg(feature = "writer-stage-trace")]
+    let tracer = WriterStageTracer::from_env();
+    #[cfg(feature = "writer-stage-trace")]
+    let notifier_tracer = tracer.clone();
+    #[cfg(feature = "writer-stage-trace")]
+    let fsync_tracer = tracer.clone();
+
     std::thread::spawn(move || {
+        #[cfg(feature = "writer-stage-trace")]
+        notifier_loop(notify_rx, notifier_tracer);
+        #[cfg(not(feature = "writer-stage-trace"))]
         notifier_loop(notify_rx);
         tracing::info!("Notifier loop exited");
+    });
+
+    let (fsync_tx, fsync_rx) = crossbeam_channel::bounded::<FsyncReq>(8);
+    let (fsync_done_tx, fsync_done_rx) = crossbeam_channel::bounded::<FsyncDone>(8);
+
+    std::thread::spawn(move || {
+        #[cfg(feature = "writer-stage-trace")]
+        fsync_loop(fsync_rx, fsync_done_tx, fsync_tracer);
+        #[cfg(not(feature = "writer-stage-trace"))]
+        fsync_loop(fsync_rx, fsync_done_tx);
+        tracing::info!("Fsync loop exited");
     });
 
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(8192);
 
     std::thread::spawn(move || {
-        writer_loop(&mut log, cfg, rx, state, notify_tx);
+        #[cfg(feature = "writer-stage-trace")]
+        writer_loop(
+            &mut log,
+            cfg,
+            rx,
+            state,
+            notify_tx,
+            fsync_tx,
+            fsync_done_rx,
+            tracer,
+        );
+        #[cfg(not(feature = "writer-stage-trace"))]
+        writer_loop(&mut log, cfg, rx, state, notify_tx, fsync_tx, fsync_done_rx);
         tracing::info!("Writer loop exited")
     });
 
     WriterHandle { tx }
 }
 
+#[cfg(not(feature = "writer-stage-trace"))]
 fn notifier_loop(rx: Receiver<NotifyMsg>) {
     while let Ok(msg) = rx.recv() {
         match msg {
@@ -135,18 +299,147 @@ fn notifier_loop(rx: Receiver<NotifyMsg>) {
     }
 }
 
+#[cfg(feature = "writer-stage-trace")]
+fn notifier_loop(rx: Receiver<NotifyMsg>, tracer: WriterStageTracer) {
+    while let Ok(msg) = rx.recv() {
+        let work_id = tracer.next_work_id();
+        match msg {
+            NotifyMsg::One { item } => {
+                trace_writer_stage!(tracer, work_id, "notify", (1, 0), {
+                    item.completion.complete(item.result);
+                });
+            }
+            NotifyMsg::Batch(items) => {
+                let records = items.len();
+                trace_writer_stage!(tracer, work_id, "notify", (records, 0), {
+                    for item in items {
+                        item.completion.complete(item.result);
+                    }
+                });
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "writer-stage-trace"))]
+fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
+    while let Ok(req) = rx.recv() {
+        let through_offset = req.job.through_offset();
+        let result = req.job.sync();
+        let done = fsync_done_from_result(through_offset, req.ready, result);
+        if done_tx.send(done).is_err() {
+            break;
+        }
+    }
+}
+
+#[cfg(feature = "writer-stage-trace")]
+fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: WriterStageTracer) {
+    while let Ok(req) = rx.recv() {
+        let through_offset = req.job.through_offset();
+        let result = trace_writer_stage!(tracer, req.work_id, "fsync", (0, 0), { req.job.sync() });
+        let mut done = fsync_done_from_result(through_offset, req.ready, result);
+        done.work_id = req.work_id;
+        if done_tx.send(done).is_err() {
+            break;
+        }
+    }
+}
+
+fn fsync_done_from_result(
+    through_offset: u64,
+    ready: Vec<NotifyItem>,
+    result: io::Result<Duration>,
+) -> FsyncDone {
+    match result {
+        Ok(elapsed) => FsyncDone {
+            through_offset,
+            elapsed,
+            ready,
+            error: None,
+            #[cfg(feature = "writer-stage-trace")]
+            work_id: 0,
+        },
+        Err(err) => {
+            let msg = err.to_string();
+            FsyncDone {
+                through_offset,
+                elapsed: Duration::ZERO,
+                ready: ready
+                    .into_iter()
+                    .map(|item| NotifyItem {
+                        completion: item.completion,
+                        result: Err(IoError::new(&msg)),
+                    })
+                    .collect(),
+                error: Some(msg),
+                #[cfg(feature = "writer-stage-trace")]
+                work_id: 0,
+            }
+        }
+    }
+}
+
+#[cfg(not(feature = "writer-stage-trace"))]
 fn writer_loop(
     log: &mut Log,
     cfg: KeratinConfig,
     writes_rx: Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
+    fsync_tx: Sender<FsyncReq>,
+    fsync_done_rx: Receiver<FsyncDone>,
+) {
+    writer_loop_inner(
+        log,
+        cfg,
+        writes_rx,
+        state,
+        notify_tx,
+        fsync_tx,
+        fsync_done_rx,
+    )
+}
+
+#[cfg(feature = "writer-stage-trace")]
+fn writer_loop(
+    log: &mut Log,
+    cfg: KeratinConfig,
+    writes_rx: Receiver<WriterCmd>,
+    state: Arc<LogState>,
+    notify_tx: Sender<NotifyMsg>,
+    fsync_tx: Sender<FsyncReq>,
+    fsync_done_rx: Receiver<FsyncDone>,
+    tracer: WriterStageTracer,
+) {
+    writer_loop_inner(
+        log,
+        cfg,
+        writes_rx,
+        state,
+        notify_tx,
+        fsync_tx,
+        fsync_done_rx,
+        tracer,
+    )
+}
+
+fn writer_loop_inner(
+    log: &mut Log,
+    cfg: KeratinConfig,
+    writes_rx: Receiver<WriterCmd>,
+    state: Arc<LogState>,
+    notify_tx: Sender<NotifyMsg>,
+    fsync_tx: Sender<FsyncReq>,
+    fsync_done_rx: Receiver<FsyncDone>,
+    #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let mut last_fsync = Instant::now();
 
     let mut pending: VecDeque<PendingAck> = VecDeque::new();
     let mut durable_offset = log.durable_watermark();
+    let mut inflight_fsyncs = 0usize;
 
     // Adaptive linger
     // TODO: Consider removing due to overlap with fsync window
@@ -171,6 +464,17 @@ fn writer_loop(
     );
 
     loop {
+        drain_fsync_done(
+            log,
+            &state,
+            &notify_tx,
+            &fsync_done_rx,
+            &mut durable_offset,
+            &mut inflight_fsyncs,
+            #[cfg(feature = "writer-stage-trace")]
+            &tracer,
+        );
+
         // Keep linger synced with adaptive tuning.
         batcher.set_linger(linger);
 
@@ -178,17 +482,19 @@ fn writer_loop(
         if let Some((FlushReason::Timeout, reqs)) = batcher.flush_if_due(Instant::now())
             && !reqs.is_empty()
         {
-            let total_bytes = stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
-            post_stage_commit_and_tune(
+            stage_reqs_then_post!(
+                tracer,
                 log,
                 &cfg,
                 &state,
                 &mut pending,
+                reqs,
+                &notify_tx,
                 &mut durable_offset,
                 &mut last_fsync,
                 fsync_interval,
-                total_bytes,
-                &notify_tx,
+                &fsync_tx,
+                &mut inflight_fsyncs,
                 &mut linger,
                 linger_min,
                 linger_max,
@@ -206,6 +512,10 @@ fn writer_loop(
             &mut last_fsync,
             fsync_interval,
             &notify_tx,
+            &fsync_tx,
+            &mut inflight_fsyncs,
+            #[cfg(feature = "writer-stage-trace")]
+            &tracer,
         );
 
         // (C) Compute how long we may wait for the next cmd.
@@ -233,38 +543,73 @@ fn writer_loop(
             Deadline::None => {}
         }
 
-        // (D) Fetch next command (bounded).
-        let cmd = if wait == Duration::MAX {
-            match writes_rx.recv() {
-                Ok(c) => c,
-                Err(_) => {
-                    shutdown_fail_unstaged(
-                        &mut batcher,
-                        "writer shutdown",
-                        FlushReason::Shutdown,
-                        &notify_tx,
-                    );
-                    // fail_all_pending(&mut pending, "writer shutdown");
-                    return;
-                }
+        // (D) Fetch next event (bounded).
+        let event = recv_writer_event(&writes_rx, &fsync_done_rx, wait);
+
+        let cmd = match event {
+            WriterEvent::Command(cmd) => cmd,
+            WriterEvent::FsyncDone(done) => {
+                handle_fsync_done(
+                    log,
+                    &state,
+                    &notify_tx,
+                    done,
+                    &mut durable_offset,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                );
+                continue;
             }
-        } else {
-            match writes_rx.recv_timeout(wait) {
-                Ok(c) => c,
-                Err(RecvTimeoutError::Timeout) => {
-                    // Either batch deadline or fsync deadline is due; loop will handle.
-                    continue;
-                }
-                Err(RecvTimeoutError::Disconnected) => {
-                    shutdown_fail_unstaged(
-                        &mut batcher,
-                        "writer disconnected",
-                        FlushReason::Shutdown,
+            WriterEvent::Timeout => {
+                // Either batch deadline or fsync deadline is due; loop will handle.
+                continue;
+            }
+            WriterEvent::WritesDisconnected => {
+                shutdown_fail_unstaged(
+                    &mut batcher,
+                    "writer shutdown",
+                    FlushReason::Shutdown,
+                    &notify_tx,
+                );
+                if !pending.is_empty() {
+                    #[cfg(feature = "writer-stage-trace")]
+                    let work_id = tracer.next_work_id();
+                    if let Err(e) = commit(
+                        log,
+                        &mut pending,
+                        &mut last_fsync,
                         &notify_tx,
-                    );
-                    // fail_all_pending(&mut pending, "writer disconnected");
-                    return;
+                        &fsync_tx,
+                        &mut inflight_fsyncs,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                        #[cfg(feature = "writer-stage-trace")]
+                        work_id,
+                    ) {
+                        fail_all_pending(
+                            &mut pending,
+                            format!("Internal Error while committing before writer shutdown: {e}"),
+                            &notify_tx,
+                            true,
+                        );
+                    }
                 }
+                wait_for_inflight_fsyncs(
+                    log,
+                    &state,
+                    &notify_tx,
+                    &fsync_done_rx,
+                    &mut durable_offset,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                );
+                return;
+            }
+            WriterEvent::FsyncDisconnected => {
+                fail_all_pending(&mut pending, "fsync worker disconnected", &notify_tx, true);
+                return;
             }
         };
 
@@ -277,18 +622,19 @@ fn writer_loop(
                         // nothing flushed yet
                     }
                     PushResult::One((_why, reqs)) => {
-                        let total_bytes =
-                            stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx);
-                        post_stage_commit_and_tune(
+                        stage_reqs_then_post!(
+                            tracer,
                             log,
                             &cfg,
                             &state,
                             &mut pending,
+                            reqs,
+                            &notify_tx,
                             &mut durable_offset,
                             &mut last_fsync,
                             fsync_interval,
-                            total_bytes,
-                            &notify_tx,
+                            &fsync_tx,
+                            &mut inflight_fsyncs,
                             &mut linger,
                             linger_min,
                             linger_max,
@@ -303,14 +649,39 @@ fn writer_loop(
                     }
                     PushResult::Two((why1, reqs1), (why2, reqs2)) => {
                         // Very rare but must be lossless (stale barrier + size flush).
-                        let b1 = stage_reqs(log, &cfg, &state, &mut pending, reqs1, &notify_tx);
-                        let b2 = stage_reqs(log, &cfg, &state, &mut pending, reqs2, &notify_tx);
+                        #[cfg(feature = "writer-stage-trace")]
+                        let work_id1 = tracer.next_work_id();
+                        let b1 = stage_reqs(
+                            log,
+                            &cfg,
+                            &state,
+                            &mut pending,
+                            reqs1,
+                            &notify_tx,
+                            #[cfg(feature = "writer-stage-trace")]
+                            &tracer,
+                            #[cfg(feature = "writer-stage-trace")]
+                            work_id1,
+                        );
+
+                        #[cfg(feature = "writer-stage-trace")]
+                        let work_id2 = tracer.next_work_id();
+                        let b2 = stage_reqs(
+                            log,
+                            &cfg,
+                            &state,
+                            &mut pending,
+                            reqs2,
+                            &notify_tx,
+                            #[cfg(feature = "writer-stage-trace")]
+                            &tracer,
+                            #[cfg(feature = "writer-stage-trace")]
+                            work_id2,
+                        );
 
                         // Use combined bytes for tuning.
                         let total_bytes = b1.saturating_add(b2);
 
-                        // Regardless of why, post-stage commit scheduling stays the same.
-                        let _ = (why1, why2); // keep for tracing if you want
                         post_stage_commit_and_tune(
                             log,
                             &cfg,
@@ -321,10 +692,19 @@ fn writer_loop(
                             fsync_interval,
                             total_bytes,
                             &notify_tx,
+                            &fsync_tx,
+                            &mut inflight_fsyncs,
                             &mut linger,
                             linger_min,
                             linger_max,
+                            #[cfg(feature = "writer-stage-trace")]
+                            &tracer,
+                            #[cfg(feature = "writer-stage-trace")]
+                            work_id2,
                         );
+
+                        // Regardless of why, post-stage commit scheduling stays the same.
+                        let _ = (why1, why2); // keep for tracing if you want
                         tracing::debug!(
                             items = batcher.len(),
                             records = batcher.total_records(),
@@ -334,6 +714,58 @@ fn writer_loop(
                             "batcher state after push"
                         );
                     }
+                }
+            }
+            WriterCmd::ReplicatedAppend {
+                epoch,
+                first_offset,
+                records,
+                mode,
+                durability,
+                respond_to,
+            } => {
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    stage_reqs_then_post!(
+                        tracer,
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        unstaged,
+                        &notify_tx,
+                        &mut durable_offset,
+                        &mut last_fsync,
+                        fsync_interval,
+                        &fsync_tx,
+                        &mut inflight_fsyncs,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                let res = trace_writer_stage!(
+                    tracer,
+                    work_id,
+                    "replicated_append",
+                    messages_trace_weight(&records),
+                    {
+                        stage_replicated_req(
+                            log,
+                            &state,
+                            epoch,
+                            first_offset,
+                            &records,
+                            mode,
+                            durability.unwrap_or(cfg.default_durability),
+                        )
+                    }
+                );
+                if let Err(_err) = respond_to.send(res) {
+                    tracing::info!("Error sending replicated append response");
                 }
             }
             WriterCmd::Truncate { before, respond_to } => {
@@ -346,19 +778,169 @@ fn writer_loop(
                     tracing::info!("Truncate successful, before {before}");
                 }
             }
-            WriterCmd::Shutdown { notify_tx } => {
-                tracing::info!("Writer received shutdown command");
-                // Sync changes
-                if let Err(e) = log
+            WriterCmd::ResetToCheckpoint {
+                next_offset,
+                respond_to,
+            } => {
+                shutdown_fail_reqs(batcher.flush(), "writer reset to checkpoint", &notify_tx);
+                fail_all_pending(
+                    &mut pending,
+                    "writer reset to checkpoint",
+                    &notify_tx,
+                    false,
+                );
+                let res = log.reset_to_checkpoint(next_offset, crate::util::unix_millis());
+                if res.is_ok() {
+                    durable_offset = log.durable_watermark();
+                    last_fsync = Instant::now();
+                }
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending reset-to-checkpoint response");
+                }
+            }
+            WriterCmd::AdvanceEpoch { epoch, respond_to } => {
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    stage_reqs_then_post!(
+                        tracer,
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        unstaged,
+                        &notify_tx,
+                        &mut durable_offset,
+                        &mut last_fsync,
+                        fsync_interval,
+                        &fsync_tx,
+                        &mut inflight_fsyncs,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                let res = commit(
+                    log,
+                    &mut pending,
+                    &mut last_fsync,
+                    &notify_tx,
+                    &fsync_tx,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                    #[cfg(feature = "writer-stage-trace")]
+                    work_id,
+                )
+                .and_then(|_| {
+                    wait_for_inflight_fsyncs(
+                        log,
+                        &state,
+                        &notify_tx,
+                        &fsync_done_rx,
+                        &mut durable_offset,
+                        &mut inflight_fsyncs,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                    );
+                    log.advance_epoch(epoch)
+                });
+                if let Ok(epoch) = res {
+                    state.epoch.store(epoch, Ordering::Release);
+                }
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending advance-epoch response");
+                }
+            }
+            WriterCmd::Sync { respond_to } => {
+                // Make everything staged so far durable. Used by callers that
+                // stage with AfterWrite and fsync separately (e.g. two logs in
+                // parallel). flush_buffers + flush move staged bytes to the file;
+                // fsync makes them durable; then advance the durable watermark.
+                let res = log
                     .flush_buffers()
                     .and_then(|_| log.flush())
                     .and_then(|_| log.fsync())
-                {
+                    .map(|_| {
+                        let durable = log.durable_watermark();
+                        state.durable.store(durable, Ordering::Release);
+                        durable_offset = durable;
+                    });
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending sync response");
+                }
+            }
+            WriterCmd::Shutdown {
+                notify_tx: shutdown_tx,
+            } => {
+                tracing::info!("Writer received shutdown command");
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    stage_reqs_then_post!(
+                        tracer,
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        unstaged,
+                        &notify_tx,
+                        &mut durable_offset,
+                        &mut last_fsync,
+                        fsync_interval,
+                        &fsync_tx,
+                        &mut inflight_fsyncs,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+
+                if !pending.is_empty() {
+                    #[cfg(feature = "writer-stage-trace")]
+                    let work_id = tracer.next_work_id();
+                    if let Err(e) = commit(
+                        log,
+                        &mut pending,
+                        &mut last_fsync,
+                        &notify_tx,
+                        &fsync_tx,
+                        &mut inflight_fsyncs,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                        #[cfg(feature = "writer-stage-trace")]
+                        work_id,
+                    ) {
+                        fail_all_pending(
+                            &mut pending,
+                            format!("Internal Error while committing before shutdown: {e}"),
+                            &notify_tx,
+                            true,
+                        );
+                    }
+                }
+
+                wait_for_inflight_fsyncs(
+                    log,
+                    &state,
+                    &notify_tx,
+                    &fsync_done_rx,
+                    &mut durable_offset,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                );
+
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                if let Err(e) = trace_writer_stage!(tracer, work_id, "shutdown_fsync", (0, 0), {
+                    log.shutdown()
+                }) {
                     tracing::error!("Error during writer shutdown fsync: {e}");
                 } else {
                     tracing::info!("Writer shutdown fsync complete");
                 }
-                if notify_tx.send(()).is_err() {
+                if shutdown_tx.send(()).is_err() {
                     tracing::info!("Error sending shutdown notification");
                 }
                 return;
@@ -375,6 +957,42 @@ fn writer_loop(
     }
 }
 
+fn stage_replicated_req(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    epoch: u64,
+    first_offset: u64,
+    records: &[Message],
+    mode: ReplicatedAppendMode,
+    durability: KDurability,
+) -> Result<ReplicatedAppendOutcome, IoError> {
+    let now_ms = crate::util::unix_millis();
+    let (outcome, end_offset) =
+        log.stage_replicated_append_batch(epoch, first_offset, records, mode, now_ms)?;
+    state.epoch.store(log.current_epoch(), Ordering::Release);
+
+    if let Some(end_offset) = end_offset {
+        state.tail.store(end_offset + 1, Ordering::Release);
+
+        match durability {
+            KDurability::AfterWrite => {
+                log.flush_buffers()?;
+                log.flush()?;
+            }
+            KDurability::AfterFsync => {
+                log.flush_buffers()?;
+                log.flush()?;
+                log.fsync()?;
+                state
+                    .durable
+                    .store(log.durable_watermark(), Ordering::Release);
+            }
+        }
+    }
+
+    Ok(outcome)
+}
+
 /// Stage a flushed batch of AppendReqs.
 /// Returns total bytes staged (for adaptive linger tuning).
 fn stage_reqs(
@@ -384,6 +1002,8 @@ fn stage_reqs(
     pending: &mut VecDeque<PendingAck>,
     reqs: Vec<AppendReq>,
     notify_tx: &Sender<NotifyMsg>,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> usize {
     let now_ms = crate::util::unix_millis();
 
@@ -393,67 +1013,52 @@ fn stage_reqs(
         total_bytes = total_bytes.saturating_add(r.records.bytes_len());
 
         let dur = r.durability.unwrap_or(cfg.default_durability);
-        match r.records {
-            AppendPayload::One(message) => match log.stage_append(&message, now_ms) {
-                Ok((ar, end_offset)) => {
-                    state.tail.store(end_offset + 1, Ordering::Release);
-                    if dur == KDurability::AfterWrite {
-                        notify_tx
-                            .send(NotifyMsg::One {
-                                item: NotifyItem {
-                                    completion: r.completion,
-                                    result: Ok(ar),
-                                },
-                            })
-                            .ok();
-                    } else {
-                        pending.push_back(PendingAck {
-                            end_offset,
-                            durability: dur,
-                            respond_to: r.completion,
-                            result: ar,
-                        });
-                    }
-                }
-                Err(e) => {
-                    let _ = notify_tx.send(NotifyMsg::One {
-                        item: NotifyItem {
-                            completion: r.completion,
-                            result: Err(e.into()),
-                        },
+        let completion = r.completion;
+        let result = match r.records {
+            AppendPayload::One(message) => {
+                #[cfg(feature = "writer-stage-trace")]
+                let result = log.stage_append_traced(&message, now_ms, tracer, work_id);
+                #[cfg(not(feature = "writer-stage-trace"))]
+                let result = log.stage_append(&message, now_ms);
+                result
+            }
+            AppendPayload::Many(messages) => {
+                #[cfg(feature = "writer-stage-trace")]
+                let result = log.stage_append_batch_traced(&messages, now_ms, tracer, work_id);
+                #[cfg(not(feature = "writer-stage-trace"))]
+                let result = log.stage_append_batch(&messages, now_ms);
+                result
+            }
+        };
+
+        match result {
+            Ok((ar, end_offset)) => {
+                state.tail.store(end_offset + 1, Ordering::Release);
+                if dur == KDurability::AfterWrite {
+                    notify_tx
+                        .send(NotifyMsg::One {
+                            item: NotifyItem {
+                                completion,
+                                result: Ok(ar),
+                            },
+                        })
+                        .ok();
+                } else {
+                    pending.push_back(PendingAck {
+                        end_offset,
+                        respond_to: completion,
+                        result: ar,
                     });
                 }
-            },
-            AppendPayload::Many(messages) => match log.stage_append_batch(&messages, now_ms) {
-                Ok((ar, end_offset)) => {
-                    state.tail.store(end_offset + 1, Ordering::Release);
-                    if dur == KDurability::AfterWrite {
-                        notify_tx
-                            .send(NotifyMsg::One {
-                                item: NotifyItem {
-                                    completion: r.completion,
-                                    result: Ok(ar),
-                                },
-                            })
-                            .ok();
-                    } else {
-                        pending.push_back(PendingAck {
-                            end_offset,
-                            durability: dur,
-                            respond_to: r.completion,
-                            result: ar,
-                        });
-                    }
-                }
-                Err(e) => {
-                    let _ = notify_tx.send(NotifyMsg::One {
-                        item: NotifyItem {
-                            completion: r.completion,
-                            result: Err(e.into()),
-                        },
-                    });
-                }
-            },
+            }
+            Err(e) => {
+                let _ = notify_tx.send(NotifyMsg::One {
+                    item: NotifyItem {
+                        completion,
+                        result: Err(e.into()),
+                    },
+                });
+            }
         }
     }
 
@@ -463,12 +1068,15 @@ fn stage_reqs(
 /// Commit if due, retry a few times and fail all pending waiters on repeated errors.
 fn maybe_commit_due(
     log: &mut Log,
-    state: &Arc<LogState>,
+    _state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
-    durable_offset: &mut u64,
+    _durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
     let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
@@ -477,14 +1085,21 @@ fn maybe_commit_due(
         return;
     }
 
+    #[cfg(feature = "writer-stage-trace")]
+    let work_id = tracer.next_work_id();
+
     let mut error_count = 0;
     while let Err(e) = commit(
         log,
         pending,
-        durable_offset,
         last_fsync,
-        state.clone(),
         notify_tx,
+        fsync_tx,
+        inflight_fsyncs,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
     ) {
         fail_all_pending(
             pending,
@@ -514,16 +1129,20 @@ fn maybe_commit_due(
 fn post_stage_commit_and_tune(
     log: &mut Log,
     cfg: &KeratinConfig,
-    state: &Arc<LogState>,
+    _state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
-    durable_offset: &mut u64,
+    _durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
     notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    inflight_fsyncs: &mut usize,
     linger: &mut Duration,
     linger_min: Duration,
     linger_max: Duration,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) {
     // Commit scheduling (same as original, but factored)
     let needs_commit = pending_needs_fsync(pending);
@@ -533,12 +1152,19 @@ fn post_stage_commit_and_tune(
         let _ = commit(
             log,
             pending,
-            durable_offset,
             last_fsync,
-            state.clone(),
             notify_tx,
+            fsync_tx,
+            inflight_fsyncs,
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+            #[cfg(feature = "writer-stage-trace")]
+            work_id,
         );
     } else if log.should_flush() {
+        #[cfg(feature = "writer-stage-trace")]
+        let _ = log.flush_buffers_traced(tracer, work_id);
+        #[cfg(not(feature = "writer-stage-trace"))]
         let _ = log.flush_buffers();
     }
 
@@ -559,7 +1185,10 @@ fn shutdown_fail_unstaged(
     _why: FlushReason,
     notify_tx: &Sender<NotifyMsg>,
 ) {
-    let reqs = batcher.flush();
+    shutdown_fail_reqs(batcher.flush(), msg, notify_tx);
+}
+
+fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<NotifyMsg>) {
     let mut items = Vec::new();
     for r in reqs {
         items.push(NotifyItem {
@@ -569,28 +1198,179 @@ fn shutdown_fail_unstaged(
             }),
         });
     }
-    let _ = notify_tx.send(NotifyMsg::Batch(items));
+    if !items.is_empty() {
+        let _ = notify_tx.send(NotifyMsg::Batch(items));
+    }
+}
+
+fn recv_writer_event(
+    writes_rx: &Receiver<WriterCmd>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    wait: Duration,
+) -> WriterEvent {
+    if wait == Duration::MAX {
+        crossbeam_channel::select! {
+            recv(writes_rx) -> msg => match msg {
+                Ok(cmd) => WriterEvent::Command(cmd),
+                Err(_) => WriterEvent::WritesDisconnected,
+            },
+            recv(fsync_done_rx) -> msg => match msg {
+                Ok(done) => WriterEvent::FsyncDone(done),
+                Err(_) => WriterEvent::FsyncDisconnected,
+            },
+        }
+    } else {
+        crossbeam_channel::select! {
+            recv(writes_rx) -> msg => match msg {
+                Ok(cmd) => WriterEvent::Command(cmd),
+                Err(_) => WriterEvent::WritesDisconnected,
+            },
+            recv(fsync_done_rx) -> msg => match msg {
+                Ok(done) => WriterEvent::FsyncDone(done),
+                Err(_) => WriterEvent::FsyncDisconnected,
+            },
+            default(wait) => WriterEvent::Timeout,
+        }
+    }
+}
+
+fn drain_fsync_done(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    durable_offset: &mut u64,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) {
+    loop {
+        match fsync_done_rx.try_recv() {
+            Ok(done) => handle_fsync_done(
+                log,
+                state,
+                notify_tx,
+                done,
+                durable_offset,
+                inflight_fsyncs,
+                #[cfg(feature = "writer-stage-trace")]
+                tracer,
+            ),
+            Err(TryRecvError::Empty) | Err(TryRecvError::Disconnected) => break,
+        }
+    }
+}
+
+fn wait_for_inflight_fsyncs(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    durable_offset: &mut u64,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) {
+    while *inflight_fsyncs > 0 {
+        match fsync_done_rx.recv() {
+            Ok(done) => handle_fsync_done(
+                log,
+                state,
+                notify_tx,
+                done,
+                durable_offset,
+                inflight_fsyncs,
+                #[cfg(feature = "writer-stage-trace")]
+                tracer,
+            ),
+            Err(_) => break,
+        }
+    }
+}
+
+fn handle_fsync_done(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    notify_tx: &Sender<NotifyMsg>,
+    done: FsyncDone,
+    durable_offset: &mut u64,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) {
+    *inflight_fsyncs = inflight_fsyncs.saturating_sub(1);
+
+    if let Some(error) = done.error {
+        tracing::error!("fsync job failed: {error}");
+        send_notify_items(notify_tx, done.ready);
+        return;
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    let finish_result =
+        log.finish_fsync_job_traced(done.through_offset, done.elapsed, tracer, done.work_id);
+    #[cfg(not(feature = "writer-stage-trace"))]
+    let finish_result = log.finish_fsync_job(done.through_offset, done.elapsed);
+
+    match finish_result {
+        Ok(()) => {
+            *durable_offset = (*durable_offset).max(done.through_offset);
+            state.durable.store(*durable_offset, Ordering::Release);
+            send_notify_items(notify_tx, done.ready);
+        }
+        Err(err) => {
+            tracing::error!("finishing fsync job failed: {err}");
+            send_notify_items(notify_tx, fail_notify_items(done.ready, err.to_string()));
+        }
+    }
+}
+
+fn send_notify_items(notify_tx: &Sender<NotifyMsg>, mut items: Vec<NotifyItem>) {
+    if items.is_empty() {
+        return;
+    }
+
+    if items.len() == 1 {
+        if let Some(item) = items.pop() {
+            notify_tx.send(NotifyMsg::One { item }).ok();
+        }
+    } else {
+        notify_tx.send(NotifyMsg::Batch(items)).ok();
+    }
+}
+
+fn fail_notify_items(items: Vec<NotifyItem>, err_msg: impl AsRef<str>) -> Vec<NotifyItem> {
+    let err_msg = err_msg.as_ref().to_string();
+    items
+        .into_iter()
+        .map(|item| NotifyItem {
+            completion: item.completion,
+            result: Err(IoError::new(&err_msg)),
+        })
+        .collect()
 }
 
 fn commit(
     log: &mut Log,
     pending: &mut VecDeque<PendingAck>,
-    durable_offset: &mut u64,
     last_fsync: &mut Instant,
-    state: Arc<LogState>,
     notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> Result<(), io::Error> {
-    log.flush_buffers()?;
-    log.fsync()?;
-    *durable_offset = log.durable_watermark();
-    state.durable.store(*durable_offset, Ordering::Release);
+    #[cfg(feature = "writer-stage-trace")]
+    let job = log.prepare_fsync_job_traced(tracer, work_id)?;
+    #[cfg(not(feature = "writer-stage-trace"))]
+    let job = log.prepare_fsync_job()?;
     *last_fsync = Instant::now();
 
     let mut ready = Vec::new();
+    let through_offset = job.through_offset();
 
     while let Some(front) = pending.front() {
-        if front.end_offset <= *durable_offset {
-            let p = pending.pop_front().unwrap();
+        if front.end_offset <= through_offset {
+            let p = pending
+                .pop_front()
+                .expect("front() returned Some on the previous line");
             ready.push(NotifyItem {
                 completion: p.respond_to,
                 result: Ok(p.result),
@@ -600,16 +1380,30 @@ fn commit(
         }
     }
 
-    if !ready.is_empty() {
-        if ready.len() == 1 {
-            if let Some(item) = ready.pop() {
-                notify_tx.send(NotifyMsg::One { item }).ok();
-            }
-        } else {
-            notify_tx.send(NotifyMsg::Batch(ready)).ok();
-        }
+    if ready.is_empty() {
+        return Ok(());
     }
 
+    let req = FsyncReq {
+        job,
+        ready,
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
+    };
+
+    if let Err(err) = fsync_tx.send(req) {
+        let FsyncReq { ready, .. } = err.into_inner();
+        send_notify_items(
+            notify_tx,
+            fail_notify_items(ready, "fsync worker disconnected"),
+        );
+        return Err(io::Error::new(
+            io::ErrorKind::BrokenPipe,
+            "fsync worker disconnected",
+        ));
+    }
+
+    *inflight_fsyncs = inflight_fsyncs.saturating_add(1);
     log.stats.batches += 1;
 
     Ok(())

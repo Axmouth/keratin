@@ -10,6 +10,7 @@ pub struct KeratinConfig {
     pub default_durability: KDurability,
     pub fsync_interval_ms: u64,
     pub flush_target_bytes: usize,
+    pub force_recovery_scan: bool,
 }
 
 impl Default for KeratinConfig {
@@ -23,6 +24,7 @@ impl Default for KeratinConfig {
             default_durability: KDurability::AfterFsync,
             fsync_interval_ms: 5,
             flush_target_bytes: 32 * 1024 * 1024,
+            force_recovery_scan: false,
         }
     }
 }
@@ -38,6 +40,7 @@ impl KeratinConfig {
             default_durability: KDurability::AfterFsync,
             fsync_interval_ms: 5,
             flush_target_bytes: 32 * 1024 * 1024,
+            force_recovery_scan: false,
         }
     }
 }

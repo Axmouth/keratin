@@ -1,5 +1,5 @@
 use keratin_log::*;
-use std::{path::PathBuf, process::Command};
+use std::process::Command;
 
 // TODO
 fn main() {

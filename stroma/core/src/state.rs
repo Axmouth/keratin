@@ -1,7 +1,11 @@
 use std::cmp::Reverse;
 use std::collections::{BTreeMap, BinaryHeap, HashMap};
+use std::marker::PhantomData;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::Weak;
+use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
+
+use arc_swap::ArcSwap;
 
 use bitvec::vec::BitVec;
 use keratin_log::Keratin;
@@ -11,7 +15,6 @@ use serde::Serialize;
 use tokio::sync::{Notify, RwLock, mpsc, oneshot};
 use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
-use uuid::Uuid;
 
 use crate::StromaError;
 use crate::event::{
@@ -19,13 +22,11 @@ use crate::event::{
     EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta,
 };
 use crate::metrics::{
-    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
-    StromaMetrics,
+    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot,
+    ReplicationCacheMetricsSnapshot, SnapshotMetricsSnapshot, StromaMetrics,
 };
-use crate::stroma::{GlobalDLQ, TaskGroup};
+use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
-pub type ClientId = Uuid;
-pub type ConsumerId = u64;
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
@@ -33,18 +34,96 @@ pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
 
 pub const FORMAT_VERSION: u64 = 2;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueRole {
+    Owner,
+    Follower,
+    Frozen,
+}
+
+impl QueueRole {
+    const OWNER: u8 = 0;
+    const FOLLOWER: u8 = 1;
+    const FROZEN: u8 = 2;
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            Self::FOLLOWER => Self::Follower,
+            Self::FROZEN => Self::Frozen,
+            _ => Self::Owner,
+        }
+    }
+
+    fn as_u8(self) -> u8 {
+        match self {
+            Self::Owner => Self::OWNER,
+            Self::Follower => Self::FOLLOWER,
+            Self::Frozen => Self::FROZEN,
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 pub enum QueueHandleError {
     ActorGone,
+    WrongRole {
+        expected: QueueRole,
+        actual: QueueRole,
+    },
     LoadSnapshotFailed(String),
     SnapshotNotCreated,
     SnapshotLoadFailed(String),
+    Internal(String),
+}
+
+#[derive(Debug)]
+pub struct OwnerOperationLease {
+    active: Arc<AtomicU64>,
+    drained: Arc<Notify>,
+}
+
+#[derive(Debug)]
+pub struct OwnerOperationPauseGuard {
+    paused: Arc<AtomicBool>,
+    resumed: Arc<Notify>,
+}
+
+impl OwnerOperationLease {
+    pub(crate) fn clone_for_continuation(&self) -> Self {
+        self.active.fetch_add(1, Ordering::AcqRel);
+        Self {
+            active: self.active.clone(),
+            drained: self.drained.clone(),
+        }
+    }
+}
+
+impl Drop for OwnerOperationPauseGuard {
+    fn drop(&mut self) {
+        self.paused.store(false, Ordering::Release);
+        self.resumed.notify_waiters();
+    }
+}
+
+impl Drop for OwnerOperationLease {
+    fn drop(&mut self) {
+        if self.active.fetch_sub(1, Ordering::AcqRel) == 1 {
+            self.drained.notify_waiters();
+        }
+    }
 }
 
 impl std::fmt::Display for QueueHandleError {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         match self {
             QueueHandleError::ActorGone => write!(f, "queue actor is gone"),
+            QueueHandleError::WrongRole { expected, actual } => {
+                write!(
+                    f,
+                    "queue role mismatch: expected {expected:?}, current role is {actual:?}"
+                )
+            }
             QueueHandleError::LoadSnapshotFailed(reason) => {
                 write!(f, "snapshot load failed: {reason}")
             }
@@ -52,6 +131,7 @@ impl std::fmt::Display for QueueHandleError {
             QueueHandleError::SnapshotLoadFailed(reason) => {
                 write!(f, "snapshot load failed: {reason}")
             }
+            QueueHandleError::Internal(reason) => write!(f, "internal queue error: {reason}"),
         }
     }
 }
@@ -60,45 +140,15 @@ impl From<QueueHandleError> for StromaError {
     fn from(value: QueueHandleError) -> Self {
         match value {
             QueueHandleError::ActorGone => StromaError::QueueActorGone,
+            QueueHandleError::WrongRole { expected, actual } => {
+                StromaError::WrongQueueRole { expected, actual }
+            }
             QueueHandleError::LoadSnapshotFailed(reason) => StromaError::Internal(reason),
             QueueHandleError::SnapshotNotCreated => {
                 StromaError::Internal("snapshot not created".to_string())
             }
             QueueHandleError::SnapshotLoadFailed(reason) => StromaError::Internal(reason),
-        }
-    }
-}
-
-#[derive(Debug, Clone, Copy, Eq, PartialEq, PartialOrd, Ord)]
-pub enum ExpiryDeadlineOutcome {
-    Updated(UnixMillis),
-    NoChange,
-}
-
-impl ExpiryDeadlineOutcome {
-    pub fn is_updated(&self) -> bool {
-        matches!(self, ExpiryDeadlineOutcome::Updated(_))
-    }
-
-    pub fn deadline(&self) -> Option<UnixMillis> {
-        match self {
-            ExpiryDeadlineOutcome::Updated(ts) => Some(*ts),
-            ExpiryDeadlineOutcome::NoChange => None,
-        }
-    }
-
-    pub fn min(a: Self, b: Self) -> Self {
-        match (a, b) {
-            (ExpiryDeadlineOutcome::Updated(ts_a), ExpiryDeadlineOutcome::Updated(ts_b)) => {
-                ExpiryDeadlineOutcome::Updated(ts_a.min(ts_b))
-            }
-            (ExpiryDeadlineOutcome::Updated(ts), ExpiryDeadlineOutcome::NoChange)
-            | (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::Updated(ts)) => {
-                ExpiryDeadlineOutcome::Updated(ts)
-            }
-            (ExpiryDeadlineOutcome::NoChange, ExpiryDeadlineOutcome::NoChange) => {
-                ExpiryDeadlineOutcome::NoChange
-            }
+            QueueHandleError::Internal(reason) => StromaError::Internal(reason),
         }
     }
 }
@@ -341,6 +391,10 @@ pub enum QueueCommand {
         reqs: Vec<AckEventMeta>,
         response: Option<oneshot::Sender<()>>,
     }, // list[offset]
+    ReleaseInflightMany {
+        reqs: Vec<AckEventMeta>,
+        response: Option<oneshot::Sender<()>>,
+    },
     Nack {
         offset: Offset,
         requeue: bool,
@@ -402,12 +456,22 @@ pub enum QueueCommand {
     }, // base, bits_bytes
     EncodeSnapshot {
         last_snapshot_event_offset: u64,
+        force: bool,
         response: Option<oneshot::Sender<Option<Vec<u8>>>>,
+    },
+    ExportStateCheckpoint {
+        last_snapshot_event_offset: u64,
+        response: Option<oneshot::Sender<QueueStateCheckpointSnapshot>>,
     },
     LoadSnapshot {
         data: Vec<u8>,
         response: Option<oneshot::Sender<std::io::Result<SnapshotMeta>>>,
     }, // data
+    InstallSnapshotState {
+        state: QueueInternalState,
+        meta: SnapshotMeta,
+        response: Option<oneshot::Sender<SnapshotMeta>>,
+    },
 
     IsAcked {
         offset: Offset,
@@ -442,8 +506,9 @@ pub enum QueueCommand {
     PollReadyAndMark {
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
         response: Option<oneshot::Sender<Vec<(Offset, u32)>>>,
-    }, // max, lease_deadline
+    }, // max, lease_deadline, upper (exclusive deliverable ceiling)
     GetLowestUnacked {
         response: Option<oneshot::Sender<Offset>>,
     },
@@ -484,6 +549,12 @@ pub enum QueueCommand {
     },
 }
 
+#[derive(Debug)]
+pub struct QueueStateCheckpointSnapshot {
+    pub message_checkpoint_offset: Offset,
+    pub state_snapshot: Vec<u8>,
+}
+
 impl QueueCommand {
     pub fn prio(&self) -> CommandPrio {
         match self {
@@ -492,6 +563,7 @@ impl QueueCommand {
             // === Recovery / loading — one-shot at startup, not in contention ===
             // Put at Express so they can't be blocked if something else is in the queue
             QueueCommand::LoadSnapshot { .. } => CommandPrio::Express,
+            QueueCommand::InstallSnapshotState { .. } => CommandPrio::Express,
             QueueCommand::SetAckedUntil { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindow { .. } => CommandPrio::Express,
             QueueCommand::SetAckWindowFromBytes { .. } => CommandPrio::Express,
@@ -532,6 +604,7 @@ impl QueueCommand {
             // low priority, consumers stall waiting for acks to register
             QueueCommand::Ack { .. } => CommandPrio::High,
             QueueCommand::AckMany { .. } => CommandPrio::High,
+            QueueCommand::ReleaseInflightMany { .. } => CommandPrio::High,
             QueueCommand::Nack { .. } => CommandPrio::High,
             QueueCommand::NackMany { .. } => CommandPrio::High,
             QueueCommand::DeadLetterCommit { .. } => CommandPrio::High,
@@ -555,6 +628,7 @@ impl QueueCommand {
             // This assumes snapshot encoding can tolerate being delayed under load.
             // If you need snapshots to run on schedule regardless of load, raise this.
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
+            QueueCommand::ExportStateCheckpoint { .. } => CommandPrio::SuperLow,
             // SuperLow: shutdown drains all queued commands before exiting. Each queued
             // command may have a oneshot response sender that callers are awaiting, if
             // shutdown jumped ahead (Express), those callers would see their rx future
@@ -580,6 +654,7 @@ impl QueueCommand {
             QueueCommand::MarkInflightMany { .. } => "MarkInflightMany",
             QueueCommand::Ack { .. } => "Ack",
             QueueCommand::AckMany { .. } => "AckMany",
+            QueueCommand::ReleaseInflightMany { .. } => "ReleaseInflightMany",
             QueueCommand::Nack { .. } => "Nack",
             QueueCommand::NackMany { .. } => "NackMany",
             QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
@@ -588,7 +663,9 @@ impl QueueCommand {
             QueueCommand::SetAckWindow { .. } => "SetAckWindow",
             QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
+            QueueCommand::ExportStateCheckpoint { .. } => "ExportStateCheckpoint",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
+            QueueCommand::InstallSnapshotState { .. } => "InstallSnapshotState",
             QueueCommand::IsAcked { .. } => "IsAcked",
             QueueCommand::IsInflight { .. } => "IsInflight",
             QueueCommand::IsInflightOrAcked { .. } => "IsInflightOrAcked",
@@ -664,7 +741,7 @@ pub struct QueueCommandPackage {
     pub enqueued_at: Instant,
 }
 
-#[derive(Debug)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct SnapshotMeta {
     pub last_snapshot_timestamp: u64,
     pub last_snapshot_event_offset: u64,
@@ -867,11 +944,9 @@ pub struct QueueSharedBundle {
     pub deadline_waker: Arc<Notify>,
 }
 
-#[derive(Debug, Clone)]
-pub struct QueueHandle {
+#[derive(Debug)]
+pub struct QueueHandleInner {
     command_sender: CommandSender,
-
-    pub(crate) task_group: Arc<TaskGroup>,
 
     topic: String,
     partition: u32,
@@ -892,6 +967,12 @@ pub struct QueueHandle {
     recovery_notify: Arc<Notify>,
     snapshot_task_started: Arc<AtomicBool>,
     background_tasks: CancellationToken,
+    role: Arc<AtomicU8>,
+    role_generation: Arc<AtomicU64>,
+    owner_operations: Arc<AtomicU64>,
+    owner_operations_drained: Arc<Notify>,
+    owner_operations_paused: Arc<AtomicBool>,
+    owner_operations_resumed: Arc<Notify>,
 
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
@@ -899,14 +980,113 @@ pub struct QueueHandle {
     deadline_waker: Arc<Notify>,
 }
 
+/// Handed-out handle to a queue partition: a TICKET, not the state itself.
+///
+/// The log-owning `QueueHandleInner` lives only in the registry slot (held
+/// strong there). A `QueueHandle` holds a `Weak` to the current incarnation
+/// plus the registry ref and key, so it can re-resolve. This means a handed-out
+/// handle (or a long-lived task that clones it) can NEVER pin a dead incarnation
+/// alive: when the slot drops the `Inner`, the logs close and the flock releases
+/// even if tickets still exist. Resolution upgrades the `Weak`; if the
+/// incarnation has rotated (destroy then recreate) it re-looks-up the live slot
+/// by key, so a stale ticket transparently rebinds to the current incarnation.
+#[derive(Debug, Clone)]
+pub struct QueueHandle {
+    registry: Arc<ArcSwap<Registry>>,
+    key: QueueKey,
+    incarnation: Weak<QueueHandleInner>,
+}
+
 impl QueueHandle {
+    /// Build a ticket pointing at `inner` (the slot's strong incarnation).
+    pub(crate) fn from_inner(
+        registry: Arc<ArcSwap<Registry>>,
+        key: QueueKey,
+        inner: &Arc<QueueHandleInner>,
+    ) -> Self {
+        Self {
+            registry,
+            key,
+            incarnation: Arc::downgrade(inner),
+        }
+    }
+
+    /// Resolve the ticket to the live incarnation for the duration of one
+    /// operation. Cheap on the common path (one `Weak::upgrade`). On a
+    /// rotated/gone incarnation it re-looks-up the slot by key (cold path),
+    /// returning the current incarnation or `ActorGone` if the partition no
+    /// longer exists.
+    ///
+    /// The returned [`Resolved`] borrows the ticket, so it cannot be moved into
+    /// a `'static` task nor stashed in a longer-lived struct: a resolved handle
+    /// cannot outlive the ticket it came from, which makes "park a strong handle
+    /// somewhere and pin the logs forever" a COMPILE error rather than a latent
+    /// leak. Resolve once per operation/batch scope and let it drop.
+    pub fn resolve(&self) -> Result<Resolved<'_>, QueueHandleError> {
+        let inner = if let Some(inner) = self.incarnation.upgrade() {
+            inner
+        } else {
+            let current = self.registry.load();
+            match current
+                .get(&self.key)
+                .and_then(|slot| slot.handle.get().cloned())
+            {
+                Some(inner) => inner,
+                None => return Err(QueueHandleError::ActorGone),
+            }
+        };
+        Ok(Resolved {
+            inner,
+            _ticket: PhantomData,
+        })
+    }
+
+    /// Resolve and run `f` against the live incarnation. The borrow cannot
+    /// escape, so callers cannot accidentally pin the incarnation.
+    pub fn with<R>(&self, f: impl FnOnce(&QueueHandleInner) -> R) -> Result<R, QueueHandleError> {
+        let inner = self.resolve()?;
+        Ok(f(&inner))
+    }
+
+    /// Identity, served from the key without resolving.
+    pub fn topic(&self) -> &str {
+        &self.key.0
+    }
+
+    pub fn partition(&self) -> u32 {
+        self.key.1
+    }
+
+    pub fn group(&self) -> Option<&str> {
+        self.key.2.as_deref()
+    }
+}
+
+/// A ticket resolved to its live incarnation for the span of one operation.
+///
+/// Holds a strong `Arc<QueueHandleInner>` (so the incarnation cannot vanish
+/// mid-operation) but is lifetime-bound to the originating [`QueueHandle`], so
+/// it cannot escape into a `'static` task or a longer-lived field. Deref gives
+/// the full `QueueHandleInner` API. Drop it promptly (one per op/batch scope).
+pub struct Resolved<'a> {
+    inner: Arc<QueueHandleInner>,
+    _ticket: PhantomData<&'a QueueHandle>,
+}
+
+impl std::ops::Deref for Resolved<'_> {
+    type Target = QueueHandleInner;
+    fn deref(&self) -> &QueueHandleInner {
+        &self.inner
+    }
+}
+
+impl QueueHandleInner {
     pub fn init(
         topic: String,
         partition: u32,
         group: Option<String>,
         bundle: QueueSharedBundle,
-    ) -> Self {
-        let bundle_clone = bundle.clone();
+    ) -> Arc<QueueHandleInner> {
         let QueueSharedBundle {
             msg_log,
             event_log,
@@ -930,11 +1110,17 @@ impl QueueHandle {
         let recovery_notify = Arc::new(Notify::new());
         let snapshot_task_started = Arc::new(AtomicBool::new(false));
         let background_tasks = CancellationToken::new();
+        let role = Arc::new(AtomicU8::new(QueueRole::Owner.as_u8()));
+        let role_generation = Arc::new(AtomicU64::new(0));
+        let owner_operations = Arc::new(AtomicU64::new(0));
+        let owner_operations_drained = Arc::new(Notify::new());
+        let owner_operations_paused = Arc::new(AtomicBool::new(false));
+        let owner_operations_resumed = Arc::new(Notify::new());
 
         let task_group_clone = task_group.clone();
 
         let waker_for_state = deadline_waker.clone();
-        let result = Self {
+        let result = Arc::new(QueueHandleInner {
             command_sender: tx,
             topic,
             partition,
@@ -950,13 +1136,23 @@ impl QueueHandle {
             recovery_notify,
             snapshot_task_started,
             background_tasks,
-            task_group,
+            role,
+            role_generation,
+            owner_operations,
+            owner_operations_drained,
+            owner_operations_paused,
+            owner_operations_resumed,
             global_dlq,
             metrics,
             deadline_waker,
-        };
+        });
 
-        let handle = result.clone();
+        // The control task holds only a Weak to the Inner, never a strong clone:
+        // the command `tx` lives in the Inner, so while the Inner is alive (held
+        // strong by the registry slot) `recv()` yields and the upgrade succeeds.
+        // When the slot drops the Inner, `tx` drops, `recv()` returns None, and
+        // the loop exits, so the task never pins a retired incarnation.
+        let weak = Arc::downgrade(&result);
 
         task_group_clone.spawn("queue control", async move {
             let mut state: QueueInternalState =
@@ -964,7 +1160,12 @@ impl QueueHandle {
 
             while let Some(pkg) = rx.recv().await {
                 let cmd = pkg.command;
-                let (processed, dirty) = Self::process_command(&mut state, cmd, &handle);
+                let Some(handle) = weak.upgrade() else {
+                    break;
+                };
+                let (processed, dirty) =
+                    QueueHandleInner::process_command(&mut state, cmd, &handle);
+                drop(handle);
                 let _old_val =
                     dirty_since_snapshot_loop.fetch_or(dirty, std::sync::atomic::Ordering::Relaxed);
 
@@ -977,7 +1178,9 @@ impl QueueHandle {
 
         result
     }
+}
 
+impl QueueHandleInner {
     pub async fn full_debug_info(&self) -> QueueDebugInfo {
         let state = self.debug_info().await;
 
@@ -988,6 +1191,8 @@ impl QueueHandle {
             materialized: true,
             exists_on_disk: true,
             evicting: false,
+            role: self.role(),
+            role_generation: self.role_generation(),
             applied_upto: self.applied_upto.load(Ordering::Relaxed),
             last_snapshot_timestamp: self.last_snapshot_timestamp(),
             last_snapshot_event_offset: self.last_snapshot_event_offset(),
@@ -1000,6 +1205,182 @@ impl QueueHandle {
     pub fn mark_recovery_complete(&self) {
         self.recovery_complete.store(true, Ordering::Release);
         self.recovery_notify.notify_waiters();
+    }
+
+    pub fn role(&self) -> QueueRole {
+        QueueRole::from_u8(self.role.load(Ordering::Acquire))
+    }
+
+    pub fn role_generation(&self) -> u64 {
+        self.role_generation.load(Ordering::Acquire)
+    }
+
+    pub fn active_owner_operations(&self) -> u64 {
+        self.owner_operations.load(Ordering::Acquire)
+    }
+
+    pub fn become_owner(&self) {
+        self.set_role(QueueRole::Owner);
+    }
+
+    pub fn become_follower(&self) {
+        self.set_role(QueueRole::Follower);
+    }
+
+    pub fn freeze(&self) {
+        self.set_role(QueueRole::Frozen);
+    }
+
+    pub fn try_freeze_owner(&self) -> Result<(), QueueHandleError> {
+        match self.role.compare_exchange(
+            QueueRole::Owner.as_u8(),
+            QueueRole::Frozen.as_u8(),
+            Ordering::AcqRel,
+            Ordering::Acquire,
+        ) {
+            Ok(_) => {
+                self.role_generation.fetch_add(1, Ordering::AcqRel);
+                Ok(())
+            }
+            Err(actual) => Err(QueueHandleError::WrongRole {
+                expected: QueueRole::Owner,
+                actual: QueueRole::from_u8(actual),
+            }),
+        }
+    }
+
+    fn set_role(&self, role: QueueRole) {
+        let old = self.role.swap(role.as_u8(), Ordering::AcqRel);
+        if old != role.as_u8() {
+            self.role_generation.fetch_add(1, Ordering::AcqRel);
+        }
+    }
+
+    pub fn ensure_owner(&self) -> Result<(), QueueHandleError> {
+        let actual = self.role();
+        if actual == QueueRole::Owner {
+            return Ok(());
+        }
+        Err(QueueHandleError::WrongRole {
+            expected: QueueRole::Owner,
+            actual,
+        })
+    }
+
+    pub async fn begin_owner_operation(&self) -> Result<OwnerOperationLease, QueueHandleError> {
+        loop {
+            self.ensure_owner()?;
+
+            while self.owner_operations_paused.load(Ordering::Acquire) {
+                let resumed = self.owner_operations_resumed.notified();
+                if !self.owner_operations_paused.load(Ordering::Acquire) {
+                    break;
+                }
+                resumed.await;
+                self.ensure_owner()?;
+            }
+
+            self.ensure_owner()?;
+            if self.owner_operations_paused.load(Ordering::Acquire) {
+                continue;
+            }
+
+            self.owner_operations.fetch_add(1, Ordering::AcqRel);
+
+            if let Err(err) = self.ensure_owner() {
+                if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.owner_operations_drained.notify_waiters();
+                }
+                return Err(err);
+            }
+
+            if self.owner_operations_paused.load(Ordering::Acquire) {
+                if self.owner_operations.fetch_sub(1, Ordering::AcqRel) == 1 {
+                    self.owner_operations_drained.notify_waiters();
+                }
+                continue;
+            }
+
+            return Ok(OwnerOperationLease {
+                active: self.owner_operations.clone(),
+                drained: self.owner_operations_drained.clone(),
+            });
+        }
+    }
+
+    pub async fn pause_owner_operations_and_wait(
+        &self,
+    ) -> Result<OwnerOperationPauseGuard, QueueHandleError> {
+        self.ensure_owner()?;
+        loop {
+            match self.owner_operations_paused.compare_exchange(
+                false,
+                true,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => break,
+                Err(_) => {
+                    let resumed = self.owner_operations_resumed.notified();
+                    if !self.owner_operations_paused.load(Ordering::Acquire) {
+                        continue;
+                    }
+                    resumed.await;
+                    self.ensure_owner()?;
+                }
+            }
+        }
+
+        if let Err(err) = self.ensure_owner() {
+            self.owner_operations_paused.store(false, Ordering::Release);
+            self.owner_operations_resumed.notify_waiters();
+            return Err(err);
+        }
+
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
+
+        Ok(OwnerOperationPauseGuard {
+            paused: self.owner_operations_paused.clone(),
+            resumed: self.owner_operations_resumed.clone(),
+        })
+    }
+
+    pub async fn freeze_owner_and_wait_operations(&self) -> Result<(), QueueHandleError> {
+        self.try_freeze_owner()?;
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
+        Ok(())
+    }
+
+    /// Quiesce the queue for teardown (evict/destroy): stop admitting new owner
+    /// operations and wait for any in-flight ones to finish before the logs are
+    /// shut down. Role-agnostic and hang-free:
+    /// - If Owner, freeze first (best-effort) so new `begin_owner_operation`
+    ///   calls return `WrongRole` rather than blocking on a resume that will
+    ///   never come (which `pause` would risk during teardown).
+    /// - For Follower/Frozen there are no owner operations (begin requires
+    ///   Owner), so `active_owner_operations` is already 0 and this returns at
+    ///   once.
+    pub async fn quiesce_for_teardown(&self) {
+        let _ = self.try_freeze_owner();
+        loop {
+            let drained = self.owner_operations_drained.notified();
+            if self.active_owner_operations() == 0 {
+                break;
+            }
+            drained.await;
+        }
     }
 
     pub fn recovery_complete(&self) -> bool {
@@ -1034,7 +1415,7 @@ impl QueueHandle {
     fn process_command(
         state: &mut QueueInternalState,
         cmd: QueueCommand,
-        handle: &QueueHandle,
+        handle: &QueueHandleInner,
     ) -> (Option<bool>, bool) {
         let mut dirty = false;
         let start = Instant::now();
@@ -1115,6 +1496,13 @@ impl QueueHandle {
                     let _ = r.send(());
                 }
                 dirty = !reqs.is_empty();
+            }
+            QueueCommand::ReleaseInflightMany { reqs, response } => {
+                let released = state.release_inflight_many(&reqs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = released > 0;
             }
             QueueCommand::Nack {
                 offset,
@@ -1294,12 +1682,13 @@ impl QueueHandle {
             }
             QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
+                force,
                 response,
             } => {
                 let trigger_time = Instant::now();
                 handle.metrics.snapshot.attempts.incr();
 
-                if !handle.dirty_snapshot() {
+                if !force && !handle.dirty_snapshot() {
                     handle
                         .metrics
                         .snapshot
@@ -1346,10 +1735,67 @@ impl QueueHandle {
                     }
                 });
             }
+            QueueCommand::ExportStateCheckpoint {
+                last_snapshot_event_offset,
+                response,
+            } => {
+                let trigger_time = Instant::now();
+                handle.metrics.snapshot.attempts.incr();
+
+                state.last_snapshot_event_offset = last_snapshot_event_offset;
+                state.last_snapshot_timestamp = unix_millis();
+
+                let message_checkpoint_offset = state.lowest_not_acked_offset();
+                let clone_start = Instant::now();
+                let state_clone = state.clone();
+                let clone_duration = clone_start.elapsed();
+                handle
+                    .metrics
+                    .snapshot
+                    .clone_latency
+                    .observe(clone_duration);
+
+                let metrics_bg = handle.metrics.clone();
+                tokio::task::spawn_blocking(move || {
+                    let encode_start = Instant::now();
+                    let blob = state_clone.encode_snapshot(last_snapshot_event_offset);
+                    let encode_duration = encode_start.elapsed();
+                    metrics_bg.snapshot.encode_latency.observe(encode_duration);
+                    metrics_bg
+                        .snapshot
+                        .bytes_written
+                        .fetch_add(blob.len() as u64, Ordering::Relaxed);
+                    metrics_bg
+                        .snapshot
+                        .last_snapshot_size_bytes
+                        .store(blob.len() as u64, Ordering::Relaxed);
+
+                    let total = trigger_time.elapsed();
+                    metrics_bg.snapshot.total_latency.observe(total);
+
+                    if let Some(r) = response {
+                        let _ = r.send(QueueStateCheckpointSnapshot {
+                            message_checkpoint_offset,
+                            state_snapshot: blob,
+                        });
+                    }
+                });
+            }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
                 if let Some(r) = response {
                     let _ = r.send(result);
+                }
+            }
+            QueueCommand::InstallSnapshotState {
+                state: mut loaded_state,
+                meta,
+                response,
+            } => {
+                loaded_state.deadline_waker = state.deadline_waker.clone();
+                *state = loaded_state;
+                if let Some(r) = response {
+                    let _ = r.send(meta);
                 }
             }
             QueueCommand::IsInflightOrAcked { offset, response } => {
@@ -1370,9 +1816,10 @@ impl QueueHandle {
             QueueCommand::PollReadyAndMark {
                 max,
                 lease_deadline,
+                upper,
                 response,
             } => {
-                let result = state.poll_ready_and_mark(max, lease_deadline);
+                let result = state.poll_ready_and_mark(max, lease_deadline, upper);
                 dirty = !result.is_empty();
                 if let Some(r) = response {
                     let _ = r.send(result);
@@ -1464,6 +1911,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue(&self, offset: Offset, retries: u32) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1479,6 +1927,7 @@ impl QueueHandle {
     }
 
     pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1497,6 +1946,7 @@ impl QueueHandle {
         offset: Offset,
         not_before: UnixMillis,
     ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1515,6 +1965,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<EnqueueDelayedEventMeta>,
     ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
 
         let _ = self
@@ -1533,6 +1984,7 @@ impl QueueHandle {
         offset: Offset,
         deadline: UnixMillis,
     ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflight {
@@ -1550,6 +2002,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<MarkInflightEventMeta>,
     ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkInflightMany {
@@ -1563,6 +2016,7 @@ impl QueueHandle {
     }
 
     pub async fn ack(&self, offset: Offset) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Ack {
@@ -1575,6 +2029,7 @@ impl QueueHandle {
     }
 
     pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AckMany {
@@ -1586,11 +2041,29 @@ impl QueueHandle {
         Ok(())
     }
 
+    pub async fn release_inflight_many(
+        &self,
+        reqs: Vec<AckEventMeta>,
+    ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::ReleaseInflightMany {
+                reqs,
+                response: Some(tx),
+            })
+            .await;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        self.deadline_waker().notify_one();
+        Ok(())
+    }
+
     pub async fn nack(
         &self,
         offset: Offset,
         requeue: bool,
     ) -> Result<NackOutcome, QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Nack {
@@ -1611,6 +2084,7 @@ impl QueueHandle {
         &self,
         reqs: Vec<NackEventMeta>,
     ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::NackMany {
@@ -1629,6 +2103,7 @@ impl QueueHandle {
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DeadLetterCommit {
@@ -1654,6 +2129,7 @@ impl QueueHandle {
     }
 
     pub async fn discard_pending_dlq(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::DiscardPendingDlq {
@@ -1666,6 +2142,7 @@ impl QueueHandle {
     }
 
     pub async fn declare(&self, meta: DeclareMeta) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Declare {
@@ -1712,6 +2189,7 @@ impl QueueHandle {
         &self,
         offsets: Vec<Offset>,
     ) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::MarkPendingDlq {
@@ -1724,6 +2202,7 @@ impl QueueHandle {
     }
 
     pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
@@ -1733,6 +2212,7 @@ impl QueueHandle {
     }
 
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::Reset { response: Some(tx) })
@@ -1779,7 +2259,9 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?.unwrap();
+        rx.await
+            .map_err(|_| QueueHandleError::ActorGone)?
+            .map_err(|error| QueueHandleError::Internal(error.to_string()))?;
         Ok(())
     }
 
@@ -1787,12 +2269,30 @@ impl QueueHandle {
         &self,
         last_snapshot_event_offset: u64,
     ) -> Result<Vec<u8>, QueueHandleError> {
+        self.encode_snapshot_inner(last_snapshot_event_offset, false)
+            .await
+    }
+
+    pub async fn force_encode_snapshot(
+        &self,
+        last_snapshot_event_offset: u64,
+    ) -> Result<Vec<u8>, QueueHandleError> {
+        self.encode_snapshot_inner(last_snapshot_event_offset, true)
+            .await
+    }
+
+    async fn encode_snapshot_inner(
+        &self,
+        last_snapshot_event_offset: u64,
+        force: bool,
+    ) -> Result<Vec<u8>, QueueHandleError> {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::EncodeSnapshot {
                 last_snapshot_event_offset,
+                force,
                 response: Some(tx),
             })
             .await;
@@ -1809,6 +2309,31 @@ impl QueueHandle {
             .ok_or_else(|| QueueHandleError::SnapshotNotCreated)
     }
 
+    pub async fn export_state_checkpoint_snapshot(
+        &self,
+        last_snapshot_event_offset: u64,
+    ) -> Result<QueueStateCheckpointSnapshot, QueueHandleError> {
+        self.creating_snapshot
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::ExportStateCheckpoint {
+                last_snapshot_event_offset,
+                response: Some(tx),
+            })
+            .await;
+        let res = rx.await;
+        self.last_snapshot_event_offset.store(
+            last_snapshot_event_offset,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.last_snapshot_timestamp
+            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        self.creating_snapshot
+            .store(false, std::sync::atomic::Ordering::SeqCst);
+        res.map_err(|_| QueueHandleError::ActorGone)
+    }
+
     pub async fn load_snapshot(&self, data: Vec<u8>) -> Result<SnapshotMeta, QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -1821,6 +2346,33 @@ impl QueueHandle {
             .await
             .map_err(|_| QueueHandleError::ActorGone)?
             .map_err(|_| QueueHandleError::SnapshotLoadFailed("Failed to load snapshot".into()))?;
+
+        self.last_snapshot_event_offset.store(
+            snapmeta.last_snapshot_event_offset,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+        self.last_snapshot_timestamp.store(
+            snapmeta.last_snapshot_timestamp,
+            std::sync::atomic::Ordering::Relaxed,
+        );
+
+        Ok(snapmeta)
+    }
+
+    pub async fn install_snapshot_state(
+        &self,
+        state: QueueInternalState,
+        meta: SnapshotMeta,
+    ) -> Result<SnapshotMeta, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        let _ = self
+            .command_enqueue(QueueCommand::InstallSnapshotState {
+                state,
+                meta,
+                response: Some(tx),
+            })
+            .await;
+        let snapmeta = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
 
         self.last_snapshot_event_offset.store(
             snapmeta.last_snapshot_event_offset,
@@ -1915,16 +2467,19 @@ impl QueueHandle {
         &self,
         max: usize,
         lease_deadline: UnixMillis,
-    ) -> Vec<(Offset, u32)> {
+        upper: Offset,
+    ) -> Result<Vec<(Offset, u32)>, QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::PollReadyAndMark {
                 max,
                 lease_deadline,
+                upper,
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap_or_default()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn lowest_unacked_offset(&self) -> Offset {
@@ -2004,7 +2559,12 @@ impl QueueHandle {
             .map_err(|err| std::io::Error::other(format!("Status report failed: {err}")))
     }
 
-    pub async fn collect_expired(&self, now: UnixMillis, max: usize) -> Vec<Offset> {
+    pub async fn collect_expired(
+        &self,
+        now: UnixMillis,
+        max: usize,
+    ) -> Result<Vec<Offset>, QueueHandleError> {
+        let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
         let _ = self
             .command_enqueue(QueueCommand::CollectExpired {
@@ -2013,7 +2573,7 @@ impl QueueHandle {
                 response: Some(tx),
             })
             .await;
-        rx.await.unwrap_or_default()
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn dump_inflight(&self) -> Vec<(Offset, UnixMillis)> {
@@ -2087,35 +2647,6 @@ impl QueueHandle {
 
     pub fn cancel_background_tasks(&self) {
         self.background_tasks.cancel();
-    }
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub struct InflightEntry {
-    pub deadline_ts: UnixMillis,
-    pub epoch: u32, // optional; ok to keep at 0 for now
-}
-
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-struct ExpiryItem {
-    deadline_rev: Reverse<UnixMillis>,
-    offset: Offset,
-    epoch: u32,
-}
-
-impl Ord for ExpiryItem {
-    fn cmp(&self, other: &Self) -> std::cmp::Ordering {
-        // BinaryHeap is max-heap; we want min-deadline => compare Reverse(deadline) first.
-        self.deadline_rev
-            .cmp(&other.deadline_rev)
-            // tie-breakers to make ordering total/deterministic
-            .then_with(|| self.offset.cmp(&other.offset))
-            .then_with(|| self.epoch.cmp(&other.epoch))
-    }
-}
-impl PartialOrd for ExpiryItem {
-    fn partial_cmp(&self, other: &Self) -> Option<std::cmp::Ordering> {
-        Some(self.cmp(other))
     }
 }
 
@@ -2239,6 +2770,9 @@ impl QueueInternalState {
             .min(min_pending)
             .min(min_delayed_enq)
             .min(min_delayed_retry);
+        if result == u64::MAX {
+            return self.settled_until;
+        }
         if result == 0 {
             return self.settled_until;
         }
@@ -2264,21 +2798,28 @@ impl QueueInternalState {
         &mut self,
         max: usize,
         lease_deadline: UnixMillis,
+        upper: Offset,
     ) -> Vec<(Offset, u32)> {
         tracing::debug!(
-            "Polling ready for ({}, {}), settled_until={}",
+            "Polling ready for ({}, {}), settled_until={}, upper={}",
             self.topic,
             self.partition,
-            self.settled_until()
+            self.settled_until(),
+            upper,
         );
         let mut offs = Vec::with_capacity(max);
         let from = self.settled_until();
-        let range = from..u64::MAX;
-        // Iterate overlapping ranges from `from` onwards, flatten to individual offsets
+        // `upper` is an exclusive deliverable ceiling: a replica-durable queue
+        // passes its committed-replicated watermark so consumers never see an
+        // offset that is not yet durable on enough replicas. u64::MAX disables it.
+        let range = from..upper;
+        // Iterate overlapping ranges from `from` onwards, flatten to individual
+        // offsets, capping each interval's end at `upper` (a ready interval can
+        // extend past the deliverable ceiling).
         let iter = self
             .ready
             .overlapping(&range)
-            .flat_map(|range| range.start.max(from)..range.end);
+            .flat_map(|range| range.start.max(from)..range.end.min(upper));
         for off in iter {
             if offs.len() >= max {
                 break;
@@ -2357,6 +2898,23 @@ impl QueueInternalState {
             // far settle: leave for persistence/event log (still applied logically by replay later)
             // (Materialized model can ignore or store it.)
         }
+    }
+
+    pub fn release_inflight(&mut self, offset: u64) -> bool {
+        if offset < self.settled_until || !self.inflight.contains_key(&offset) {
+            return false;
+        }
+
+        self.inflight.remove(&offset);
+        self.ready.insert(offset..offset + 1);
+        self.recompute_hint_if_needed();
+        true
+    }
+
+    pub fn release_inflight_many(&mut self, reqs: &[AckEventMeta]) -> usize {
+        reqs.iter()
+            .filter(|req| self.release_inflight(req.off))
+            .count()
     }
 
     pub fn nack(&mut self, offset: u64, requeue: bool) -> NackOutcome {
@@ -2856,6 +3414,8 @@ impl QueueInternalState {
     /// Returns true iff this offset ever entered the delivery lifecycle
     /// (i.e. enqueue or inflight).
     /// Terminal-only operations (ack/reject without enqueue) do NOT create history.
+    /// Only used as a test probe for the ready/inflight/retries history semantics.
+    #[cfg(test)]
     #[inline]
     fn has_history(&self, offset: Offset) -> bool {
         self.ready.contains(&offset)
@@ -2864,17 +3424,18 @@ impl QueueInternalState {
     }
 
     /// Walk heap until we find a valid inflight entry, rebuild if heap fully stale.
-    fn recompute_hint_if_needed(&mut self) -> ExpiryDeadlineOutcome {
+    /// Keeps `min_deadline_hint` in sync with the live inflight set.
+    fn recompute_hint_if_needed(&mut self) {
         if self.inflight.is_empty() {
             self.min_deadline_hint = None;
-            return ExpiryDeadlineOutcome::NoChange;
+            return;
         }
 
         while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
             match self.inflight.get(&off).copied() {
                 Some(cur) if cur == ts => {
                     self.min_deadline_hint = Some(ts);
-                    return ExpiryDeadlineOutcome::Updated(ts);
+                    return;
                 }
                 _ => {
                     self.expiry_heap.pop(); // stale
@@ -2889,46 +3450,9 @@ impl QueueInternalState {
             self.expiry_heap.push((Reverse(deadline), off));
             min = Some(min.map_or(deadline, |m| m.min(deadline)));
         }
-        let new_min = if self.min_deadline_hint > min {
-            if let Some(m) = min {
-                ExpiryDeadlineOutcome::Updated(m)
-            } else {
-                ExpiryDeadlineOutcome::NoChange
-            }
-        } else {
-            ExpiryDeadlineOutcome::NoChange
-        };
-        self.min_deadline_hint = min;
-        new_min
-    }
-
-    fn recompute_hint_full(&mut self) {
-        while let Some(&(Reverse(ts), off)) = self.expiry_heap.peek() {
-            match self.inflight.get(&off).copied() {
-                Some(cur) if cur == ts => {
-                    self.min_deadline_hint = Some(ts);
-                    return;
-                }
-                _ => {
-                    self.expiry_heap.pop(); // stale
-                }
-            }
-        }
-
-        if self.inflight.is_empty() {
-            self.min_deadline_hint = None;
-            return;
-        }
-
-        // rebuild heap from inflight
-        self.expiry_heap.clear();
-        let mut min = None;
-        for (&off, &deadline) in self.inflight.iter() {
-            self.expiry_heap.push((Reverse(deadline), off));
-            min = Some(min.map_or(deadline, |m: u64| m.min(deadline)));
-        }
         self.min_deadline_hint = min;
     }
+
 
     // ---------------- Delivery helper ----------------
 
@@ -3050,7 +3574,7 @@ impl QueueInternalState {
 
         // snapshot meta
         out.extend_from_slice(&self.last_snapshot_timestamp.to_be_bytes());
-        out.extend_from_slice(&self.last_snapshot_event_offset.to_be_bytes());
+        out.extend_from_slice(&last_snapshot_event_offset.to_be_bytes());
 
         // acked_until
         out.extend_from_slice(&self.settled_until.to_be_bytes());
@@ -3171,7 +3695,7 @@ impl QueueInternalState {
             }
             let (a, rest) = b.split_at(N);
             *b = rest;
-            Ok(a.try_into().unwrap())
+            Ok(a.try_into().expect("exact-length slice"))
         }
 
         // Version
@@ -3404,6 +3928,7 @@ pub struct StromaDebugSnapshot {
     pub snapshot_metrics: SnapshotMetricsSnapshot,
     pub recovery_metrics: RecoveryMetricsSnapshot,
     pub log_metrics: LogMetricsSnapshot,
+    pub replication_cache_metrics: ReplicationCacheMetricsSnapshot,
     pub command_metrics: CommandMetricsSnapshot,
     pub uptime_seconds: u64,
 }
@@ -3415,6 +3940,8 @@ pub struct QueueDebugInfo {
     pub materialized: bool,
     pub exists_on_disk: bool,
     pub evicting: bool,
+    pub role: QueueRole,
+    pub role_generation: u64,
 
     pub applied_upto: u64,
     pub last_snapshot_timestamp: u64,
@@ -3749,6 +4276,19 @@ mod tests {
     }
 
     #[test]
+    fn release_inflight_returns_ready_without_retry_accounting() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(1, 2);
+        s.mark_inflight(1, 100);
+        assert!(s.release_inflight(1));
+
+        assert!(s.is_ready(1));
+        assert!(!s.is_inflight(1));
+        assert_eq!(s.get_retries(1), 2);
+    }
+
+    #[test]
     fn expired_then_nacked_is_still_not_acked() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
@@ -4070,6 +4610,18 @@ mod tests {
         s2.load_snapshot(&snap).unwrap();
 
         assert_eq!(s.canonical(), s2.canonical());
+    }
+
+    #[test]
+    fn snapshot_records_supplied_event_offset() {
+        let s = QueueInternalState::new("test".into(), 0);
+        let snap = s.encode_snapshot(42);
+
+        let mut loaded = QueueInternalState::new("test".into(), 0);
+        let meta = loaded.load_snapshot(&snap).unwrap();
+
+        assert_eq!(meta.last_snapshot_event_offset, 42);
+        assert_eq!(loaded.last_snapshot_event_offset, 42);
     }
 
     #[test]
@@ -4611,7 +5163,7 @@ mod tests {
         s.mark_inflight(1, 100);
         s.nack(1, false); // 1 -> pending_dlq
 
-        let polled = s.poll_ready_and_mark(10, 200);
+        let polled = s.poll_ready_and_mark(10, 200, u64::MAX);
         let offsets: Vec<_> = polled.iter().map(|(o, _)| *o).collect();
 
         assert!(!offsets.contains(&1));
@@ -4814,6 +5366,19 @@ mod tests {
         s.ack(11);
 
         assert!(s.safe_message_truncate_before() <= 5);
+    }
+
+    #[test]
+    fn safe_truncate_without_retained_offsets_uses_frontier() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+
+        assert_eq!(s.safe_message_truncate_before(), 0);
+
+        s.ack(0);
+        s.ack(1);
+
+        assert_eq!(s.settled_until(), 2);
+        assert_eq!(s.safe_message_truncate_before(), 2);
     }
 
     #[test]

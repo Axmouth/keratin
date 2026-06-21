@@ -3,8 +3,11 @@ name = "keratin-log"
 version = "0.1.0"
 edition = "2024"
 
+[features]
+default = []
+writer-stage-trace = []
+
 [dependencies]
-anyhow = "1.0"
 byteorder = "1.5"
 crc32c = "0.6"
 crossbeam-channel = "0.5"

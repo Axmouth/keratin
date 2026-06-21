@@ -24,12 +24,6 @@ pub enum PushResult<T> {
     Two((FlushReason, Vec<T>), (FlushReason, Vec<T>)),
 }
 
-struct Entry<T> {
-    item: T,
-    records: usize,
-    bytes: usize,
-}
-
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Deadline {
     None,         // no active batch
@@ -64,7 +58,7 @@ where
     cfg: BatcherConfig,
     weight: W,
 
-    items: Vec<Entry<T>>,
+    items: Vec<T>,
     total_records: usize,
     total_bytes: usize,
     last_arrival: Option<Instant>,
@@ -85,10 +79,6 @@ where
         }
     }
 
-    pub fn is_empty(&self) -> bool {
-        self.items.is_empty()
-    }
-
     pub fn len(&self) -> usize {
         self.items.len()
     }
@@ -99,14 +89,6 @@ where
 
     pub fn total_records(&self) -> usize {
         self.total_records
-    }
-
-    pub fn time_until_deadline(&self, now: Instant) -> Option<Duration> {
-        match self.deadline(now) {
-            Deadline::In(d) => Some(d),
-            Deadline::DueNow => Some(Duration::ZERO),
-            Deadline::None => None,
-        }
     }
 
     pub fn deadline(&self, now: Instant) -> Deadline {
@@ -124,7 +106,7 @@ where
         }
 
         match last.checked_add(self.cfg.linger) {
-            None => Deadline::DueNow, // overflow => due immediately (per your policy)
+            None => Deadline::DueNow, // Instant overflow: treat as due immediately
             Some(deadline) => {
                 if now >= deadline {
                     Deadline::DueNow
@@ -170,11 +152,7 @@ where
             "weight() returned (0,0) with unbounded max_items: batch may grow without bound"
         );
 
-        self.items.push(Entry {
-            item,
-            records: r,
-            bytes: b,
-        });
+        self.items.push(item);
         self.total_records = self.total_records.saturating_add(r);
         self.total_bytes = self.total_bytes.saturating_add(b);
         self.last_arrival = Some(now);
@@ -196,87 +174,7 @@ where
         self.total_bytes = 0;
         self.last_arrival = None;
 
-        let mut out = Vec::with_capacity(self.items.len());
-        for e in self.items.drain(..) {
-            out.push(e.item);
-        }
-        out
-    }
-
-    pub fn has_active_batch(&self) -> bool {
-        !self.items.is_empty()
-    }
-}
-
-pub struct BatcherDriver<T, W>
-where
-    W: FnMut(&T) -> (usize, usize),
-{
-    core: BatcherCore<T, W>,
-}
-
-impl<T, W> BatcherDriver<T, W>
-where
-    W: FnMut(&T) -> (usize, usize),
-{
-    pub fn new(cfg: BatcherConfig, weight: W) -> Self {
-        Self {
-            core: BatcherCore::new(cfg, weight),
-        }
-    }
-
-    pub fn next_batch(
-        &mut self,
-        rx: &crossbeam_channel::Receiver<T>,
-    ) -> Option<(FlushReason, Vec<T>)> {
-        // Ensure at least one item in flight
-        if self.core.is_empty() {
-            let x = rx.recv().ok()?;
-            let now = Instant::now();
-            match self.core.push(now, x) {
-                PushResult::One(f) => return Some(f),
-                PushResult::Two(f, _) => return Some(f),
-                PushResult::None => {}
-            }
-        }
-
-        loop {
-            let now = Instant::now();
-
-            if let Some(flush) = self.core.flush_if_due(now) {
-                return Some(flush);
-            }
-
-            let wait = match self.core.deadline(now) {
-                Deadline::In(w) => w,
-                Deadline::DueNow => return self.core.flush_if_due(now),
-                Deadline::None if !self.core.is_empty() => Duration::ZERO,
-                Deadline::None => Duration::MAX,
-            };
-
-            match rx.recv_timeout(wait) {
-                Ok(x) => {
-                    let now = Instant::now();
-                    match self.core.push(now, x) {
-                        PushResult::None => {}
-                        PushResult::One(f) => return Some(f),
-                        PushResult::Two(f1, _) => return Some(f1),
-                    }
-                }
-                Err(crossbeam_channel::RecvTimeoutError::Timeout) => continue,
-                Err(crossbeam_channel::RecvTimeoutError::Disconnected) => {
-                    // Don't silently drop buffered data on shutdown.
-                    if !self.core.is_empty() {
-                        return Some((FlushReason::Shutdown, self.core.flush()));
-                    }
-                    return None;
-                }
-            }
-        }
-    }
-
-    pub fn drain(&mut self) -> Vec<T> {
-        self.core.flush()
+        self.items.drain(..).collect()
     }
 }
 
@@ -293,6 +191,7 @@ mod tests {
         ($($t:ty),*) => {$(
             impl Ms for $t {
                 #[inline]
+                #[allow(unused_comparisons)] // assert is a real guard for the signed types in the list
                 fn ms(self) -> Duration {
                     assert!(self >= 0, "negative duration literal");
                     Duration::from_millis(self as u64)
@@ -463,33 +362,12 @@ mod tests {
         let final_now = base + Duration::from_millis(16 + 7);
         if let Some((_r, b)) = c.flush_if_due(final_now) {
             out.push(b);
-        } else if !c.is_empty() {
+        } else if c.len() > 0 {
             out.push(c.flush());
         }
 
         let flat: Vec<u32> = out.into_iter().flatten().collect();
         assert_eq!(flat, vec![1, 2, 3, 4, 5]);
-    }
-
-    #[test]
-    fn driver_flushes_on_timeout() {
-        use crossbeam_channel::bounded;
-
-        let cfg = BatcherConfig {
-            max_items: 100,
-            max_records: 100,
-            max_bytes: 100,
-            linger: Duration::from_millis(5),
-        };
-
-        let (tx, rx) = bounded::<u32>(10);
-        let mut d = BatcherDriver::new(cfg, |_x: &u32| (1, 1));
-
-        tx.send(1).unwrap();
-
-        let (reason, batch) = d.next_batch(&rx).unwrap();
-        assert_eq!(reason, FlushReason::Timeout);
-        assert_eq!(batch, vec![1]);
     }
 
     #[test]
@@ -663,24 +541,6 @@ mod tests {
         assert_eq!(b_old, vec![1]);
         assert_eq!(r_new, FlushReason::MaxItems);
         assert_eq!(b_new, vec![2]);
-    }
-
-    #[test]
-    fn driver_wait_rule_treats_none_as_due_when_batch_nonempty() {
-        fn driver_wait(time_until: Option<Duration>, has_batch: bool) -> Duration {
-            match time_until {
-                Some(w) => w,
-                None if has_batch => Duration::ZERO,
-                None => Duration::MAX,
-            }
-        }
-
-        assert_eq!(driver_wait(None, true), Duration::ZERO);
-        assert_eq!(driver_wait(None, false), Duration::MAX);
-        assert_eq!(
-            driver_wait(Some(Duration::from_millis(5)), true),
-            Duration::from_millis(5)
-        );
     }
 
     #[cfg(debug_assertions)]

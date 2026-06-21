@@ -3,14 +3,11 @@ use std::fs::OpenOptions;
 use std::io::{self, Read, Seek, SeekFrom};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Instant;
 
 use parking_lot::RwLock;
 
 use crate::Message;
-use crate::record::{
-    ByteRemainder, DecodedRecord, RECORD_HEADER_LEN, decode_header_prefix, decode_record_prefix,
-};
+use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix};
 
 #[derive(Debug, Clone)]
 pub struct OwnedRecord {
@@ -71,7 +68,15 @@ impl LogReader {
         while out.len() < max {
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
-                None => break,
+                None => {
+                    if let Some(first) = self.first_segment_base()
+                        && cur < first
+                    {
+                        cur = first;
+                        continue;
+                    }
+                    break;
+                }
             };
 
             let mut log = self.open_log(base)?;
@@ -135,8 +140,8 @@ impl LogReader {
             idx.seek(SeekFrom::Start(off))?;
             idx.read_exact(&mut buf)?;
 
-            let rel = u32::from_be_bytes(buf[0..4].try_into().unwrap());
-            let pos = u64::from_be_bytes(buf[8..16].try_into().unwrap());
+            let rel = u32::from_be_bytes(buf[0..4].try_into().expect("exact-length slice"));
+            let pos = u64::from_be_bytes(buf[8..16].try_into().expect("exact-length slice"));
 
             if rel <= target_rel {
                 best_pos = pos;
@@ -162,13 +167,19 @@ impl LogReader {
 
         let mut buf = vec![0u8; SLAB];
         let mut window: Vec<u8> = Vec::with_capacity(SLAB * 2);
+        let mut consumed = 0usize;
         let mut file_pos = start_pos;
 
         file.seek(SeekFrom::Start(start_pos))?;
 
         while out.len() < max {
             // Ensure we have enough data to attempt a decode
-            if window.len() < RECORD_HEADER_LEN {
+            if window.len().saturating_sub(consumed) < RECORD_HEADER_LEN {
+                if consumed > 0 {
+                    window.drain(..consumed);
+                    file_pos += consumed as u64;
+                    consumed = 0;
+                }
                 let n = file.read(&mut buf)?;
                 if n == 0 {
                     return Ok(()); // EOF
@@ -177,15 +188,14 @@ impl LogReader {
                 continue;
             }
 
-            match decode_record_prefix(&window) {
+            match decode_record_prefix(&window[consumed..]) {
                 Ok((rec, used)) => {
-                    let rec_start = file_pos;
+                    let rec_start = file_pos + consumed as u64;
                     let next_pos = rec_start + used as u64;
 
                     // Enforce monotonic offsets
                     if rec.offset < *cur {
-                        window.drain(..used);
-                        file_pos = next_pos;
+                        consumed += used;
                         continue;
                     }
 
@@ -198,12 +208,17 @@ impl LogReader {
                         }
                     }
 
-                    window.drain(..used);
-                    file_pos = next_pos;
+                    consumed += used;
+                    debug_assert_eq!(file_pos + consumed as u64, next_pos);
                 }
 
                 Err(crate::record::RecordError::Truncated) => {
                     // Need more bytes
+                    if consumed > 0 {
+                        window.drain(..consumed);
+                        file_pos += consumed as u64;
+                        consumed = 0;
+                    }
                     let n = file.read(&mut buf)?;
                     if n == 0 {
                         return Ok(()); // EOF in middle of record
@@ -214,8 +229,7 @@ impl LogReader {
                 Err(e) => {
                     // Corruption: resync by shifting one byte forward
                     tracing::error!("{:#?}", e);
-                    window.drain(..1);
-                    file_pos += 1;
+                    consumed += 1;
                 }
             }
         }
@@ -290,25 +304,17 @@ impl LogReader {
             .map(|(k, _)| *k)
     }
 
+    fn first_segment_base(&self) -> Option<u64> {
+        self.segment_mapping.read().keys().next().copied()
+    }
+
     fn find_segment_base(&self, offset: u64) -> io::Result<Option<u64>> {
-        // let mut bases = Vec::new();
-        // for e in std::fs::read_dir(self.root.join("segments"))? {
-        //     let e = e?;
-        //     if let Some(s) = e.file_name().to_str()
-        //         && let Some(stem) = s.strip_suffix(".log")
-        //         && let Ok(b) = stem.parse::<u64>()
-        //     {
-        //         bases.push(b);
-        //     }
-        // }
-        // bases.sort_unstable();
-        // Ok(bases.into_iter().rfind(|b| *b <= offset))
         Ok(self
             .segment_mapping
             .read()
-            .keys()
-            .copied()
-            .rfind(|b| *b <= offset))
+            .range(..=offset)
+            .next_back()
+            .map(|(base, _)| *base))
     }
 }
 

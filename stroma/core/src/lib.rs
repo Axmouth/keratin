@@ -1,31 +1,38 @@
 mod event;
 mod global;
 mod metrics;
+mod replication;
+#[allow(dead_code)]
+mod replication_cache;
 mod state;
 mod stroma;
 
-use keratin_log::KDurability;
 use thiserror::Error;
 
 pub use event::{
-    AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeclareMeta, EnqueueEventMeta,
-    MarkInflightEventMeta, NackEventMeta,
+    AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeadLetterReason, DeclareMeta,
+    EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta, StromaEvent,
 };
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
-    AppendCompletion, AppendResult, CompletionPair, IoError, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage, test_dir, util::TempDir,
+    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
+    KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
-    MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueInspectionSnapshot,
-    QueueInspectionState, QueueInternalState, StromaDebugSnapshot,
+    MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
+    QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
+    Resolved, SnapshotMeta, StromaDebugSnapshot,
 };
 pub use stroma::{
-    EvictOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType,
-    MessageHeaders, MessageInspectionItem, MessageInspectionPage, PublishItem, SnapshotConfig,
-    Stroma, StromaKeratinConfig, TaskGroup,
+    DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,
+    FollowerStateCheckpointInstallOutcome, GlobalDLQ,
+    GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
+    MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
+    OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
+    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome,
+    ReplicationCacheConfig, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;
@@ -74,8 +81,67 @@ pub enum StromaError {
     #[error("queue actor is gone")]
     QueueActorGone,
 
+    #[error("queue role mismatch: expected {expected:?}, current role is {actual:?}")]
+    WrongQueueRole {
+        expected: QueueRole,
+        actual: QueueRole,
+    },
+
+    #[error("recovery mismatch for {topic}/{partition}/{group:?}: {reason}")]
+    RecoveryMismatch {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
+        reason: String,
+    },
+
+    #[error("queue {topic}/{partition}/{group:?} is quarantined: {reason}")]
+    QueueQuarantined {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
+        reason: String,
+    },
+
     #[error("internal: {0}")]
     Internal(String),
+}
+
+/// What to do when recovery finds the event log references a message the message
+/// log has not durably accepted (a dangling event->message reference).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum RecoveryMismatchPolicy {
+    /// Default: park the affected partition (it does not serve) and keep the rest
+    /// of the broker running. The partition is surfaced as quarantined for an
+    /// operator to repair. Blast radius is the one queue.
+    #[default]
+    Quarantine,
+    /// Louder: treat the mismatch as fatal. Stroma still quarantines the
+    /// partition and returns the error; the caller (broker) escalates - e.g.
+    /// refuses to serve / exits - so the failure cannot be missed.
+    Refuse,
+    /// "Screw it, continue": auto-apply the truncate-to-valid repair (drop the
+    /// dangling event-log suffix) and carry on, with a loud warning. Never the
+    /// default; for operators who accept the potential data loss.
+    Ignore,
+}
+
+impl RecoveryMismatchPolicy {
+    pub fn as_u8(self) -> u8 {
+        match self {
+            RecoveryMismatchPolicy::Quarantine => 0,
+            RecoveryMismatchPolicy::Refuse => 1,
+            RecoveryMismatchPolicy::Ignore => 2,
+        }
+    }
+
+    pub fn from_u8(v: u8) -> Self {
+        match v {
+            1 => RecoveryMismatchPolicy::Refuse,
+            2 => RecoveryMismatchPolicy::Ignore,
+            _ => RecoveryMismatchPolicy::Quarantine,
+        }
+    }
 }
 
 pub type Result<T> = std::result::Result<T, StromaError>;
@@ -348,49 +414,16 @@ pub mod group {
     }
 }
 
+// Partition/Offset now live in the dependency-light `stroma-common` crate so
+// they can be shared upward (e.g. by network clients) without the engine.
+// Re-exported through these module paths so existing `partition::Partition` /
+// `offset::Offset` references keep working.
 pub mod partition {
-    #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-    pub struct Partition {
-        id: u32,
-    }
-
-    impl Partition {
-        #[inline]
-        pub const fn new(id: u32) -> Self {
-            Self { id }
-        }
-
-        #[inline]
-        pub const fn id(self) -> u32 {
-            self.id
-        }
-    }
+    pub use stroma_common::Partition;
 }
 
 pub mod offset {
-    #[derive(Clone, Copy, Hash, Eq, PartialEq, Ord, PartialOrd, Debug)]
-    pub struct Offset {
-        inner: u64,
-    }
-
-    impl Offset {
-        #[inline]
-        pub fn new(offset: u64) -> Self {
-            Self { inner: offset }
-        }
-
-        #[inline]
-        pub fn value(&self) -> u64 {
-            self.inner
-        }
-
-        #[inline]
-        pub const fn next(self) -> Self {
-            Self {
-                inner: self.inner + 1,
-            }
-        }
-    }
+    pub use stroma_common::Offset;
 }
 
 pub mod unix_millis {

@@ -45,17 +45,18 @@ pub async fn append_one(
 async fn expired_messages_are_redelivered_and_never_lost() {
     let (st, _td) = open_test_stroma().await;
     let q = st.queue_handle("t", 0, None).await.unwrap();
+    let q = q.resolve().unwrap();
 
     for i in 0..100 {
-        q.enqueue(i, 0).await;
-        q.mark_inflight(i, 1000).await;
+        q.enqueue(i, 0).await.unwrap();
+        q.mark_inflight(i, 1000).await.unwrap();
     }
 
-    let expired = q.collect_expired(2000, 1000).await;
+    let expired = q.collect_expired(2000, 1000).await.unwrap();
 
     for off in expired {
-        q.enqueue(off, 1).await;
-        q.mark_inflight(off, 3000).await;
+        q.enqueue(off, 1).await.unwrap();
+        q.mark_inflight(off, 3000).await.unwrap();
     }
 
     assert_eq!(q.inflight_len().await, 100);
@@ -253,13 +254,50 @@ async fn poll_ready_delivers_and_marks_inflight() {
     }
 
     let now = 1000;
-    let msgs = st.poll_ready("t", 0, None, 10, now + 100).await.unwrap();
+    let msgs = st.poll_ready("t", 0, None, 10, now + 100, u64::MAX).await.unwrap();
 
     assert_eq!(msgs.len(), 3);
 
     for (off, _, _, _) in msgs {
         assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
     }
+}
+
+#[tokio::test]
+async fn poll_ready_upper_gates_leasing_to_committed_offsets() {
+    let (st, _td) = open_test_stroma().await;
+
+    // append 5 messages (offsets 0..5)
+    for _ in 0..5 {
+        let (c, rx) = KeratinAppendCompletion::pair();
+        let headers = MessageHeaders {
+            published: Default::default(),
+            publish_received: Default::default(),
+            content_type: None,
+            extra: Default::default(),
+        };
+        st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
+            .await
+            .unwrap();
+        rx.await.unwrap().unwrap();
+    }
+
+    let now = 1000;
+    // Visibility ceiling of 3 (exclusive): only offsets 0,1,2 are deliverable.
+    let msgs = st.poll_ready("t", 0, None, 10, now + 100, 3).await.unwrap();
+    let offs: Vec<u64> = msgs.iter().map(|m| m.0).collect();
+    assert_eq!(offs, vec![0, 1, 2], "must not lease at or above the ceiling");
+    // The gated offsets must not have been leased.
+    assert!(!st.is_inflight_or_acked("t", 0, None, 3).await.unwrap());
+    assert!(!st.is_inflight_or_acked("t", 0, None, 4).await.unwrap());
+
+    // Raising the ceiling releases the rest.
+    let msgs = st
+        .poll_ready("t", 0, None, 10, now + 100, u64::MAX)
+        .await
+        .unwrap();
+    let offs: Vec<u64> = msgs.iter().map(|m| m.0).collect();
+    assert_eq!(offs, vec![3, 4]);
 }
 
 #[tokio::test]
@@ -279,13 +317,13 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
     let off = rx.await.unwrap().unwrap().base_offset;
 
     let now = 1000;
-    let _ = st.poll_ready("t", 0, None, 1, now + 10).await.unwrap();
+    let _ = st.poll_ready("t", 0, None, 1, now + 10, u64::MAX).await.unwrap();
 
     // expire
     let expired = st.collect_expired(now + 20, 10).await.unwrap();
     assert_eq!(expired.len(), 1);
 
-    let msgs2 = st.poll_ready("t", 0, None, 1, now + 30).await.unwrap();
+    let msgs2 = st.poll_ready("t", 0, None, 1, now + 30, u64::MAX).await.unwrap();
     assert_eq!(msgs2[0].0, off);
 }
 

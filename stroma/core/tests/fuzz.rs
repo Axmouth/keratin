@@ -24,6 +24,7 @@ async fn random_operations_never_break_invariants() {
 
     let (st, _test_dir) = open_test_stroma().await;
     let q = st.queue_handle("test", 0, None).await.unwrap();
+    let q = q.resolve().unwrap();
 
     for _ in 0..50_000 {
         let o = fastrand::u64(0..2000);

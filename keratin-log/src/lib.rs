@@ -11,11 +11,13 @@ mod recovery;
 mod segment;
 pub mod util;
 mod writer;
+#[cfg(feature = "writer-stage-trace")]
+mod writer_stage_trace;
 
 pub use config::*;
 pub use durability::KDurability;
-pub use keratin::Keratin;
-pub use log::AppendResult;
+pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
+pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
 pub use writer::IoError;

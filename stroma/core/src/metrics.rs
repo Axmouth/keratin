@@ -13,7 +13,7 @@ fn current_epoch_secs() -> u64 {
     use std::time::{SystemTime, UNIX_EPOCH};
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
-        .unwrap()
+        .expect("system clock is set before the UNIX epoch")
         .as_secs()
 }
 
@@ -228,6 +228,9 @@ pub struct StromaMetrics {
     pub msg_log_reads: OpStats,
     pub log_truncations: OpStats,
 
+    // === Recent replication cache ===
+    pub replication_cache: ReplicationCacheMetrics,
+
     // === Current state gauges ===
     pub queues_active: AtomicUsize,
 }
@@ -255,6 +258,7 @@ impl StromaMetrics {
             event_log_reads: OpStats::new(bucket_count),
             msg_log_reads: OpStats::new(bucket_count),
             log_truncations: OpStats::new(bucket_count),
+            replication_cache: ReplicationCacheMetrics::default(),
 
             queues_active: AtomicUsize::new(0),
         }
@@ -324,6 +328,70 @@ impl StromaMetrics {
         }
         out
     }
+}
+
+#[derive(Debug, Default)]
+pub struct ReplicationCacheMetrics {
+    pub message_hits: AtomicU64,
+    pub message_misses: AtomicU64,
+    pub event_hits: AtomicU64,
+    pub event_misses: AtomicU64,
+    pub evicted_records: AtomicU64,
+    pub retained_bytes: AtomicUsize,
+}
+
+impl ReplicationCacheMetrics {
+    #[inline]
+    pub fn record_message_read(&self, hit: bool) {
+        let target = if hit {
+            &self.message_hits
+        } else {
+            &self.message_misses
+        };
+        target.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_event_read(&self, hit: bool) {
+        let target = if hit {
+            &self.event_hits
+        } else {
+            &self.event_misses
+        };
+        target.fetch_add(1, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn record_evicted_records(&self, count: usize) {
+        self.evicted_records
+            .fetch_add(count as u64, Ordering::Relaxed);
+    }
+
+    #[inline]
+    pub fn set_retained_bytes(&self, bytes: usize) {
+        self.retained_bytes.store(bytes, Ordering::Relaxed);
+    }
+
+    pub fn snapshot(&self) -> ReplicationCacheMetricsSnapshot {
+        ReplicationCacheMetricsSnapshot {
+            message_hits: self.message_hits.load(Ordering::Relaxed),
+            message_misses: self.message_misses.load(Ordering::Relaxed),
+            event_hits: self.event_hits.load(Ordering::Relaxed),
+            event_misses: self.event_misses.load(Ordering::Relaxed),
+            evicted_records: self.evicted_records.load(Ordering::Relaxed),
+            retained_bytes: self.retained_bytes.load(Ordering::Relaxed),
+        }
+    }
+}
+
+#[derive(Debug, Serialize)]
+pub struct ReplicationCacheMetricsSnapshot {
+    pub message_hits: u64,
+    pub message_misses: u64,
+    pub event_hits: u64,
+    pub event_misses: u64,
+    pub evicted_records: u64,
+    pub retained_bytes: usize,
 }
 
 fn log_kind_snapshot(appends: &BatchStats, reads: &OpStats) -> LogKindSnapshot {
@@ -432,6 +500,12 @@ pub struct RecoveryMetrics {
     pub snapshot_load_latency: LatencyStats,
     pub events_replayed: AtomicU64,
     pub replay_duration: LatencyStats,
+    /// Partitions currently quarantined (recovery found a dangling event->message
+    /// reference or a corrupt event record). A gauge: up on quarantine, down on
+    /// repair.
+    pub quarantined: AtomicU64,
+    /// Total times a partition has been quarantined since start (monotonic).
+    pub quarantines_total: AtomicU64,
 }
 
 #[derive(Debug, Serialize)]
@@ -443,6 +517,8 @@ pub struct RecoveryMetricsSnapshot {
     pub max_replay_ms: Option<f64>,
     pub total_events_replayed: u64,
     pub queues_recovered: u64,
+    pub quarantined: u64,
+    pub quarantines_total: u64,
 }
 impl RecoveryMetrics {
     pub fn new() -> Self {
@@ -461,6 +537,8 @@ impl RecoveryMetrics {
             max_replay_ms: self.replay_duration.max_micros().map(|v| v as f64 / 1000.0),
             total_events_replayed: self.events_replayed.load(Ordering::Relaxed),
             queues_recovered: self.startup_duration.count.load(Ordering::Relaxed),
+            quarantined: self.quarantined.load(Ordering::Relaxed),
+            quarantines_total: self.quarantines_total.load(Ordering::Relaxed),
         }
     }
 }
