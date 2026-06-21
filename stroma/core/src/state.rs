@@ -1110,6 +1110,15 @@ impl QueueHandleInner {
         let recovery_notify = Arc::new(Notify::new());
         let snapshot_task_started = Arc::new(AtomicBool::new(false));
         let background_tasks = CancellationToken::new();
+        // A freshly created or recovered queue defaults to Owner, and the role is
+        // in-memory only (not persisted). Latent footgun: a queue that was
+        // Frozen/Follower loses that role on eviction or restart and comes back
+        // as Owner. In a coordinated cluster the broker's ownership gate masks it
+        // (it refuses owner traffic for queues it does not own), so this is
+        // defense-in-depth, not the primary guard. Robust fix (tracked in the
+        // fibril FOLLOWUPS Clients/coordination notes): persist the role (or at
+        // least "not owner") so recovery restores a non-owner state and ownership
+        // is always coordination's decision, never a default.
         let role = Arc::new(AtomicU8::new(QueueRole::Owner.as_u8()));
         let role_generation = Arc::new(AtomicU64::new(0));
         let owner_operations = Arc::new(AtomicU64::new(0));
