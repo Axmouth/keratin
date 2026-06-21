@@ -228,7 +228,7 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
         Some(ReplicatedEventBatch {
             epoch: 0,
             first_offset: 1,
-            events: vec![StromaEvent::Enqueue { off: 1, retries: 0 }],
+            events: vec![StromaEvent::Enqueue { off: 1, retries: 0, expire_at: None }],
             durability: Some(KDurability::AfterFsync),
         }),
     )
@@ -391,8 +391,8 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
                 first_offset: 0,
                 events: vec![StromaEvent::EnqueueMany {
                     reqs: vec![
-                        EnqueueEventMeta { off: 0, retries: 0 },
-                        EnqueueEventMeta { off: 1, retries: 0 },
+                        EnqueueEventMeta { off: 0, retries: 0, expire_at: None },
+                        EnqueueEventMeta { off: 1, retries: 0, expire_at: None },
                     ],
                 }],
                 durability: Some(KDurability::AfterFsync),
@@ -446,7 +446,7 @@ async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
             Some(ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
-                events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+                events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
                 durability: Some(KDurability::AfterFsync),
             }),
         )
@@ -478,7 +478,7 @@ async fn replicated_ingest_rejects_owner_queue() {
             Some(ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
-                events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+                events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
                 durability: Some(KDurability::AfterFsync),
             }),
         )
@@ -518,7 +518,7 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
             epoch: 0,
             first_offset: 0,
             events: vec![
-                StromaEvent::Enqueue { off: 0, retries: 0 },
+                StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None },
                 StromaEvent::DeadLetter {
                     reqs: vec![DeadLetterMeta {
                         off: 0,
@@ -567,7 +567,7 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
         Some(ReplicatedEventBatch {
             epoch: 0,
             first_offset: 0,
-            events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+            events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
             durability: Some(KDurability::AfterFsync),
         }),
     )
@@ -653,7 +653,7 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
         Some(ReplicatedEventBatch {
             epoch: 0,
             first_offset: 0,
-            events: vec![StromaEvent::Enqueue { off: 0, retries: 0 }],
+            events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
             durability: Some(KDurability::AfterFsync),
         }),
     )

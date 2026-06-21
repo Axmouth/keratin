@@ -3376,7 +3376,11 @@ impl QueueInternalState {
 
             self.delayed_enqueue_heap.pop();
 
-            let meta = EnqueueEventMeta { off, retries: 0 };
+            let meta = EnqueueEventMeta {
+                off,
+                retries: 0,
+                expire_at: None,
+            };
             to_enqueue.push(meta);
         }
 
@@ -3390,6 +3394,7 @@ impl QueueInternalState {
             let meta = EnqueueEventMeta {
                 off,
                 retries: self.retries.get(&off).copied().unwrap_or(0),
+                expire_at: None,
             };
             to_enqueue.push(meta);
         }
@@ -5204,6 +5209,7 @@ mod tests {
         s.apply_declare(&DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
             dlq_max_retries: None,
+            default_ttl_ms: None,
         });
 
         assert_eq!(s.dlq_policy, DLQDiscardPolicy::GlobalDQL);
@@ -5220,6 +5226,7 @@ mod tests {
                 group: Some("g1".into()), // assumes you added the group field
             }),
             dlq_max_retries: Some(99),
+            default_ttl_ms: None,
         });
 
         assert_eq!(

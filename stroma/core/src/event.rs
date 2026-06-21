@@ -6,7 +6,7 @@ pub type Offset = u64;
 pub type UnixMillis = u64;
 
 pub const STROMA_MAGIC: &[u8; 8] = b"STROMA\0\0";
-pub const STROMA_VER: u16 = 2;
+pub const STROMA_VER: u16 = 3;
 
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -33,6 +33,10 @@ pub enum EventType {
 pub struct EnqueueEventMeta {
     pub off: Offset,
     pub retries: u32,
+    /// Absolute drop deadline (message TTL). `None` = never expires. Set at the
+    /// original enqueue; the in-memory requeue paths leave it `None` because the
+    /// deadline persists in the queue's `ttl_deadlines` map across requeues.
+    pub expire_at: Option<UnixMillis>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -179,6 +183,9 @@ pub struct DeadLetterMeta {
 pub struct DeclareMeta {
     pub dlq_policy: Option<DLQDiscardPolicyWire>,
     pub dlq_max_retries: Option<u32>,
+    /// Per-queue default message TTL in milliseconds. Applied at publish when a
+    /// message carries no explicit TTL. `None` = no default (never expires).
+    pub default_ttl_ms: Option<u64>,
 }
 
 /// Wire form of DLQDiscardPolicy. Mirrors state::DLQDiscardPolicy
@@ -200,6 +207,8 @@ pub enum StromaEvent {
     Enqueue {
         off: Offset,
         retries: u32,
+        /// Absolute drop deadline (message TTL). `None` = never expires.
+        expire_at: Option<UnixMillis>,
     },
     EnqueueMany {
         reqs: Vec<EnqueueEventMeta>,
@@ -277,6 +286,18 @@ fn put_u64(out: &mut Vec<u8>, v: u64) {
     out.extend_from_slice(&v.to_be_bytes());
 }
 
+/// Presence byte followed by the value when present. Mirrors how NackMany
+/// encodes its optional `not_before`.
+fn put_opt_u64(out: &mut Vec<u8>, v: Option<u64>) {
+    match v {
+        Some(value) => {
+            put_bool(out, true);
+            put_u64(out, value);
+        }
+        None => put_bool(out, false),
+    }
+}
+
 fn put_str(out: &mut Vec<u8>, s: &str) -> io::Result<()> {
     let b = s.as_bytes();
     if b.len() > u16::MAX as usize {
@@ -329,6 +350,9 @@ fn rd_u64(b: &[u8], i: &mut usize) -> io::Result<u64> {
     *i += 8;
     Ok(v)
 }
+fn rd_opt_u64(b: &[u8], i: &mut usize) -> io::Result<Option<u64>> {
+    rd_bool(b, i)?.then(|| rd_u64(b, i)).transpose()
+}
 fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
     let len = rd_u16(b, i)? as usize;
     if *i + len > b.len() {
@@ -378,10 +402,15 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
-            StromaEvent::Enqueue { off, retries } => {
+            StromaEvent::Enqueue {
+                off,
+                retries,
+                expire_at,
+            } => {
                 put_u16(&mut out, EventType::Enqueue as u16);
                 put_u64(&mut out, *off);
                 put_u32(&mut out, *retries);
+                put_opt_u64(&mut out, *expire_at);
             }
             StromaEvent::EnqueueMany { reqs } => {
                 put_u16(&mut out, EventType::EnqueueMany as u16);
@@ -389,6 +418,7 @@ impl StromaEvent {
                 for req in reqs {
                     put_u64(&mut out, req.off);
                     put_u32(&mut out, req.retries);
+                    put_opt_u64(&mut out, req.expire_at);
                 }
             }
             StromaEvent::EnqueueDelayed { off, not_before } => {
@@ -510,6 +540,9 @@ impl StromaEvent {
                 if m.dlq_max_retries.is_some() {
                     flags |= 1 << 1;
                 }
+                if m.default_ttl_ms.is_some() {
+                    flags |= 1 << 2;
+                }
                 put_u16(&mut out, flags);
                 if let Some(p) = &m.dlq_policy {
                     match p {
@@ -525,6 +558,9 @@ impl StromaEvent {
                 }
                 if let Some(n) = m.dlq_max_retries {
                     put_u32(&mut out, n);
+                }
+                if let Some(ttl) = m.default_ttl_ms {
+                    put_u64(&mut out, ttl);
                 }
             }
         }
@@ -554,7 +590,12 @@ impl StromaEvent {
             x if x == EventType::Enqueue as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let retries = rd_u32(bytes, &mut i)?;
-                Ok(StromaEvent::Enqueue { off, retries })
+                let expire_at = rd_opt_u64(bytes, &mut i)?;
+                Ok(StromaEvent::Enqueue {
+                    off,
+                    retries,
+                    expire_at,
+                })
             }
             x if x == EventType::EnqueueMany as u16 => {
                 let count = rd_u32(bytes, &mut i)? as usize;
@@ -562,7 +603,12 @@ impl StromaEvent {
                 for _ in 0..count {
                     let off = rd_u64(bytes, &mut i)?;
                     let retries = rd_u32(bytes, &mut i)?;
-                    reqs.push(EnqueueEventMeta { off, retries });
+                    let expire_at = rd_opt_u64(bytes, &mut i)?;
+                    reqs.push(EnqueueEventMeta {
+                        off,
+                        retries,
+                        expire_at,
+                    });
                 }
                 Ok(StromaEvent::EnqueueMany { reqs })
             }
@@ -742,9 +788,15 @@ impl StromaEvent {
                 } else {
                     None
                 };
+                let default_ttl_ms = if flags & (1 << 2) != 0 {
+                    Some(rd_u64(bytes, &mut i)?)
+                } else {
+                    None
+                };
                 Ok(StromaEvent::Declare(DeclareMeta {
                     dlq_policy,
                     dlq_max_retries,
+                    default_ttl_ms,
                 }))
             }
             _ => Err(io::Error::new(
@@ -764,6 +816,7 @@ mod tests {
         let event = StromaEvent::Enqueue {
             off: 100,
             retries: 5,
+            expire_at: None,
         };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -772,7 +825,44 @@ mod tests {
 
     #[test]
     fn test_enqueue_without_group() {
-        let event = StromaEvent::Enqueue { off: 0, retries: 0 };
+        let event = StromaEvent::Enqueue {
+            off: 0,
+            retries: 0,
+            expire_at: None,
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_enqueue_with_expire_at_round_trips() {
+        let event = StromaEvent::Enqueue {
+            off: 7,
+            retries: 2,
+            expire_at: Some(1_700_000_000_000),
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_enqueue_many_with_mixed_expire_at_round_trips() {
+        let event = StromaEvent::EnqueueMany {
+            reqs: vec![
+                EnqueueEventMeta {
+                    off: 0,
+                    retries: 0,
+                    expire_at: None,
+                },
+                EnqueueEventMeta {
+                    off: 1,
+                    retries: 1,
+                    expire_at: Some(42),
+                },
+            ],
+        };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);
@@ -895,6 +985,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: None,
             dlq_max_retries: None,
+            default_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -906,6 +997,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::Discard),
             dlq_max_retries: None,
+            default_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -917,6 +1009,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
             dlq_max_retries: Some(10),
+            default_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -932,6 +1025,7 @@ mod tests {
                 group: Some("custom_dlq_group".into()),
             }),
             dlq_max_retries: Some(5),
+            default_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -943,6 +1037,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: None,
             dlq_max_retries: Some(3),
+            default_ttl_ms: Some(60_000),
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -968,10 +1063,12 @@ mod tests {
                 EnqueueEventMeta {
                     off: 100,
                     retries: 1,
+                    expire_at: None,
                 },
                 EnqueueEventMeta {
                     off: 101,
                     retries: 2,
+                    expire_at: None,
                 },
             ],
         };

@@ -439,7 +439,11 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
         for (i, CompletionItem { meta, .. }) in items.iter().enumerate() {
             let off = base + i as u64;
             match meta.not_before {
-                None => immediate.push(EnqueueEventMeta { off, retries: 0 }),
+                None => immediate.push(EnqueueEventMeta {
+                    off,
+                    retries: 0,
+                    expire_at: None,
+                }),
                 Some(nb) => delayed.push(EnqueueDelayedEventMeta {
                     off,
                     not_before: nb,
@@ -1876,7 +1880,11 @@ impl Stroma {
     fn enqueue_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> std::io::Result<()> {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
-            StromaEvent::Enqueue { off, retries } => {
+            StromaEvent::Enqueue {
+                off,
+                retries,
+                expire_at: _,
+            } => {
                 let command = QueueCommand::Enqueue {
                     offset: off,
                     retries,
@@ -2017,7 +2025,11 @@ impl Stroma {
     pub(crate) async fn apply_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> Result<()> {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
-            StromaEvent::Enqueue { off, retries } => {
+            StromaEvent::Enqueue {
+                off,
+                retries,
+                expire_at: _,
+            } => {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::Enqueue {
                     offset: off,
@@ -3578,6 +3590,7 @@ impl Stroma {
             let ev = StromaEvent::Enqueue {
                 retries: 0,
                 off: msg_offset,
+                expire_at: None,
             };
 
             let durability = stroma.keratin_cfg_msg.default_durability;
@@ -4908,7 +4921,7 @@ mod tests {
         assert_eq!(events.next_offset, 1);
         assert_eq!(
             events.records,
-            vec![(0, StromaEvent::Enqueue { off: 0, retries: 0 })]
+            vec![(0, StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None })]
         );
 
         shutdown_stroma("owner_replication_read_records", &stroma).await;
@@ -7000,7 +7013,7 @@ mod tests {
         {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
-            let bogus = StromaEvent::Enqueue { off: 0, retries: 0 };
+            let bogus = StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None };
             qh.event_log()
                 .append_batch(vec![event_msg(&bogus).unwrap()], None)
                 .await
@@ -7111,7 +7124,7 @@ mod tests {
         {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
-            let bogus = StromaEvent::Enqueue { off: 0, retries: 0 };
+            let bogus = StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None };
             qh.event_log()
                 .append_batch(vec![event_msg(&bogus).unwrap()], None)
                 .await
