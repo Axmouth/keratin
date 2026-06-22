@@ -78,6 +78,9 @@ pub struct PublishItem {
     pub headers: MessageHeaders,
     pub payload: Vec<u8>,
     pub not_before: Option<UnixMillis>,
+    /// Absolute drop deadline (message TTL), already resolved by the caller.
+    /// `None` = never expires.
+    pub expire_at: Option<UnixMillis>,
     pub completion: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
@@ -119,6 +122,7 @@ pub struct QueueDemotionOutcome {
 
 struct ItemMeta {
     not_before: Option<UnixMillis>,
+    expire_at: Option<UnixMillis>,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -442,8 +446,10 @@ impl AppendCompletion<IoError> for MsgBatchCompletion {
                 None => immediate.push(EnqueueEventMeta {
                     off,
                     retries: 0,
-                    expire_at: None,
+                    expire_at: meta.expire_at,
                 }),
+                // Delayed publishes do not carry a TTL yet - EnqueueDelayed has no
+                // expire_at field. Combining delay + TTL is a follow-up.
                 Some(nb) => delayed.push(EnqueueDelayedEventMeta {
                     off,
                     not_before: nb,
@@ -3546,6 +3552,7 @@ impl Stroma {
                 payload,
                 completion,
                 not_before,
+                expire_at,
             } = item;
             if let Err(err) = validate_user_message_headers(&headers) {
                 completion.complete(Err(IoError::new(err.to_string())));
@@ -3566,7 +3573,10 @@ impl Stroma {
             cache_messages.push(message.clone());
             messages.push(message);
             completion_items.push(CompletionItem {
-                meta: ItemMeta { not_before },
+                meta: ItemMeta {
+                    not_before,
+                    expire_at,
+                },
                 completion,
             });
         }
@@ -3610,7 +3620,24 @@ impl Stroma {
         event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         validate_user_message_headers(headers)?;
-        self.append_message_unchecked(tp, part, group, headers, payload, event_completion)
+        self.append_message_unchecked(tp, part, group, headers, payload, None, event_completion)
+            .await
+    }
+
+    /// Publish a single message with an absolute drop deadline (message TTL).
+    /// `expire_at` is `None` for no TTL.
+    pub async fn append_message_with_ttl(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        headers: &MessageHeaders,
+        payload: Vec<u8>,
+        expire_at: Option<UnixMillis>,
+        event_completion: Box<dyn AppendCompletion<IoError> + Send>,
+    ) -> Result<()> {
+        validate_user_message_headers(headers)?;
+        self.append_message_unchecked(tp, part, group, headers, payload, expire_at, event_completion)
             .await
     }
 
@@ -3621,6 +3648,7 @@ impl Stroma {
         group: Option<&str>,
         headers: &MessageHeaders,
         payload: Vec<u8>,
+        expire_at: Option<UnixMillis>,
         event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
@@ -3660,7 +3688,7 @@ impl Stroma {
             let ev = StromaEvent::Enqueue {
                 retries: 0,
                 off: msg_offset,
-                expire_at: None,
+                expire_at,
             };
 
             let durability = stroma.keratin_cfg_msg.default_durability;
@@ -4092,6 +4120,7 @@ impl Stroma {
                         target_group,
                         &headers,
                         msg.payload.clone(),
+                        None,
                         cmp,
                     )
                     .await;
