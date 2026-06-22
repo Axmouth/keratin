@@ -355,6 +355,10 @@ pub struct QueueInternalState {
     // when to send to DLQ
     dlq_discard_max_retries: u32,
 
+    // per-queue default message TTL (ms); applied at publish when a message
+    // carries no explicit deadline. None = no default.
+    default_message_ttl_ms: Option<u64>,
+
     deadline_waker: Arc<Notify>,
 }
 
@@ -762,6 +766,10 @@ pub struct QueueCommandPackage {
 pub struct SnapshotMeta {
     pub last_snapshot_timestamp: u64,
     pub last_snapshot_event_offset: u64,
+    /// Per-queue default message TTL (ms) restored from the snapshot, so the
+    /// handle-side cache can be repopulated on recovery from a snapshot that
+    /// already compacted the original Declare event. None = no default.
+    pub default_message_ttl_ms: Option<u64>,
 }
 
 #[derive(Debug)]
@@ -991,6 +999,11 @@ pub struct QueueHandleInner {
     owner_operations_paused: Arc<AtomicBool>,
     owner_operations_resumed: Arc<Notify>,
 
+    // Hot-path cache of the per-queue default message TTL (ms). 0 = none.
+    // Populated by the actor on Declare and snapshot load so the publish path
+    // can resolve a default deadline without a command roundtrip.
+    default_message_ttl_ms: Arc<AtomicU64>,
+
     global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
     metrics: Arc<StromaMetrics>,
 
@@ -1168,6 +1181,7 @@ impl QueueHandleInner {
             owner_operations_drained,
             owner_operations_paused,
             owner_operations_resumed,
+            default_message_ttl_ms: Arc::new(AtomicU64::new(0)),
             global_dlq,
             metrics,
             deadline_waker,
@@ -1570,6 +1584,7 @@ impl QueueHandleInner {
             }
             QueueCommand::Declare { meta, response } => {
                 state.apply_declare(&meta);
+                handle.set_default_message_ttl_ms(state.default_message_ttl_ms());
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
@@ -1817,6 +1832,9 @@ impl QueueHandleInner {
             }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
+                if result.is_ok() {
+                    handle.set_default_message_ttl_ms(state.default_message_ttl_ms());
+                }
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -1828,6 +1846,7 @@ impl QueueHandleInner {
             } => {
                 loaded_state.deadline_waker = state.deadline_waker.clone();
                 *state = loaded_state;
+                handle.set_default_message_ttl_ms(state.default_message_ttl_ms());
                 if let Some(r) = response {
                     let _ = r.send(meta);
                 }
@@ -2668,6 +2687,20 @@ impl QueueHandleInner {
         self.applied_upto.clone()
     }
 
+    /// Per-queue default message TTL (ms), or `None`. Hot-path read for the
+    /// publish path. Kept in sync by the actor on Declare and snapshot load.
+    pub fn default_message_ttl_ms(&self) -> Option<u64> {
+        match self.default_message_ttl_ms.load(Ordering::Relaxed) {
+            0 => None,
+            v => Some(v),
+        }
+    }
+
+    fn set_default_message_ttl_ms(&self, value: Option<u64>) {
+        self.default_message_ttl_ms
+            .store(value.unwrap_or(0), Ordering::Relaxed);
+    }
+
     pub fn last_snapshot_timestamp(&self) -> u64 {
         self.last_snapshot_timestamp
             .load(std::sync::atomic::Ordering::Relaxed)
@@ -2729,6 +2762,7 @@ impl QueueInternalState {
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
             dlq_discard_max_retries: 5,
+            default_message_ttl_ms: None,
             deadline_waker: Arc::new(Notify::new()),
         }
     }
@@ -2753,6 +2787,7 @@ impl QueueInternalState {
             min_deadline_hint: None,
             dlq_policy: DLQDiscardPolicy::Discard,
             dlq_discard_max_retries: 5,
+            default_message_ttl_ms: None,
             deadline_waker,
         }
     }
@@ -3221,6 +3256,13 @@ impl QueueInternalState {
         if let Some(n) = meta.dlq_max_retries {
             self.dlq_discard_max_retries = n;
         }
+        if let Some(ttl) = meta.default_message_ttl_ms {
+            self.default_message_ttl_ms = Some(ttl);
+        }
+    }
+
+    pub fn default_message_ttl_ms(&self) -> Option<u64> {
+        self.default_message_ttl_ms
     }
 
     pub fn ack_many(&mut self, reqs: &[AckEventMeta]) {
@@ -3787,6 +3829,15 @@ impl QueueInternalState {
         // dlq max retries
         out.extend_from_slice(&self.dlq_discard_max_retries.to_be_bytes());
 
+        // per-queue default message TTL (presence byte + value)
+        match self.default_message_ttl_ms {
+            Some(ttl) => {
+                out.push(1);
+                out.extend_from_slice(&ttl.to_be_bytes());
+            }
+            None => out.push(0),
+        }
+
         tracing::info!(
             "ms taken to encode snapshot: {}",
             start.elapsed().as_millis()
@@ -3964,6 +4015,12 @@ impl QueueInternalState {
 
         self.dlq_discard_max_retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
 
+        // per-queue default message TTL (presence byte + value)
+        self.default_message_ttl_ms = match take::<1>(&mut bytes)?[0] {
+            0 => None,
+            _ => Some(u64::from_be_bytes(take::<8>(&mut bytes)?)),
+        };
+
         if !bytes.is_empty() {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -3992,6 +4049,7 @@ impl QueueInternalState {
         Ok(SnapshotMeta {
             last_snapshot_event_offset: self.last_snapshot_event_offset,
             last_snapshot_timestamp: self.last_snapshot_timestamp,
+            default_message_ttl_ms: self.default_message_ttl_ms,
         })
     }
 
@@ -5325,7 +5383,7 @@ mod tests {
         s.apply_declare(&DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
             dlq_max_retries: None,
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
 
         assert_eq!(s.dlq_policy, DLQDiscardPolicy::GlobalDQL);
@@ -5342,7 +5400,7 @@ mod tests {
                 group: Some("g1".into()), // assumes you added the group field
             }),
             dlq_max_retries: Some(99),
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
 
         assert_eq!(

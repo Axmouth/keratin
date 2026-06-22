@@ -3536,10 +3536,17 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, msg_log) = {
+        let (owner_operation, msg_log, default_ttl_ms) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.msg_log())
+            (
+                h.begin_owner_operation().await?,
+                h.msg_log(),
+                h.default_message_ttl_ms(),
+            )
         };
+        // Resolve the per-queue default deadline once for this batch (broker
+        // clock). A message's own expire_at wins; otherwise the default applies.
+        let default_expire_at = default_ttl_ms.map(|ttl| unix_millis().saturating_add(ttl));
 
         // Build msg_log batch and extract per client completions.
         // Per message header encode failures fail just that one completion.
@@ -3575,7 +3582,7 @@ impl Stroma {
             completion_items.push(CompletionItem {
                 meta: ItemMeta {
                     not_before,
-                    expire_at,
+                    expire_at: expire_at.or(default_expire_at),
                 },
                 completion,
             });

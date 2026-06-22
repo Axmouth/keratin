@@ -110,7 +110,7 @@ async fn declare_dlq_custom(
                 group: target_group.map(Into::into),
             }),
             dlq_max_retries: Some(max_retries),
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         },
     )
     .await
@@ -129,7 +129,7 @@ async fn declare_discard(
     qh.declare(DeclareMeta {
         dlq_policy: Some(DLQDiscardPolicyWire::Discard),
         dlq_max_retries: Some(max_retries),
-        default_ttl_ms: None,
+        default_message_ttl_ms: None,
     })
     .await
     .unwrap();

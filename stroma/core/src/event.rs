@@ -190,7 +190,7 @@ pub struct DeclareMeta {
     pub dlq_max_retries: Option<u32>,
     /// Per-queue default message TTL in milliseconds. Applied at publish when a
     /// message carries no explicit TTL. `None` = no default (never expires).
-    pub default_ttl_ms: Option<u64>,
+    pub default_message_ttl_ms: Option<u64>,
 }
 
 /// Wire form of DLQDiscardPolicy. Mirrors state::DLQDiscardPolicy
@@ -545,7 +545,7 @@ impl StromaEvent {
                 if m.dlq_max_retries.is_some() {
                     flags |= 1 << 1;
                 }
-                if m.default_ttl_ms.is_some() {
+                if m.default_message_ttl_ms.is_some() {
                     flags |= 1 << 2;
                 }
                 put_u16(&mut out, flags);
@@ -564,7 +564,7 @@ impl StromaEvent {
                 if let Some(n) = m.dlq_max_retries {
                     put_u32(&mut out, n);
                 }
-                if let Some(ttl) = m.default_ttl_ms {
+                if let Some(ttl) = m.default_message_ttl_ms {
                     put_u64(&mut out, ttl);
                 }
             }
@@ -793,7 +793,7 @@ impl StromaEvent {
                 } else {
                     None
                 };
-                let default_ttl_ms = if flags & (1 << 2) != 0 {
+                let default_message_ttl_ms = if flags & (1 << 2) != 0 {
                     Some(rd_u64(bytes, &mut i)?)
                 } else {
                     None
@@ -801,7 +801,7 @@ impl StromaEvent {
                 Ok(StromaEvent::Declare(DeclareMeta {
                     dlq_policy,
                     dlq_max_retries,
-                    default_ttl_ms,
+                    default_message_ttl_ms,
                 }))
             }
             _ => Err(io::Error::new(
@@ -990,7 +990,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: None,
             dlq_max_retries: None,
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -1002,7 +1002,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::Discard),
             dlq_max_retries: None,
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -1014,7 +1014,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: Some(DLQDiscardPolicyWire::GlobalDQL),
             dlq_max_retries: Some(10),
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -1030,7 +1030,7 @@ mod tests {
                 group: Some("custom_dlq_group".into()),
             }),
             dlq_max_retries: Some(5),
-            default_ttl_ms: None,
+            default_message_ttl_ms: None,
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
@@ -1042,7 +1042,7 @@ mod tests {
         let event = StromaEvent::Declare(DeclareMeta {
             dlq_policy: None,
             dlq_max_retries: Some(3),
-            default_ttl_ms: Some(60_000),
+            default_message_ttl_ms: Some(60_000),
         });
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
