@@ -39,7 +39,7 @@ pub use stroma::{
     MessageContentType, MessageHeaders, MessageInspectionItem, MessageInspectionPage,
     OwnerReplicationBatch, OwnerReplicationRead, OwnerStateCheckpoint, PublishItem, QuarantineInfo,
     QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
-    ReplicatedQueueApplyOutcome, ReplicationCacheConfig, SnapshotConfig, Stroma,
+    ReplicatedQueueApplyOutcome, ReplicationCacheConfig, SnapshotConfig, StagedStreamAppend, Stroma,
     StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 

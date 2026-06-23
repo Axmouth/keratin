@@ -635,6 +635,15 @@ pub struct MessageHeaders {
     pub extra: HashMap<String, String>,
 }
 
+/// Result of an express-path stream append ([`Stroma::append_stream_record_staged`]).
+/// The offset is known immediately (assigned at stage); `durable` resolves later
+/// when the record is flushed and fsynced, or with an error if the write failed.
+#[derive(Debug)]
+pub struct StagedStreamAppend {
+    pub offset: Offset,
+    pub durable: tokio::sync::oneshot::Receiver<std::result::Result<(), StromaError>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageInspectionPage {
     pub next_offset_hint: Offset,
@@ -4034,6 +4043,81 @@ impl Stroma {
         self.cache_owner_messages(&h, msg_offset, vec![cache_message]);
 
         Ok(msg_offset)
+    }
+
+    /// Append a stream record on the express path: enqueue it, then return as soon
+    /// as the offset is ASSIGNED (staged in the in-memory buffer), without waiting
+    /// for the flush or fsync. The returned `durable` resolves later when the
+    /// record is durable (or with an error). The stream tail is advanced at stage
+    /// so a new subscriber sees the record immediately. Used by the speculative and
+    /// ephemeral durability tiers; the standard durable path is
+    /// [`append_stream_record`].
+    pub async fn append_stream_record_staged(
+        &self,
+        tp: &str,
+        part: u32,
+        headers: &MessageHeaders,
+        payload: Vec<u8>,
+    ) -> Result<StagedStreamAppend> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let (owner_operation, msg_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.msg_log())
+        };
+        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        let message = Message {
+            flags: 0,
+            headers: headers.encode()?,
+            payload,
+        };
+        let cache_message = message.clone();
+        msg_log
+            .append_enqueue_staged(message, None, msg_completion, staged_tx)
+            .map_err(io_err)?;
+
+        // Wait only for the offset to be assigned (staged), not for durability.
+        let msg_offset = match staged_rx.await {
+            Ok(offset) => offset,
+            Err(_) => {
+                return Err(StromaError::Io(
+                    "stream staged-offset channel closed".into(),
+                ));
+            }
+        };
+        let next = msg_offset + 1;
+
+        let h = qh.resolve()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.stream_command_enqueue(StreamCommand::AdvanceTail {
+            next_offset: next,
+            response: Some(tx),
+        })
+        .await
+        .map_err(io_err)?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)?;
+
+        self.cache_owner_messages(&h, msg_offset, vec![cache_message]);
+
+        // The durability completion resolves in the background. Hold the owner
+        // operation until then so the partition is not evicted mid-flush.
+        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _owner_operation = owner_operation;
+            let result = match msg_rx.await {
+                Ok(Ok(_ar)) => Ok(()),
+                Ok(Err(err)) => Err(io_err(err)),
+                Err(_) => Err(StromaError::Io(
+                    "stream record completion channel closed".into(),
+                )),
+            };
+            let _ = durable_tx.send(result);
+        });
+
+        Ok(StagedStreamAppend {
+            offset: msg_offset,
+            durable: durable_rx,
+        })
     }
 
     /// Commit a durable named cursor for a stream. The commit is logged as a
