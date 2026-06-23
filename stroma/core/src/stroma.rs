@@ -644,6 +644,19 @@ pub struct StagedStreamAppend {
     pub durable: tokio::sync::oneshot::Receiver<std::result::Result<(), StromaError>>,
 }
 
+/// Result of a pipelined durable stream append
+/// ([`Stroma::append_stream_records_enqueue`]). Neither the offset nor durability
+/// is awaited by the caller: `offset` resolves at stage (the base offset of the
+/// batch) and `durable` resolves when the batch is fsynced (or with an error).
+/// Returning both as receivers lets the caller enqueue the next append without
+/// waiting for keratin to report back, so keratin coalesces fsyncs across the
+/// queued appends instead of paying one fsync per record.
+#[derive(Debug)]
+pub struct EnqueuedStreamAppend {
+    pub offset: tokio::sync::oneshot::Receiver<Offset>,
+    pub durable: tokio::sync::oneshot::Receiver<std::result::Result<(), StromaError>>,
+}
+
 #[derive(Debug, Clone, Serialize)]
 pub struct MessageInspectionPage {
     pub next_offset_hint: Offset,
@@ -4121,21 +4134,23 @@ impl Stroma {
         })
     }
 
-    /// Batched express-path stream append: stage a whole batch as ONE keratin
-    /// append (so the batch shares a single fsync) and return the base offset plus
-    /// a single durability handle for the batch. The records occupy
-    /// `base..base+records.len()`. The tail is advanced at stage. Used by the
-    /// durable-tier pipeline to amortize the fsync over a batch.
-    pub async fn append_stream_records_batch(
+    /// Pipelined durable stream append: enqueue the batch as ONE keratin append and
+    /// return immediately, WITHOUT waiting for the offset to be staged or for the
+    /// flush. The tail advance and replication caching run in a background task once
+    /// the offset is assigned. This mirrors the queue publish path (hand keratin a
+    /// completion, return) so a caller can enqueue the next batch right away and let
+    /// keratin coalesce fsyncs across the queued appends, instead of paying one
+    /// fsync per record by waiting for keratin to report back between appends.
+    pub async fn append_stream_records_enqueue(
         &self,
         tp: &str,
         part: u32,
         records: Vec<(MessageHeaders, Vec<u8>)>,
         durability: Option<KDurability>,
-    ) -> Result<StagedStreamAppend> {
+    ) -> Result<EnqueuedStreamAppend> {
         if records.is_empty() {
             return Err(StromaError::InvalidArgument(
-                "append_stream_records_batch requires at least one record".into(),
+                "append_stream_records_enqueue requires at least one record".into(),
             ));
         }
         let qh = self.queue_handle(tp, part, None).await?;
@@ -4159,30 +4174,36 @@ impl Stroma {
             .append_batch_enqueue_staged(messages, durability, msg_completion, staged_tx)
             .map_err(io_err)?;
 
-        let base_offset = match staged_rx.await {
-            Ok(offset) => offset,
-            Err(_) => {
-                return Err(StromaError::Io(
-                    "stream staged-offset channel closed".into(),
-                ));
-            }
-        };
-
-        let h = qh.resolve()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        h.stream_command_enqueue(StreamCommand::AdvanceTail {
-            next_offset: base_offset + count,
-            response: Some(tx),
-        })
-        .await
-        .map_err(io_err)?;
-        rx.await.map_err(|_| StromaError::QueueActorGone)?;
-
-        self.cache_owner_messages(&h, base_offset, cache_messages);
-
+        let (offset_tx, offset_rx) = tokio::sync::oneshot::channel();
         let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+        let stroma = self.clone();
         tokio::spawn(async move {
+            // Hold the owner operation across the whole append so the partition is
+            // not evicted mid-flush.
             let _owner_operation = owner_operation;
+            let base = match staged_rx.await {
+                Ok(offset) => offset,
+                Err(_) => {
+                    let _ = durable_tx.send(Err(StromaError::Io(
+                        "stream staged-offset channel closed".into(),
+                    )));
+                    return;
+                }
+            };
+            // Advance the tail (fire and forget, max-semantics) and cache the records
+            // for owner replication. Order across concurrent appends does not matter:
+            // the tail only ever moves forward and the cache is keyed by offset.
+            if let Ok(h) = qh.resolve() {
+                let _ = h
+                    .stream_command_enqueue(StreamCommand::AdvanceTail {
+                        next_offset: base + count,
+                        response: None,
+                    })
+                    .await;
+                stroma.cache_owner_messages(&h, base, cache_messages);
+            }
+            let _ = offset_tx.send(base);
+
             let result = match msg_rx.await {
                 Ok(Ok(_ar)) => Ok(()),
                 Ok(Err(err)) => Err(io_err(err)),
@@ -4193,8 +4214,8 @@ impl Stroma {
             let _ = durable_tx.send(result);
         });
 
-        Ok(StagedStreamAppend {
-            offset: base_offset,
+        Ok(EnqueuedStreamAppend {
+            offset: offset_rx,
             durable: durable_rx,
         })
     }
