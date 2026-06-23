@@ -195,6 +195,32 @@ impl Keratin {
                 records: AppendPayload::One(payload),
                 durability,
                 completion: completion.into(),
+                staged_offset_tx: None,
+            }))
+            .map_err(|_| IoError::new("writer channel closed"))?;
+
+        Ok(())
+    }
+
+    /// Append one record, reporting its assigned base offset as soon as it is
+    /// staged (offset assigned, in the in-memory buffer) over `staged_offset_tx`,
+    /// while `completion` still resolves at the chosen durability point. Lets a
+    /// caller act on the offset without waiting for the flush. Used by the stream
+    /// express lane.
+    pub fn append_enqueue_staged(
+        &self,
+        payload: Message,
+        durability: Option<KDurability>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+        staged_offset_tx: oneshot::Sender<u64>,
+    ) -> Result<(), IoError> {
+        self.ensure_role(KeratinRole::Owner, "append")?;
+        self.tx
+            .send(WriterCmd::Append(AppendReq {
+                records: AppendPayload::One(payload),
+                durability,
+                completion: completion.into(),
+                staged_offset_tx: Some(staged_offset_tx),
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
@@ -213,6 +239,7 @@ impl Keratin {
                 records: AppendPayload::One(payload),
                 durability,
                 completion: AppendCompletionTarget::Oneshot(result_tx),
+                staged_offset_tx: None,
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
@@ -241,6 +268,7 @@ impl Keratin {
                 records: AppendPayload::Many(payloads),
                 durability,
                 completion: completion.into(),
+                staged_offset_tx: None,
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
@@ -259,6 +287,7 @@ impl Keratin {
                 records: AppendPayload::Many(payloads),
                 durability,
                 completion: AppendCompletionTarget::Oneshot(result_tx),
+                staged_offset_tx: None,
             }))
             .map_err(|_| IoError::new("writer channel closed"))?;
 
