@@ -275,6 +275,28 @@ impl Keratin {
         Ok(())
     }
 
+    /// Batch counterpart of [`append_enqueue_staged`]: reports the batch's assigned
+    /// base offset as soon as it is staged, before the durability ack.
+    pub fn append_batch_enqueue_staged(
+        &self,
+        payloads: Vec<Message>,
+        durability: Option<KDurability>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+        staged_offset_tx: oneshot::Sender<u64>,
+    ) -> Result<(), IoError> {
+        self.ensure_role(KeratinRole::Owner, "append_batch")?;
+        self.tx
+            .send(WriterCmd::Append(AppendReq {
+                records: AppendPayload::Many(payloads),
+                durability,
+                completion: completion.into(),
+                staged_offset_tx: Some(staged_offset_tx),
+            }))
+            .map_err(|_| IoError::new("writer channel closed"))?;
+
+        Ok(())
+    }
+
     pub fn append_batch_enqueue_receiver(
         &self,
         payloads: Vec<Message>,

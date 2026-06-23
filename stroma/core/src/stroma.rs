@@ -4121,6 +4121,84 @@ impl Stroma {
         })
     }
 
+    /// Batched express-path stream append: stage a whole batch as ONE keratin
+    /// append (so the batch shares a single fsync) and return the base offset plus
+    /// a single durability handle for the batch. The records occupy
+    /// `base..base+records.len()`. The tail is advanced at stage. Used by the
+    /// durable-tier pipeline to amortize the fsync over a batch.
+    pub async fn append_stream_records_batch(
+        &self,
+        tp: &str,
+        part: u32,
+        records: Vec<(MessageHeaders, Vec<u8>)>,
+        durability: Option<KDurability>,
+    ) -> Result<StagedStreamAppend> {
+        if records.is_empty() {
+            return Err(StromaError::InvalidArgument(
+                "append_stream_records_batch requires at least one record".into(),
+            ));
+        }
+        let qh = self.queue_handle(tp, part, None).await?;
+        let (owner_operation, msg_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.msg_log())
+        };
+        let mut messages = Vec::with_capacity(records.len());
+        for (headers, payload) in records {
+            messages.push(Message {
+                flags: 0,
+                headers: headers.encode()?,
+                payload,
+            });
+        }
+        let count = messages.len() as u64;
+        let cache_messages = messages.clone();
+        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+        msg_log
+            .append_batch_enqueue_staged(messages, durability, msg_completion, staged_tx)
+            .map_err(io_err)?;
+
+        let base_offset = match staged_rx.await {
+            Ok(offset) => offset,
+            Err(_) => {
+                return Err(StromaError::Io(
+                    "stream staged-offset channel closed".into(),
+                ));
+            }
+        };
+
+        let h = qh.resolve()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.stream_command_enqueue(StreamCommand::AdvanceTail {
+            next_offset: base_offset + count,
+            response: Some(tx),
+        })
+        .await
+        .map_err(io_err)?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)?;
+
+        self.cache_owner_messages(&h, base_offset, cache_messages);
+
+        let (durable_tx, durable_rx) = tokio::sync::oneshot::channel();
+        tokio::spawn(async move {
+            let _owner_operation = owner_operation;
+            let result = match msg_rx.await {
+                Ok(Ok(_ar)) => Ok(()),
+                Ok(Err(err)) => Err(io_err(err)),
+                Err(_) => Err(StromaError::Io(
+                    "stream record completion channel closed".into(),
+                )),
+            };
+            let _ = durable_tx.send(result);
+        });
+
+        Ok(StagedStreamAppend {
+            offset: base_offset,
+            durable: durable_rx,
+        })
+    }
+
     /// Commit a durable named cursor for a stream. The commit is logged as a
     /// CursorCommit event (durable and replicated) and applied to the stream
     /// engine, so it survives a crash or redeploy and a follower promoted after
