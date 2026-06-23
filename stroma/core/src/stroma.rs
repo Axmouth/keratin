@@ -4058,6 +4058,7 @@ impl Stroma {
         part: u32,
         headers: &MessageHeaders,
         payload: Vec<u8>,
+        durability: Option<KDurability>,
     ) -> Result<StagedStreamAppend> {
         let qh = self.queue_handle(tp, part, None).await?;
         let (owner_operation, msg_log) = {
@@ -4073,7 +4074,7 @@ impl Stroma {
         };
         let cache_message = message.clone();
         msg_log
-            .append_enqueue_staged(message, None, msg_completion, staged_tx)
+            .append_enqueue_staged(message, durability, msg_completion, staged_tx)
             .map_err(io_err)?;
 
         // Wait only for the offset to be assigned (staged), not for durability.
