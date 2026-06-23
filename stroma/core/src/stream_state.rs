@@ -15,6 +15,8 @@
 use std::collections::HashMap;
 use std::io::{Error, ErrorKind};
 
+use tokio::sync::{mpsc, oneshot};
+
 use crate::Offset;
 use crate::engine::{PartitionEngine, PartitionKind};
 use crate::state::SnapshotMeta;
@@ -287,6 +289,152 @@ impl PartitionEngine for StreamState {
     }
 }
 
+/// Commands the stream control actor processes against its `StreamState`. The
+/// stream engine has its own vocabulary, separate from the work queue's
+/// `QueueCommand`, because the two engines share only the substrate (logs,
+/// durable append, replication, recovery, snapshot IO), not their semantics. A
+/// stream never leases, acks, requeues, or dead-letters, so none of those appear
+/// here.
+///
+/// Each variant that mutates carries an optional response sender so a caller can
+/// await the apply (used when an apply must be ordered before the next step, for
+/// example replaying a durable event before continuing recovery).
+#[derive(Debug)]
+pub enum StreamCommand {
+    /// Record a durable cursor position. The actor applies the advance-on-ack
+    /// policy for the durable default; the engine itself clamps into the retained
+    /// window. See [`StreamState::commit_cursor`].
+    CommitCursor {
+        name: String,
+        offset: Offset,
+        response: Option<oneshot::Sender<()>>,
+    },
+    /// Read a durable cursor position.
+    GetCursor {
+        name: String,
+        response: oneshot::Sender<Option<Offset>>,
+    },
+    /// Forget a durable cursor (consumer retired or explicit delete).
+    RemoveCursor {
+        name: String,
+        response: Option<oneshot::Sender<Option<Offset>>>,
+    },
+    /// Replace the retention policy.
+    SetRetention {
+        config: RetentionConfig,
+        response: Option<oneshot::Sender<()>>,
+    },
+    /// Move the tail forward after records were appended to the message log.
+    AdvanceTail {
+        next_offset: Offset,
+        response: Option<oneshot::Sender<()>>,
+    },
+    /// Apply a retention truncation that dropped everything below `new_head`.
+    /// Returns the names of cursors that fell behind and were clamped up (lagged).
+    ApplyTruncation {
+        new_head: Offset,
+        response: Option<oneshot::Sender<Vec<String>>>,
+    },
+    /// Read the current head/tail watermarks.
+    GetHeadTail {
+        response: oneshot::Sender<(Offset, Offset)>,
+    },
+    /// Serialize the current state for a snapshot.
+    EncodeSnapshot {
+        last_event_offset: u64,
+        response: oneshot::Sender<Vec<u8>>,
+    },
+    /// Restore state from a snapshot blob.
+    LoadSnapshot {
+        bytes: Vec<u8>,
+        response: oneshot::Sender<std::io::Result<SnapshotMeta>>,
+    },
+    /// Drop all in-memory state back to empty.
+    Reset {
+        response: Option<oneshot::Sender<()>>,
+    },
+    /// Stop the actor.
+    Shutdown {
+        response: Option<oneshot::Sender<()>>,
+    },
+}
+
+/// The per-partition stream control actor loop. Owns the `StreamState` and
+/// processes commands sequentially on a single task, so the state needs no
+/// locking, exactly like the work queue's control loop. Returns when the channel
+/// closes (all senders dropped) or a `Shutdown` is received, so when the
+/// substrate drops the partition the sender drops and the loop exits on its own.
+pub async fn run_stream_control(mut state: StreamState, mut rx: mpsc::Receiver<StreamCommand>) {
+    while let Some(cmd) = rx.recv().await {
+        match cmd {
+            StreamCommand::CommitCursor {
+                name,
+                offset,
+                response,
+            } => {
+                state.commit_cursor(name, offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::GetCursor { name, response } => {
+                let _ = response.send(state.cursor(&name));
+            }
+            StreamCommand::RemoveCursor { name, response } => {
+                let removed = state.remove_cursor(&name);
+                if let Some(r) = response {
+                    let _ = r.send(removed);
+                }
+            }
+            StreamCommand::SetRetention { config, response } => {
+                state.set_retention(config);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::AdvanceTail {
+                next_offset,
+                response,
+            } => {
+                state.advance_tail(next_offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::ApplyTruncation { new_head, response } => {
+                let lagged = state.apply_truncation(new_head);
+                if let Some(r) = response {
+                    let _ = r.send(lagged);
+                }
+            }
+            StreamCommand::GetHeadTail { response } => {
+                let _ = response.send((state.head(), state.tail()));
+            }
+            StreamCommand::EncodeSnapshot {
+                last_event_offset,
+                response,
+            } => {
+                let _ = response.send(state.encode_snapshot(last_event_offset));
+            }
+            StreamCommand::LoadSnapshot { bytes, response } => {
+                let _ = response.send(state.load_snapshot(&bytes));
+            }
+            StreamCommand::Reset { response } => {
+                StreamState::reset(&mut state);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::Shutdown { response } => {
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                break;
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -393,5 +541,86 @@ mod tests {
         assert_eq!(s.head(), 0);
         assert_eq!(s.tail(), 0);
         assert_eq!(s.kind(), PartitionKind::Stream);
+    }
+
+    async fn ask<T>(
+        tx: &mpsc::Sender<StreamCommand>,
+        make: impl FnOnce(oneshot::Sender<T>) -> StreamCommand,
+    ) -> T {
+        let (rtx, rrx) = oneshot::channel();
+        tx.send(make(rtx)).await.expect("send");
+        rrx.await.expect("reply")
+    }
+
+    #[tokio::test]
+    async fn actor_commits_reads_and_snapshots() {
+        let mut s = StreamState::new("sensors".into(), 0);
+        s.advance_tail(1000);
+        let (tx, rx) = mpsc::channel(16);
+        let actor = tokio::spawn(run_stream_control(s, rx));
+
+        tx.send(StreamCommand::CommitCursor {
+            name: "group-a".into(),
+            offset: 250,
+            response: None,
+        })
+        .await
+        .expect("send");
+
+        let got = ask(&tx, |response| StreamCommand::GetCursor {
+            name: "group-a".into(),
+            response,
+        })
+        .await;
+        assert_eq!(got, Some(250));
+
+        // Truncating past a cursor clamps it up and flags it lagged.
+        let lagged = ask(&tx, |response| StreamCommand::ApplyTruncation {
+            new_head: 300,
+            response: Some(response),
+        })
+        .await;
+        assert_eq!(lagged, vec!["group-a".to_string()]);
+
+        let blob = ask(&tx, |response| StreamCommand::EncodeSnapshot {
+            last_event_offset: 42,
+            response,
+        })
+        .await;
+
+        // A fresh actor restores the same state from the snapshot blob.
+        let (tx2, rx2) = mpsc::channel(16);
+        let actor2 = tokio::spawn(run_stream_control(
+            StreamState::new("sensors".into(), 0),
+            rx2,
+        ));
+        let meta = ask(&tx2, |response| StreamCommand::LoadSnapshot {
+            bytes: blob,
+            response,
+        })
+        .await
+        .expect("load");
+        assert_eq!(meta.last_snapshot_event_offset, 42);
+        let restored = ask(&tx2, |response| StreamCommand::GetCursor {
+            name: "group-a".into(),
+            response,
+        })
+        .await;
+        assert_eq!(restored, Some(300));
+        let (head, _tail) = ask(&tx2, |response| StreamCommand::GetHeadTail { response }).await;
+        assert_eq!(head, 300);
+
+        drop(tx);
+        drop(tx2);
+        actor.await.expect("actor join");
+        actor2.await.expect("actor2 join");
+    }
+
+    #[tokio::test]
+    async fn actor_exits_when_sender_dropped() {
+        let (tx, rx) = mpsc::channel(4);
+        let actor = tokio::spawn(run_stream_control(StreamState::new("t".into(), 0), rx));
+        drop(tx);
+        actor.await.expect("actor should exit when channel closes");
     }
 }
