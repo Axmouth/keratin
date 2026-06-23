@@ -16,8 +16,7 @@ use dashmap::DashMap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
     KeratinAppendCompletion, KeratinConfig, KeratinReplicaExt, KeratinRole, Message,
-    ReplicatedAppendOutcome,
-    util::unix_millis,
+    ReplicatedAppendOutcome, util::unix_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -29,6 +28,7 @@ use tokio_util::sync::CancellationToken;
 
 use crate::{
     DeclareMeta, RecoveryMismatchPolicy, Result, StromaError,
+    engine::PartitionKind,
     event::{
         AckEventMeta, DeadLetterMeta, DeadLetterReason, EnqueueDelayedEventMeta, EnqueueEventMeta,
         NackEventMeta, StromaEvent,
@@ -41,10 +41,11 @@ use crate::{
     },
     state::{
         CustomDLQ, InspectMode, NackOutcome, Offset, OwnerOperationLease, QueueCommand,
-        QueueDebugInfo, QueueHandle, QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState,
-        QueueInternalDebugInfo, QueueRole, QueueSharedBundle,
+        QueueDebugInfo, QueueHandle, QueueHandleInner, QueueInspectionSnapshot,
+        QueueInspectionState, QueueInternalDebugInfo, QueueRole, QueueSharedBundle,
         QueueStatusReport, StromaDebugSnapshot, UnixMillis,
     },
+    stream_state::{RetentionConfig, StreamCommand},
     topic,
 };
 
@@ -1015,7 +1016,12 @@ impl Stroma {
             .record_evicted_records(mutation.evicted_records);
     }
 
-    fn cache_owner_messages(&self, qh: &QueueHandleInner, first_offset: Offset, messages: Vec<Message>) {
+    fn cache_owner_messages(
+        &self,
+        qh: &QueueHandleInner,
+        first_offset: Offset,
+        messages: Vec<Message>,
+    ) {
         if messages.is_empty() {
             return;
         }
@@ -1034,7 +1040,12 @@ impl Stroma {
         self.record_replication_cache_mutation(mutation);
     }
 
-    fn cache_owner_events(&self, qh: &QueueHandleInner, first_offset: Offset, events: Vec<StromaEvent>) {
+    fn cache_owner_events(
+        &self,
+        qh: &QueueHandleInner,
+        first_offset: Offset,
+        events: Vec<StromaEvent>,
+    ) {
         if events.is_empty() {
             return;
         }
@@ -1228,6 +1239,58 @@ impl Stroma {
             .join(format!("{}.snap", Self::enc_component(tp)))
     }
 
+    /// Per-partition marker recording which engine owns the partition. Lives in
+    /// the partition's snapshot directory so it persists across restarts. Absence
+    /// means a work queue (the default), so existing partitions need no marker and
+    /// no migration.
+    fn kind_marker_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        self.snap_dir(tp, part, group).join("partition.kind")
+    }
+
+    /// Read a partition's engine kind from its marker, defaulting to `Queue` when
+    /// the marker is missing or unreadable. Called on the materialization path
+    /// before spawning the control actor, so a stream partition spawns the stream
+    /// engine rather than the work queue.
+    fn read_partition_kind(&self, tp: &str, part: u32, group: Option<&str>) -> PartitionKind {
+        let path = self.kind_marker_file(tp, part, group);
+        match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => PartitionKind::from_u8(bytes[0]).unwrap_or_default(),
+            _ => PartitionKind::Queue,
+        }
+    }
+
+    /// Persist a partition's engine kind. Written before the partition is first
+    /// materialized as a stream (a queue needs no marker). Uses write-temp +
+    /// fsync + rename so a crash mid-write never leaves a torn marker that would
+    /// be misread as the wrong engine.
+    fn write_partition_kind(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        kind: PartitionKind,
+    ) -> Result<()> {
+        let final_path = self.kind_marker_file(tp, part, group);
+        if let Some(parent) = final_path.parent() {
+            fs::create_dir_all(parent).map_err(io_err)?;
+        }
+        let tmp = final_path.with_extension("kind.new");
+        {
+            let mut f = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&tmp)
+                .map_err(io_err)?;
+            use io::Write;
+            f.write_all(&[kind.as_u8()]).map_err(io_err)?;
+            f.flush().map_err(io_err)?;
+            f.sync_all().map_err(io_err)?;
+        }
+        fs::rename(&tmp, &final_path).map_err(io_err)?;
+        Ok(())
+    }
+
     fn snap_tmp_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
         let group = normalize_group(group);
         let p = self.root.join("tmp");
@@ -1324,11 +1387,8 @@ impl Stroma {
 
     pub fn is_quarantined(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
         let group = normalize_group(group);
-        self.quarantined.contains_key(&(
-            Box::<str>::from(tp),
-            part,
-            group.map(Box::<str>::from),
-        ))
+        self.quarantined
+            .contains_key(&(Box::<str>::from(tp), part, group.map(Box::<str>::from)))
     }
 
     /// Repair a quarantined partition: truncate the event log's unresolvable
@@ -1426,11 +1486,10 @@ impl Stroma {
         // A quarantined partition (recovery found a dangling event->message
         // reference) does not serve: fail loud instead of materializing corrupt
         // state. An operator clears this via `repair_partition`.
-        if let Some(info) = self.quarantined.get(&(
-            Box::<str>::from(tp),
-            part,
-            group.map(Box::<str>::from),
-        )) {
+        if let Some(info) =
+            self.quarantined
+                .get(&(Box::<str>::from(tp), part, group.map(Box::<str>::from)))
+        {
             return Err(StromaError::QueueQuarantined {
                 topic: tp.to_string(),
                 partition: part,
@@ -1534,8 +1593,14 @@ impl Stroma {
                         deadline_waker: self.deadline_waker.clone(),
                     };
 
-                    let inner =
-                        QueueHandleInner::init(tp.into(), part, group.map(|s| s.into()), bundle);
+                    let kind = self.read_partition_kind(tp, part, group);
+                    let inner = QueueHandleInner::init(
+                        tp.into(),
+                        part,
+                        group.map(|s| s.into()),
+                        bundle,
+                        kind,
+                    );
 
                     if slot.exists_on_disk {
                         self.recover_one_log_with_handle(
@@ -2025,11 +2090,22 @@ impl Stroma {
                     "Snapshot event unsupported in v0",
                 ));
             }
+            StromaEvent::CursorCommit { name, offset } => {
+                qh.blocking_stream_command_enqueue(StreamCommand::CommitCursor {
+                    name: name.into(),
+                    offset,
+                    response: None,
+                })?;
+            }
         }
         Ok(())
     }
 
-    pub(crate) async fn apply_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> Result<()> {
+    pub(crate) async fn apply_event_inmem(
+        &self,
+        ev: StromaEvent,
+        qh: &QueueHandleInner,
+    ) -> Result<()> {
         tracing::debug!("Applying event: {ev:?}");
         match ev {
             StromaEvent::Enqueue {
@@ -2216,6 +2292,17 @@ impl Stroma {
                 return Err(StromaError::Decode(
                     "Snapshot event unsupported in v0".into(),
                 ));
+            }
+            StromaEvent::CursorCommit { name, offset } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.stream_command_enqueue(StreamCommand::CommitCursor {
+                    name: name.into(),
+                    offset,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
         }
         Ok(())
@@ -2588,7 +2675,12 @@ impl Stroma {
                     requeue: false,
                     not_before: None,
                 });
-                dropped.insert((tp.to_string(), part, group.clone().map(|s| s.to_string()), off));
+                dropped.insert((
+                    tp.to_string(),
+                    part,
+                    group.clone().map(|s| s.to_string()),
+                    off,
+                ));
             }
         }
 
@@ -2849,7 +2941,11 @@ impl Stroma {
         }
 
         // crc check
-        let want = u32::from_be_bytes(bytes[bytes.len() - 4..].try_into().expect("exact-length slice"));
+        let want = u32::from_be_bytes(
+            bytes[bytes.len() - 4..]
+                .try_into()
+                .expect("exact-length slice"),
+        );
         let payload = &bytes[8..bytes.len() - 4];
         let got = crc32c::crc32c(payload);
         if got != want {
@@ -2861,8 +2957,10 @@ impl Stroma {
             return Err(StromaError::Decode("snapshot version mismatch".into()));
         }
 
-        let last_applied = u64::from_be_bytes(payload[4..12].try_into().expect("exact-length slice"));
-        let blob_len = u32::from_be_bytes(payload[12..16].try_into().expect("exact-length slice")) as usize;
+        let last_applied =
+            u64::from_be_bytes(payload[4..12].try_into().expect("exact-length slice"));
+        let blob_len =
+            u32::from_be_bytes(payload[12..16].try_into().expect("exact-length slice")) as usize;
 
         if 16 + blob_len > payload.len() {
             return Err(StromaError::Decode("snapshot blob truncated".into()));
@@ -2939,11 +3037,7 @@ impl Stroma {
     /// checkpoint` is follower-gated (a follower resetting its tail to match the
     /// owner); here we drop our OWN corrupt suffix, so briefly assume the
     /// follower role around the reset and restore the prior role.
-    async fn truncate_event_log_tail(
-        &self,
-        h: &QueueHandleInner,
-        next_offset: u64,
-    ) -> Result<()> {
+    async fn truncate_event_log_tail(&self, h: &QueueHandleInner, next_offset: u64) -> Result<()> {
         let event_log = h.event_log();
         let prev_role = event_log.role();
         event_log.become_follower();
@@ -3171,45 +3265,68 @@ impl Stroma {
             }
         }
 
+        // A stream's tail is the message log head. Per-record appends carry no
+        // event (only cursor commits do), so recovery cannot replay the tail.
+        // Reconcile it from the durable message log BEFORE replaying cursor
+        // commits, so a committed cursor clamps against the real retained window
+        // rather than an empty one.
+        if h.kind() == PartitionKind::Stream {
+            let next = h.msg_log().next_offset();
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            if h.stream_command_enqueue(StreamCommand::AdvanceTail {
+                next_offset: next,
+                response: Some(tx),
+            })
+            .await
+            .is_ok()
+            {
+                let _ = rx.await;
+            }
+        }
+
         for ev in events {
             self.apply_event_inmem(ev, &h).await?;
         }
 
-        let pending = h.pending_dlq().await?;
-        let source_tp = tp;
-        let source_part = part;
-        let source_group = group;
-        let target = h.get_dlq_target().await?;
-        let src = (
-            source_tp.to_string(),
-            source_part,
-            source_group.map(|s| s.into()),
-        );
-        for (off, _target) in pending {
-            // We don't have the resolved target stored in state — only in the DeadLetter event.
-            // Two options:
-            //   (a) walk the event log backward to find the matching DeadLetter event for this offset
-            //   (b) re-resolve via current dlq_policy
-            // (b) is simpler and matches "policy is mutable", (a) is more faithful to original intent.
-            // oon recovery, the *current* policy wins.
-            match target {
-                Some((ref tp, part, ref grp)) => {
-                    let stroma = self.clone();
-                    let qh2 = qh.clone();
-                    let meta = DeadLetterMeta {
-                        off,
-                        retry_count: 0,
-                        reason: DeadLetterReason::PendingRecovery,
-                        target_tp: tp.clone().into(),
-                        target_part: part,
-                        target_group: grp.clone().map(Into::into),
-                    };
-                    let src = src.clone();
-                    tokio::spawn(async move {
-                        let fut: std::pin::Pin<
-                            Box<dyn std::future::Future<Output = Result<()>> + Send>,
-                        > = Box::pin(stroma.dlq_copy_then_commit(src.clone(), qh2, meta, None));
-                        fut.await.unwrap_or_else(|err| {
+        // Re-issue any DLQ copies that were pending at the crash. Streams have no
+        // dead-letter path, so this is a work-queue-only recovery step (its
+        // commands target the queue engine and would error on a stream).
+        if h.kind() == PartitionKind::Queue {
+            let pending = h.pending_dlq().await?;
+            let source_tp = tp;
+            let source_part = part;
+            let source_group = group;
+            let target = h.get_dlq_target().await?;
+            let src = (
+                source_tp.to_string(),
+                source_part,
+                source_group.map(|s| s.into()),
+            );
+            for (off, _target) in pending {
+                // We don't have the resolved target stored in state — only in the DeadLetter event.
+                // Two options:
+                //   (a) walk the event log backward to find the matching DeadLetter event for this offset
+                //   (b) re-resolve via current dlq_policy
+                // (b) is simpler and matches "policy is mutable", (a) is more faithful to original intent.
+                // oon recovery, the *current* policy wins.
+                match target {
+                    Some((ref tp, part, ref grp)) => {
+                        let stroma = self.clone();
+                        let qh2 = qh.clone();
+                        let meta = DeadLetterMeta {
+                            off,
+                            retry_count: 0,
+                            reason: DeadLetterReason::PendingRecovery,
+                            target_tp: tp.clone().into(),
+                            target_part: part,
+                            target_group: grp.clone().map(Into::into),
+                        };
+                        let src = src.clone();
+                        tokio::spawn(async move {
+                            let fut: std::pin::Pin<
+                                Box<dyn std::future::Future<Output = Result<()>> + Send>,
+                            > = Box::pin(stroma.dlq_copy_then_commit(src.clone(), qh2, meta, None));
+                            fut.await.unwrap_or_else(|err| {
                             let (source_tp, source_part, source_group) = src;
                             tracing::error!(
                                 "Error in dlq copy task for tp={} part={} group={:?} off={}: {err}",
@@ -3219,11 +3336,12 @@ impl Stroma {
                                 off
                             );
                         });
-                    });
-                }
-                None => {
-                    // Policy is now Discard -> ack locally.
-                    // self.commit_dlq_event(&qh, vec![off]).await;
+                        });
+                    }
+                    None => {
+                        // Policy is now Discard -> ack locally.
+                        // self.commit_dlq_event(&qh, vec![off]).await;
+                    }
                 }
             }
         }
@@ -3465,9 +3583,12 @@ impl Stroma {
         let mut out = String::new();
         use std::fmt::Write;
 
-        writeln!(out, "=== Stroma debug report ===").expect("writing to an in-memory String never fails");
-        writeln!(out, "Uptime: {}s", snap.uptime_seconds).expect("writing to an in-memory String never fails");
-        writeln!(out, "Indexed queues: {}", snap.queue_count).expect("writing to an in-memory String never fails");
+        writeln!(out, "=== Stroma debug report ===")
+            .expect("writing to an in-memory String never fails");
+        writeln!(out, "Uptime: {}s", snap.uptime_seconds)
+            .expect("writing to an in-memory String never fails");
+        writeln!(out, "Indexed queues: {}", snap.queue_count)
+            .expect("writing to an in-memory String never fails");
         writeln!(
             out,
             "Materialized queues: {}",
@@ -3478,12 +3599,14 @@ impl Stroma {
 
         writeln!(out, "Command queue depths:").expect("writing to an in-memory String never fails");
         for (lane, depth) in &snap.cmd_queue_depths {
-            writeln!(out, "  {}: {}", lane, depth).expect("writing to an in-memory String never fails");
+            writeln!(out, "  {}: {}", lane, depth)
+                .expect("writing to an in-memory String never fails");
         }
         writeln!(out).expect("writing to an in-memory String never fails");
 
         writeln!(out, "Snapshots:").expect("writing to an in-memory String never fails");
-        writeln!(out, "  attempts: {}", snap.snapshot_metrics.attempts_total).expect("writing to an in-memory String never fails");
+        writeln!(out, "  attempts: {}", snap.snapshot_metrics.attempts_total)
+            .expect("writing to an in-memory String never fails");
         writeln!(
             out,
             "  skipped (not dirty): {}",
@@ -3491,10 +3614,12 @@ impl Stroma {
         )
         .expect("writing to an in-memory String never fails");
         if let Some(avg) = snap.snapshot_metrics.avg_clone_ms {
-            writeln!(out, "  avg clone: {:.1}ms", avg).expect("writing to an in-memory String never fails");
+            writeln!(out, "  avg clone: {:.1}ms", avg)
+                .expect("writing to an in-memory String never fails");
         }
         if let Some(avg) = snap.snapshot_metrics.avg_total_ms {
-            writeln!(out, "  avg total: {:.1}ms", avg).expect("writing to an in-memory String never fails");
+            writeln!(out, "  avg total: {:.1}ms", avg)
+                .expect("writing to an in-memory String never fails");
         }
         writeln!(out).expect("writing to an in-memory String never fails");
 
@@ -3644,8 +3769,16 @@ impl Stroma {
         event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
         validate_user_message_headers(headers)?;
-        self.append_message_unchecked(tp, part, group, headers, payload, expire_at, event_completion)
-            .await
+        self.append_message_unchecked(
+            tp,
+            part,
+            group,
+            headers,
+            payload,
+            expire_at,
+            event_completion,
+        )
+        .await
     }
 
     async fn append_message_unchecked(
@@ -3722,6 +3855,145 @@ impl Stroma {
         });
 
         Ok(())
+    }
+
+    // ---------------- Stream (Plexus) engine API ----------------
+    //
+    // These operate on stream partitions (PartitionKind::Stream). The substrate is
+    // shared with the work queue (message log, event log, durable append,
+    // replication, recovery, snapshot IO); only the per-partition engine differs.
+    // fibril owns consumer matching, fan-out, the live ring, and filtering on top
+    // of these primitives. Streams (currently) have no group dimension.
+
+    /// Create a stream partition: persist the engine-kind marker, then materialize
+    /// it so the stream control actor is spawned, and optionally set retention.
+    /// Call before first use; an already-materialized partition keeps the engine
+    /// it was built with.
+    pub async fn create_stream(
+        &self,
+        tp: &str,
+        part: u32,
+        retention: Option<RetentionConfig>,
+    ) -> Result<()> {
+        self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
+        let qh = self.queue_handle(tp, part, None).await?;
+        if let Some(retention) = retention {
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            qh.resolve()?
+                .stream_command_enqueue(StreamCommand::SetRetention {
+                    config: retention,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+            rx.await.map_err(|_| StromaError::QueueActorGone)?;
+        }
+        Ok(())
+    }
+
+    /// Append a record to a stream and return its offset. The record goes to the
+    /// message log (durable and replicated by the substrate) and the stream tail
+    /// advances past it. Unlike a queue publish this emits no per-record event:
+    /// streams have no ready/inflight/ack state, so the message log is the record,
+    /// and consumers read it by offset.
+    pub async fn append_stream_record(
+        &self,
+        tp: &str,
+        part: u32,
+        headers: &MessageHeaders,
+        payload: Vec<u8>,
+    ) -> Result<Offset> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let (owner_operation, msg_log) = {
+            let h = qh.resolve()?;
+            (h.begin_owner_operation().await?, h.msg_log())
+        };
+        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
+        let message = Message {
+            flags: 0,
+            headers: headers.encode()?,
+            payload,
+        };
+        let cache_message = message.clone();
+        msg_log
+            .append_enqueue(message, None, msg_completion)
+            .map_err(io_err)?;
+        let ar = match msg_rx.await {
+            Ok(Ok(ar)) => ar,
+            Ok(Err(err)) => return Err(io_err(err)),
+            Err(_) => {
+                return Err(StromaError::Io(
+                    "stream record completion channel closed".into(),
+                ));
+            }
+        };
+        // The owner operation only needs to span the durable append.
+        drop(owner_operation);
+
+        let msg_offset = ar.base_offset;
+        let next = msg_offset + ar.count as u64;
+
+        let h = qh.resolve()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.stream_command_enqueue(StreamCommand::AdvanceTail {
+            next_offset: next,
+            response: Some(tx),
+        })
+        .await
+        .map_err(io_err)?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)?;
+
+        self.cache_owner_messages(&h, msg_offset, vec![cache_message]);
+
+        Ok(msg_offset)
+    }
+
+    /// Commit a durable named cursor for a stream. The commit is logged as a
+    /// CursorCommit event (durable and replicated) and applied to the stream
+    /// engine, so it survives a crash or redeploy and a follower promoted after
+    /// owner loss resumes from it.
+    pub async fn commit_stream_cursor(
+        &self,
+        tp: &str,
+        part: u32,
+        name: &str,
+        offset: Offset,
+    ) -> Result<()> {
+        let ev = StromaEvent::CursorCommit {
+            name: name.into(),
+            offset,
+        };
+        let durability = self.keratin_cfg_event.default_durability;
+        self.append_events_durable(tp, part, None, vec![ev], durability)
+            .await?;
+        Ok(())
+    }
+
+    /// Read a stream's durable cursor position, or `None` if the name has no
+    /// committed position.
+    pub async fn stream_cursor(&self, tp: &str, part: u32, name: &str) -> Result<Option<Offset>> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let h = qh.resolve()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.stream_command_enqueue(StreamCommand::GetCursor {
+            name: name.to_string(),
+            response: tx,
+        })
+        .await
+        .map_err(io_err)?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)
+    }
+
+    /// Read a stream's current head/tail watermarks (lowest retained offset and
+    /// one past the last appended offset).
+    pub async fn stream_head_tail(&self, tp: &str, part: u32) -> Result<(Offset, Offset)> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let h = qh.resolve()?;
+        let (tx, rx) = tokio::sync::oneshot::channel();
+        h.stream_command_enqueue(StreamCommand::GetHeadTail { response: tx })
+            .await
+            .map_err(io_err)?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)
     }
 
     pub async fn ack_enqueue(
@@ -4398,7 +4670,11 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Offset> {
-        let msg_log = self.queue_handle(tp, part, group).await?.resolve()?.msg_log();
+        let msg_log = self
+            .queue_handle(tp, part, group)
+            .await?
+            .resolve()?
+            .msg_log();
         Ok(msg_log.next_offset())
     }
 
@@ -4410,7 +4686,11 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let msg_log = self.queue_handle(tp, part, group).await?.resolve()?.msg_log();
+        let msg_log = self
+            .queue_handle(tp, part, group)
+            .await?
+            .resolve()?
+            .msg_log();
         msg_log.truncate_before(before).await.map_err(io_err)
     }
 
@@ -4558,7 +4838,8 @@ impl Stroma {
             .applied_upto_entry(tp, part, group)
             .await?
             .load(Ordering::Acquire);
-        self.write_snapshots_for_partition(tp, part, group, upto).await
+        self.write_snapshots_for_partition(tp, part, group, upto)
+            .await
     }
 
     pub async fn truncate_partition_log(
@@ -4632,7 +4913,9 @@ impl Stroma {
     }
 }
 
-pub(crate) fn replicated_append_outcome_allows_state_apply(outcome: &ReplicatedAppendOutcome) -> bool {
+pub(crate) fn replicated_append_outcome_allows_state_apply(
+    outcome: &ReplicatedAppendOutcome,
+) -> bool {
     matches!(
         outcome,
         ReplicatedAppendOutcome::Applied(_)
@@ -5044,7 +5327,14 @@ mod tests {
         assert_eq!(events.next_offset, 1);
         assert_eq!(
             events.records,
-            vec![(0, StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None })]
+            vec![(
+                0,
+                StromaEvent::Enqueue {
+                    off: 0,
+                    retries: 0,
+                    expire_at: None
+                }
+            )]
         );
 
         shutdown_stroma("owner_replication_read_records", &stroma).await;
@@ -6247,7 +6537,10 @@ mod tests {
         .unwrap();
 
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
-        qh.resolve().unwrap().recovery_complete.store(false, Ordering::Release);
+        qh.resolve()
+            .unwrap()
+            .recovery_complete
+            .store(false, Ordering::Release);
 
         let qh_waiter = qh.clone();
         let waiter = tokio::spawn(async move {
@@ -6642,15 +6935,24 @@ mod tests {
         .await
         .unwrap();
 
-        test_step("destroy_partition/materialize", stroma.materialize("orders", 3, None))
-            .await
-            .unwrap();
+        test_step(
+            "destroy_partition/materialize",
+            stroma.materialize("orders", 3, None),
+        )
+        .await
+        .unwrap();
         assert_eq!(stroma.indexed_queue_count(), 1);
 
         let msg_dir = stroma.msg_tp_part_dir("orders", 3, None);
         let event_dir = stroma.tp_part_dir("orders", 3, None);
-        assert!(msg_dir.exists(), "message dir should exist after materialize");
-        assert!(event_dir.exists(), "event dir should exist after materialize");
+        assert!(
+            msg_dir.exists(),
+            "message dir should exist after materialize"
+        );
+        assert!(
+            event_dir.exists(),
+            "event dir should exist after materialize"
+        );
 
         // Drop a marker into the on-disk tree so we can prove the storage is
         // actually deleted (not just unindexed) and a recreate starts fresh.
@@ -6665,8 +6967,14 @@ mod tests {
         .unwrap();
         assert_eq!(outcome, DestroyOutcome::Destroyed);
         assert_eq!(stroma.indexed_queue_count(), 0);
-        assert!(!msg_dir.exists(), "message dir should be deleted after destroy");
-        assert!(!event_dir.exists(), "event dir should be deleted after destroy");
+        assert!(
+            !msg_dir.exists(),
+            "message dir should be deleted after destroy"
+        );
+        assert!(
+            !event_dir.exists(),
+            "event dir should be deleted after destroy"
+        );
 
         // A recreate (later grow reusing the index) starts from empty storage.
         test_step(
@@ -6676,13 +6984,20 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stroma.indexed_queue_count(), 1);
-        assert!(msg_dir.exists(), "message dir should be recreated on materialize");
+        assert!(
+            msg_dir.exists(),
+            "message dir should be recreated on materialize"
+        );
         assert!(
             !marker.exists(),
             "recreated partition must not see the destroyed partition's files"
         );
 
-        shutdown_stroma("destroy_partition_removes_index_entry_and_on_disk_storage", &stroma).await;
+        shutdown_stroma(
+            "destroy_partition_removes_index_entry_and_on_disk_storage",
+            &stroma,
+        )
+        .await;
     }
 
     // Adversarial: hammer destroy and materialize against the same partition
@@ -6756,10 +7071,17 @@ mod tests {
             }
 
             // Exactly one (or zero) registry entry for the key: never duplicated.
-            assert!(stroma.indexed_queue_count() <= 1, "round {round}: duplicate slot");
+            assert!(
+                stroma.indexed_queue_count() <= 1,
+                "round {round}: duplicate slot"
+            );
         }
 
-        shutdown_stroma("destroy_and_materialize_race_never_corrupts_or_leaks", &stroma).await;
+        shutdown_stroma(
+            "destroy_and_materialize_race_never_corrupts_or_leaks",
+            &stroma,
+        )
+        .await;
     }
 
     // One trip-wire, two scales (mouse / bear): a storm of concurrent destroyers,
@@ -7138,7 +7460,11 @@ mod tests {
         {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
-            let bogus = StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None };
+            let bogus = StromaEvent::Enqueue {
+                off: 0,
+                retries: 0,
+                expire_at: None,
+            };
             qh.event_log()
                 .append_batch(vec![event_msg(&bogus).unwrap()], None)
                 .await
@@ -7169,9 +7495,16 @@ mod tests {
         ));
         assert_eq!(stroma.quarantined_partitions().len(), 1);
         // Metric: gauge up, monotonic counter incremented.
-        assert_eq!(stroma.metrics.recovery.quarantined.load(Ordering::Relaxed), 1);
         assert_eq!(
-            stroma.metrics.recovery.quarantines_total.load(Ordering::Relaxed),
+            stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
+            1
+        );
+        assert_eq!(
+            stroma
+                .metrics
+                .recovery
+                .quarantines_total
+                .load(Ordering::Relaxed),
             1
         );
 
@@ -7179,9 +7512,16 @@ mod tests {
         stroma.repair_partition("t", 0, None).await.unwrap();
         assert!(!stroma.is_quarantined("t", 0, None));
         // Metric: gauge back to zero (counter stays).
-        assert_eq!(stroma.metrics.recovery.quarantined.load(Ordering::Relaxed), 0);
         assert_eq!(
-            stroma.metrics.recovery.quarantines_total.load(Ordering::Relaxed),
+            stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
+            0
+        );
+        assert_eq!(
+            stroma
+                .metrics
+                .recovery
+                .quarantines_total
+                .load(Ordering::Relaxed),
             1
         );
 
@@ -7190,8 +7530,11 @@ mod tests {
         let qh = qh.resolve().unwrap();
         assert!(qh.recovery_complete());
 
-        shutdown_stroma("recovery_quarantines_and_repairs_dangling_event_reference", &stroma)
-            .await;
+        shutdown_stroma(
+            "recovery_quarantines_and_repairs_dangling_event_reference",
+            &stroma,
+        )
+        .await;
     }
 
     /// A corrupt (undecodable) event record is the genuinely mid-log failure and
@@ -7212,7 +7555,10 @@ mod tests {
                 headers: vec![],
                 payload: vec![0xFF, 0xFF, 0xFF, 0xFF],
             };
-            qh.event_log().append_batch(vec![garbage], None).await.unwrap();
+            qh.event_log()
+                .append_batch(vec![garbage], None)
+                .await
+                .unwrap();
         }
         assert_eq!(
             stroma.unmaterialize("t", 0, None).await.unwrap(),
@@ -7233,7 +7579,11 @@ mod tests {
         let qh = qh.resolve().unwrap();
         assert!(qh.recovery_complete());
 
-        shutdown_stroma("recovery_quarantines_and_repairs_corrupt_event_record", &stroma).await;
+        shutdown_stroma(
+            "recovery_quarantines_and_repairs_corrupt_event_record",
+            &stroma,
+        )
+        .await;
     }
 
     /// With on_mismatch=Ignore, recovery auto-truncates the dangling suffix and
@@ -7249,7 +7599,11 @@ mod tests {
         {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
-            let bogus = StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None };
+            let bogus = StromaEvent::Enqueue {
+                off: 0,
+                retries: 0,
+                expire_at: None,
+            };
             qh.event_log()
                 .append_batch(vec![event_msg(&bogus).unwrap()], None)
                 .await
@@ -7267,6 +7621,10 @@ mod tests {
         assert!(qh.recovery_complete());
         assert!(!stroma.is_quarantined("t", 0, None));
 
-        shutdown_stroma("recovery_ignore_policy_auto_truncates_and_continues", &stroma).await;
+        shutdown_stroma(
+            "recovery_ignore_policy_auto_truncates_and_continues",
+            &stroma,
+        )
+        .await;
     }
 }
