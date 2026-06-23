@@ -1292,6 +1292,14 @@ impl Stroma {
         }
     }
 
+    /// Read a partition's durable engine-kind marker (Queue when absent). Exposed
+    /// so a caller can route a request to the stream or queue path before the
+    /// partition is materialized in memory (e.g. a publish that arrives at a fresh
+    /// owner after failover, before the stream channel is opened).
+    pub fn partition_kind(&self, tp: &str, part: u32, group: Option<&str>) -> PartitionKind {
+        self.read_partition_kind(tp, part, group)
+    }
+
     /// Persist a partition's engine kind. Written before the partition is first
     /// materialized as a stream (a queue needs no marker). Uses write-temp +
     /// fsync + rename so a crash mid-write never leaves a torn marker that would
