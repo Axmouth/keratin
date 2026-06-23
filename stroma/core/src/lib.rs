@@ -6,6 +6,10 @@ mod replication;
 #[allow(dead_code)]
 mod replication_cache;
 mod state;
+// Wired into the substrate (build/apply/snapshot dispatch by kind) with the stream
+// engine integration step, so the type and its helpers are unused until then.
+#[allow(dead_code)]
+mod stream_state;
 mod stroma;
 
 use thiserror::Error;

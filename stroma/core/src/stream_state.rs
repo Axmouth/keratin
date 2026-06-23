@@ -1,0 +1,397 @@
+//! Stream engine in-memory state (Plexus fan-out channels).
+//!
+//! Counterpart to the work queue's `QueueInternalState`, but far smaller: a
+//! stream never leases, acks, requeues, or dead-letters. A record is appended
+//! once and stays until retention drops it, and every consumer reads the same log
+//! at its own position. So the only durable state the stream engine keeps is a map
+//! of named cursors (durable consumer positions), a retention policy, and the
+//! head/tail watermarks of the retained window.
+//!
+//! Like the work queue, this state lives inside a per-partition control actor and
+//! is driven by commands and by replayed events. It rides the same substrate
+//! (message log, event log, durable append, replication, recovery, snapshot file
+//! IO) through the `PartitionEngine` seam.
+
+use std::collections::HashMap;
+use std::io::{Error, ErrorKind};
+
+use crate::Offset;
+use crate::engine::{PartitionEngine, PartitionKind};
+use crate::state::SnapshotMeta;
+
+/// Snapshot format version for the stream engine. Independent of the work queue's
+/// `FORMAT_VERSION` because the two engines serialize different state. Strict: a
+/// reader rejects any other version (pre-alpha, no back-compat).
+const STREAM_FORMAT_VERSION: u64 = 1;
+
+/// How long records are kept before retention may drop them. Each axis is
+/// independent and optional. A record may be dropped once it exceeds any
+/// configured axis. `None` everywhere means keep forever (bounded only by disk).
+///
+/// The stream engine only stores this. The retention worker reads it and decides
+/// what to truncate, then reports the new head back through `apply_truncation`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub struct RetentionConfig {
+    /// Drop records older than this age in milliseconds.
+    pub max_age_ms: Option<u64>,
+    /// Drop oldest records once the retained byte size exceeds this.
+    pub max_bytes: Option<u64>,
+    /// Drop oldest records once the retained record count exceeds this.
+    pub max_records: Option<u64>,
+}
+
+/// In-memory state for a stream (Plexus) partition.
+#[derive(Debug)]
+pub struct StreamState {
+    topic: String,
+    partition: u32,
+
+    last_snapshot_timestamp: u64,
+    last_snapshot_event_offset: u64,
+
+    /// Durable named cursors: consumer durable-name -> committed offset. The
+    /// offset is the next record the consumer has not yet settled, so resuming
+    /// reads from here. Naming and ownership (the optional single-active lease)
+    /// live in fibril; the engine treats a name as an opaque bookmark key.
+    cursors: HashMap<String, Offset>,
+
+    retention: RetentionConfig,
+
+    /// Lowest offset still retained. Advanced by retention truncation. Cursors
+    /// below it are clamped up to it (retention wins over a lagging consumer).
+    head: Offset,
+    /// One past the highest appended offset (the next offset to be written).
+    tail: Offset,
+}
+
+impl StreamState {
+    pub fn new(topic: String, partition: u32) -> Self {
+        StreamState {
+            topic,
+            partition,
+            last_snapshot_timestamp: 0,
+            last_snapshot_event_offset: 0,
+            cursors: HashMap::new(),
+            retention: RetentionConfig::default(),
+            head: 0,
+            tail: 0,
+        }
+    }
+
+    pub fn topic(&self) -> &str {
+        &self.topic
+    }
+
+    pub fn partition(&self) -> u32 {
+        self.partition
+    }
+
+    /// Record a durable cursor position for `name`. Last-writer-wins: the caller
+    /// (the control actor) enforces advance-on-ack for the durable default and
+    /// allows an explicit backward seek for replay. The engine just stores it,
+    /// clamped into the retained window so a commit can never point below head or
+    /// past tail.
+    pub fn commit_cursor(&mut self, name: impl Into<String>, offset: Offset) {
+        let clamped = offset.clamp(self.head, self.tail);
+        self.cursors.insert(name.into(), clamped);
+    }
+
+    pub fn cursor(&self, name: &str) -> Option<Offset> {
+        self.cursors.get(name).copied()
+    }
+
+    /// Forget a durable cursor (consumer retired or explicit delete).
+    pub fn remove_cursor(&mut self, name: &str) -> Option<Offset> {
+        self.cursors.remove(name)
+    }
+
+    pub fn cursor_count(&self) -> usize {
+        self.cursors.len()
+    }
+
+    pub fn set_retention(&mut self, retention: RetentionConfig) {
+        self.retention = retention;
+    }
+
+    pub fn retention(&self) -> RetentionConfig {
+        self.retention
+    }
+
+    pub fn head(&self) -> Offset {
+        self.head
+    }
+
+    pub fn tail(&self) -> Offset {
+        self.tail
+    }
+
+    /// Advance the tail to reflect newly appended records. Monotonic: a stale or
+    /// out-of-order call never moves the tail backward.
+    pub fn advance_tail(&mut self, next_offset: Offset) {
+        if next_offset > self.tail {
+            self.tail = next_offset;
+        }
+    }
+
+    /// Apply a retention truncation that dropped everything below `new_head`.
+    /// Advances head (monotonic) and clamps any cursor that fell behind up to the
+    /// new head. Returns the names of clamped cursors so the actor can flag those
+    /// consumers as lagged (retention won over their position).
+    pub fn apply_truncation(&mut self, new_head: Offset) -> Vec<String> {
+        if new_head <= self.head {
+            return Vec::new();
+        }
+        self.head = new_head;
+        if self.tail < self.head {
+            self.tail = self.head;
+        }
+        let mut lagged = Vec::new();
+        for (name, off) in self.cursors.iter_mut() {
+            if *off < new_head {
+                *off = new_head;
+                lagged.push(name.clone());
+            }
+        }
+        lagged
+    }
+
+    pub fn set_snapshot_meta(&mut self, timestamp: u64, event_offset: u64) {
+        self.last_snapshot_timestamp = timestamp;
+        self.last_snapshot_event_offset = event_offset;
+    }
+
+    fn reset_to_empty(&mut self) {
+        self.last_snapshot_timestamp = 0;
+        self.last_snapshot_event_offset = 0;
+        self.cursors.clear();
+        self.retention = RetentionConfig::default();
+        self.head = 0;
+        self.tail = 0;
+    }
+
+    /// Serialize the durable state. Format (big endian):
+    /// version u64, last_snapshot_timestamp u64, last_snapshot_event_offset u64,
+    /// head u64, tail u64, retention (3 x optional u64 as presence byte + value),
+    /// cursor count u64, then per cursor: name_len u32, name bytes, offset u64.
+    fn encode(&self, last_event_offset: u64) -> Vec<u8> {
+        let mut out = Vec::new();
+        out.extend_from_slice(&STREAM_FORMAT_VERSION.to_be_bytes());
+        out.extend_from_slice(&self.last_snapshot_timestamp.to_be_bytes());
+        out.extend_from_slice(&last_event_offset.to_be_bytes());
+        out.extend_from_slice(&self.head.to_be_bytes());
+        out.extend_from_slice(&self.tail.to_be_bytes());
+
+        for axis in [
+            self.retention.max_age_ms,
+            self.retention.max_bytes,
+            self.retention.max_records,
+        ] {
+            match axis {
+                Some(v) => {
+                    out.push(1);
+                    out.extend_from_slice(&v.to_be_bytes());
+                }
+                None => out.push(0),
+            }
+        }
+
+        out.extend_from_slice(&(self.cursors.len() as u64).to_be_bytes());
+        for (name, &offset) in &self.cursors {
+            let name_bytes = name.as_bytes();
+            out.extend_from_slice(&(name_bytes.len() as u32).to_be_bytes());
+            out.extend_from_slice(name_bytes);
+            out.extend_from_slice(&offset.to_be_bytes());
+        }
+
+        out
+    }
+
+    fn decode(&mut self, mut bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
+        fn take<const N: usize>(b: &mut &[u8]) -> std::io::Result<[u8; N]> {
+            if b.len() < N {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "stream snapshot"));
+            }
+            let (a, rest) = b.split_at(N);
+            *b = rest;
+            Ok(a.try_into().expect("exact-length slice"))
+        }
+
+        fn take_optional_u64(b: &mut &[u8]) -> std::io::Result<Option<u64>> {
+            let present = u8::from_be_bytes(take::<1>(b)?);
+            match present {
+                0 => Ok(None),
+                1 => Ok(Some(u64::from_be_bytes(take::<8>(b)?))),
+                _ => Err(Error::new(ErrorKind::InvalidData, "bad presence byte")),
+            }
+        }
+
+        let version = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        if version != STREAM_FORMAT_VERSION {
+            return Err(Error::new(
+                ErrorKind::InvalidData,
+                format!(
+                    "unsupported stream snapshot version {version}, expected {STREAM_FORMAT_VERSION}"
+                ),
+            ));
+        }
+
+        self.reset_to_empty();
+
+        self.last_snapshot_timestamp = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.last_snapshot_event_offset = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.head = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.tail = u64::from_be_bytes(take::<8>(&mut bytes)?);
+
+        self.retention = RetentionConfig {
+            max_age_ms: take_optional_u64(&mut bytes)?,
+            max_bytes: take_optional_u64(&mut bytes)?,
+            max_records: take_optional_u64(&mut bytes)?,
+        };
+
+        let cursor_count = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        for _ in 0..cursor_count {
+            let name_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+            if bytes.len() < name_len {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "cursor name"));
+            }
+            let name = String::from_utf8(bytes[..name_len].to_vec())
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "cursor name not utf8"))?;
+            bytes = &bytes[name_len..];
+            let offset = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            self.cursors.insert(name, offset);
+        }
+
+        Ok(SnapshotMeta {
+            last_snapshot_event_offset: self.last_snapshot_event_offset,
+            last_snapshot_timestamp: self.last_snapshot_timestamp,
+            default_message_ttl_ms: None,
+        })
+    }
+}
+
+impl PartitionEngine for StreamState {
+    fn kind(&self) -> PartitionKind {
+        PartitionKind::Stream
+    }
+
+    fn encode_snapshot(&self, last_event_offset: u64) -> Vec<u8> {
+        self.encode(last_event_offset)
+    }
+
+    fn load_snapshot(&mut self, bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
+        self.decode(bytes)
+    }
+
+    fn reset(&mut self) {
+        self.reset_to_empty();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn state() -> StreamState {
+        let mut s = StreamState::new("sensors".into(), 0);
+        s.advance_tail(1000);
+        s
+    }
+
+    #[test]
+    fn commit_and_read_cursor() {
+        let mut s = state();
+        s.commit_cursor("group-a", 42);
+        assert_eq!(s.cursor("group-a"), Some(42));
+        assert_eq!(s.cursor("group-b"), None);
+    }
+
+    #[test]
+    fn commit_clamps_into_retained_window() {
+        let mut s = state();
+        s.apply_truncation(100);
+        // below head clamps up, past tail clamps down
+        s.commit_cursor("low", 10);
+        s.commit_cursor("high", 99_999);
+        assert_eq!(s.cursor("low"), Some(100));
+        assert_eq!(s.cursor("high"), Some(1000));
+    }
+
+    #[test]
+    fn truncation_advances_head_and_flags_lagged_cursors() {
+        let mut s = state();
+        s.commit_cursor("behind", 50);
+        s.commit_cursor("ahead", 500);
+        let lagged = s.apply_truncation(200);
+        assert_eq!(lagged, vec!["behind".to_string()]);
+        assert_eq!(s.cursor("behind"), Some(200));
+        assert_eq!(s.cursor("ahead"), Some(500));
+        assert_eq!(s.head(), 200);
+    }
+
+    #[test]
+    fn truncation_is_monotonic() {
+        let mut s = state();
+        s.apply_truncation(300);
+        let lagged = s.apply_truncation(100);
+        assert!(lagged.is_empty());
+        assert_eq!(s.head(), 300);
+    }
+
+    #[test]
+    fn tail_advance_is_monotonic() {
+        let mut s = StreamState::new("t".into(), 0);
+        s.advance_tail(10);
+        s.advance_tail(5);
+        assert_eq!(s.tail(), 10);
+    }
+
+    #[test]
+    fn snapshot_round_trip() {
+        let mut s = state();
+        s.set_retention(RetentionConfig {
+            max_age_ms: Some(3_600_000),
+            max_bytes: None,
+            max_records: Some(1_000_000),
+        });
+        s.apply_truncation(100);
+        s.commit_cursor("group-a", 150);
+        s.commit_cursor("group-b", 900);
+        s.set_snapshot_meta(12_345, 678);
+
+        let blob = s.encode_snapshot(678);
+
+        let mut restored = StreamState::new("sensors".into(), 0);
+        let meta = restored.load_snapshot(&blob).expect("load");
+
+        assert_eq!(meta.last_snapshot_event_offset, 678);
+        assert_eq!(meta.last_snapshot_timestamp, 12_345);
+        assert_eq!(meta.default_message_ttl_ms, None);
+        assert_eq!(restored.head(), 100);
+        assert_eq!(restored.tail(), 1000);
+        assert_eq!(restored.retention().max_age_ms, Some(3_600_000));
+        assert_eq!(restored.retention().max_records, Some(1_000_000));
+        assert_eq!(restored.retention().max_bytes, None);
+        assert_eq!(restored.cursor("group-a"), Some(150));
+        assert_eq!(restored.cursor("group-b"), Some(900));
+    }
+
+    #[test]
+    fn load_rejects_unknown_version() {
+        let mut bad = 99u64.to_be_bytes().to_vec();
+        bad.extend_from_slice(&[0u8; 32]);
+        let mut s = StreamState::new("t".into(), 0);
+        assert!(s.load_snapshot(&bad).is_err());
+    }
+
+    #[test]
+    fn reset_clears_everything() {
+        let mut s = state();
+        s.commit_cursor("g", 10);
+        s.apply_truncation(5);
+        PartitionEngine::reset(&mut s);
+        assert_eq!(s.cursor_count(), 0);
+        assert_eq!(s.head(), 0);
+        assert_eq!(s.tail(), 0);
+        assert_eq!(s.kind(), PartitionKind::Stream);
+    }
+}
