@@ -228,9 +228,6 @@ pub struct StromaMetrics {
     pub msg_log_reads: OpStats,
     pub log_truncations: OpStats,
 
-    // === Recent replication cache ===
-    pub replication_cache: ReplicationCacheMetrics,
-
     // === Current state gauges ===
     pub queues_active: AtomicUsize,
 }
@@ -258,7 +255,6 @@ impl StromaMetrics {
             event_log_reads: OpStats::new(bucket_count),
             msg_log_reads: OpStats::new(bucket_count),
             log_truncations: OpStats::new(bucket_count),
-            replication_cache: ReplicationCacheMetrics::default(),
 
             queues_active: AtomicUsize::new(0),
         }
@@ -328,70 +324,6 @@ impl StromaMetrics {
         }
         out
     }
-}
-
-#[derive(Debug, Default)]
-pub struct ReplicationCacheMetrics {
-    pub message_hits: AtomicU64,
-    pub message_misses: AtomicU64,
-    pub event_hits: AtomicU64,
-    pub event_misses: AtomicU64,
-    pub evicted_records: AtomicU64,
-    pub retained_bytes: AtomicUsize,
-}
-
-impl ReplicationCacheMetrics {
-    #[inline]
-    pub fn record_message_read(&self, hit: bool) {
-        let target = if hit {
-            &self.message_hits
-        } else {
-            &self.message_misses
-        };
-        target.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_event_read(&self, hit: bool) {
-        let target = if hit {
-            &self.event_hits
-        } else {
-            &self.event_misses
-        };
-        target.fetch_add(1, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn record_evicted_records(&self, count: usize) {
-        self.evicted_records
-            .fetch_add(count as u64, Ordering::Relaxed);
-    }
-
-    #[inline]
-    pub fn set_retained_bytes(&self, bytes: usize) {
-        self.retained_bytes.store(bytes, Ordering::Relaxed);
-    }
-
-    pub fn snapshot(&self) -> ReplicationCacheMetricsSnapshot {
-        ReplicationCacheMetricsSnapshot {
-            message_hits: self.message_hits.load(Ordering::Relaxed),
-            message_misses: self.message_misses.load(Ordering::Relaxed),
-            event_hits: self.event_hits.load(Ordering::Relaxed),
-            event_misses: self.event_misses.load(Ordering::Relaxed),
-            evicted_records: self.evicted_records.load(Ordering::Relaxed),
-            retained_bytes: self.retained_bytes.load(Ordering::Relaxed),
-        }
-    }
-}
-
-#[derive(Debug, Serialize)]
-pub struct ReplicationCacheMetricsSnapshot {
-    pub message_hits: u64,
-    pub message_misses: u64,
-    pub event_hits: u64,
-    pub event_misses: u64,
-    pub evicted_records: u64,
-    pub retained_bytes: usize,
 }
 
 fn log_kind_snapshot(appends: &BatchStats, reads: &OpStats) -> LogKindSnapshot {

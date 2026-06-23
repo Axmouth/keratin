@@ -23,8 +23,8 @@ use crate::event::{
     EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta,
 };
 use crate::metrics::{
-    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot,
-    ReplicationCacheMetricsSnapshot, SnapshotMetricsSnapshot, StromaMetrics,
+    CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
+    StromaMetrics,
 };
 use crate::stream_state::{StreamCommand, StreamState, run_stream_control};
 use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
@@ -4270,7 +4270,6 @@ pub struct StromaDebugSnapshot {
     pub snapshot_metrics: SnapshotMetricsSnapshot,
     pub recovery_metrics: RecoveryMetricsSnapshot,
     pub log_metrics: LogMetricsSnapshot,
-    pub replication_cache_metrics: ReplicationCacheMetricsSnapshot,
     pub command_metrics: CommandMetricsSnapshot,
     pub uptime_seconds: u64,
 }

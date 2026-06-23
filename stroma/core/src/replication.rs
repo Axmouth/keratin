@@ -416,18 +416,6 @@ impl Stroma {
             return Ok(owner_replication_checkpoint_required(&log, from));
         }
 
-        if max > 0 {
-            let cache_key = self.replication_cache_key_for(topic, part, group);
-            if let Some(read) = self.read_cached_owner_messages(&cache_key, from, max) {
-                return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-                    epoch: log.current_epoch(),
-                    requested_offset: read.requested_offset,
-                    next_offset: read.next_offset,
-                    records: read.records,
-                }));
-            }
-        }
-
         let (records, batch_next_offset) = if max == 0 {
             (Vec::new(), from)
         } else {
@@ -483,18 +471,6 @@ impl Stroma {
         let head_offset = log.head_offset();
         if from < head_offset {
             return Ok(owner_replication_checkpoint_required(&log, from));
-        }
-
-        if max > 0 {
-            let cache_key = self.replication_cache_key_for(topic, part, group);
-            if let Some(read) = self.read_cached_owner_events(&cache_key, from, max) {
-                return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-                    epoch: log.current_epoch(),
-                    requested_offset: read.requested_offset,
-                    next_offset: read.next_offset,
-                    records: read.records,
-                }));
-            }
         }
 
         let (records, batch_next_offset) = if max == 0 {

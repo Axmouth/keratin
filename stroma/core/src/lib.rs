@@ -3,8 +3,6 @@ mod event;
 mod global;
 mod metrics;
 mod replication;
-#[allow(dead_code)]
-mod replication_cache;
 mod state;
 // Some stream-engine helpers (cursor introspection, retention axes) are wired in
 // by later Plexus steps (fibril stream actor, retention worker), so they are
@@ -40,8 +38,8 @@ pub use stroma::{
     MessageInspectionPage,
     OwnerReplicationBatch, OwnerReplicationRead, OwnerStateCheckpoint, PublishItem, QuarantineInfo,
     QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
-    ReplicatedQueueApplyOutcome, ReplicationCacheConfig, SnapshotConfig, Stroma,
-    StromaKeratinConfig, StromaOptions, TaskGroup,
+    ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions,
+    TaskGroup,
 };
 
 pub type Offset = u64;
