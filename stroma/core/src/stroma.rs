@@ -1292,6 +1292,22 @@ impl Stroma {
         }
     }
 
+    /// Read the kind marker WITHOUT defaulting: `None` means no marker exists yet
+    /// (never declared), distinct from a marker that says `Queue`. Used by the
+    /// declare paths to reject re-declaring a topic as the other channel kind.
+    fn partition_kind_marker(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Option<PartitionKind> {
+        let path = self.kind_marker_file(tp, part, group);
+        match fs::read(&path) {
+            Ok(bytes) if !bytes.is_empty() => PartitionKind::from_u8(bytes[0]),
+            _ => None,
+        }
+    }
+
     /// Read a partition's durable engine-kind marker (Queue when absent). Exposed
     /// so a caller can route a request to the stream or queue path before the
     /// partition is materialized in memory (e.g. a publish that arrives at a fresh
@@ -3940,6 +3956,13 @@ impl Stroma {
         part: u32,
         retention: Option<RetentionConfig>,
     ) -> Result<()> {
+        // Reject declaring a queue partition as a stream (it would materialize a
+        // stream engine over queue data). The reverse guard lives in `declare`.
+        if self.partition_kind_marker(tp, part, None) == Some(PartitionKind::Queue) {
+            return Err(StromaError::InvalidArgument(format!(
+                "{tp}/{part} is already declared as a queue, cannot declare it as a plexus stream"
+            )));
+        }
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
         let qh = self.queue_handle(tp, part, None).await?;
         if let Some(retention) = retention {
@@ -4419,6 +4442,17 @@ impl Stroma {
         group: Option<&str>,
         meta: DeclareMeta,
     ) -> Result<()> {
+        // A topic/partition is one channel kind for life. Reject re-declaring a
+        // stream partition as a queue (it would materialize a queue engine over
+        // stream data). Stamp the Queue marker so the reverse case (declaring this
+        // as a stream later) is just as detectable.
+        if self.partition_kind_marker(tp, part, group) == Some(PartitionKind::Stream) {
+            return Err(StromaError::InvalidArgument(format!(
+                "{tp}/{part} is already declared as a plexus stream, cannot declare it as a queue"
+            )));
+        }
+        self.write_partition_kind(tp, part, group, PartitionKind::Queue)?;
+
         self.ensure_queue(tp, part, group).await?;
 
         let _upto = self

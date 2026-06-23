@@ -4,7 +4,8 @@ use keratin_log::{
     CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
 };
 use stroma_core::{
-    MessageHeaders, Offset, RetentionConfig, SnapshotConfig, Stroma, StromaKeratinConfig,
+    DeclareMeta, MessageHeaders, Offset, RetentionConfig, SnapshotConfig, Stroma, StromaError,
+    StromaKeratinConfig,
 };
 
 async fn open_on(dir: &std::path::Path) -> Arc<Stroma> {
@@ -206,4 +207,37 @@ async fn queue_command_on_stream_partition_is_rejected() {
     // The append is rejected either at submit or at completion.
     let rejected = res.is_err() || rx.await.map(|r| r.is_err()).unwrap_or(true);
     assert!(rejected, "queue publish on a stream partition should fail");
+}
+
+fn queue_meta() -> DeclareMeta {
+    DeclareMeta {
+        dlq_policy: None,
+        dlq_max_retries: None,
+        default_message_ttl_ms: None,
+    }
+}
+
+#[tokio::test]
+async fn declaring_a_queue_then_a_stream_is_rejected() {
+    let (st, _dir) = open_test_stroma().await;
+    st.declare("shared", 0, None, queue_meta()).await.unwrap();
+    let err = st.create_stream("shared", 0, None).await.unwrap_err();
+    assert!(matches!(err, StromaError::InvalidArgument(_)));
+}
+
+#[tokio::test]
+async fn declaring_a_stream_then_a_queue_is_rejected() {
+    let (st, _dir) = open_test_stroma().await;
+    st.create_stream("shared", 0, None).await.unwrap();
+    let err = st.declare("shared", 0, None, queue_meta()).await.unwrap_err();
+    assert!(matches!(err, StromaError::InvalidArgument(_)));
+}
+
+#[tokio::test]
+async fn redeclaring_same_kind_is_idempotent() {
+    let (st, _dir) = open_test_stroma().await;
+    st.create_stream("s", 0, None).await.unwrap();
+    st.create_stream("s", 0, None).await.unwrap();
+    st.declare("q", 0, None, queue_meta()).await.unwrap();
+    st.declare("q", 0, None, queue_meta()).await.unwrap();
 }
