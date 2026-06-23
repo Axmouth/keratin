@@ -4053,6 +4053,48 @@ impl Stroma {
         rx.await.map_err(|_| StromaError::QueueActorGone)
     }
 
+    /// Read up to `max` stream records starting at `from`, for subscribe backfill.
+    /// Returns `(offset, payload, headers)` per record, oldest first.
+    pub async fn read_stream_records(
+        &self,
+        tp: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+    ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let qh = qh.resolve()?;
+        self.scan_messages_from(&qh, from, max)
+    }
+
+    /// Resolve the first offset whose record timestamp is at or after `ts_ms`, for
+    /// by-time subscribe starts. Binary search over the retained range probing
+    /// record timestamps. Returns the tail when every retained record is older
+    /// than `ts_ms` (so a by-time start past the end becomes a live tail).
+    pub async fn stream_offset_at_or_after_time(
+        &self,
+        tp: &str,
+        part: u32,
+        ts_ms: u64,
+    ) -> Result<Offset> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let h = qh.resolve()?;
+        let msg_log = h.msg_log();
+        let reader = msg_log.reader();
+        let mut lo = msg_log.head_offset();
+        let mut hi = msg_log.next_offset();
+        // Invariant: the answer is in [lo, hi]. A probe that is missing (a gap from
+        // retention) or older than the target moves the lower bound up.
+        while lo < hi {
+            let mid = lo + (hi - lo) / 2;
+            match reader.fetch(mid).map_err(io_err)? {
+                Some(record) if record.timestamp_ms >= ts_ms => hi = mid,
+                _ => lo = mid + 1,
+            }
+        }
+        Ok(lo)
+    }
+
     /// Enforce a stream's retention policy once. Computes the segment-granular
     /// truncation boundary from the policy and the message log's segment list,
     /// then (if it advances the head) durably logs and applies a StreamTruncate so
