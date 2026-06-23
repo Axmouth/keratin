@@ -254,7 +254,10 @@ async fn poll_ready_delivers_and_marks_inflight() {
     }
 
     let now = 1000;
-    let msgs = st.poll_ready("t", 0, None, 10, now + 100, u64::MAX).await.unwrap();
+    let msgs = st
+        .poll_ready("t", 0, None, 10, now + 100, u64::MAX)
+        .await
+        .unwrap();
 
     assert_eq!(msgs.len(), 3);
 
@@ -286,7 +289,11 @@ async fn poll_ready_upper_gates_leasing_to_committed_offsets() {
     // Visibility ceiling of 3 (exclusive): only offsets 0,1,2 are deliverable.
     let msgs = st.poll_ready("t", 0, None, 10, now + 100, 3).await.unwrap();
     let offs: Vec<u64> = msgs.iter().map(|m| m.0).collect();
-    assert_eq!(offs, vec![0, 1, 2], "must not lease at or above the ceiling");
+    assert_eq!(
+        offs,
+        vec![0, 1, 2],
+        "must not lease at or above the ceiling"
+    );
     // The gated offsets must not have been leased.
     assert!(!st.is_inflight_or_acked("t", 0, None, 3).await.unwrap());
     assert!(!st.is_inflight_or_acked("t", 0, None, 4).await.unwrap());
@@ -317,13 +324,19 @@ async fn expired_messages_are_redelivered_via_poll_ready() {
     let off = rx.await.unwrap().unwrap().base_offset;
 
     let now = 1000;
-    let _ = st.poll_ready("t", 0, None, 1, now + 10, u64::MAX).await.unwrap();
+    let _ = st
+        .poll_ready("t", 0, None, 1, now + 10, u64::MAX)
+        .await
+        .unwrap();
 
     // expire
     let expired = st.collect_expired(now + 20, 10).await.unwrap();
     assert_eq!(expired.len(), 1);
 
-    let msgs2 = st.poll_ready("t", 0, None, 1, now + 30, u64::MAX).await.unwrap();
+    let msgs2 = st
+        .poll_ready("t", 0, None, 1, now + 30, u64::MAX)
+        .await
+        .unwrap();
     assert_eq!(msgs2[0].0, off);
 }
 

@@ -39,11 +39,7 @@ fn headers() -> MessageHeaders {
     }
 }
 
-async fn append_with_ttl(
-    st: &Arc<Stroma>,
-    tp: &str,
-    expire_at: Option<u64>,
-) -> Offset {
+async fn append_with_ttl(st: &Arc<Stroma>, tp: &str, expire_at: Option<u64>) -> Offset {
     let (c, rx) = KeratinAppendCompletion::pair();
     st.append_message_with_ttl(tp, 0, None, &headers(), b"x".to_vec(), expire_at, c)
         .await
@@ -111,7 +107,12 @@ async fn explicit_message_ttl_overrides_queue_default() {
     let _off = append_batch(&st, "t", Some(t0 + 1_000_000)).await;
 
     // The default alone would have dropped it by now; the explicit deadline holds.
-    assert!(st.drop_ttl_expired(t0 + 5_000, 100).await.unwrap().is_empty());
+    assert!(
+        st.drop_ttl_expired(t0 + 5_000, 100)
+            .await
+            .unwrap()
+            .is_empty()
+    );
 }
 
 #[tokio::test]

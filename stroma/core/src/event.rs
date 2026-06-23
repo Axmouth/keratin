@@ -27,6 +27,7 @@ pub enum EventType {
     Declare = 50,
     ResetQueue = 60,
     Snapshot = 70,
+    CursorCommit = 80,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -269,6 +270,13 @@ pub enum StromaEvent {
         /// Encoded QueueState snapshot payload (see state snapshot helpers below)
         blob: Vec<u8>,
     },
+    /// Stream (Plexus) engine: a durable named cursor advanced to `offset`. The
+    /// name is an opaque consumer bookmark; ownership and advance policy live in
+    /// fibril. Work queues never emit this.
+    CursorCommit {
+        name: Box<str>,
+        offset: Offset,
+    },
 }
 
 // ---- encoding helpers (big endian + length-prefixed strings)
@@ -395,7 +403,11 @@ impl StromaEvent {
             StromaEvent::DeadLetterCommit { offs } => offs.iter().copied().max(),
             StromaEvent::Declare(_)
             | StromaEvent::ResetQueue { .. }
-            | StromaEvent::Snapshot { .. } => None,
+            | StromaEvent::Snapshot { .. }
+            // A cursor is a soft pointer (it may legitimately sit at the tail or
+            // be clamped by retention), not a durable message reference, so it
+            // never triggers the dangling-reference recovery check.
+            | StromaEvent::CursorCommit { .. } => None,
         }
     }
 
@@ -567,6 +579,11 @@ impl StromaEvent {
                 if let Some(ttl) = m.default_message_ttl_ms {
                     put_u64(&mut out, ttl);
                 }
+            }
+            StromaEvent::CursorCommit { name, offset } => {
+                put_u16(&mut out, EventType::CursorCommit as u16);
+                put_str(&mut out, name)?;
+                put_u64(&mut out, *offset);
             }
         }
 
@@ -803,6 +820,11 @@ impl StromaEvent {
                     dlq_max_retries,
                     default_message_ttl_ms,
                 }))
+            }
+            x if x == EventType::CursorCommit as u16 => {
+                let name = rd_box_str(bytes, &mut i)?;
+                let offset = rd_u64(bytes, &mut i)?;
+                Ok(StromaEvent::CursorCommit { name, offset })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

@@ -6,8 +6,9 @@ mod replication;
 #[allow(dead_code)]
 mod replication_cache;
 mod state;
-// Wired into the substrate (build/apply/snapshot dispatch by kind) with the stream
-// engine integration step, so the type and its helpers are unused until then.
+// Some stream-engine helpers (cursor introspection, retention axes) are wired in
+// by later Plexus steps (fibril stream actor, retention worker), so they are
+// unused for now.
 #[allow(dead_code)]
 mod stream_state;
 mod stroma;
@@ -23,7 +24,9 @@ pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
+pub use engine::PartitionKind;
 pub use metrics::StromaMetrics;
+pub use stream_state::RetentionConfig;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
     MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
@@ -32,12 +35,12 @@ pub use state::{
 };
 pub use stroma::{
     DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,
-    FollowerStateCheckpointInstallOutcome, GlobalDLQ,
-    GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
-    MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
-    OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
-    ReplicatedEventBatch, ReplicatedMessageBatch, ReplicatedQueueApplyOutcome,
-    ReplicationCacheConfig, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
+    FollowerStateCheckpointInstallOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome,
+    MessageContentType, MessageHeaders, MessageInspectionItem, MessageInspectionPage,
+    OwnerReplicationBatch, OwnerReplicationRead, OwnerStateCheckpoint, PublishItem, QuarantineInfo,
+    QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
+    ReplicatedQueueApplyOutcome, ReplicationCacheConfig, SnapshotConfig, Stroma,
+    StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;

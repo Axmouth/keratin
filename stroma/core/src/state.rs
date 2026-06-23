@@ -17,6 +17,7 @@ use tokio::time::Instant;
 use tokio_util::sync::CancellationToken;
 
 use crate::StromaError;
+use crate::engine::PartitionKind;
 use crate::event::{
     AckEventMeta, DLQDiscardPolicyWire, DeadLetterReason, DeclareMeta, EnqueueDelayedEventMeta,
     EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta,
@@ -25,6 +26,7 @@ use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot,
     ReplicationCacheMetricsSnapshot, SnapshotMetricsSnapshot, StromaMetrics,
 };
+use crate::stream_state::{StreamCommand, StreamState, run_stream_control};
 use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
 pub type Offset = u64;
@@ -969,9 +971,34 @@ pub struct QueueSharedBundle {
     pub deadline_waker: Arc<Notify>,
 }
 
+/// Bound on the stream control actor's command channel. The work queue uses
+/// five priority lanes (latency-sensitive ack/publish interleaving); a stream has
+/// no such interleaving, so a single plain channel is enough.
+const STREAM_COMMAND_CHANNEL_CAPACITY: usize = 8192;
+
+/// The per-partition engine the substrate hosts. Both engines share the same
+/// substrate (logs, durable append, replication, recovery, snapshot IO) but each
+/// runs its own control actor with its own command vocabulary, so the handle to
+/// that actor is the one field that differs by kind. The work queue is the
+/// default; streams (Plexus) are the second.
+#[derive(Debug, Clone)]
+enum EngineHandle {
+    Queue(CommandSender),
+    Stream(mpsc::Sender<StreamCommand>),
+}
+
+impl EngineHandle {
+    fn kind(&self) -> PartitionKind {
+        match self {
+            EngineHandle::Queue(_) => PartitionKind::Queue,
+            EngineHandle::Stream(_) => PartitionKind::Stream,
+        }
+    }
+}
+
 #[derive(Debug)]
 pub struct QueueHandleInner {
-    command_sender: CommandSender,
+    engine: EngineHandle,
 
     topic: String,
     partition: u32,
@@ -1116,6 +1143,7 @@ impl QueueHandleInner {
         partition: u32,
         group: Option<String>,
         bundle: QueueSharedBundle,
+        kind: PartitionKind,
     ) -> Arc<QueueHandleInner> {
         let QueueSharedBundle {
             msg_log,
@@ -1125,7 +1153,23 @@ impl QueueHandleInner {
             global_dlq,
             deadline_waker,
         } = bundle;
-        let (tx, mut rx) = CommandSender::channel_pair(metrics.clone());
+
+        // Build the engine handle for this kind, keeping the receiver so its
+        // control actor can be spawned once the Arc exists. The queue actor needs
+        // a Weak back-reference (it calls process_command with the handle), so it
+        // is spawned after the Arc; the stream actor operates purely on its own
+        // state and needs no back-reference.
+        let (engine, pending) = match kind {
+            PartitionKind::Queue => {
+                let (tx, rx) = CommandSender::channel_pair(metrics.clone());
+                (EngineHandle::Queue(tx), PendingActor::Queue(rx))
+            }
+            PartitionKind::Stream => {
+                let (tx, rx) = mpsc::channel(STREAM_COMMAND_CHANNEL_CAPACITY);
+                (EngineHandle::Stream(tx), PendingActor::Stream(rx))
+            }
+        };
+
         let dirty_since_snapshot = Arc::new(AtomicBool::new(false));
 
         let topic_clone = topic.clone();
@@ -1160,7 +1204,7 @@ impl QueueHandleInner {
 
         let waker_for_state = deadline_waker.clone();
         let result = Arc::new(QueueHandleInner {
-            command_sender: tx,
+            engine,
             topic,
             partition,
             group,
@@ -1187,37 +1231,51 @@ impl QueueHandleInner {
             deadline_waker,
         });
 
-        // The control task holds only a Weak to the Inner, never a strong clone:
-        // the command `tx` lives in the Inner, so while the Inner is alive (held
-        // strong by the registry slot) `recv()` yields and the upgrade succeeds.
-        // When the slot drops the Inner, `tx` drops, `recv()` returns None, and
-        // the loop exits, so the task never pins a retired incarnation.
-        let weak = Arc::downgrade(&result);
+        // Spawn the control actor for this engine. Both hold only the receiver
+        // (and, for the queue, a Weak to the Inner), never a strong clone: the
+        // sender lives in the Inner, so when the slot drops the Inner the sender
+        // drops, `recv()` returns None, and the loop exits, so the task never pins
+        // a retired incarnation.
+        match pending {
+            PendingActor::Queue(mut rx) => {
+                let weak = Arc::downgrade(&result);
+                task_group_clone.spawn("queue control", async move {
+                    let mut state: QueueInternalState =
+                        QueueInternalState::new_with_waker(topic_clone, partition, waker_for_state);
 
-        task_group_clone.spawn("queue control", async move {
-            let mut state: QueueInternalState =
-                QueueInternalState::new_with_waker(topic_clone, partition, waker_for_state);
+                    while let Some(pkg) = rx.recv().await {
+                        let cmd = pkg.command;
+                        let Some(handle) = weak.upgrade() else {
+                            break;
+                        };
+                        let (processed, dirty) =
+                            QueueHandleInner::process_command(&mut state, cmd, &handle);
+                        drop(handle);
+                        let _old_val = dirty_since_snapshot_loop
+                            .fetch_or(dirty, std::sync::atomic::Ordering::Relaxed);
 
-            while let Some(pkg) = rx.recv().await {
-                let cmd = pkg.command;
-                let Some(handle) = weak.upgrade() else {
-                    break;
-                };
-                let (processed, dirty) =
-                    QueueHandleInner::process_command(&mut state, cmd, &handle);
-                drop(handle);
-                let _old_val =
-                    dirty_since_snapshot_loop.fetch_or(dirty, std::sync::atomic::Ordering::Relaxed);
-
-                if processed.is_none() {
-                    break;
-                }
+                        if processed.is_none() {
+                            break;
+                        }
+                    }
+                    // If the loop exits, the channel was closed.
+                });
             }
-            // If the loop exits, the channel was closed.
-        });
+            PendingActor::Stream(rx) => {
+                let state = StreamState::new(topic_clone, partition);
+                task_group_clone.spawn("stream control", run_stream_control(state, rx));
+            }
+        }
 
         result
     }
+}
+
+/// Carries the spawned engine's command receiver from `init`'s kind match down to
+/// the actor spawn after the Arc is built.
+enum PendingActor {
+    Queue(CommandReceiver),
+    Stream(mpsc::Receiver<StreamCommand>),
 }
 
 impl QueueHandleInner {
@@ -1935,8 +1993,23 @@ impl QueueHandleInner {
         (Some(true), dirty) // signal to continue processing
     }
 
+    /// Which engine owns this partition.
+    pub fn kind(&self) -> PartitionKind {
+        self.engine.kind()
+    }
+
+    fn queue_sender(&self) -> std::io::Result<&CommandSender> {
+        match &self.engine {
+            EngineHandle::Queue(s) => Ok(s),
+            EngineHandle::Stream(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "queue command on a stream partition",
+            )),
+        }
+    }
+
     pub async fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        self.command_sender
+        self.queue_sender()?
             .send(QueueCommandPackage {
                 command: cmd,
                 enqueued_at: Instant::now(),
@@ -1946,12 +2019,47 @@ impl QueueHandleInner {
     }
 
     pub fn blocking_command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
-        self.command_sender
+        self.queue_sender()?
             .blocking_send(QueueCommandPackage {
                 command: cmd,
                 enqueued_at: Instant::now(),
             })
             .map_err(command_send_error)
+    }
+
+    /// Send a command to the stream control actor. Errors if this partition is a
+    /// work queue.
+    pub async fn stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
+        match &self.engine {
+            EngineHandle::Stream(s) => s.send(cmd).await.map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stream actor is gone while sending a command",
+                )
+            }),
+            EngineHandle::Queue(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "stream command on a queue partition",
+            )),
+        }
+    }
+
+    /// Blocking counterpart to [`stream_command_enqueue`], for the synchronous
+    /// event-apply path (recovery replay and follower ingest), mirroring
+    /// `blocking_command_enqueue`.
+    pub fn blocking_stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
+        match &self.engine {
+            EngineHandle::Stream(s) => s.blocking_send(cmd).map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "stream actor is gone while sending a command",
+                )
+            }),
+            EngineHandle::Queue(_) => Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "stream command on a queue partition",
+            )),
+        }
     }
 
     pub async fn debug_info(&self) -> QueueInternalDebugInfo {
@@ -2268,9 +2376,18 @@ impl QueueHandleInner {
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
         let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::Reset { response: Some(tx) })
-            .await;
+        match &self.engine {
+            EngineHandle::Queue(_) => {
+                let _ = self
+                    .command_enqueue(QueueCommand::Reset { response: Some(tx) })
+                    .await;
+            }
+            EngineHandle::Stream(_) => {
+                let _ = self
+                    .stream_command_enqueue(StreamCommand::Reset { response: Some(tx) })
+                    .await;
+            }
+        }
         rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         Ok(())
     }
@@ -2342,15 +2459,33 @@ impl QueueHandleInner {
     ) -> Result<Vec<u8>, QueueHandleError> {
         self.creating_snapshot
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::EncodeSnapshot {
-                last_snapshot_event_offset,
-                force,
-                response: Some(tx),
-            })
-            .await;
-        let res = rx.await;
+        let result = match &self.engine {
+            EngineHandle::Queue(_) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = self
+                    .command_enqueue(QueueCommand::EncodeSnapshot {
+                        last_snapshot_event_offset,
+                        force,
+                        response: Some(tx),
+                    })
+                    .await;
+                rx.await
+                    .map_err(|_| QueueHandleError::ActorGone)?
+                    .ok_or(QueueHandleError::SnapshotNotCreated)
+            }
+            EngineHandle::Stream(_) => {
+                // The stream engine always encodes; it has no dirty/skip gate, so
+                // `force` does not apply.
+                let (tx, rx) = oneshot::channel();
+                let _ = self
+                    .stream_command_enqueue(StreamCommand::EncodeSnapshot {
+                        last_event_offset: last_snapshot_event_offset,
+                        response: tx,
+                    })
+                    .await;
+                rx.await.map_err(|_| QueueHandleError::ActorGone)
+            }
+        };
         self.last_snapshot_event_offset.store(
             last_snapshot_event_offset,
             std::sync::atomic::Ordering::Relaxed,
@@ -2359,8 +2494,7 @@ impl QueueHandleInner {
             .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
         self.creating_snapshot
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        res.map_err(|_| QueueHandleError::ActorGone)?
-            .ok_or_else(|| QueueHandleError::SnapshotNotCreated)
+        result
     }
 
     pub async fn export_state_checkpoint_snapshot(
@@ -2389,17 +2523,38 @@ impl QueueHandleInner {
     }
 
     pub async fn load_snapshot(&self, data: Vec<u8>) -> Result<SnapshotMeta, QueueHandleError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::LoadSnapshot {
-                data,
-                response: Some(tx),
-            })
-            .await;
-        let snapmeta = rx
-            .await
-            .map_err(|_| QueueHandleError::ActorGone)?
-            .map_err(|_| QueueHandleError::SnapshotLoadFailed("Failed to load snapshot".into()))?;
+        let snapmeta = match &self.engine {
+            EngineHandle::Queue(_) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = self
+                    .command_enqueue(QueueCommand::LoadSnapshot {
+                        data,
+                        response: Some(tx),
+                    })
+                    .await;
+                rx.await
+                    .map_err(|_| QueueHandleError::ActorGone)?
+                    .map_err(|_| {
+                        QueueHandleError::SnapshotLoadFailed("Failed to load snapshot".into())
+                    })?
+            }
+            EngineHandle::Stream(_) => {
+                let (tx, rx) = oneshot::channel();
+                let _ = self
+                    .stream_command_enqueue(StreamCommand::LoadSnapshot {
+                        bytes: data,
+                        response: tx,
+                    })
+                    .await;
+                rx.await
+                    .map_err(|_| QueueHandleError::ActorGone)?
+                    .map_err(|e| {
+                        QueueHandleError::SnapshotLoadFailed(format!(
+                            "Failed to load snapshot: {e}"
+                        ))
+                    })?
+            }
+        };
 
         self.last_snapshot_event_offset.store(
             snapmeta.last_snapshot_event_offset,
@@ -3604,7 +3759,6 @@ impl QueueInternalState {
         }
         self.min_deadline_hint = min;
     }
-
 
     // ---------------- Delivery helper ----------------
 
