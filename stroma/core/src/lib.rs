@@ -15,6 +15,7 @@ mod stroma;
 
 use thiserror::Error;
 
+pub use engine::PartitionKind;
 pub use event::{
     AckEventMeta, DLQDiscardPolicyWire, DeadLetterMeta, DeadLetterReason, DeclareMeta,
     EnqueueEventMeta, MarkInflightEventMeta, NackEventMeta, StromaEvent,
@@ -24,15 +25,14 @@ pub use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };
-pub use engine::PartitionKind;
 pub use metrics::StromaMetrics;
-pub use stream_state::RetentionConfig;
 pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
     MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
     QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
     Resolved, SnapshotMeta, StromaDebugSnapshot,
 };
+pub use stream_state::RetentionConfig;
 pub use stroma::{
     DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,
     FollowerStateCheckpointInstallOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome,

@@ -101,3 +101,36 @@ impl Segment {
         &self.file
     }
 }
+
+/// Summary of one segment, for retention decisions. Cheap to build from the
+/// in-memory segment list plus each segment file's header.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SegmentInfo {
+    pub base_offset: u64,
+    /// Exclusive end: one past the last offset this segment can hold. For a sealed
+    /// segment this is the next segment's base; for the active segment it is the
+    /// log's next offset.
+    pub end_offset: u64,
+    /// On-disk size of the segment file in bytes (including the header).
+    pub bytes: u64,
+    /// Wall-clock time the segment file was created, in milliseconds.
+    pub created_ts_ms: u64,
+    /// False only for the active (still-being-written) segment, which retention
+    /// never drops.
+    pub sealed: bool,
+}
+
+/// Read a segment file's creation timestamp (ms) from its header without opening
+/// the whole segment.
+pub fn read_segment_created_ts_ms(path: &std::path::Path) -> io::Result<u64> {
+    let mut file = File::open(path)?;
+    // magic(8) ver(2) flags(2) hdrlen(4) base(8) created_ts(8)
+    let mut hdr = [0u8; 32];
+    file.read_exact(&mut hdr)?;
+    if &hdr[0..8] != LOG_MAGIC {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "bad log magic"));
+    }
+    Ok(u64::from_be_bytes(
+        hdr[24..32].try_into().expect("exact-length slice"),
+    ))
+}

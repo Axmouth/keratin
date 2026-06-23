@@ -339,6 +339,11 @@ pub enum StreamCommand {
     GetHeadTail {
         response: oneshot::Sender<(Offset, Offset)>,
     },
+    /// Read the retention policy plus the head/tail watermarks, for the retention
+    /// worker (one round trip instead of two).
+    GetRetentionState {
+        response: oneshot::Sender<(RetentionConfig, Offset, Offset)>,
+    },
     /// Serialize the current state for a snapshot.
     EncodeSnapshot {
         last_event_offset: u64,
@@ -409,6 +414,9 @@ pub async fn run_stream_control(mut state: StreamState, mut rx: mpsc::Receiver<S
             }
             StreamCommand::GetHeadTail { response } => {
                 let _ = response.send((state.head(), state.tail()));
+            }
+            StreamCommand::GetRetentionState { response } => {
+                let _ = response.send((state.retention(), state.head(), state.tail()));
             }
             StreamCommand::EncodeSnapshot {
                 last_event_offset,

@@ -89,7 +89,8 @@ impl Manifest {
                 ),
             ));
         }
-        let header_len = u32::from_be_bytes(buf[12..16].try_into().expect("exact-length slice")) as usize;
+        let header_len =
+            u32::from_be_bytes(buf[12..16].try_into().expect("exact-length slice")) as usize;
         if header_len != 8 + 2 + 2 + 4 + 4 {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,
@@ -115,12 +116,18 @@ impl Manifest {
                 "manifest payload len mismatch",
             ));
         }
-        let created_ts_ms = u64::from_be_bytes(payload[0..8].try_into().expect("exact-length slice"));
-        let segment_max_bytes = u64::from_be_bytes(payload[8..16].try_into().expect("exact-length slice"));
-        let index_stride_bytes = u32::from_be_bytes(payload[16..20].try_into().expect("exact-length slice"));
-        let active_base_offset = u64::from_be_bytes(payload[24..32].try_into().expect("exact-length slice"));
-        let next_offset = u64::from_be_bytes(payload[32..40].try_into().expect("exact-length slice"));
-        let head_offset = u64::from_be_bytes(payload[40..48].try_into().expect("exact-length slice"));
+        let created_ts_ms =
+            u64::from_be_bytes(payload[0..8].try_into().expect("exact-length slice"));
+        let segment_max_bytes =
+            u64::from_be_bytes(payload[8..16].try_into().expect("exact-length slice"));
+        let index_stride_bytes =
+            u32::from_be_bytes(payload[16..20].try_into().expect("exact-length slice"));
+        let active_base_offset =
+            u64::from_be_bytes(payload[24..32].try_into().expect("exact-length slice"));
+        let next_offset =
+            u64::from_be_bytes(payload[32..40].try_into().expect("exact-length slice"));
+        let head_offset =
+            u64::from_be_bytes(payload[40..48].try_into().expect("exact-length slice"));
         let epoch = u64::from_be_bytes(payload[48..56].try_into().expect("exact-length slice"));
 
         Ok(Self {
