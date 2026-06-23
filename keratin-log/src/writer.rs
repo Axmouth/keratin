@@ -154,6 +154,13 @@ pub struct AppendReq {
     pub records: AppendPayload,
     pub durability: Option<KDurability>,
     pub completion: AppendCompletionTarget,
+    /// Optional early-offset signal: when set, the writer sends the record's
+    /// assigned base offset the moment it is staged (offset assigned, in the
+    /// in-memory buffer), BEFORE the durability ack on `completion`. This exposes
+    /// the assigned-offset point of the append lifecycle (assigned -> written ->
+    /// fsynced) as data, so a caller can act on the offset without waiting for the
+    /// flush. `None` for the normal durable path.
+    pub staged_offset_tx: Option<tokio::sync::oneshot::Sender<u64>>,
 }
 
 impl AppendPayload {
@@ -1014,6 +1021,7 @@ fn stage_reqs(
 
         let dur = r.durability.unwrap_or(cfg.default_durability);
         let completion = r.completion;
+        let staged_offset_tx = r.staged_offset_tx;
         let result = match r.records {
             AppendPayload::One(message) => {
                 #[cfg(feature = "writer-stage-trace")]
@@ -1033,6 +1041,12 @@ fn stage_reqs(
 
         match result {
             Ok((ar, end_offset)) => {
+                // Report the assigned offset as early as possible (staged, pre-ack).
+                // A oneshot send is a non-blocking store plus a waker, safe on the
+                // writer thread. The durability ack still flows through `completion`.
+                if let Some(tx) = staged_offset_tx {
+                    let _ = tx.send(ar.base_offset);
+                }
                 state.tail.store(end_offset + 1, Ordering::Release);
                 if dur == KDurability::AfterWrite {
                     notify_tx

@@ -381,3 +381,28 @@ async fn sync_makes_after_write_durable() {
     assert_eq!(got.len(), 3);
     k.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn staged_offset_fires_with_assigned_offset_before_durable() {
+    let dir = test_dir!("staged_offset_before_durable");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+
+    let (completion, done_rx) = KeratinAppendCompletion::pair();
+    let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+    k.append_enqueue_staged(
+        message("a"),
+        Some(KDurability::AfterFsync),
+        completion,
+        staged_tx,
+    )
+    .unwrap();
+
+    // The staged signal carries the assigned base offset, and the durable
+    // completion later reports the same offset.
+    let staged_offset = staged_rx.await.unwrap();
+    assert_eq!(staged_offset, 0);
+    let durable = done_rx.await.unwrap().unwrap();
+    assert_eq!(durable.base_offset, staged_offset);
+}
