@@ -4135,6 +4135,19 @@ impl Stroma {
         })
     }
 
+    /// Flush and fsync a stream partition's message log, advancing the durable
+    /// watermark. The fsync runs on keratin's fsync worker stage, so this does not
+    /// block staging. Pairs with the ephemeral tier, which appends with AfterWrite
+    /// (no per-record fsync): the broker calls this on an interval so dirty pages
+    /// drain steadily instead of piling up until the kernel throttles the writer
+    /// mid-write (which spikes ephemeral delivery tails).
+    pub async fn sync_stream(&self, tp: &str, part: u32) -> Result<()> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let msg_log = qh.resolve()?.msg_log();
+        msg_log.sync().await.map_err(io_err)?;
+        Ok(())
+    }
+
     /// Commit a durable named cursor for a stream. The commit is logged as a
     /// CursorCommit event (durable and replicated) and applied to the stream
     /// engine, so it survives a crash or redeploy and a follower promoted after

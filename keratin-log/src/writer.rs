@@ -218,6 +218,10 @@ struct NotifyItem {
 struct FsyncReq {
     job: FsyncJob,
     ready: Vec<NotifyItem>,
+    /// Callers of `WriterCmd::Sync` waiting for this fsync to land. The writer
+    /// thread hands the fsync to the worker stage and the worker carries these back
+    /// in the `FsyncDone`, so a Sync never blocks staging. Empty for normal commits.
+    sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
     #[cfg(feature = "writer-stage-trace")]
     work_id: u64,
 }
@@ -226,6 +230,7 @@ struct FsyncDone {
     through_offset: u64,
     elapsed: Duration,
     ready: Vec<NotifyItem>,
+    sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
     error: Option<String>,
     #[cfg(feature = "writer-stage-trace")]
     work_id: u64,
@@ -333,7 +338,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
     while let Ok(req) = rx.recv() {
         let through_offset = req.job.through_offset();
         let result = req.job.sync();
-        let done = fsync_done_from_result(through_offset, req.ready, result);
+        let done = fsync_done_from_result(through_offset, req.ready, req.sync_acks, result);
         if done_tx.send(done).is_err() {
             break;
         }
@@ -345,7 +350,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: Writer
     while let Ok(req) = rx.recv() {
         let through_offset = req.job.through_offset();
         let result = trace_writer_stage!(tracer, req.work_id, "fsync", (0, 0), { req.job.sync() });
-        let mut done = fsync_done_from_result(through_offset, req.ready, result);
+        let mut done = fsync_done_from_result(through_offset, req.ready, req.sync_acks, result);
         done.work_id = req.work_id;
         if done_tx.send(done).is_err() {
             break;
@@ -356,6 +361,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: Writer
 fn fsync_done_from_result(
     through_offset: u64,
     ready: Vec<NotifyItem>,
+    sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
     result: io::Result<Duration>,
 ) -> FsyncDone {
     match result {
@@ -363,6 +369,7 @@ fn fsync_done_from_result(
             through_offset,
             elapsed,
             ready,
+            sync_acks,
             error: None,
             #[cfg(feature = "writer-stage-trace")]
             work_id: 0,
@@ -379,6 +386,7 @@ fn fsync_done_from_result(
                         result: Err(IoError::new(&msg)),
                     })
                     .collect(),
+                sync_acks,
                 error: Some(msg),
                 #[cfg(feature = "writer-stage-trace")]
                 work_id: 0,
@@ -861,21 +869,41 @@ fn writer_loop_inner(
                 }
             }
             WriterCmd::Sync { respond_to } => {
-                // Make everything staged so far durable. Used by callers that
-                // stage with AfterWrite and fsync separately (e.g. two logs in
-                // parallel). flush_buffers + flush move staged bytes to the file;
-                // fsync makes them durable; then advance the durable watermark.
-                let res = log
-                    .flush_buffers()
-                    .and_then(|_| log.flush())
-                    .and_then(|_| log.fsync())
-                    .map(|_| {
-                        let durable = log.durable_watermark();
-                        state.durable.store(durable, Ordering::Release);
-                        durable_offset = durable;
-                    });
-                if respond_to.send(res).is_err() {
-                    tracing::info!("Error sending sync response");
+                // Make everything staged so far durable. Used by callers that stage
+                // with AfterWrite and fsync separately (e.g. the ephemeral stream
+                // tier's periodic flush). prepare_fsync_job flushes staged bytes to
+                // the file on this (writer) thread, then the actual fsync goes one
+                // stage down to the fsync worker so staging keeps chugging. The
+                // FsyncDone handler advances the durable watermark and answers the
+                // responder when the fsync lands.
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                #[cfg(feature = "writer-stage-trace")]
+                let job = log.prepare_fsync_job_traced(&tracer, work_id);
+                #[cfg(not(feature = "writer-stage-trace"))]
+                let job = log.prepare_fsync_job();
+                match job {
+                    Ok(job) => {
+                        let req = FsyncReq {
+                            job,
+                            ready: Vec::new(),
+                            sync_acks: vec![respond_to],
+                            #[cfg(feature = "writer-stage-trace")]
+                            work_id,
+                        };
+                        if let Err(err) = fsync_tx.send(req) {
+                            let FsyncReq { sync_acks, .. } = err.into_inner();
+                            answer_sync_acks(
+                                sync_acks,
+                                Err(io::Error::other("fsync worker disconnected")),
+                            );
+                        } else {
+                            inflight_fsyncs = inflight_fsyncs.saturating_add(1);
+                        }
+                    }
+                    Err(e) => {
+                        let _ = respond_to.send(Err(e));
+                    }
                 }
             }
             WriterCmd::Shutdown {
@@ -1314,6 +1342,7 @@ fn handle_fsync_done(
     if let Some(error) = done.error {
         tracing::error!("fsync job failed: {error}");
         send_notify_items(notify_tx, done.ready);
+        answer_sync_acks(done.sync_acks, Err(io::Error::other(error)));
         return;
     }
 
@@ -1328,11 +1357,29 @@ fn handle_fsync_done(
             *durable_offset = (*durable_offset).max(done.through_offset);
             state.durable.store(*durable_offset, Ordering::Release);
             send_notify_items(notify_tx, done.ready);
+            answer_sync_acks(done.sync_acks, Ok(()));
         }
         Err(err) => {
             tracing::error!("finishing fsync job failed: {err}");
-            send_notify_items(notify_tx, fail_notify_items(done.ready, err.to_string()));
+            let msg = err.to_string();
+            send_notify_items(notify_tx, fail_notify_items(done.ready, &msg));
+            answer_sync_acks(done.sync_acks, Err(io::Error::other(msg)));
         }
+    }
+}
+
+/// Fire the `WriterCmd::Sync` responders carried by a finished fsync job. Each ack
+/// gets a clone of the result. A dropped receiver (caller gone) is ignored.
+fn answer_sync_acks(
+    acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
+    result: io::Result<()>,
+) {
+    for ack in acks {
+        let cloned = result
+            .as_ref()
+            .map(|_| ())
+            .map_err(|e| io::Error::new(e.kind(), e.to_string()));
+        let _ = ack.send(cloned);
     }
 }
 
@@ -1401,6 +1448,7 @@ fn commit(
     let req = FsyncReq {
         job,
         ready,
+        sync_acks: Vec::new(),
         #[cfg(feature = "writer-stage-trace")]
         work_id,
     };
