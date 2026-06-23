@@ -28,6 +28,7 @@ pub enum EventType {
     ResetQueue = 60,
     Snapshot = 70,
     CursorCommit = 80,
+    StreamTruncate = 81,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -277,6 +278,13 @@ pub enum StromaEvent {
         name: Box<str>,
         offset: Offset,
     },
+    /// Stream (Plexus) engine: retention dropped everything below `before`. Applied
+    /// by advancing the stream head watermark (and clamping lagging cursors) plus a
+    /// best-effort physical message-log truncation, so owner and followers converge
+    /// on the same logical head. Work queues never emit this.
+    StreamTruncate {
+        before: Offset,
+    },
 }
 
 // ---- encoding helpers (big endian + length-prefixed strings)
@@ -406,8 +414,10 @@ impl StromaEvent {
             | StromaEvent::Snapshot { .. }
             // A cursor is a soft pointer (it may legitimately sit at the tail or
             // be clamped by retention), not a durable message reference, so it
-            // never triggers the dangling-reference recovery check.
-            | StromaEvent::CursorCommit { .. } => None,
+            // never triggers the dangling-reference recovery check. A truncation
+            // boundary is a delete directive, likewise not a durable reference.
+            | StromaEvent::CursorCommit { .. }
+            | StromaEvent::StreamTruncate { .. } => None,
         }
     }
 
@@ -584,6 +594,10 @@ impl StromaEvent {
                 put_u16(&mut out, EventType::CursorCommit as u16);
                 put_str(&mut out, name)?;
                 put_u64(&mut out, *offset);
+            }
+            StromaEvent::StreamTruncate { before } => {
+                put_u16(&mut out, EventType::StreamTruncate as u16);
+                put_u64(&mut out, *before);
             }
         }
 
@@ -825,6 +839,10 @@ impl StromaEvent {
                 let name = rd_box_str(bytes, &mut i)?;
                 let offset = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::CursorCommit { name, offset })
+            }
+            x if x == EventType::StreamTruncate as u16 => {
+                let before = rd_u64(bytes, &mut i)?;
+                Ok(StromaEvent::StreamTruncate { before })
             }
             _ => Err(io::Error::new(
                 io::ErrorKind::InvalidData,

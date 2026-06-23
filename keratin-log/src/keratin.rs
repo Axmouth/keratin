@@ -11,6 +11,7 @@ use tokio::sync::oneshot;
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
 use crate::reader::LogReader;
 use crate::record::Message;
+use crate::segment::{SegmentInfo, read_segment_created_ts_ms};
 use crate::writer::{AppendCompletionTarget, AppendPayload, AppendReq, IoError, WriterHandle};
 use crate::{AppendCompletion, KDurability, KeratinConfig};
 
@@ -284,6 +285,43 @@ impl Keratin {
 
     pub fn head_offset(&self) -> u64 {
         self.log_state.head.load(Ordering::Acquire)
+    }
+
+    /// Read-only summary of the log's segments, oldest first, for retention
+    /// decisions. The last entry is the active segment (`sealed == false`), which
+    /// truncation never drops. Builds from the in-memory segment list plus a small
+    /// header read per segment, so it does not disturb the writer.
+    pub fn segment_infos(&self) -> io::Result<Vec<SegmentInfo>> {
+        let bases: Vec<(u64, PathBuf)> = {
+            let map = self.segment_mapping.read();
+            let mut v: Vec<(u64, PathBuf)> = map.iter().map(|(k, v)| (*k, v.clone())).collect();
+            v.sort_unstable_by_key(|(b, _)| *b);
+            v
+        };
+        if bases.is_empty() {
+            return Ok(Vec::new());
+        }
+        let next_offset = self.next_offset();
+        let active_base = bases.last().map(|(b, _)| *b).expect("non-empty checked");
+        let mut out = Vec::with_capacity(bases.len());
+        for i in 0..bases.len() {
+            let (base, path) = &bases[i];
+            let end_offset = if i + 1 < bases.len() {
+                bases[i + 1].0
+            } else {
+                next_offset
+            };
+            let bytes = std::fs::metadata(path).map(|m| m.len()).unwrap_or(0);
+            let created_ts_ms = read_segment_created_ts_ms(path)?;
+            out.push(SegmentInfo {
+                base_offset: *base,
+                end_offset,
+                bytes,
+                created_ts_ms,
+                sealed: *base != active_base,
+            });
+        }
+        Ok(out)
     }
 
     pub fn current_epoch(&self) -> u64 {

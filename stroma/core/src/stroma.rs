@@ -16,7 +16,7 @@ use dashmap::DashMap;
 use keratin_log::{
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, Keratin,
     KeratinAppendCompletion, KeratinConfig, KeratinReplicaExt, KeratinRole, Message,
-    ReplicatedAppendOutcome, util::unix_millis,
+    ReplicatedAppendOutcome, SegmentInfo, util::unix_millis,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::{HashMap, HashSet};
@@ -165,9 +165,26 @@ impl Default for ReplicationCacheConfig {
     }
 }
 
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+/// Default cadence for the background stream-retention sweep.
+pub const DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS: u64 = 60_000;
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StromaOptions {
     pub replication_cache: ReplicationCacheConfig,
+    /// How often the background worker sweeps already-materialized stream
+    /// partitions to enforce their retention policy. `None` (or zero) disables the
+    /// sweep, for example when an external scheduler drives retention instead. The
+    /// sweep never materializes an idle partition.
+    pub stream_retention_sweep_interval_ms: Option<u64>,
+}
+
+impl Default for StromaOptions {
+    fn default() -> Self {
+        Self {
+            replication_cache: ReplicationCacheConfig::default(),
+            stream_retention_sweep_interval_ms: Some(DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS),
+        }
+    }
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -968,6 +985,22 @@ impl Stroma {
                 }
             }
         });
+
+        // Background stream-retention sweep. Periodically enforces retention on
+        // already-materialized stream partitions (it never materializes an idle
+        // one). Disabled when the interval is None or zero.
+        if let Some(interval_ms) = options
+            .stream_retention_sweep_interval_ms
+            .filter(|&ms| ms > 0)
+        {
+            let st_retention = st.clone();
+            st.task_group.spawn("stream retention", async move {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(interval_ms)).await;
+                    let _ = st_retention.enforce_all_stream_retention().await;
+                }
+            });
+        }
 
         Ok(st)
     }
@@ -2097,6 +2130,16 @@ impl Stroma {
                     response: None,
                 })?;
             }
+            StromaEvent::StreamTruncate { before } => {
+                // Logical head advance only on the blocking path. Physical reclaim
+                // happens on the async apply path that emits and replicates this
+                // event; this path is for recovery replay, where the message log is
+                // already physically truncated.
+                qh.blocking_stream_command_enqueue(StreamCommand::ApplyTruncation {
+                    new_head: before,
+                    response: None,
+                })?;
+            }
         }
         Ok(())
     }
@@ -2298,6 +2341,20 @@ impl Stroma {
                 qh.stream_command_enqueue(StreamCommand::CommitCursor {
                     name: name.into(),
                     offset,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            StromaEvent::StreamTruncate { before } => {
+                // Best-effort physical reclaim (segment-granular, idempotent). The
+                // logical head advance below is what gates reads and keeps the owner
+                // and followers converged on the same head.
+                let _ = qh.msg_log().truncate_before(before).await;
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.stream_command_enqueue(StreamCommand::ApplyTruncation {
+                    new_head: before,
                     response: Some(tx),
                 })
                 .await
@@ -3996,6 +4053,70 @@ impl Stroma {
         rx.await.map_err(|_| StromaError::QueueActorGone)
     }
 
+    /// Enforce a stream's retention policy once. Computes the segment-granular
+    /// truncation boundary from the policy and the message log's segment list,
+    /// then (if it advances the head) durably logs and applies a StreamTruncate so
+    /// the head advance and physical reclaim replicate to followers. Returns the
+    /// new head if anything was dropped. A no-op for queues, unconfigured
+    /// retention, or when nothing is old/large/numerous enough to drop.
+    pub async fn enforce_stream_retention(&self, tp: &str, part: u32) -> Result<Option<Offset>> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let (config, head, tail, infos) = {
+            let h = qh.resolve()?;
+            if h.kind() != PartitionKind::Stream {
+                return Ok(None);
+            }
+            let (tx, rx) = tokio::sync::oneshot::channel();
+            h.stream_command_enqueue(StreamCommand::GetRetentionState { response: tx })
+                .await
+                .map_err(io_err)?;
+            let (config, head, tail) = rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            let infos = h.msg_log().segment_infos().map_err(io_err)?;
+            (config, head, tail, infos)
+        };
+
+        let before = match compute_stream_truncate_before(&infos, config, tail, unix_millis()) {
+            Some(before) if before > head => before,
+            _ => return Ok(None),
+        };
+
+        let durability = self.keratin_cfg_event.default_durability;
+        self.append_events_durable(
+            tp,
+            part,
+            None,
+            vec![StromaEvent::StreamTruncate { before }],
+            durability,
+        )
+        .await?;
+        Ok(Some(before))
+    }
+
+    /// Enforce retention across every materialized stream partition. The caller
+    /// (the broker maintenance tick) drives this periodically.
+    pub async fn enforce_all_stream_retention(
+        &self,
+    ) -> Vec<(Box<str>, u32, Result<Option<Offset>>)> {
+        let mut out = Vec::new();
+        for (tp, part, group) in self.list_queues() {
+            if group.is_some() {
+                continue;
+            }
+            // Only sweep partitions that are already materialized, so retention
+            // never forces an idle partition back into memory. enforce_stream_
+            // retention self-guards on kind, so a materialized queue is a cheap
+            // no-op.
+            if !self.is_materialized(&tp, part, None) {
+                continue;
+            }
+            let res = self.enforce_stream_retention(&tp, part).await;
+            if !matches!(res, Ok(None)) {
+                out.push((tp, part, res));
+            }
+        }
+        out
+    }
+
     pub async fn ack_enqueue(
         &self,
         tp: &str,
@@ -4972,6 +5093,78 @@ fn contiguous_spans(offsets: impl IntoIterator<Item = Offset>) -> Vec<(Offset, u
     spans
 }
 
+/// Compute the segment-granular truncation boundary for a stream from its
+/// retention policy. Returns the new logical head (the offset everything below
+/// which may be dropped), or `None` when no whole sealed segment qualifies.
+///
+/// Truncation is segment-granular (only whole sealed segments are dropped, never
+/// the active one), so the boundary is always a sealed segment's exclusive end.
+/// Each enabled axis independently selects how many of the oldest sealed segments
+/// to drop; the result is the largest prefix any axis wants:
+/// - max_records: drop sealed segments whose records all sit below `tail - N`.
+/// - max_bytes: drop oldest sealed segments while the bytes kept from a segment
+///   onward (including the active segment) still exceed the cap.
+/// - max_age: drop a sealed segment when the next segment was created at or before
+///   `now - max_age`, so every record in it predates the age cutoff.
+fn compute_stream_truncate_before(
+    infos: &[SegmentInfo],
+    config: RetentionConfig,
+    tail: Offset,
+    now_ms: u64,
+) -> Option<Offset> {
+    let sealed: Vec<&SegmentInfo> = infos.iter().filter(|s| s.sealed).collect();
+    if sealed.is_empty() {
+        return None;
+    }
+    let total_bytes: u64 = infos.iter().map(|s| s.bytes).sum();
+
+    let mut before: Offset = 0;
+
+    if let Some(max_records) = config.max_records {
+        let keep_from = tail.saturating_sub(max_records);
+        for s in &sealed {
+            if s.end_offset <= keep_from {
+                before = before.max(s.end_offset);
+            }
+        }
+    }
+
+    if let Some(max_bytes) = config.max_bytes {
+        let mut dropped_bytes = 0u64;
+        for s in &sealed {
+            let kept_from_here = total_bytes - dropped_bytes;
+            if kept_from_here > max_bytes {
+                before = before.max(s.end_offset);
+                dropped_bytes += s.bytes;
+            } else {
+                break;
+            }
+        }
+    }
+
+    if let Some(max_age_ms) = config.max_age_ms {
+        let cutoff = now_ms.saturating_sub(max_age_ms);
+        for (idx, s) in sealed.iter().enumerate() {
+            // The records in `s` all predate the next segment's creation, so `s`
+            // is fully older than the cutoff when that next creation is.
+            let next_created = if idx + 1 < sealed.len() {
+                sealed[idx + 1].created_ts_ms
+            } else {
+                // The active segment is the next one after the last sealed.
+                infos
+                    .last()
+                    .map(|a| a.created_ts_ms)
+                    .unwrap_or(s.created_ts_ms)
+            };
+            if next_created <= cutoff {
+                before = before.max(s.end_offset);
+            }
+        }
+    }
+
+    if before == 0 { None } else { Some(before) }
+}
+
 fn assert_send<T: Send>(_: T) {}
 
 #[allow(dead_code)]
@@ -5349,6 +5542,7 @@ mod tests {
             SnapshotConfig { every_events: 1 },
             StromaOptions {
                 replication_cache: ReplicationCacheConfig::enabled(64 * 1024),
+                ..StromaOptions::default()
             },
         )
         .await
@@ -7626,5 +7820,124 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+}
+
+#[cfg(test)]
+mod retention_tests {
+    use super::{SegmentInfo, compute_stream_truncate_before};
+    use crate::stream_state::RetentionConfig;
+
+    fn seg(base: u64, end: u64, bytes: u64, created_ts_ms: u64, sealed: bool) -> SegmentInfo {
+        SegmentInfo {
+            base_offset: base,
+            end_offset: end,
+            bytes,
+            created_ts_ms,
+            sealed,
+        }
+    }
+
+    // Three sealed segments [0,10) [10,20) [20,30) plus an active [30,35), tail=35.
+    fn infos() -> Vec<SegmentInfo> {
+        vec![
+            seg(0, 10, 1000, 1_000, true),
+            seg(10, 20, 1000, 2_000, true),
+            seg(20, 30, 1000, 3_000, true),
+            seg(30, 35, 500, 4_000, false),
+        ]
+    }
+
+    #[test]
+    fn no_policy_drops_nothing() {
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), RetentionConfig::default(), 35, 10_000),
+            None
+        );
+    }
+
+    #[test]
+    fn max_records_drops_oldest_whole_segments() {
+        // Keep newest 20 records => keep_from = 15 => drop the [0,10) segment only
+        // ([10,20) ends at 20 > 15 so it stays).
+        let cfg = RetentionConfig {
+            max_records: Some(20),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            Some(10)
+        );
+    }
+
+    #[test]
+    fn max_bytes_keeps_newest_within_cap() {
+        // total bytes = 3500. Cap 1500: keeping from [0,10) (3500) > cap -> drop;
+        // from [10,20) (2500) > cap -> drop; from [20,30) (1500) <= cap -> stop.
+        // So drop through [10,20): before = 20.
+        let cfg = RetentionConfig {
+            max_bytes: Some(1500),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn max_age_drops_segments_fully_older_than_cutoff() {
+        // now=10_000, max_age=7_000 => cutoff=3_000. A sealed segment goes when the
+        // NEXT segment was created at/under 3_000: [0,10) next=2_000<=3_000 drop;
+        // [10,20) next=3_000<=3_000 drop; [20,30) next=4_000>3_000 keep. before=20.
+        let cfg = RetentionConfig {
+            max_age_ms: Some(7_000),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn axes_combine_to_the_largest_prefix() {
+        // records wants drop through 10, bytes wants drop through 20 -> union = 20.
+        let cfg = RetentionConfig {
+            max_records: Some(25),
+            max_bytes: Some(1500),
+            max_age_ms: None,
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            Some(20)
+        );
+    }
+
+    #[test]
+    fn active_segment_is_never_dropped() {
+        // A tiny cap that even one segment exceeds still keeps the active segment:
+        // the boundary never passes the last sealed end (30).
+        let cfg = RetentionConfig {
+            max_bytes: Some(1),
+            ..Default::default()
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            Some(30)
+        );
+    }
+
+    #[test]
+    fn nothing_to_drop_returns_none() {
+        let cfg = RetentionConfig {
+            max_records: Some(10_000),
+            max_bytes: Some(10_000_000),
+            max_age_ms: Some(10_000_000),
+        };
+        assert_eq!(
+            compute_stream_truncate_before(&infos(), cfg, 35, 10_000),
+            None
+        );
     }
 }

@@ -3,7 +3,9 @@ use std::sync::Arc;
 use keratin_log::{
     CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
 };
-use stroma_core::{MessageHeaders, Offset, SnapshotConfig, Stroma, StromaKeratinConfig};
+use stroma_core::{
+    MessageHeaders, Offset, RetentionConfig, SnapshotConfig, Stroma, StromaKeratinConfig,
+};
 
 async fn open_on(dir: &std::path::Path) -> Arc<Stroma> {
     Arc::new(
@@ -126,6 +128,68 @@ async fn stream_cursor_survives_evict_and_rematerialize_via_snapshot() {
     );
     let (head, tail) = st.stream_head_tail("sensors", 0).await.unwrap();
     assert_eq!((head, tail), (0, 3));
+}
+
+#[tokio::test]
+async fn stream_retention_drops_oldest_segments_and_clamps_lagging_cursors() {
+    // Tiny segments so each record rolls into its own segment, making whole sealed
+    // segments droppable by retention (truncation is segment-granular).
+    let test_dir = test_dir!("test_data");
+    let cfg = KeratinConfig {
+        segment_max_bytes: 160,
+        ..KeratinConfig::test_default()
+    };
+    let st = Arc::new(
+        Stroma::open(
+            &test_dir.root,
+            StromaKeratinConfig::from_message_log(cfg),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    );
+
+    st.create_stream(
+        "sensors",
+        0,
+        Some(RetentionConfig {
+            max_records: Some(3),
+            ..Default::default()
+        }),
+    )
+    .await
+    .unwrap();
+
+    for i in 0..10u32 {
+        append(&st, "sensors", format!("m{i}").as_bytes()).await;
+    }
+    let (head_before, tail) = st.stream_head_tail("sensors", 0).await.unwrap();
+    assert_eq!((head_before, tail), (0, 10));
+
+    // A durable cursor that will fall behind retention.
+    st.commit_stream_cursor("sensors", 0, "lagger", 1)
+        .await
+        .unwrap();
+
+    let dropped = st.enforce_stream_retention("sensors", 0).await.unwrap();
+    let new_head = dropped.expect("retention should drop oldest segments");
+    assert!(new_head > 0, "head should advance");
+    assert!(new_head <= 7, "must keep at least the newest ~3 records");
+
+    let (head_after, tail_after) = st.stream_head_tail("sensors", 0).await.unwrap();
+    assert_eq!(head_after, new_head);
+    assert_eq!(tail_after, 10, "the tail (and active segment) is untouched");
+
+    // The lagging cursor was clamped up to the new head.
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "lagger").await.unwrap(),
+        Some(new_head)
+    );
+
+    // Records below the new head are physically gone; the newest are still there.
+    let qh = st.queue_handle("sensors", 0, None).await.unwrap();
+    let qh = qh.resolve().unwrap();
+    assert!(st.scan_messages_from(&qh, new_head, 100).unwrap().len() as u64 >= tail - new_head);
 }
 
 #[tokio::test]

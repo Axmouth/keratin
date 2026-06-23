@@ -20,6 +20,7 @@ pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
+pub use segment::SegmentInfo;
 pub use writer::IoError;
 
 #[derive(Debug)]
