@@ -46,15 +46,19 @@ pub fn encode_record(dst: &mut Vec<u8>, r: &Record<'_>) -> Result<usize, RecordE
 
     let start_len = dst.len();
 
-    // Fixed header fields.
-    dst.extend_from_slice(&RECORD_MAGIC.to_be_bytes());
-    dst.extend_from_slice(&RECORD_VERSION.to_be_bytes());
-    dst.extend_from_slice(&r.flags.to_be_bytes());
-    dst.extend_from_slice(&0u16.to_be_bytes()); // reserved0
-    dst.extend_from_slice(&header_len.to_be_bytes());
-    dst.extend_from_slice(&payload_len.to_be_bytes());
-    dst.extend_from_slice(&r.timestamp_ms.to_be_bytes());
-    dst.extend_from_slice(&r.offset.to_be_bytes());
+    // Fixed 32-byte header packed into one buffer and appended once (fewer Vec
+    // capacity checks and memcpys than appending each field separately). Byte
+    // layout is unchanged: magic, version, flags, reserved0, header_len,
+    // payload_len, timestamp_ms, offset. reserved0 (head[6..8]) stays zero.
+    let mut head = [0u8; 32];
+    head[0..2].copy_from_slice(&RECORD_MAGIC.to_be_bytes());
+    head[2..4].copy_from_slice(&RECORD_VERSION.to_be_bytes());
+    head[4..6].copy_from_slice(&r.flags.to_be_bytes());
+    head[8..12].copy_from_slice(&header_len.to_be_bytes());
+    head[12..16].copy_from_slice(&payload_len.to_be_bytes());
+    head[16..24].copy_from_slice(&r.timestamp_ms.to_be_bytes());
+    head[24..32].copy_from_slice(&r.offset.to_be_bytes());
+    dst.extend_from_slice(&head);
 
     // Variable parts.
     dst.extend_from_slice(r.headers);
