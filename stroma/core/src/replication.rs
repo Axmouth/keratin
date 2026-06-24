@@ -276,6 +276,19 @@ impl Stroma {
         self.advance_queue_epoch(topic, part, None, epoch).await
     }
 
+    /// A stream follower's next offsets for both logs: `(record_next,
+    /// cursor_event_next)`. The follower worker pulls from these so it resumes at
+    /// the right place after a restart without re-fetching the whole log.
+    pub async fn stream_replication_next_offsets(
+        &self,
+        topic: &str,
+        part: u32,
+    ) -> Result<(Offset, Offset)> {
+        let qh = self.queue_handle(topic, part, None).await?;
+        let qh = qh.resolve()?;
+        Ok((qh.msg_log().next_offset(), qh.event_log().next_offset()))
+    }
+
     pub async fn become_stream_follower_with_epoch(
         &self,
         topic: &str,
