@@ -1286,6 +1286,7 @@ impl QueueHandleInner {
             topic: self.topic.clone(),
             partition: self.partition,
             group: self.group.clone(),
+            kind: self.kind(),
             materialized: true,
             exists_on_disk: true,
             evicting: false,
@@ -4278,6 +4279,10 @@ pub struct QueueDebugInfo {
     pub topic: String,
     pub partition: u32,
     pub group: Option<String>,
+    /// Whether this partition is a work queue or a Plexus stream. Streams reuse
+    /// the queue handle, so they appear in this snapshot; the kind lets a viewer
+    /// (e.g. the admin UI) route them to the stream view instead of the queue list.
+    pub kind: PartitionKind,
     pub materialized: bool,
     pub exists_on_disk: bool,
     pub evicting: bool,

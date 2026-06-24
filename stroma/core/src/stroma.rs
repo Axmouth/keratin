@@ -3468,10 +3468,12 @@ impl Stroma {
                 continue;
             }
 
+            let kind = self.read_partition_kind(&tp, *part, group.as_deref());
             queues.push(QueueDebugInfo {
                 topic: tp.to_string(),
                 partition: *part,
                 group: group.map(|group| group.to_string()),
+                kind,
                 materialized: false,
                 exists_on_disk,
                 evicting,

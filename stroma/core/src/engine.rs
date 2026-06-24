@@ -25,7 +25,8 @@ use crate::state::SnapshotMeta;
 // The stream engine (step 2) is the first reader of the kind discriminant and the
 // non-Queue variant, so the helpers are unused until then.
 #[allow(dead_code)]
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, serde::Serialize)]
+#[serde(rename_all = "lowercase")]
 pub enum PartitionKind {
     /// RabbitMQ-style work queue. A message is delivered, leased, and on ack it
     /// is gone (consumed=gone).
