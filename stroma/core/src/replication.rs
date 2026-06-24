@@ -10,6 +10,7 @@ use std::sync::atomic::Ordering;
 
 use keratin_log::{KDurability, Keratin, KeratinReplicaExt, Message, ReplicatedAppendOutcome};
 
+use crate::engine::PartitionKind;
 use crate::event::StromaEvent;
 use crate::state::{QueueInternalState, QueueRole, SnapshotMeta};
 use crate::stream_state::StreamCommand;
@@ -295,6 +296,15 @@ impl Stroma {
         part: u32,
         epoch: u64,
     ) -> Result<()> {
+        // A stream follower must materialize the partition as a stream (kind
+        // marker + stream control actor) so replicated batches can advance the
+        // stream tail, mirroring the owner's create_stream. Idempotent: skip if
+        // the partition is already a stream. Retention is the owner's concern and
+        // is mirrored via replication, so the follower opens with no local
+        // retention policy here.
+        if self.partition_kind(topic, part, None) != PartitionKind::Stream {
+            self.create_stream(topic, part, None).await?;
+        }
         self.become_queue_follower_with_epoch(topic, part, None, epoch)
             .await
     }
