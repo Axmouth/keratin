@@ -12,6 +12,7 @@ use keratin_log::{KDurability, Keratin, KeratinReplicaExt, Message, ReplicatedAp
 
 use crate::event::StromaEvent;
 use crate::state::{QueueInternalState, QueueRole, SnapshotMeta};
+use crate::stream_state::StreamCommand;
 use crate::stroma::{
     QueueDemotionOutcome, QueuePromotionOutcome, Stroma, decode_err, event_msg, io_err,
     replicated_append_outcome_allows_state_apply,
@@ -265,6 +266,34 @@ impl Stroma {
     ) -> Result<()> {
         self.advance_queue_epoch(topic, part, group, epoch).await?;
         self.become_queue_follower(topic, part, group).await
+    }
+
+    /// Stream-named role/epoch wrappers. A stream partition reuses the queue
+    /// handle (record log + cursor-commit event log, no group), so these delegate
+    /// to the queue role machinery; they exist as a distinct seam for the stream
+    /// store and to keep stream call sites readable.
+    pub async fn advance_stream_epoch(&self, topic: &str, part: u32, epoch: u64) -> Result<u64> {
+        self.advance_queue_epoch(topic, part, None, epoch).await
+    }
+
+    pub async fn become_stream_follower_with_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        epoch: u64,
+    ) -> Result<()> {
+        self.become_queue_follower_with_epoch(topic, part, None, epoch)
+            .await
+    }
+
+    pub async fn become_stream_owner_with_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        epoch: u64,
+    ) -> Result<()> {
+        self.become_queue_owner_with_epoch(topic, part, None, epoch)
+            .await
     }
 
     pub async fn promote_queue_follower_if_caught_up(
@@ -559,6 +588,39 @@ impl Stroma {
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
     ) -> Result<ReplicatedQueueApplyOutcome> {
+        self.apply_replicated_two_log_batch(topic, part, group, messages, events, false)
+            .await
+    }
+
+    /// Apply a replicated two-log batch to a STREAM partition: records to the
+    /// message log, cursor-commit events to the event log. Identical to the queue
+    /// apply except the stream tail is advanced after the record append, so the
+    /// follower's head/tail (and a promoted owner's fan-out + cursor clamping)
+    /// reflect the applied records, mirroring the owner append path. Streams have
+    /// no group.
+    pub async fn apply_replicated_stream_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        messages: Option<ReplicatedMessageBatch>,
+        events: Option<ReplicatedEventBatch>,
+    ) -> Result<ReplicatedQueueApplyOutcome> {
+        self.apply_replicated_two_log_batch(topic, part, None, messages, events, true)
+            .await
+    }
+
+    /// Shared two-log follower apply for queues and streams. `advance_stream_tail`
+    /// is the only difference: streams advance the keratin stream actor's tail
+    /// after the record append; queues have no stream actor and pass `false`.
+    async fn apply_replicated_two_log_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        messages: Option<ReplicatedMessageBatch>,
+        events: Option<ReplicatedEventBatch>,
+        advance_stream_tail: bool,
+    ) -> Result<ReplicatedQueueApplyOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let role = qh.role();
@@ -572,8 +634,10 @@ impl Stroma {
         qh.event_log().become_follower();
 
         let message_log = match messages {
-            Some(batch) => Some(
-                qh.msg_log()
+            Some(batch) => {
+                let msg_next = batch.first_offset + batch.records.len() as u64;
+                let outcome = qh
+                    .msg_log()
                     .append_replicated_batch(
                         batch.epoch,
                         batch.first_offset,
@@ -581,8 +645,19 @@ impl Stroma {
                         batch.durability,
                     )
                     .await
-                    .map_err(io_err)?,
-            ),
+                    .map_err(io_err)?;
+                if advance_stream_tail && replicated_append_outcome_allows_state_apply(&outcome) {
+                    let (tx, rx) = tokio::sync::oneshot::channel();
+                    qh.stream_command_enqueue(StreamCommand::AdvanceTail {
+                        next_offset: msg_next,
+                        response: Some(tx),
+                    })
+                    .await
+                    .map_err(io_err)?;
+                    rx.await.map_err(|_| StromaError::QueueActorGone)?;
+                }
+                Some(outcome)
+            }
             None => None,
         };
 

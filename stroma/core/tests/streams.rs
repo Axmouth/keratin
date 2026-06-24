@@ -1,11 +1,12 @@
 use std::sync::Arc;
 
 use keratin_log::{
-    CompletionPair, KeratinAppendCompletion, KeratinConfig, test_dir, util::TempDir,
+    CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig, Message, test_dir,
+    util::TempDir,
 };
 use stroma_core::{
-    DeclareMeta, MessageHeaders, Offset, RetentionConfig, SnapshotConfig, Stroma, StromaError,
-    StromaKeratinConfig,
+    DeclareMeta, MessageHeaders, Offset, ReplicatedEventBatch, ReplicatedMessageBatch,
+    RetentionConfig, SnapshotConfig, Stroma, StromaError, StromaEvent, StromaKeratinConfig,
 };
 
 async fn open_on(dir: &std::path::Path) -> Arc<Stroma> {
@@ -52,6 +53,65 @@ async fn stream_append_assigns_sequential_offsets_and_advances_tail() {
 
     let (head, tail) = st.stream_head_tail("sensors", 0).await.unwrap();
     assert_eq!((head, tail), (0, 3));
+}
+
+#[tokio::test]
+async fn follower_apply_replicated_stream_batch_advances_tail_and_cursor() {
+    // A stream follower applies a replicated two-log batch: records to the
+    // message log (at the owner's offsets) and a cursor-commit event. The stream
+    // tail advances so head/tail and a promoted owner reflect the records, and
+    // the replicated cursor is committed so subscribers resume correctly.
+    let (st, _dir) = open_test_stroma().await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    st.become_stream_follower_with_epoch("sensors", 0, 0)
+        .await
+        .unwrap();
+
+    st.apply_replicated_stream_batch(
+        "sensors",
+        0,
+        Some(ReplicatedMessageBatch {
+            epoch: 0,
+            first_offset: 0,
+            records: vec![
+                Message {
+                    flags: 0,
+                    headers: headers().encode().unwrap(),
+                    payload: b"a".to_vec(),
+                },
+                Message {
+                    flags: 0,
+                    headers: headers().encode().unwrap(),
+                    payload: b"b".to_vec(),
+                },
+            ],
+            durability: Some(KDurability::AfterFsync),
+        }),
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 0,
+            events: vec![StromaEvent::CursorCommit {
+                name: "group-a".into(),
+                offset: 2,
+            }],
+            durability: Some(KDurability::AfterFsync),
+        }),
+    )
+    .await
+    .unwrap();
+
+    let (head, tail) = st.stream_head_tail("sensors", 0).await.unwrap();
+    assert_eq!((head, tail), (0, 2), "tail advanced to reflect applied records");
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "group-a").await.unwrap(),
+        Some(2),
+        "replicated cursor commit applied"
+    );
+
+    // Records are readable at the owner's offsets, oldest first.
+    let records = st.read_stream_records("sensors", 0, 0, 10).await.unwrap();
+    let payloads: Vec<&[u8]> = records.iter().map(|(_, p, _)| p.as_slice()).collect();
+    assert_eq!(payloads, vec![b"a".as_slice(), b"b".as_slice()]);
 }
 
 #[tokio::test]
