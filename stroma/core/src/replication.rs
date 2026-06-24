@@ -319,6 +319,22 @@ impl Stroma {
             .await
     }
 
+    /// Failover promotion for a stream follower (dead owner, no expected tails):
+    /// promote at the local log tails under the assignment epoch fence. A stream
+    /// reuses the queue handle (group None), and the events-applied gate carries
+    /// over unchanged - here the "events" are cursor-commit events, so a promoted
+    /// stream owner is guaranteed to have applied every replicated cursor before
+    /// it serves subscribers.
+    pub async fn promote_stream_follower_to_local_tail(
+        &self,
+        topic: &str,
+        part: u32,
+        epoch: u64,
+    ) -> Result<QueuePromotionOutcome> {
+        self.promote_queue_follower_to_local_tail(topic, part, None, epoch)
+            .await
+    }
+
     pub async fn promote_queue_follower_if_caught_up(
         &self,
         topic: &str,
