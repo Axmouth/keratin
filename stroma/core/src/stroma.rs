@@ -2010,6 +2010,15 @@ impl Stroma {
                     response: None,
                 })?;
             }
+            StromaEvent::CursorCommitBatch { commits } => {
+                qh.blocking_stream_command_enqueue(StreamCommand::CommitCursors {
+                    commits: commits
+                        .into_iter()
+                        .map(|(name, offset)| (name.into(), offset))
+                        .collect(),
+                    response: None,
+                })?;
+            }
             StromaEvent::StreamTruncate { before } => {
                 // Logical head advance only on the blocking path. Physical reclaim
                 // happens on the async apply path that emits and replicates this
@@ -2221,6 +2230,19 @@ impl Stroma {
                 qh.stream_command_enqueue(StreamCommand::CommitCursor {
                     name: name.into(),
                     offset,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            StromaEvent::CursorCommitBatch { commits } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.stream_command_enqueue(StreamCommand::CommitCursors {
+                    commits: commits
+                        .into_iter()
+                        .map(|(name, offset)| (name.into(), offset))
+                        .collect(),
                     response: Some(tx),
                 })
                 .await
@@ -3990,6 +4012,31 @@ impl Stroma {
         let ev = StromaEvent::CursorCommit {
             name: name.into(),
             offset,
+        };
+        let durability = self.keratin_cfg_event.default_durability;
+        self.append_events_durable(tp, part, None, vec![ev], durability)
+            .await?;
+        Ok(())
+    }
+
+    /// Commit a coalesced batch of stream cursors in ONE durable record and ONE
+    /// in-memory apply (a single `CursorCommitBatch` event + one actor command),
+    /// instead of one of each per cursor. Used by the broker's cursor-commit
+    /// microbatcher to amortize high-fan-out auto-ack. Empty input is a no-op.
+    pub async fn commit_stream_cursors(
+        &self,
+        tp: &str,
+        part: u32,
+        commits: Vec<(String, Offset)>,
+    ) -> Result<()> {
+        if commits.is_empty() {
+            return Ok(());
+        }
+        let ev = StromaEvent::CursorCommitBatch {
+            commits: commits
+                .into_iter()
+                .map(|(name, offset)| (name.into_boxed_str(), offset))
+                .collect(),
         };
         let durability = self.keratin_cfg_event.default_durability;
         self.append_events_durable(tp, part, None, vec![ev], durability)

@@ -309,6 +309,14 @@ pub enum StreamCommand {
         offset: Offset,
         response: Option<oneshot::Sender<()>>,
     },
+    /// Record a coalesced batch of cursor positions in one actor message. The
+    /// broker microbatches a window of acks into this so high-fan-out auto-ack
+    /// does not send one command per record. Each entry applies exactly like
+    /// [`StreamCommand::CommitCursor`].
+    CommitCursors {
+        commits: Vec<(String, Offset)>,
+        response: Option<oneshot::Sender<()>>,
+    },
     /// Read a durable cursor position.
     GetCursor {
         name: String,
@@ -378,6 +386,14 @@ pub async fn run_stream_control(mut state: StreamState, mut rx: mpsc::Receiver<S
                 response,
             } => {
                 state.commit_cursor(name, offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::CommitCursors { commits, response } => {
+                for (name, offset) in commits {
+                    state.commit_cursor(name, offset);
+                }
                 if let Some(r) = response {
                     let _ = r.send(());
                 }

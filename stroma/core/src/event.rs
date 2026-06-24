@@ -29,6 +29,7 @@ pub enum EventType {
     Snapshot = 70,
     CursorCommit = 80,
     StreamTruncate = 81,
+    CursorCommitBatch = 82,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -278,6 +279,15 @@ pub enum StromaEvent {
         name: Box<str>,
         offset: Offset,
     },
+    /// Stream (Plexus) engine: a coalesced batch of cursor commits, one durable
+    /// record and one in-memory apply for many `(name, offset)` advances. The
+    /// broker microbatches a window of acks (cursors are monotonic high-water
+    /// marks, last-write-wins) into this so high-fan-out auto-ack does not flood
+    /// the event log or the stream control actor with one commit per record.
+    /// Semantically equivalent to a sequence of `CursorCommit`s.
+    CursorCommitBatch {
+        commits: Vec<(Box<str>, Offset)>,
+    },
     /// Stream (Plexus) engine: retention dropped everything below `before`. Applied
     /// by advancing the stream head watermark (and clamping lagging cursors) plus a
     /// best-effort physical message-log truncation, so owner and followers converge
@@ -417,6 +427,7 @@ impl StromaEvent {
             // never triggers the dangling-reference recovery check. A truncation
             // boundary is a delete directive, likewise not a durable reference.
             | StromaEvent::CursorCommit { .. }
+            | StromaEvent::CursorCommitBatch { .. }
             | StromaEvent::StreamTruncate { .. } => None,
         }
     }
@@ -594,6 +605,20 @@ impl StromaEvent {
                 put_u16(&mut out, EventType::CursorCommit as u16);
                 put_str(&mut out, name)?;
                 put_u64(&mut out, *offset);
+            }
+            StromaEvent::CursorCommitBatch { commits } => {
+                put_u16(&mut out, EventType::CursorCommitBatch as u16);
+                if commits.len() > u32::MAX as usize {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "cursor commit batch too large",
+                    ));
+                }
+                put_u32(&mut out, commits.len() as u32);
+                for (name, offset) in commits {
+                    put_str(&mut out, name)?;
+                    put_u64(&mut out, *offset);
+                }
             }
             StromaEvent::StreamTruncate { before } => {
                 put_u16(&mut out, EventType::StreamTruncate as u16);
@@ -839,6 +864,16 @@ impl StromaEvent {
                 let name = rd_box_str(bytes, &mut i)?;
                 let offset = rd_u64(bytes, &mut i)?;
                 Ok(StromaEvent::CursorCommit { name, offset })
+            }
+            x if x == EventType::CursorCommitBatch as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut commits = Vec::with_capacity(count);
+                for _ in 0..count {
+                    let name = rd_box_str(bytes, &mut i)?;
+                    let offset = rd_u64(bytes, &mut i)?;
+                    commits.push((name, offset));
+                }
+                Ok(StromaEvent::CursorCommitBatch { commits })
             }
             x if x == EventType::StreamTruncate as u16 => {
                 let before = rd_u64(bytes, &mut i)?;

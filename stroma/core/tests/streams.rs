@@ -136,6 +136,53 @@ async fn stream_cursor_commits_and_reads_back() {
 }
 
 #[tokio::test]
+async fn stream_cursor_batch_commit_applies_and_survives_restart() {
+    let (st, dir) = open_test_stroma().await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    for _ in 0..6 {
+        append(&st, "sensors", b"x").await;
+    }
+
+    // One batch commits several cursors at once (one durable record, one apply).
+    st.commit_stream_cursors(
+        "sensors",
+        0,
+        vec![
+            ("group-a".to_string(), 2),
+            ("group-b".to_string(), 4),
+            ("group-c".to_string(), 5),
+        ],
+    )
+    .await
+    .unwrap();
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "group-a").await.unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "group-b").await.unwrap(),
+        Some(4)
+    );
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "group-c").await.unwrap(),
+        Some(5)
+    );
+
+    // The batch event replays on recovery exactly like single commits.
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st2 = open_on(&dir.root).await;
+    assert_eq!(
+        st2.stream_cursor("sensors", 0, "group-a").await.unwrap(),
+        Some(2)
+    );
+    assert_eq!(
+        st2.stream_cursor("sensors", 0, "group-c").await.unwrap(),
+        Some(5)
+    );
+}
+
+#[tokio::test]
 async fn stream_cursor_and_tail_survive_restart_via_event_replay() {
     let (st, dir) = open_test_stroma().await;
     st.create_stream("sensors", 0, None).await.unwrap();
