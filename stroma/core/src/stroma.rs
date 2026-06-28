@@ -2491,7 +2491,7 @@ impl Stroma {
             let hint = async {
                 let qh = self.queue_handle(&t, p, g.as_deref()).await?;
                 let qh = qh.resolve()?;
-                if qh.role() != QueueRole::Owner {
+                if qh.kind() != PartitionKind::Queue || qh.role() != QueueRole::Owner {
                     return Ok::<Option<UnixMillis>, StromaError>(None);
                 }
                 Ok(qh.next_expiry_hint().await)
@@ -2549,7 +2549,9 @@ impl Stroma {
             let collected = async {
                 let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
                 let qh = qh.resolve()?;
-                if qh.role() != QueueRole::Owner {
+                // Only owner work queues have lease-expiry. Streams have their own
+                // retention worker and run no work-queue actor.
+                if qh.kind() != PartitionKind::Queue || qh.role() != QueueRole::Owner {
                     return Ok::<Vec<Offset>, StromaError>(Vec::new());
                 }
                 qh.collect_expired(now, want).await.map_err(StromaError::from)
@@ -5011,22 +5013,31 @@ impl Stroma {
             std::result::Result<QueueStatusReport, String>,
         > = HashMap::new();
         for (tp, part, group) in self.queue_keys_snapshot() {
-            // Report per queue so one unreachable partition (e.g. a torn-down
-            // actor whose handle is still materialized) does not blank the whole
-            // snapshot. A queue spans partitions under one (tp, group), so prefer a
-            // successful report over an error: a single dead partition must not mask
-            // healthy ones.
-            let report: std::result::Result<QueueStatusReport, String> = async {
+            // Report per queue so one unreachable partition does not blank the whole
+            // snapshot. Skip Plexus streams: they run a StreamEngine, not the
+            // work-queue actor, so a status report routed to one finds no actor.
+            // Streams report under the stream stats path. A queue spans partitions
+            // under one (tp, group), so prefer a successful report over an error: a
+            // single dead partition must not mask healthy ones.
+            let outcome: std::result::Result<Option<QueueStatusReport>, StromaError> = async {
                 let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
                 let qh = qh.resolve()?;
-                qh.status_report().await.map_err(io_err)
+                if qh.kind() != PartitionKind::Queue {
+                    return Ok(None);
+                }
+                Ok(Some(qh.status_report().await.map_err(io_err)?))
             }
-            .await
-            .map_err(|err: StromaError| err.to_string());
+            .await;
+
+            let report = match outcome {
+                Ok(None) => continue, // not a work queue
+                Ok(Some(report)) => Ok(report),
+                Err(err) => Err(err.to_string()),
+            };
 
             let key = (tp, group);
-            // Keep a successful report once we have one; otherwise record the latest
-            // (so an all-dead queue still surfaces its error).
+            // Keep a successful report once we have one. Otherwise record the latest,
+            // so an all-dead queue still surfaces its error.
             if matches!(stats.get(&key), Some(Ok(_))) {
                 continue;
             }
