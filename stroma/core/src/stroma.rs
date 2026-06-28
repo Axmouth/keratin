@@ -2487,16 +2487,30 @@ impl Stroma {
         let mut min: Option<UnixMillis> = None;
         let keys = self.queue_keys_snapshot();
         for (t, p, g) in keys {
-            let qh = self.queue_handle(&t, p, g.as_deref()).await?;
-            let qh = qh.resolve()?;
-            if qh.role() != QueueRole::Owner {
-                continue;
+            // Per queue so one unreachable partition does not drop the hint for all.
+            let hint = async {
+                let qh = self.queue_handle(&t, p, g.as_deref()).await?;
+                let qh = qh.resolve()?;
+                if qh.role() != QueueRole::Owner {
+                    return Ok::<Option<UnixMillis>, StromaError>(None);
+                }
+                Ok(qh.next_expiry_hint().await)
             }
-            if let Some(hint) = qh.next_expiry_hint().await {
-                min = Some(match min {
-                    Some(m) => m.min(hint),
-                    None => hint,
-                });
+            .await;
+            match hint {
+                Ok(Some(hint)) => {
+                    min = Some(match min {
+                        Some(m) => m.min(hint),
+                        None => hint,
+                    });
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::warn!(
+                        topic = %t, partition = p, group = ?g, %err,
+                        "expiry: skipping queue, next_expiry_hint failed"
+                    );
+                }
             }
         }
 
@@ -2526,16 +2540,32 @@ impl Stroma {
         let keys = self.queue_keys_snapshot();
         for key in keys {
             let (tp, part, group) = key;
-            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
-            let qh = qh.resolve()?;
-            if qh.role() != QueueRole::Owner {
-                continue;
-            }
             if out.len() >= max {
                 break;
             }
             let want = max - out.len();
-            for off in qh.collect_expired(now, want).await? {
+            // Collect per queue so one unreachable partition does not abort expiry
+            // for the rest. A non-owner contributes nothing.
+            let collected = async {
+                let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+                let qh = qh.resolve()?;
+                if qh.role() != QueueRole::Owner {
+                    return Ok::<Vec<Offset>, StromaError>(Vec::new());
+                }
+                qh.collect_expired(now, want).await.map_err(StromaError::from)
+            }
+            .await;
+            let offsets = match collected {
+                Ok(offsets) => offsets,
+                Err(err) => {
+                    tracing::warn!(
+                        topic = %tp, partition = part, group = ?group, %err,
+                        "expiry: skipping queue, collect_expired failed"
+                    );
+                    continue;
+                }
+            };
+            for off in offsets {
                 out.push((
                     tp.to_string(),
                     part,
@@ -4974,13 +5004,33 @@ impl Stroma {
 
     pub async fn get_queues_stats(
         &self,
-    ) -> Result<HashMap<(Box<str>, Option<Box<str>>), QueueStatusReport>> {
-        let mut stats = HashMap::new();
+    ) -> Result<HashMap<(Box<str>, Option<Box<str>>), std::result::Result<QueueStatusReport, String>>>
+    {
+        let mut stats: HashMap<
+            (Box<str>, Option<Box<str>>),
+            std::result::Result<QueueStatusReport, String>,
+        > = HashMap::new();
         for (tp, part, group) in self.queue_keys_snapshot() {
-            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
-            let qh = qh.resolve()?;
-            let status = qh.status_report().await.map_err(io_err)?;
-            stats.insert((tp, group), status);
+            // Report per queue so one unreachable partition (e.g. a torn-down
+            // actor whose handle is still materialized) does not blank the whole
+            // snapshot. A queue spans partitions under one (tp, group), so prefer a
+            // successful report over an error: a single dead partition must not mask
+            // healthy ones.
+            let report: std::result::Result<QueueStatusReport, String> = async {
+                let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+                let qh = qh.resolve()?;
+                qh.status_report().await.map_err(io_err)
+            }
+            .await
+            .map_err(|err: StromaError| err.to_string());
+
+            let key = (tp, group);
+            // Keep a successful report once we have one; otherwise record the latest
+            // (so an all-dead queue still surfaces its error).
+            if matches!(stats.get(&key), Some(Ok(_))) {
+                continue;
+            }
+            stats.insert(key, report);
         }
         Ok(stats)
     }
