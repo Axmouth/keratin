@@ -2098,59 +2098,6 @@ impl WorkQueueHandle<'_> {
         Ok(())
     }
 
-    pub async fn enqueue_many(&self, reqs: Vec<EnqueueEventMeta>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-
-        let _ = self
-            .command_enqueue(QueueCommand::EnqueueMany {
-                reqs,
-                response: Some(tx),
-            })
-            .await;
-
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
-    pub async fn enqueue_delayed(
-        &self,
-        offset: Offset,
-        not_before: UnixMillis,
-    ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-
-        let _ = self
-            .command_enqueue(QueueCommand::EnqueueDelayed {
-                offset,
-                not_before,
-                response: Some(tx),
-            })
-            .await;
-
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
-    pub async fn enqueue_delayed_many(
-        &self,
-        reqs: Vec<EnqueueDelayedEventMeta>,
-    ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-
-        let _ = self
-            .command_enqueue(QueueCommand::EnqueueDelayedMany {
-                reqs,
-                response: Some(tx),
-            })
-            .await;
-
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
     pub async fn mark_inflight(
         &self,
         offset: Offset,
@@ -2200,19 +2147,6 @@ impl WorkQueueHandle<'_> {
         Ok(())
     }
 
-    pub async fn ack_many(&self, reqs: Vec<AckEventMeta>) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::AckMany {
-                reqs,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
     pub async fn release_inflight_many(
         &self,
         reqs: Vec<AckEventMeta>,
@@ -2250,28 +2184,6 @@ impl WorkQueueHandle<'_> {
             self.deadline_waker().notify_one();
         }
         Ok(outcome)
-    }
-
-    pub async fn nack_many(
-        &self,
-        reqs: Vec<NackEventMeta>,
-    ) -> Result<Vec<(Offset, NackOutcome)>, QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::NackMany {
-                reqs,
-                response: Some(tx),
-            })
-            .await;
-        let outcomes = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        for (_offset, outcome) in &outcomes {
-            if let NackOutcome::RequeuedLater { .. } = outcome {
-                self.deadline_waker().notify_one();
-                break;
-            }
-        }
-        Ok(outcomes)
     }
 
     pub async fn dead_letter_commit(&self, offsets: Vec<Offset>) -> Result<(), QueueHandleError> {
@@ -2355,22 +2267,6 @@ impl WorkQueueHandle<'_> {
             next_offset_hint: from,
             items: Vec::new(),
         })
-    }
-
-    pub async fn mark_pending_dlq_many(
-        &self,
-        offsets: Vec<Offset>,
-    ) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::MarkPendingDlq {
-                offsets,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
     }
 
 }
