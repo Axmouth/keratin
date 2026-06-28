@@ -46,6 +46,7 @@ async fn expired_messages_are_redelivered_and_never_lost() {
     let (st, _td) = open_test_stroma().await;
     let q = st.queue_handle("t", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
+    let q = q.work_queue().unwrap();
 
     for i in 0..100 {
         q.enqueue(i, 0).await.unwrap();

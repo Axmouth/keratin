@@ -1601,7 +1601,13 @@ impl Stroma {
             Some(h) => h.clone(),
             None => return Ok(EvictOutcome::NotMaterialized),
         };
-        if qh.inflight_len().await > 0 {
+        // Streams have no leased-delivery set, so the inflight guard only applies
+        // to work queues. A stream is always safe on this axis.
+        let inflight = match qh.as_work_queue() {
+            Some(wq) => wq.inflight_len().await,
+            None => 0,
+        };
+        if inflight > 0 {
             return Ok(EvictOutcome::HasInflight);
         }
 
@@ -1643,8 +1649,12 @@ impl Stroma {
 
         qh.cancel_background_tasks();
 
-        // Shut down old handle. Pending writes flush; logs close.
-        qh.shutdown().await;
+        // Shut down old handle. Pending writes flush and the logs close. The
+        // stream actor exits when the slot drops its sender, so it has no
+        // explicit shutdown command.
+        if let Some(wq) = qh.as_work_queue() {
+            wq.shutdown().await;
+        }
         qh.event_log().shutdown().await.map_err(io_err)?;
         qh.msg_log().shutdown().await.map_err(io_err)?;
 
@@ -1719,7 +1729,8 @@ impl Stroma {
             // the primitive safe if it is ever called on a live one.
             if let Some(slot) = &existing
                 && let Some(qh) = slot.handle.get()
-                && qh.inflight_len().await > 0
+                && let Some(wq) = qh.as_work_queue()
+                && wq.inflight_len().await > 0
             {
                 return Ok(DestroyOutcome::HasInflight);
             }
@@ -1745,7 +1756,9 @@ impl Stroma {
             // ops error, no hang), so an append in progress is not cut off.
             qh.quiesce_for_teardown().await;
             qh.cancel_background_tasks();
-            qh.shutdown().await;
+            if let Some(wq) = qh.as_work_queue() {
+                wq.shutdown().await;
+            }
             qh.event_log().shutdown().await.map_err(io_err)?;
             qh.msg_log().shutdown().await.map_err(io_err)?;
         }
@@ -1825,7 +1838,11 @@ impl Stroma {
         let Some(handle) = slot.handle.get() else {
             return Ok(false);
         };
-        Ok(handle.inflight_len().await > 0)
+        // A stream has no leased deliveries, so it is never "inflight".
+        Ok(match handle.as_work_queue() {
+            Some(wq) => wq.inflight_len().await > 0,
+            None => false,
+        })
     }
 
     async fn ensure_queue(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
@@ -2429,7 +2446,7 @@ impl Stroma {
     ) -> Result<Offset> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.lowest_unacked_offset().await)
+        Ok(q.work_queue()?.lowest_unacked_offset().await)
     }
 
     pub async fn is_inflight_or_acked(
@@ -2441,7 +2458,7 @@ impl Stroma {
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.is_inflight_or_acked(off).await)
+        Ok(q.work_queue()?.is_inflight_or_acked(off).await)
     }
 
     pub async fn is_ready(
@@ -2453,7 +2470,7 @@ impl Stroma {
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.is_ready(off).await)
+        Ok(q.work_queue()?.is_ready(off).await)
     }
 
     pub async fn filter_not_enqueued(
@@ -2465,7 +2482,7 @@ impl Stroma {
     ) -> Result<Vec<(Offset, Vec<u8>)>> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.filter_not_enqueued(items).await)
+        Ok(q.work_queue()?.filter_not_enqueued(items).await)
     }
 
     fn queue_keys_snapshot(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
@@ -2491,10 +2508,15 @@ impl Stroma {
             let hint = async {
                 let qh = self.queue_handle(&t, p, g.as_deref()).await?;
                 let qh = qh.resolve()?;
-                if qh.kind() != PartitionKind::Queue || qh.role() != QueueRole::Owner {
+                // Only owner work queues have lease-expiry. The projection skips
+                // streams (which run no work-queue actor) by construction.
+                let Some(wq) = qh.as_work_queue() else {
+                    return Ok::<Option<UnixMillis>, StromaError>(None);
+                };
+                if wq.role() != QueueRole::Owner {
                     return Ok::<Option<UnixMillis>, StromaError>(None);
                 }
-                Ok(qh.next_expiry_hint().await)
+                Ok(wq.next_expiry_hint().await)
             }
             .await;
             match hint {
@@ -2527,7 +2549,7 @@ impl Stroma {
     ) -> Result<Option<Offset>> {
         let q = self.queue_handle(topic, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.next_deliverable(from, upper).await)
+        Ok(q.work_queue()?.next_deliverable(from, upper).await)
     }
 
     pub async fn collect_expired(
@@ -2550,11 +2572,15 @@ impl Stroma {
                 let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
                 let qh = qh.resolve()?;
                 // Only owner work queues have lease-expiry. Streams have their own
-                // retention worker and run no work-queue actor.
-                if qh.kind() != PartitionKind::Queue || qh.role() != QueueRole::Owner {
+                // retention worker and run no work-queue actor, so the projection
+                // skips them by construction.
+                let Some(wq) = qh.as_work_queue() else {
+                    return Ok::<Vec<Offset>, StromaError>(Vec::new());
+                };
+                if wq.role() != QueueRole::Owner {
                     return Ok::<Vec<Offset>, StromaError>(Vec::new());
                 }
-                qh.collect_expired(now, want).await.map_err(StromaError::from)
+                wq.collect_expired(now, want).await.map_err(StromaError::from)
             }
             .await;
             let offsets = match collected {
@@ -2646,11 +2672,16 @@ impl Stroma {
             }
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
             let qh = qh.resolve()?;
-            if qh.role() != QueueRole::Owner {
+            // Message TTL applies only to owner work queues. Streams expire by
+            // their own retention worker, so the projection skips them.
+            let Some(wq) = qh.as_work_queue() else {
+                continue;
+            };
+            if wq.role() != QueueRole::Owner {
                 continue;
             }
             let want = max - dropped.len();
-            let expired = qh.collect_ttl_expired(now, want).await?;
+            let expired = wq.collect_ttl_expired(now, want).await?;
             if expired.is_empty() {
                 continue;
             }
@@ -2722,7 +2753,14 @@ impl Stroma {
             return Ok::<(), StromaError>(());
         }
         let msg_log = qh.msg_log();
-        let safe_msg_truncate = qh.lowest_not_acked_offset().await;
+        // The message-log truncation floor is the lowest un-acked offset for a
+        // work queue. A stream has no acks and prunes its message log through its
+        // own retention worker, so it contributes no floor here (0 truncates
+        // nothing).
+        let safe_msg_truncate = match qh.as_work_queue() {
+            Some(wq) => wq.lowest_not_acked_offset().await,
+            None => 0,
+        };
         let applied_upto = qh.applied_upto().load(Ordering::Relaxed);
         // let every = stroma.snap_cfg.every_events.max(1);
         // let last = qh.last_snapshot_event_offset();
@@ -3278,14 +3316,13 @@ impl Stroma {
         }
 
         // Re-issue any DLQ copies that were pending at the crash. Streams have no
-        // dead-letter path, so this is a work-queue-only recovery step (its
-        // commands target the queue engine and would error on a stream).
-        if h.kind() == PartitionKind::Queue {
-            let pending = h.pending_dlq().await?;
+        // dead-letter path, so this is a work-queue-only recovery step.
+        if let Some(wq) = h.as_work_queue() {
+            let pending = wq.pending_dlq().await?;
             let source_tp = tp;
             let source_part = part;
             let source_group = group;
-            let target = h.get_dlq_target().await?;
+            let target = wq.get_dlq_target().await?;
             let src = (
                 source_tp.to_string(),
                 source_part,
@@ -3456,7 +3493,9 @@ impl Stroma {
             if let Some(q) = slot.handle.get() {
                 let q = q.clone();
                 futs.push(async move {
-                    q.shutdown().await;
+                    if let Some(wq) = q.as_work_queue() {
+                        wq.shutdown().await;
+                    }
                     q.event_log().shutdown().await.map_err(io_err)?;
                     q.msg_log().shutdown().await.map_err(io_err)?;
                     Ok::<_, StromaError>(())
@@ -3868,15 +3907,7 @@ impl Stroma {
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
         let qh = self.queue_handle(tp, part, None).await?;
         if let Some(retention) = retention {
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            qh.resolve()?
-                .stream_command_enqueue(StreamCommand::SetRetention {
-                    config: retention,
-                    response: Some(tx),
-                })
-                .await
-                .map_err(io_err)?;
-            rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            qh.resolve()?.stream()?.set_retention(retention).await?;
         }
         Ok(())
     }
@@ -3922,15 +3953,7 @@ impl Stroma {
         let msg_offset = ar.base_offset;
         let next = msg_offset + ar.count as u64;
 
-        let h = qh.resolve()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        h.stream_command_enqueue(StreamCommand::AdvanceTail {
-            next_offset: next,
-            response: Some(tx),
-        })
-        .await
-        .map_err(io_err)?;
-        rx.await.map_err(|_| StromaError::QueueActorGone)?;
+        qh.resolve()?.stream()?.advance_tail(next).await?;
 
         Ok(msg_offset)
     }
@@ -3991,13 +4014,10 @@ impl Stroma {
             };
             // Advance the tail (fire and forget, max-semantics). Order across
             // concurrent appends does not matter: the tail only ever moves forward.
-            if let Ok(h) = qh.resolve() {
-                let _ = h
-                    .stream_command_enqueue(StreamCommand::AdvanceTail {
-                        next_offset: base + count,
-                        response: None,
-                    })
-                    .await;
+            if let Ok(h) = qh.resolve()
+                && let Some(s) = h.as_stream()
+            {
+                let _ = s.advance_tail_unconfirmed(base + count).await;
             }
             let _ = offset_tx.send(base);
 
@@ -4080,27 +4100,14 @@ impl Stroma {
     /// committed position.
     pub async fn stream_cursor(&self, tp: &str, part: u32, name: &str) -> Result<Option<Offset>> {
         let qh = self.queue_handle(tp, part, None).await?;
-        let h = qh.resolve()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        h.stream_command_enqueue(StreamCommand::GetCursor {
-            name: name.to_string(),
-            response: tx,
-        })
-        .await
-        .map_err(io_err)?;
-        rx.await.map_err(|_| StromaError::QueueActorGone)
+        Ok(qh.resolve()?.stream()?.cursor(name).await?)
     }
 
     /// Read a stream's current head/tail watermarks (lowest retained offset and
     /// one past the last appended offset).
     pub async fn stream_head_tail(&self, tp: &str, part: u32) -> Result<(Offset, Offset)> {
         let qh = self.queue_handle(tp, part, None).await?;
-        let h = qh.resolve()?;
-        let (tx, rx) = tokio::sync::oneshot::channel();
-        h.stream_command_enqueue(StreamCommand::GetHeadTail { response: tx })
-            .await
-            .map_err(io_err)?;
-        rx.await.map_err(|_| StromaError::QueueActorGone)
+        Ok(qh.resolve()?.stream()?.head_tail().await?)
     }
 
     /// Read up to `max` stream records starting at `from`, for subscribe backfill.
@@ -4155,14 +4162,10 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, None).await?;
         let (config, head, tail, infos) = {
             let h = qh.resolve()?;
-            if h.kind() != PartitionKind::Stream {
+            let Some(s) = h.as_stream() else {
                 return Ok(None);
-            }
-            let (tx, rx) = tokio::sync::oneshot::channel();
-            h.stream_command_enqueue(StreamCommand::GetRetentionState { response: tx })
-                .await
-                .map_err(io_err)?;
-            let (config, head, tail) = rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            };
+            let (config, head, tail) = s.retention_state().await?;
             let infos = h.msg_log().segment_infos().map_err(io_err)?;
             (config, head, tail, infos)
         };
@@ -4311,7 +4314,8 @@ impl Stroma {
             .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
         qh.set_dirty_snapshot(true);
 
-        qh.release_inflight_many(reqs)
+        qh.work_queue()?
+            .release_inflight_many(reqs)
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?;
 
@@ -4403,7 +4407,7 @@ impl Stroma {
                 .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
                 .await
                 .map_err(io_err)?;
-            h.discard_pending_dlq(to_discard).await?;
+            h.work_queue()?.discard_pending_dlq(to_discard).await?;
         }
 
         // DLQ-bound: emit DeadLetter event with resolved targets.
@@ -4492,7 +4496,7 @@ impl Stroma {
         qh: &QueueHandleInner,
         requests: &[(Offset, u32, DeadLetterReason)],
     ) -> Result<(Vec<DeadLetterMeta>, Vec<Offset>)> {
-        let resolved = match qh.get_dlq_target().await {
+        let resolved = match qh.work_queue()?.get_dlq_target().await {
             Ok(t) => t,
             Err(e) => {
                 tracing::error!(
@@ -4738,7 +4742,10 @@ impl Stroma {
         // Offsets are now already marked inflight inside queue. `upper` is the
         // exclusive deliverable ceiling (replica-durable committed watermark);
         // u64::MAX disables it for local-durable queues.
-        let offs = qs.poll_ready_and_mark(max, lease_deadline, upper).await?;
+        let offs = qs
+            .work_queue()?
+            .poll_ready_and_mark(max, lease_deadline, upper)
+            .await?;
 
         if offs.is_empty() {
             return Ok(Vec::new());
@@ -4840,7 +4847,8 @@ impl Stroma {
     ) -> Result<MessageInspectionPage> {
         let qh = self.queue_handle(tp, part, group).await?;
         let qh = qh.resolve()?;
-        let snapshot: QueueInspectionSnapshot = qh.inspect_offsets(from, limit, mode).await;
+        let snapshot: QueueInspectionSnapshot =
+            qh.work_queue()?.inspect_offsets(from, limit, mode).await;
         if snapshot.items.is_empty() {
             return Ok(MessageInspectionPage {
                 next_offset_hint: snapshot.next_offset_hint,
@@ -4945,8 +4953,13 @@ impl Stroma {
     ) -> Result<Offset> {
         let qh = self.queue_handle(tp, part, group).await?;
         let qh = qh.resolve()?;
-        let settled_until = qh.settled_until().await;
-        let min = settled_until.min(qh.lowest_not_acked_offset().await);
+        // This deletable-floor is an ack/settlement concept. A stream prunes its
+        // message log through retention instead, so it offers no floor here.
+        let Some(wq) = qh.as_work_queue() else {
+            return Ok(0);
+        };
+        let settled_until = wq.settled_until().await;
+        let min = settled_until.min(wq.lowest_not_acked_offset().await);
 
         Ok(min)
     }
@@ -4970,13 +4983,17 @@ impl Stroma {
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.is_acked(off).await)
+        Ok(q.work_queue()?.is_acked(off).await)
     }
 
     pub async fn count_inflight(&self, tp: &str, part: u32, group: Option<&str>) -> Result<usize> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.inflight_len().await)
+        // A stream has no leased deliveries, so its inflight count is always 0.
+        Ok(match q.as_work_queue() {
+            Some(wq) => wq.inflight_len().await,
+            None => 0,
+        })
     }
 
     pub fn list_topics(&self) -> Vec<Box<str>> {
@@ -5022,10 +5039,10 @@ impl Stroma {
             let outcome: std::result::Result<Option<QueueStatusReport>, StromaError> = async {
                 let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
                 let qh = qh.resolve()?;
-                if qh.kind() != PartitionKind::Queue {
+                let Some(wq) = qh.as_work_queue() else {
                     return Ok(None);
-                }
-                Ok(Some(qh.status_report().await.map_err(io_err)?))
+                };
+                Ok(Some(wq.status_report().await.map_err(io_err)?))
             }
             .await;
 
@@ -5119,7 +5136,12 @@ impl Stroma {
         );
         let msg_log = qh.msg_log();
         // let safe_msg_truncate = self.safe_truncate_before(tp, part, group).await?;
-        let safe_msg_truncate = qh.lowest_not_acked_offset().await;
+        // A stream has no ack frontier and prunes via retention, so it offers no
+        // message-log floor here (0 truncates nothing).
+        let safe_msg_truncate = match qh.as_work_queue() {
+            Some(wq) => wq.lowest_not_acked_offset().await,
+            None => 0,
+        };
         let msg_head = msg_log
             .truncate_before(safe_msg_truncate)
             .await
@@ -5144,7 +5166,7 @@ impl Stroma {
     ) -> Result<String> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(format!("{:#?}", q.canonical().await))
+        Ok(format!("{:#?}", q.work_queue()?.canonical().await))
     }
 
     pub async fn validate(&self) -> Result<()> {
@@ -5152,13 +5174,18 @@ impl Stroma {
         for (k_tp, k_part, k_group) in keys {
             let qh = self.queue_handle(&k_tp, k_part, k_group.as_deref()).await?;
             let qh = qh.resolve()?;
-            for (off, _) in qh.dump_inflight().await {
-                if off < qh.settled_until().await {
+            // The invariants below are ack-lifecycle properties of a work queue.
+            // Streams have no inflight or ack frontier, so they are skipped.
+            let Some(wq) = qh.as_work_queue() else {
+                continue;
+            };
+            for (off, _) in wq.dump_inflight().await {
+                if off < wq.settled_until().await {
                     return Err(StromaError::Decode("inflight < ack frontier".into()));
                 }
             }
 
-            if qh.ack_window_base().await > qh.settled_until().await {
+            if wq.ack_window_base().await > wq.settled_until().await {
                 return Err(StromaError::Decode("ack window base > frontier".into()));
             }
         }
@@ -5582,6 +5609,7 @@ mod tests {
         .unwrap();
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
+        let qh = qh.work_queue().unwrap();
         qh.enqueue(0, 0).await.unwrap();
 
         let page = stroma
@@ -6801,6 +6829,7 @@ mod tests {
 
         let qh = stroma.queue_handle("new-topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
+        let qh = qh.work_queue().unwrap();
 
         qh.enqueue(0, 0).await.unwrap();
 
@@ -6827,6 +6856,7 @@ mod tests {
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
+            let qh = qh.work_queue().unwrap();
             qh.enqueue(0, 0).await.unwrap();
 
             shutdown_stroma(
@@ -6995,6 +7025,7 @@ mod tests {
             .await
             .unwrap();
             let qh = qh.resolve().unwrap();
+            let qh = qh.work_queue().unwrap();
             assert!(qh.recovery_complete());
             for &off in &expected {
                 assert!(
@@ -7061,6 +7092,7 @@ mod tests {
 
             let qh = stroma.queue_handle("topic-a", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
+            let qh = qh.work_queue().unwrap();
             qh.enqueue(0, 0).await.unwrap();
 
             shutdown_stroma("concurrent_first_access_recovers_only_once/setup", &stroma).await;
@@ -7088,6 +7120,7 @@ mod tests {
         for join in joins {
             let qh = join.await.unwrap();
             let qh = qh.resolve().unwrap();
+            let qh = qh.work_queue().unwrap();
             assert!(qh.recovery_complete());
         }
 
@@ -7520,6 +7553,7 @@ mod tests {
         .await
         .unwrap();
         let qh = qh.resolve().unwrap();
+        let qh = qh.work_queue().unwrap();
         assert!(
             test_step(
                 format!("materialize_after_unmaterialize_recovers_messages/is_ready/{off}"),

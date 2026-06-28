@@ -598,6 +598,7 @@ impl Stroma {
             let event_next_offset = qh.event_log().next_offset();
             let applied_event_offset = event_next_offset.saturating_sub(1);
             let state_checkpoint = qh
+                .work_queue()?
                 .export_state_checkpoint_snapshot(applied_event_offset)
                 .await
                 .map_err(|err| {
@@ -803,7 +804,8 @@ impl Stroma {
             .await
             .map_err(io_err)?;
 
-        qh.install_snapshot_state(checkpoint_state, snapshot_meta)
+        qh.work_queue()?
+            .install_snapshot_state(checkpoint_state, snapshot_meta)
             .await
             .map_err(|err| {
                 StromaError::Io(format!(

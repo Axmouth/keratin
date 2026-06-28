@@ -126,6 +126,7 @@ async fn declare_discard(
 ) {
     let qh = st.queue_handle(tp, part, group).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     qh.declare(DeclareMeta {
         dlq_policy: Some(DLQDiscardPolicyWire::Discard),
         dlq_max_retries: Some(max_retries),
@@ -165,6 +166,7 @@ async fn nack_under_max_requeues_no_dlq() {
 
     let q = st.queue_handle("src", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
+    let q = q.work_queue().unwrap();
     assert_eq!(q.retries(off).await, 1);
     assert!(q.is_ready(off).await);
     assert!(!st.is_acked("src", 0, None, off).await.unwrap());
@@ -203,6 +205,7 @@ async fn nack_at_max_dead_letters_to_custom_target() {
 
     let qh = st.queue_handle("dlq", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let m = st
         .fetch_message_by_offset(&qh, 0)
         .await
@@ -218,6 +221,7 @@ async fn nack_at_max_dead_letters_to_custom_target() {
 
     let q = st.queue_handle("src", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
+    let q = q.work_queue().unwrap();
     assert!(!q.is_ready(off).await);
     assert!(!q.is_inflight(off).await);
     assert!(
@@ -357,6 +361,7 @@ async fn dlq_routing_preserves_distinct_payloads() {
     let mut dlq_payloads: Vec<Vec<u8>> = Vec::new();
     let qh = st.queue_handle("dlq", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     for i in 0..offs.len() as u64 {
         let m = st.fetch_message_by_offset(&qh, i).await.unwrap().unwrap();
         dlq_payloads.push(m.payload);
@@ -398,6 +403,7 @@ async fn dlq_routing_survives_restart_no_duplicates() {
 
     let qh = st2.queue_handle("dlq", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let m = st2.fetch_message_by_offset(&qh, 0).await.unwrap().unwrap();
     assert_eq!(m.payload, b"persist");
 }
@@ -414,6 +420,7 @@ async fn declare_settings_survive_restart() {
     let st2 = reopen_test_stroma(&dir).await;
     let qh = st2.queue_handle("t", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let dbg = qh.debug_info().await;
     assert_eq!(dbg.dlq_max_retries, 42);
     assert!(
@@ -440,6 +447,7 @@ async fn pending_dlq_blocks_msg_truncation_watermark() {
 
     let q = st.queue_handle("src", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
+    let q = q.work_queue().unwrap();
     let pending = q.pending_dlq().await.unwrap();
     let watermark = q.lowest_not_acked_offset().await;
 
@@ -483,5 +491,6 @@ async fn expiry_path_dead_letters_at_max_retries() {
     );
     let q = st.queue_handle("t", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
+    let q = q.work_queue().unwrap();
     assert!(!q.is_ready(off).await);
 }

@@ -28,7 +28,7 @@ pub use state::{
     AckOutcome, CustomDLQ, DLQDiscardPolicy, DLQDiscardSettings, InspectMode,
     MessageInspectionStatus, NackBatchOutcome, NackOutcome, QueueHandle, QueueHandleError,
     QueueHandleInner, QueueInspectionSnapshot, QueueInspectionState, QueueInternalState, QueueRole,
-    Resolved, SnapshotMeta, StromaDebugSnapshot,
+    Resolved, SnapshotMeta, StreamHandle, StromaDebugSnapshot, WorkQueueHandle,
 };
 pub use stream_state::RetentionConfig;
 pub use stroma::{
@@ -92,6 +92,12 @@ pub enum StromaError {
     WrongQueueRole {
         expected: QueueRole,
         actual: QueueRole,
+    },
+
+    #[error("partition kind mismatch: expected {expected:?}, this partition is {actual:?}")]
+    WrongPartitionKind {
+        expected: PartitionKind,
+        actual: PartitionKind,
     },
 
     #[error("recovery mismatch for {topic}/{partition}/{group:?}: {reason}")]

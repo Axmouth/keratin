@@ -5,8 +5,9 @@ use keratin_log::{
     util::TempDir,
 };
 use stroma_core::{
-    DeclareMeta, MessageHeaders, Offset, ReplicatedEventBatch, ReplicatedMessageBatch,
-    RetentionConfig, SnapshotConfig, Stroma, StromaError, StromaEvent, StromaKeratinConfig,
+    DeclareMeta, MessageHeaders, Offset, PartitionKind, QueueHandleError, ReplicatedEventBatch,
+    ReplicatedMessageBatch, RetentionConfig, SnapshotConfig, Stroma, StromaError, StromaEvent,
+    StromaKeratinConfig,
 };
 
 async fn open_on(dir: &std::path::Path) -> Arc<Stroma> {
@@ -347,4 +348,37 @@ async fn redeclaring_same_kind_is_idempotent() {
     st.create_stream("s", 0, None).await.unwrap();
     st.declare("q", 0, None, queue_meta()).await.unwrap();
     st.declare("q", 0, None, queue_meta()).await.unwrap();
+}
+
+#[tokio::test]
+async fn handle_projects_only_to_its_own_kind() {
+    let (st, _dir) = open_test_stroma().await;
+
+    // A work queue projects to the work-queue surface and refuses the stream one.
+    st.declare("jobs", 0, None, queue_meta()).await.unwrap();
+    let q = st.queue_handle("jobs", 0, None).await.unwrap();
+    let q = q.resolve().unwrap();
+    assert!(q.as_work_queue().is_some());
+    assert!(q.as_stream().is_none());
+    assert!(matches!(
+        q.stream(),
+        Err(QueueHandleError::WrongKind {
+            expected: PartitionKind::Stream,
+            actual: PartitionKind::Queue,
+        })
+    ));
+
+    // A stream projects the other way.
+    st.create_stream("sensors", 0, None).await.unwrap();
+    let s = st.queue_handle("sensors", 0, None).await.unwrap();
+    let s = s.resolve().unwrap();
+    assert!(s.as_stream().is_some());
+    assert!(s.as_work_queue().is_none());
+    assert!(matches!(
+        s.work_queue(),
+        Err(QueueHandleError::WrongKind {
+            expected: PartitionKind::Queue,
+            actual: PartitionKind::Stream,
+        })
+    ));
 }

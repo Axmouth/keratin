@@ -26,7 +26,7 @@ use crate::metrics::{
     CommandMetricsSnapshot, LogMetricsSnapshot, RecoveryMetricsSnapshot, SnapshotMetricsSnapshot,
     StromaMetrics,
 };
-use crate::stream_state::{StreamCommand, StreamState, run_stream_control};
+use crate::stream_state::{RetentionConfig, StreamCommand, StreamState, run_stream_control};
 use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
 pub type Offset = u64;
@@ -72,6 +72,10 @@ pub enum QueueHandleError {
     WrongRole {
         expected: QueueRole,
         actual: QueueRole,
+    },
+    WrongKind {
+        expected: PartitionKind,
+        actual: PartitionKind,
     },
     LoadSnapshotFailed(String),
     SnapshotNotCreated,
@@ -126,6 +130,12 @@ impl std::fmt::Display for QueueHandleError {
                     "queue role mismatch: expected {expected:?}, current role is {actual:?}"
                 )
             }
+            QueueHandleError::WrongKind { expected, actual } => {
+                write!(
+                    f,
+                    "partition kind mismatch: expected {expected:?}, this partition is {actual:?}"
+                )
+            }
             QueueHandleError::LoadSnapshotFailed(reason) => {
                 write!(f, "snapshot load failed: {reason}")
             }
@@ -144,6 +154,9 @@ impl From<QueueHandleError> for StromaError {
             QueueHandleError::ActorGone => StromaError::QueueActorGone,
             QueueHandleError::WrongRole { expected, actual } => {
                 StromaError::WrongQueueRole { expected, actual }
+            }
+            QueueHandleError::WrongKind { expected, actual } => {
+                StromaError::WrongPartitionKind { expected, actual }
             }
             QueueHandleError::LoadSnapshotFailed(reason) => StromaError::Internal(reason),
             QueueHandleError::SnapshotNotCreated => {
@@ -1137,6 +1150,40 @@ impl std::ops::Deref for Resolved<'_> {
     }
 }
 
+/// A resolved incarnation projected to the WORK-QUEUE command surface.
+///
+/// Constructed only via [`QueueHandleInner::as_work_queue`] /
+/// [`QueueHandleInner::work_queue`], which hand one back exactly when the
+/// partition runs the work-queue engine. The work-queue ops (enqueue, ack,
+/// nack, lease, status, expiry sweeps, ...) live on this type, so they are
+/// unreachable on a stream partition by construction rather than failing at
+/// runtime when a queue command is sent to a stream actor. Derefs to the shared
+/// substrate ([`QueueHandleInner`]: role, logs, snapshot, recovery), so a holder
+/// keeps full access to everything that is kind-agnostic.
+#[derive(Clone, Copy)]
+pub struct WorkQueueHandle<'a>(&'a QueueHandleInner);
+
+impl std::ops::Deref for WorkQueueHandle<'_> {
+    type Target = QueueHandleInner;
+    fn deref(&self) -> &QueueHandleInner {
+        self.0
+    }
+}
+
+/// A resolved incarnation projected to the STREAM command surface, the mirror of
+/// [`WorkQueueHandle`]. Constructed only via [`QueueHandleInner::as_stream`] /
+/// [`QueueHandleInner::stream`], so the stream command vocabulary is unreachable
+/// on a work-queue partition. Derefs to the shared substrate.
+#[derive(Clone, Copy)]
+pub struct StreamHandle<'a>(&'a QueueHandleInner);
+
+impl std::ops::Deref for StreamHandle<'_> {
+    type Target = QueueHandleInner;
+    fn deref(&self) -> &QueueHandleInner {
+        self.0
+    }
+}
+
 impl QueueHandleInner {
     pub fn init(
         topic: String,
@@ -1280,7 +1327,12 @@ enum PendingActor {
 
 impl QueueHandleInner {
     pub async fn full_debug_info(&self) -> QueueDebugInfo {
-        let state = self.debug_info().await;
+        // The internal debug snapshot is a work-queue command. Streams have no
+        // equivalent here, so report the default for them.
+        let state = match self.as_work_queue() {
+            Some(wq) => wq.debug_info().await,
+            None => QueueInternalDebugInfo::default(),
+        };
 
         QueueDebugInfo {
             topic: self.topic.clone(),
@@ -1999,6 +2051,44 @@ impl QueueHandleInner {
         self.engine.kind()
     }
 
+    /// Project to the work-queue command surface, `Some` iff this partition runs
+    /// the work-queue engine. The work-queue ops live on [`WorkQueueHandle`], so
+    /// callers that iterate partitions of mixed kind (stats/expiry sweeps) get a
+    /// natural skip for streams, and a caller that knows it holds a queue uses
+    /// [`work_queue`](Self::work_queue) to propagate a typed error instead.
+    pub fn as_work_queue(&self) -> Option<WorkQueueHandle<'_>> {
+        match &self.engine {
+            EngineHandle::Queue(_) => Some(WorkQueueHandle(self)),
+            EngineHandle::Stream(_) => None,
+        }
+    }
+
+    /// Project to the stream command surface, `Some` iff this partition runs the
+    /// stream engine. Mirror of [`as_work_queue`](Self::as_work_queue).
+    pub fn as_stream(&self) -> Option<StreamHandle<'_>> {
+        match &self.engine {
+            EngineHandle::Stream(_) => Some(StreamHandle(self)),
+            EngineHandle::Queue(_) => None,
+        }
+    }
+
+    /// Project to the work-queue surface or fail with [`QueueHandleError::WrongKind`].
+    /// For callers that already expect a work queue and want to `?`-propagate.
+    pub fn work_queue(&self) -> Result<WorkQueueHandle<'_>, QueueHandleError> {
+        self.as_work_queue().ok_or(QueueHandleError::WrongKind {
+            expected: PartitionKind::Queue,
+            actual: self.kind(),
+        })
+    }
+
+    /// Project to the stream surface or fail with [`QueueHandleError::WrongKind`].
+    pub fn stream(&self) -> Result<StreamHandle<'_>, QueueHandleError> {
+        self.as_stream().ok_or(QueueHandleError::WrongKind {
+            expected: PartitionKind::Stream,
+            actual: self.kind(),
+        })
+    }
+
     fn queue_sender(&self) -> std::io::Result<&CommandSender> {
         match &self.engine {
             EngineHandle::Queue(s) => Ok(s),
@@ -2009,7 +2099,7 @@ impl QueueHandleInner {
         }
     }
 
-    pub async fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
+    pub(crate) async fn command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
         self.queue_sender()?
             .send(QueueCommandPackage {
                 command: cmd,
@@ -2019,7 +2109,7 @@ impl QueueHandleInner {
             .map_err(command_send_error)
     }
 
-    pub fn blocking_command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
+    pub(crate) fn blocking_command_enqueue(&self, cmd: QueueCommand) -> std::io::Result<()> {
         self.queue_sender()?
             .blocking_send(QueueCommandPackage {
                 command: cmd,
@@ -2030,7 +2120,7 @@ impl QueueHandleInner {
 
     /// Send a command to the stream control actor. Errors if this partition is a
     /// work queue.
-    pub async fn stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
+    pub(crate) async fn stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
         match &self.engine {
             EngineHandle::Stream(s) => s.send(cmd).await.map_err(|_| {
                 std::io::Error::new(
@@ -2048,7 +2138,7 @@ impl QueueHandleInner {
     /// Blocking counterpart to [`stream_command_enqueue`], for the synchronous
     /// event-apply path (recovery replay and follower ingest), mirroring
     /// `blocking_command_enqueue`.
-    pub fn blocking_stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
+    pub(crate) fn blocking_stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
         match &self.engine {
             EngineHandle::Stream(s) => s.blocking_send(cmd).map_err(|_| {
                 std::io::Error::new(
@@ -2062,7 +2152,13 @@ impl QueueHandleInner {
             )),
         }
     }
+}
 
+/// Work-queue command surface. Reachable only through a [`WorkQueueHandle`],
+/// which is handed out exclusively for work-queue partitions, so none of these
+/// ops can be issued against a stream actor: the misroute is a type error rather
+/// than a runtime channel failure.
+impl WorkQueueHandle<'_> {
     pub async fn debug_info(&self) -> QueueInternalDebugInfo {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -2373,7 +2469,9 @@ impl QueueHandleInner {
         rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         Ok(())
     }
+}
 
+impl QueueHandleInner {
     pub async fn reset(&self) -> Result<(), QueueHandleError> {
         let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
@@ -2392,7 +2490,9 @@ impl QueueHandleInner {
         rx.await.map_err(|_| QueueHandleError::ActorGone)?;
         Ok(())
     }
+}
 
+impl WorkQueueHandle<'_> {
     pub async fn set_acked_until(&self, offset: Offset) -> Result<(), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -2436,7 +2536,9 @@ impl QueueHandleInner {
             .map_err(|error| QueueHandleError::Internal(error.to_string()))?;
         Ok(())
     }
+}
 
+impl QueueHandleInner {
     pub async fn encode_snapshot(
         &self,
         last_snapshot_event_offset: u64,
@@ -2497,7 +2599,9 @@ impl QueueHandleInner {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         result
     }
+}
 
+impl WorkQueueHandle<'_> {
     pub async fn export_state_checkpoint_snapshot(
         &self,
         last_snapshot_event_offset: u64,
@@ -2522,7 +2626,9 @@ impl QueueHandleInner {
             .store(false, std::sync::atomic::Ordering::SeqCst);
         res.map_err(|_| QueueHandleError::ActorGone)
     }
+}
 
+impl QueueHandleInner {
     pub async fn load_snapshot(&self, data: Vec<u8>) -> Result<SnapshotMeta, QueueHandleError> {
         let snapmeta = match &self.engine {
             EngineHandle::Queue(_) => {
@@ -2568,7 +2674,9 @@ impl QueueHandleInner {
 
         Ok(snapmeta)
     }
+}
 
+impl WorkQueueHandle<'_> {
     pub async fn install_snapshot_state(
         &self,
         state: QueueInternalState,
@@ -2818,7 +2926,9 @@ impl QueueHandleInner {
             .await;
         let _ = rx.await;
     }
+}
 
+impl QueueHandleInner {
     pub fn topic(&self) -> &str {
         &self.topic
     }
@@ -2888,6 +2998,80 @@ impl QueueHandleInner {
 
     pub fn cancel_background_tasks(&self) {
         self.background_tasks.cancel();
+    }
+}
+
+/// Stream command surface, the mirror of [`WorkQueueHandle`]. Reachable only
+/// through a [`StreamHandle`], handed out exclusively for stream partitions, so
+/// these ops cannot be issued against a work-queue actor. Each method is a thin
+/// round trip to the stream control actor over the same transport the kind-
+/// dispatched apply path uses.
+impl StreamHandle<'_> {
+    /// Move the tail forward after records were appended, waiting for the apply.
+    pub async fn advance_tail(&self, next_offset: Offset) -> Result<(), QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::AdvanceTail {
+            next_offset,
+            response: Some(tx),
+        })
+        .await
+        .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
+    }
+
+    /// Move the tail forward without waiting for confirmation. Tail advances are
+    /// monotonic (max-semantics), so a fire-and-forget advance from the durable
+    /// append path cannot regress the tail.
+    pub async fn advance_tail_unconfirmed(&self, next_offset: Offset) -> std::io::Result<()> {
+        self.stream_command_enqueue(StreamCommand::AdvanceTail {
+            next_offset,
+            response: None,
+        })
+        .await
+    }
+
+    pub async fn set_retention(&self, config: RetentionConfig) -> Result<(), QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::SetRetention {
+            config,
+            response: Some(tx),
+        })
+        .await
+        .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        Ok(())
+    }
+
+    /// Read a durable named cursor position, or `None` if it has none.
+    pub async fn cursor(&self, name: &str) -> Result<Option<Offset>, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::GetCursor {
+            name: name.to_string(),
+            response: tx,
+        })
+        .await
+        .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
+    pub async fn head_tail(&self) -> Result<(Offset, Offset), QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::GetHeadTail { response: tx })
+            .await
+            .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
+    /// Read the retention policy plus the head/tail watermarks in one round trip.
+    pub async fn retention_state(
+        &self,
+    ) -> Result<(RetentionConfig, Offset, Offset), QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::GetRetentionState { response: tx })
+            .await
+            .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 }
 

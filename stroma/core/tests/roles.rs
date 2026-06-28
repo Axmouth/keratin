@@ -77,6 +77,7 @@ async fn follower_handle_rejects_owner_operations() {
     let (st, _dir) = open_test_stroma("stroma_roles_follower_handle_rejects_owner_ops").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     qh.enqueue(0, 0).await.unwrap();
     qh.become_follower();
@@ -94,6 +95,7 @@ async fn public_event_append_rejects_follower_before_log_append() {
     let (st, _dir) = open_test_stroma("stroma_roles_reject_before_log_append").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let before = qh.event_log().next_offset();
 
     qh.become_follower();
@@ -108,8 +110,10 @@ async fn expiry_scan_skips_follower_queues() {
     let (st, _dir) = open_test_stroma("stroma_roles_expiry_skips_followers").await;
     let owner = st.queue_handle("owner", 0, None).await.unwrap();
     let owner = owner.resolve().unwrap();
+    let owner = owner.work_queue().unwrap();
     let follower = st.queue_handle("follower", 0, None).await.unwrap();
     let follower = follower.resolve().unwrap();
+    let follower = follower.work_queue().unwrap();
 
     owner.enqueue(0, 0).await.unwrap();
     owner.mark_inflight(0, 10).await.unwrap();
@@ -126,6 +130,7 @@ async fn freeze_waits_for_active_owner_operation_before_role_swap() {
     let (st, _dir) = open_test_stroma("stroma_roles_freeze_waits_for_owner_operation").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let owner_operation = qh.begin_owner_operation().await.unwrap();
 
     let freezer = {
@@ -159,6 +164,7 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
     let (st, _dir) = open_delayed_fsync_stroma("stroma_roles_demote_owner_to_follower").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let headers = MessageHeaders {
         published: 1,
         publish_received: 2,
@@ -250,6 +256,7 @@ async fn demotion_refuses_non_owner_without_changing_role() {
     st.become_queue_follower("topic-a", 0, None).await.unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     let result = st.demote_queue_owner_to_follower("topic-a", 0, None).await;
 
@@ -262,6 +269,7 @@ async fn freeze_allows_started_publish_to_finish_but_rejects_new_publish() {
     let (st, _dir) = open_delayed_fsync_stroma("stroma_roles_freeze_started_publish").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let headers = MessageHeaders {
         published: 1,
         publish_received: 2,
@@ -322,6 +330,7 @@ async fn freeze_allows_started_ack_to_finish_but_rejects_new_ack() {
     let (st, _dir) = open_delayed_fsync_stroma("stroma_roles_freeze_started_ack").await;
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     qh.enqueue(0, 0).await.unwrap();
     qh.mark_inflight(0, 60_000).await.unwrap();
 
@@ -364,6 +373,7 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
     st.become_queue_follower("topic-a", 0, None).await.unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
     let headers = MessageHeaders {
         published: 1,
         publish_received: 2,
@@ -442,6 +452,7 @@ async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
         .unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     let outcome = st
         .apply_replicated_queue_batch(
@@ -522,6 +533,7 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
     st.become_queue_follower("src", 0, None).await.unwrap();
     let src = st.queue_handle("src", 0, None).await.unwrap();
     let src = src.resolve().unwrap();
+    let src = src.work_queue().unwrap();
 
     st.apply_replicated_queue_batch(
         "src",
@@ -576,6 +588,7 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
     st.become_queue_follower("topic-a", 0, None).await.unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     st.apply_replicated_queue_batch(
         "topic-a",
@@ -644,6 +657,7 @@ async fn promotion_reports_follower_lag_without_changing_role() {
     st.become_queue_follower("topic-a", 0, None).await.unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     let outcome = st
         .promote_queue_follower_if_caught_up("topic-a", 0, None, 1, 1)
@@ -666,6 +680,7 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
     st.become_queue_follower("topic-a", 0, None).await.unwrap();
     let qh = st.queue_handle("topic-a", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
+    let qh = qh.work_queue().unwrap();
 
     st.apply_replicated_queue_batch(
         "topic-a",
