@@ -169,7 +169,7 @@ async fn nack_under_max_requeues_no_dlq() {
     let q = q.work_queue().unwrap();
     assert_eq!(q.retries(off).await, 1);
     assert!(q.is_ready(off).await);
-    assert!(!st.is_acked("src", 0, None, off).await.unwrap());
+    assert!(!st.is_settled("src", 0, None, off).await.unwrap());
     // No DLQ message produced.
     assert_eq!(
         st.current_next_offset("dlq", 0, None).await.unwrap(),
@@ -193,7 +193,7 @@ async fn nack_at_max_dead_letters_to_custom_target() {
     wait_until(
         Duration::from_secs(5),
         "source acked after dlq copy",
-        || async { st.is_acked("src", 0, None, off).await.unwrap() },
+        || async { st.is_settled("src", 0, None, off).await.unwrap() },
     )
     .await;
 
@@ -242,7 +242,7 @@ async fn nack_no_requeue_with_discard_acks_locally() {
     nack_one(&st, "src", 0, None, off, false).await;
 
     wait_until(Duration::from_secs(2), "discard acked", || async {
-        st.is_acked("src", 0, None, off).await.unwrap()
+        st.is_settled("src", 0, None, off).await.unwrap()
     })
     .await;
 
@@ -266,7 +266,7 @@ async fn nack_no_requeue_with_custom_dlq_routes_to_dlq() {
     nack_one(&st, "src", 0, None, off, false).await;
 
     wait_until(Duration::from_secs(5), "source acked", || async {
-        st.is_acked("src", 0, None, off).await.unwrap()
+        st.is_settled("src", 0, None, off).await.unwrap()
     })
     .await;
     assert_eq!(st.current_next_offset("dlq", 0, None).await.unwrap(), 1);
@@ -313,7 +313,7 @@ async fn batched_nacks_split_requeue_and_dlq() {
 
     wait_until(Duration::from_secs(5), "all 4 acked on source", || async {
         for &o in &offs {
-            if !st.is_acked("src", 0, None, o).await.unwrap() {
+            if !st.is_settled("src", 0, None, o).await.unwrap() {
                 return false;
             }
         }
@@ -384,7 +384,7 @@ async fn dlq_routing_survives_restart_no_duplicates() {
     nack_one(&st, "src", 0, None, off, false).await;
 
     wait_until(Duration::from_secs(5), "pre-restart acked", || async {
-        st.is_acked("src", 0, None, off).await.unwrap()
+        st.is_settled("src", 0, None, off).await.unwrap()
     })
     .await;
     assert_eq!(st.current_next_offset("dlq", 0, None).await.unwrap(), 1);
@@ -394,7 +394,7 @@ async fn dlq_routing_survives_restart_no_duplicates() {
 
     let st2 = reopen_test_stroma(&dir).await;
 
-    assert!(st2.is_acked("src", 0, None, off).await.unwrap());
+    assert!(st2.is_settled("src", 0, None, off).await.unwrap());
     assert_eq!(
         st2.current_next_offset("dlq", 0, None).await.unwrap(),
         1,
@@ -458,7 +458,7 @@ async fn pending_dlq_blocks_msg_truncation_watermark() {
         );
     } else {
         // Background task already finished; offset is acked. Nothing pathological.
-        assert!(st.is_acked("src", 0, None, off).await.unwrap());
+        assert!(st.is_settled("src", 0, None, off).await.unwrap());
     }
 }
 
@@ -479,7 +479,7 @@ async fn expiry_path_dead_letters_at_max_retries() {
     }
 
     wait_until(Duration::from_secs(5), "dlq routed via expiry", || async {
-        st.is_acked("t", 0, None, off).await.unwrap()
+        st.is_settled("t", 0, None, off).await.unwrap()
             && st.current_next_offset("dlq", 0, None).await.unwrap() >= 1
     })
     .await;

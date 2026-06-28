@@ -364,7 +364,7 @@ async fn freeze_allows_started_ack_to_finish_but_rejects_new_ack() {
         .unwrap();
     freezer.await.unwrap();
     assert_eq!(qh.active_owner_operations(), 0);
-    assert!(st.is_acked("topic-a", 0, None, 0).await.unwrap());
+    assert!(st.is_settled("topic-a", 0, None, 0).await.unwrap());
 }
 
 #[tokio::test]

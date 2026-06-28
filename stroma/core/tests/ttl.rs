@@ -135,7 +135,7 @@ async fn ttl_expired_message_is_dropped_and_settled() {
     let off = append_with_ttl(&st, "t", Some(1000)).await;
 
     // Ready before the deadline.
-    assert!(!st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
 
     // Drop after the deadline. No DLQ configured -> discard (settle).
     let dropped = st.drop_ttl_expired(2000, 100).await.unwrap();
@@ -143,7 +143,7 @@ async fn ttl_expired_message_is_dropped_and_settled() {
     assert!(dropped.contains(&("t".to_string(), 0, None, off)));
 
     // Settled now, so it is no longer deliverable.
-    assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
 
     // Idempotent: a second sweep drops nothing.
     assert!(st.drop_ttl_expired(2000, 100).await.unwrap().is_empty());
@@ -176,5 +176,5 @@ async fn ttl_drop_never_touches_inflight() {
 
     // Past its deadline but in flight -> must not be dropped.
     assert!(st.drop_ttl_expired(2000, 100).await.unwrap().is_empty());
-    assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
 }

@@ -86,7 +86,7 @@ async fn mark_inflight_after_enqueue_is_applied() {
     // Now mark inflight is allowed
     st.mark_inflight_one("t", 0, None, off, 100).await.unwrap();
 
-    assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
 }
 
 #[tokio::test]
@@ -160,7 +160,7 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
     // Now mark inflight must work
     st.mark_inflight_one("t", 0, None, 0, 100).await.unwrap();
 
-    assert!(st.is_inflight_or_acked("t", 0, None, 0).await.unwrap());
+    assert!(st.is_inflight_or_settled("t", 0, None, 0).await.unwrap());
 }
 
 #[tokio::test]
@@ -168,7 +168,7 @@ async fn inflight_before_enqueue_is_ignored() {
     let (st, _td) = open_test_stroma().await;
 
     st.mark_inflight_one("t", 0, None, 0, 100).await.unwrap();
-    assert!(!st.is_inflight_or_acked("t", 0, None, 0).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, 0).await.unwrap());
 
     let (completion, rx) = KeratinAppendCompletion::pair();
     let headers = MessageHeaders {
@@ -184,7 +184,7 @@ async fn inflight_before_enqueue_is_ignored() {
     let offset = ar.base_offset;
 
     // Must still not be inflight unless re-issued
-    assert!(!st.is_inflight_or_acked("t", 0, None, offset).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, offset).await.unwrap());
 }
 
 #[tokio::test]
@@ -263,7 +263,7 @@ async fn poll_ready_delivers_and_marks_inflight() {
     assert_eq!(msgs.len(), 3);
 
     for (off, _, _, _) in msgs {
-        assert!(st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+        assert!(st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
     }
 }
 
@@ -296,8 +296,8 @@ async fn poll_ready_upper_gates_leasing_to_committed_offsets() {
         "must not lease at or above the ceiling"
     );
     // The gated offsets must not have been leased.
-    assert!(!st.is_inflight_or_acked("t", 0, None, 3).await.unwrap());
-    assert!(!st.is_inflight_or_acked("t", 0, None, 4).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, 3).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, 4).await.unwrap());
 
     // Raising the ceiling releases the rest.
     let msgs = st
@@ -351,7 +351,7 @@ async fn expired_message_is_redelivered() {
     st.requeue_expired(10, 10).await.unwrap();
 
     assert!(st.is_ready("t", 0, None, off).await.unwrap());
-    assert!(!st.is_inflight_or_acked("t", 0, None, off).await.unwrap());
+    assert!(!st.is_inflight_or_settled("t", 0, None, off).await.unwrap());
 }
 
 #[tokio::test]
@@ -364,7 +364,7 @@ async fn ack_before_expiry_prevents_redelivery() {
 
     st.requeue_expired(20, 10).await.unwrap();
 
-    assert!(st.is_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_settled("t", 0, None, off).await.unwrap());
     assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 }
 

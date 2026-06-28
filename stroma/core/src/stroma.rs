@@ -2449,7 +2449,7 @@ impl Stroma {
         Ok(q.work_queue()?.lowest_unacked_offset().await)
     }
 
-    pub async fn is_inflight_or_acked(
+    pub async fn is_inflight_or_settled(
         &self,
         tp: &str,
         part: u32,
@@ -2458,7 +2458,7 @@ impl Stroma {
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.work_queue()?.is_inflight_or_acked(off).await)
+        Ok(q.work_queue()?.is_inflight_or_settled(off).await)
     }
 
     pub async fn is_ready(
@@ -4974,7 +4974,7 @@ impl Stroma {
             .collect()
     }
 
-    pub async fn is_acked(
+    pub async fn is_settled(
         &self,
         tp: &str,
         part: u32,
@@ -4983,7 +4983,7 @@ impl Stroma {
     ) -> Result<bool> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.work_queue()?.is_acked(off).await)
+        Ok(q.work_queue()?.is_settled(off).await)
     }
 
     pub async fn count_inflight(&self, tp: &str, part: u32, group: Option<&str>) -> Result<usize> {

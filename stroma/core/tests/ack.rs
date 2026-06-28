@@ -85,7 +85,7 @@ async fn acked_offsets_never_resurrect() {
         }
     }
 
-    assert!(st.is_acked("t", 0, None, 5).await.unwrap());
+    assert!(st.is_settled("t", 0, None, 5).await.unwrap());
     assert!(!st.is_ready("t", 0, None, 5).await.unwrap());
 }
 
@@ -109,7 +109,7 @@ async fn expiry_never_resurrects_acked_offsets_after_restart() {
     .await
     .unwrap();
 
-    assert!(st2.is_acked("t", 0, None, off).await.unwrap());
+    assert!(st2.is_settled("t", 0, None, off).await.unwrap());
     assert!(!st2.is_ready("t", 0, None, off).await.unwrap());
 }
 
@@ -128,7 +128,7 @@ async fn expiry_respects_max_retries() {
     st.mark_inflight_one("t", 0, None, off, 10).await.unwrap();
     st.requeue_expired(10, 10).await.unwrap();
 
-    assert!(st.is_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_settled("t", 0, None, off).await.unwrap());
     assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 
     let qh = st.queue_handle("t", 0, None).await.unwrap();
@@ -137,6 +137,6 @@ async fn expiry_respects_max_retries() {
 
     qh.dead_letter_commit(vec![off]).await.unwrap();
 
-    assert!(st.is_acked("t", 0, None, off).await.unwrap());
+    assert!(st.is_settled("t", 0, None, off).await.unwrap());
     assert!(!st.is_ready("t", 0, None, off).await.unwrap());
 }

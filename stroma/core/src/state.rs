@@ -480,7 +480,7 @@ pub enum QueueCommand {
         response: Option<oneshot::Sender<SnapshotMeta>>,
     },
 
-    IsAcked {
+    IsSettled {
         offset: Offset,
         response: Option<oneshot::Sender<bool>>,
     }, // offset
@@ -488,7 +488,7 @@ pub enum QueueCommand {
         offset: Offset,
         response: Option<oneshot::Sender<bool>>,
     }, // offset
-    IsInflightOrAcked {
+    IsInflightOrSettled {
         offset: Offset,
         response: Option<oneshot::Sender<bool>>,
     }, // offset
@@ -587,9 +587,9 @@ impl QueueCommand {
             QueueCommand::GetRetries { .. } => CommandPrio::Express,
 
             // === Point-reads used in hot paths — cheap but not observability-critical ===
-            QueueCommand::IsAcked { .. } => CommandPrio::High,
+            QueueCommand::IsSettled { .. } => CommandPrio::High,
             QueueCommand::IsInflight { .. } => CommandPrio::High,
-            QueueCommand::IsInflightOrAcked { .. } => CommandPrio::High,
+            QueueCommand::IsInflightOrSettled { .. } => CommandPrio::High,
             QueueCommand::IsReady { .. } => CommandPrio::High,
             QueueCommand::FilterNotEnqueued { .. } => CommandPrio::High,
             QueueCommand::GetNextDeliverable { .. } => CommandPrio::High,
@@ -664,9 +664,9 @@ impl QueueCommand {
             QueueCommand::ExportStateCheckpoint { .. } => "ExportStateCheckpoint",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
             QueueCommand::InstallSnapshotState { .. } => "InstallSnapshotState",
-            QueueCommand::IsAcked { .. } => "IsAcked",
+            QueueCommand::IsSettled { .. } => "IsSettled",
             QueueCommand::IsInflight { .. } => "IsInflight",
-            QueueCommand::IsInflightOrAcked { .. } => "IsInflightOrAcked",
+            QueueCommand::IsInflightOrSettled { .. } => "IsInflightOrSettled",
             QueueCommand::IsReady { .. } => "IsReady",
             QueueCommand::FilterNotEnqueued { .. } => "FilterNotEnqueued",
             QueueCommand::GetRetries { .. } => "GetRetries",
@@ -1692,8 +1692,8 @@ impl QueueHandleInner {
                     let _ = r.send(v);
                 }
             }
-            QueueCommand::IsAcked { offset, response } => {
-                let result = state.is_acked(offset);
+            QueueCommand::IsSettled { offset, response } => {
+                let result = state.is_settled(offset);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -1887,8 +1887,8 @@ impl QueueHandleInner {
                     let _ = r.send(meta);
                 }
             }
-            QueueCommand::IsInflightOrAcked { offset, response } => {
-                let result = state.is_inflight_or_acked(offset);
+            QueueCommand::IsInflightOrSettled { offset, response } => {
+                let result = state.is_inflight_or_settled(offset);
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -2562,10 +2562,10 @@ impl WorkQueueHandle<'_> {
         Ok(snapmeta)
     }
 
-    pub async fn is_acked(&self, offset: Offset) -> bool {
+    pub async fn is_settled(&self, offset: Offset) -> bool {
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::IsAcked {
+            .command_enqueue(QueueCommand::IsSettled {
                 offset,
                 response: Some(tx),
             })
@@ -2584,10 +2584,10 @@ impl WorkQueueHandle<'_> {
         rx.await.unwrap_or(false)
     }
 
-    pub async fn is_inflight_or_acked(&self, offset: Offset) -> bool {
+    pub async fn is_inflight_or_settled(&self, offset: Offset) -> bool {
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::IsInflightOrAcked {
+            .command_enqueue(QueueCommand::IsInflightOrSettled {
                 offset,
                 response: Some(tx),
             })
@@ -3107,7 +3107,7 @@ impl QueueInternalState {
 
     /// True if this offset is known settled (acked, terminal-nacked, or DLQ'd).
     #[inline]
-    pub fn is_acked(&self, offset: Offset) -> bool {
+    pub fn is_settled(&self, offset: Offset) -> bool {
         self.settled.contains(&offset)
     }
 
@@ -3117,8 +3117,8 @@ impl QueueInternalState {
     }
 
     #[inline]
-    pub fn is_inflight_or_acked(&self, offset: Offset) -> bool {
-        self.is_acked(offset) || self.is_inflight(offset) || self.pending_dlq.contains_key(&offset)
+    pub fn is_inflight_or_settled(&self, offset: Offset) -> bool {
+        self.is_settled(offset) || self.is_inflight(offset) || self.pending_dlq.contains_key(&offset)
     }
 
     #[inline]
@@ -3325,7 +3325,7 @@ impl QueueInternalState {
         }
 
         for &(Reverse(deadline), offset) in &self.delayed_enqueue_heap {
-            if (from..end).contains(&offset) && !self.is_acked(offset) {
+            if (from..end).contains(&offset) && !self.is_settled(offset) {
                 states.entry(offset).or_insert(QueueInspectionState {
                     offset,
                     status: MessageInspectionStatus::Delayed,
@@ -3337,7 +3337,7 @@ impl QueueInternalState {
         }
 
         for &(Reverse(deadline), offset) in &self.delayed_retry_heap {
-            if (from..end).contains(&offset) && !self.is_acked(offset) {
+            if (from..end).contains(&offset) && !self.is_settled(offset) {
                 states.entry(offset).or_insert(QueueInspectionState {
                     offset,
                     status: MessageInspectionStatus::Delayed,
@@ -3451,7 +3451,7 @@ impl QueueInternalState {
     pub fn enqueue(&mut self, offset: Offset, retries: u32, expire_at: Option<UnixMillis>) {
         // We assume it is only used on messages that have been properly stored earlier
         // TODO: possibly use different checks as ack window has limited trust
-        if self.is_acked(offset) {
+        if self.is_settled(offset) {
             return;
         }
 
@@ -3475,7 +3475,7 @@ impl QueueInternalState {
     /// Record a message's drop deadline (message TTL) and wake the deadline
     /// worker if this is the new earliest deadline.
     fn set_ttl_deadline(&mut self, offset: Offset, deadline: UnixMillis) {
-        if self.is_acked(offset) {
+        if self.is_settled(offset) {
             return;
         }
         let was_earlier_or_empty = self.min_ttl_deadline().is_none_or(|d| deadline < d);
@@ -3744,7 +3744,7 @@ impl QueueInternalState {
                 if self.inflight.contains_key(&off) {
                     continue;
                 }
-                if self.is_acked(off) {
+                if self.is_settled(off) {
                     continue;
                 }
                 return off;
@@ -4307,7 +4307,7 @@ mod tests {
 
         s.nack(1, true);
 
-        assert!(s.is_acked(1));
+        assert!(s.is_settled(1));
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
         assert_eq!(s.get_retries(1), 0);
@@ -4319,7 +4319,7 @@ mod tests {
 
         s.ack(3);
 
-        assert!(s.is_acked(3));
+        assert!(s.is_settled(3));
         assert!(!s.is_ready(3));
         assert!(!s.is_inflight(3));
         assert_eq!(s.settled_until(), 0); // frontier doesn't move unless contiguous
@@ -4361,7 +4361,7 @@ mod tests {
 
         s.ack(5);
 
-        assert!(s.is_acked(5));
+        assert!(s.is_settled(5));
         assert_eq!(s.settled_until(), 0); // frontier does not advance
         assert!(!s.is_ready(5));
         assert!(!s.is_inflight(5));
@@ -4374,7 +4374,7 @@ mod tests {
         s.ack(3);
         s.enqueue(3, 0, None);
 
-        assert!(s.is_acked(3));
+        assert!(s.is_settled(3));
         assert!(!s.is_ready(3));
         assert_eq!(s.next_deliverable(0, 10), 10);
     }
@@ -4404,7 +4404,7 @@ mod tests {
 
         assert!(!s.is_ready(5));
         assert!(!s.is_inflight(5));
-        assert!(!s.is_acked(5));
+        assert!(!s.is_settled(5));
     }
 
     #[test]
@@ -4456,13 +4456,13 @@ mod tests {
 
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
-        assert!(!s.is_acked(1));
+        assert!(!s.is_settled(1));
 
         s.commit_dlq(1);
 
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
-        assert!(s.is_acked(1));
+        assert!(s.is_settled(1));
     }
 
     #[test]
@@ -4482,7 +4482,7 @@ mod tests {
         assert!(!s.is_inflight(5));
 
         s.ack(5);
-        assert!(s.is_acked(5));
+        assert!(s.is_settled(5));
         assert!(!s.is_ready(5));
         assert!(!s.is_inflight(5));
     }
@@ -4523,7 +4523,7 @@ mod tests {
         s.collect_expired(10, 10);
         s.nack(2, true);
 
-        assert!(!s.is_acked(2));
+        assert!(!s.is_settled(2));
         assert_eq!(s.next_deliverable(0, 10), 2);
     }
 
@@ -4559,7 +4559,7 @@ mod tests {
         s.mark_inflight(3, 100);
         s.nack(3, true);
 
-        assert!(!s.is_acked(3));
+        assert!(!s.is_settled(3));
         assert!(!s.is_inflight(3));
         assert_eq!(s.settled_until(), 0);
     }
@@ -4570,18 +4570,18 @@ mod tests {
 
         s.enqueue(5, 0, None);
         s.mark_inflight(5, 10);
-        assert!(!s.is_acked(5));
+        assert!(!s.is_settled(5));
 
         let ex = s.collect_expired(10, 10);
         assert_eq!(ex, vec![5]);
 
         // Still NOT acked
-        assert!(!s.is_acked(5));
+        assert!(!s.is_settled(5));
         assert_eq!(s.settled_until(), 0);
 
         // Offset 5 is now eligible again, but ordering is preserved
         assert!(!s.is_inflight(5));
-        assert!(!s.is_acked(5));
+        assert!(!s.is_settled(5));
 
         // Earliest deliverable is still 0
         let d = s.next_deliverable(0, 100);
@@ -4633,7 +4633,7 @@ mod tests {
         let ex = s.collect_expired(200, 10);
         assert!(ex.is_empty());
 
-        assert!(s.is_acked(7));
+        assert!(s.is_settled(7));
         assert!(!s.is_inflight(7));
     }
 
@@ -4650,8 +4650,8 @@ mod tests {
         assert_eq!(ex, vec![0]);
 
         // ACK window still intact
-        assert!(s.is_acked(1));
-        assert!(!s.is_acked(0));
+        assert!(s.is_settled(1));
+        assert!(!s.is_settled(0));
         assert_eq!(s.settled_until(), 0);
     }
 
@@ -4752,7 +4752,7 @@ mod tests {
 
         let expired = s.collect_expired(100, 10);
         assert!(expired.is_empty());
-        assert!(s.is_acked(5));
+        assert!(s.is_settled(5));
     }
 
     #[test]
@@ -4779,7 +4779,7 @@ mod tests {
         assert!(!s.is_ready(5));
 
         s.ack(5);
-        assert!(s.is_acked(5));
+        assert!(s.is_settled(5));
         assert!(!s.is_inflight(5));
         assert!(!s.is_ready(5));
     }
@@ -4812,7 +4812,7 @@ mod tests {
                 break;
             }
 
-            assert!(!s.is_acked(d));
+            assert!(!s.is_settled(d));
             assert!(!s.is_inflight(d));
 
             s.mark_inflight(d, 2000);
@@ -4975,7 +4975,7 @@ mod tests {
         assert_eq!(s.settled_until(), s2.settled_until());
 
         for i in 0..20000 {
-            assert_eq!(s.is_acked(i), s2.is_acked(i));
+            assert_eq!(s.is_settled(i), s2.is_settled(i));
         }
     }
 
@@ -5055,9 +5055,9 @@ mod tests {
         s.ack(2);
         s.ack(4);
         assert_eq!(s.settled_until(), 0);
-        assert!(s.is_acked(2));
-        assert!(s.is_acked(4));
-        assert!(!s.is_acked(0));
+        assert!(s.is_settled(2));
+        assert!(s.is_settled(4));
+        assert!(!s.is_settled(0));
 
         // ACK 0 should advance frontier to 1
         s.ack(0);
@@ -5073,7 +5073,7 @@ mod tests {
 
         // sanity: everything < 5 is acked now
         for o in 0..5 {
-            assert!(s.is_acked(o));
+            assert!(s.is_settled(o));
         }
     }
 
@@ -5083,14 +5083,14 @@ mod tests {
 
         s.enqueue(10, 0, None);
         s.mark_inflight(10, 1000);
-        assert!(s.is_inflight_or_acked(10));
-        assert!(!s.is_acked(10));
+        assert!(s.is_inflight_or_settled(10));
+        assert!(!s.is_settled(10));
 
         s.ack(10);
-        assert!(s.is_acked(10));
-        assert!(s.is_inflight_or_acked(10 /* still true via ack */)); // just to show logic
+        assert!(s.is_settled(10));
+        assert!(s.is_inflight_or_settled(10 /* still true via ack */)); // just to show logic
         // More direct:
-        assert!(s.is_inflight_or_acked(10));
+        assert!(s.is_inflight_or_settled(10));
         assert_eq!(s.inflight_len(), 0);
     }
 
@@ -5164,17 +5164,17 @@ mod tests {
     }
 
     #[test]
-    fn is_inflight_or_acked_behaves() {
+    fn is_inflight_or_settled_behaves() {
         let mut s = QueueInternalState::new("test".into(), 0);
 
         s.enqueue(5, 0, None);
         s.mark_inflight(5, 100);
-        assert!(s.is_inflight_or_acked(5));
-        assert!(!s.is_acked(5));
+        assert!(s.is_inflight_or_settled(5));
+        assert!(!s.is_settled(5));
 
         s.ack(5);
-        assert!(s.is_inflight_or_acked(5));
-        assert!(s.is_acked(5));
+        assert!(s.is_inflight_or_settled(5));
+        assert!(s.is_settled(5));
 
         // below frontier is always acked
         s.ack(0);
@@ -5184,8 +5184,8 @@ mod tests {
         s.ack(4);
         assert_eq!(s.settled_until(), 6);
         for o in 0..6 {
-            assert!(s.is_inflight_or_acked(o));
-            assert!(s.is_acked(o));
+            assert!(s.is_inflight_or_settled(o));
+            assert!(s.is_settled(o));
         }
     }
 
@@ -5258,7 +5258,7 @@ mod tests {
         assert!(s.is_pending_dlq(1));
         assert!(!s.is_ready(1));
         assert!(!s.is_inflight(1));
-        assert!(!s.is_acked(1)); // NOT acked yet — phase 2 hasn't happened
+        assert!(!s.is_settled(1)); // NOT acked yet — phase 2 hasn't happened
     }
 
     #[test]
@@ -5277,7 +5277,7 @@ mod tests {
             }
         );
         assert!(s.is_pending_dlq(1));
-        assert!(!s.is_acked(1));
+        assert!(!s.is_settled(1));
     }
 
     #[test]
@@ -5286,7 +5286,7 @@ mod tests {
         let out = s.nack(42, true);
         assert_eq!(out, NackOutcome::NoOp);
         assert!(!s.is_pending_dlq(42));
-        assert!(!s.is_acked(42));
+        assert!(!s.is_settled(42));
     }
 
     #[test]
@@ -5318,7 +5318,7 @@ mod tests {
         s.commit_dlq(0);
 
         assert!(!s.is_pending_dlq(0));
-        assert!(s.is_acked(0));
+        assert!(s.is_settled(0));
         assert_eq!(s.settled_until(), 1);
     }
 
@@ -5326,7 +5326,7 @@ mod tests {
     fn commit_dlq_unknown_offset_is_idempotent() {
         let mut s = QueueInternalState::new("t".into(), 0);
         s.commit_dlq(99); // never been pending
-        assert!(!s.is_acked(99));
+        assert!(!s.is_settled(99));
         assert_eq!(s.settled_until(), 0);
     }
 
@@ -5340,7 +5340,7 @@ mod tests {
         s.commit_dlq(0);
         s.commit_dlq(0); // second call: pending_dlq no longer contains, no-op
 
-        assert!(s.is_acked(0));
+        assert!(s.is_settled(0));
         assert_eq!(s.settled_until(), 1);
     }
 
@@ -5354,7 +5354,7 @@ mod tests {
         s.discard_pending_dlq(0);
 
         assert!(!s.is_pending_dlq(0));
-        assert!(s.is_acked(0));
+        assert!(s.is_settled(0));
     }
 
     #[test]
@@ -5366,7 +5366,7 @@ mod tests {
 
         // Frontier is 0, but pending_dlq holds 5, so safe truncation must not pass 5.
         assert!(s.safe_message_truncate_before() <= 5);
-        assert!(s.is_inflight_or_acked(5)); // delivery must skip it
+        assert!(s.is_inflight_or_settled(5)); // delivery must skip it
     }
 
     #[test]
@@ -5409,8 +5409,8 @@ mod tests {
         assert!(s.is_pending_dlq(2));
         assert!(!s.is_inflight(1));
         assert!(!s.is_ready(2));
-        assert!(!s.is_acked(1));
-        assert!(!s.is_acked(2));
+        assert!(!s.is_settled(1));
+        assert!(!s.is_settled(2));
     }
 
     #[test]
