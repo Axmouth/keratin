@@ -496,10 +496,6 @@ pub enum QueueCommand {
         offset: Offset,
         response: Option<oneshot::Sender<bool>>,
     }, // offset
-    FilterNotEnqueued {
-        items: Vec<(Offset, Vec<u8>)>,
-        response: Option<oneshot::Sender<Vec<(Offset, Vec<u8>)>>>,
-    }, // items
     GetDebugInfo {
         response: Option<oneshot::Sender<QueueInternalDebugInfo>>,
     }, // debug info
@@ -591,7 +587,6 @@ impl QueueCommand {
             QueueCommand::IsInflight { .. } => CommandPrio::High,
             QueueCommand::IsInflightOrSettled { .. } => CommandPrio::High,
             QueueCommand::IsReady { .. } => CommandPrio::High,
-            QueueCommand::FilterNotEnqueued { .. } => CommandPrio::High,
             QueueCommand::GetNextDeliverable { .. } => CommandPrio::High,
             QueueCommand::GetNextExpiryHint { .. } => CommandPrio::High,
 
@@ -668,7 +663,6 @@ impl QueueCommand {
             QueueCommand::IsInflight { .. } => "IsInflight",
             QueueCommand::IsInflightOrSettled { .. } => "IsInflightOrSettled",
             QueueCommand::IsReady { .. } => "IsReady",
-            QueueCommand::FilterNotEnqueued { .. } => "FilterNotEnqueued",
             QueueCommand::GetRetries { .. } => "GetRetries",
             QueueCommand::GetSettledUntil { .. } => "GetSettledUntil",
             QueueCommand::PollReadyAndMark { .. } => "PollReadyAndMark",
@@ -1893,15 +1887,6 @@ impl QueueHandleInner {
                     let _ = r.send(result);
                 }
             }
-            QueueCommand::FilterNotEnqueued {
-                mut items,
-                response,
-            } => {
-                state.filter_not_enqueued(&mut items);
-                if let Some(r) = response {
-                    let _ = r.send(items);
-                }
-            }
             QueueCommand::PollReadyAndMark {
                 max,
                 lease_deadline,
@@ -2502,20 +2487,6 @@ impl WorkQueueHandle<'_> {
         rx.await.unwrap_or(false)
     }
 
-    pub async fn filter_not_enqueued(
-        &self,
-        items: Vec<(Offset, Vec<u8>)>,
-    ) -> Vec<(Offset, Vec<u8>)> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::FilterNotEnqueued {
-                items: items.clone(),
-                response: Some(tx),
-            })
-            .await;
-        rx.await.unwrap_or_default()
-    }
-
     pub async fn retries(&self, offset: Offset) -> u32 {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -3020,10 +2991,6 @@ impl QueueInternalState {
     #[inline]
     pub fn is_ready(&self, offset: Offset) -> bool {
         self.ready.contains(&offset)
-    }
-
-    pub fn filter_not_enqueued<T>(&self, items: &mut Vec<(Offset, T)>) {
-        items.retain(|(off, _)| self.ready.contains(off));
     }
 
     pub fn ack(&mut self, offset: u64) {

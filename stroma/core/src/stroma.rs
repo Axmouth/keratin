@@ -2473,18 +2473,6 @@ impl Stroma {
         Ok(q.work_queue()?.is_ready(off).await)
     }
 
-    pub async fn filter_not_enqueued(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-        items: Vec<(Offset, Vec<u8>)>,
-    ) -> Result<Vec<(Offset, Vec<u8>)>> {
-        let q = self.queue_handle(tp, part, group).await?;
-        let q = q.resolve()?;
-        Ok(q.work_queue()?.filter_not_enqueued(items).await)
-    }
-
     fn queue_keys_snapshot(&self) -> Vec<(Box<str>, u32, Option<Box<str>>)> {
         let map = self.queue_handles.load();
 
@@ -4984,16 +4972,6 @@ impl Stroma {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
         Ok(q.work_queue()?.is_settled(off).await)
-    }
-
-    pub async fn count_inflight(&self, tp: &str, part: u32, group: Option<&str>) -> Result<usize> {
-        let q = self.queue_handle(tp, part, group).await?;
-        let q = q.resolve()?;
-        // A stream has no leased deliveries, so its inflight count is always 0.
-        Ok(match q.as_work_queue() {
-            Some(wq) => wq.inflight_len().await,
-            None => 0,
-        })
     }
 
     pub fn list_topics(&self) -> Vec<Box<str>> {
