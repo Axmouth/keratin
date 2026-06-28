@@ -3766,13 +3766,6 @@ impl QueueInternalState {
         *self = QueueInternalState::new_with_waker(self.topic.clone(), self.partition, waker);
     }
 
-    /// Mark every offset below `frontier` settled. Recovery/snapshot helper.
-    pub fn set_settled_frontier(&mut self, frontier: Offset) {
-        if frontier > 0 {
-            self.settled.insert(0..frontier);
-        }
-    }
-
     // TODO: Add enqueued state?
     pub fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Vec<u8> {
         let start = Instant::now();
