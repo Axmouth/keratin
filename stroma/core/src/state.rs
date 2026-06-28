@@ -7,7 +7,6 @@ use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU64, Ordering};
 
 use arc_swap::ArcSwap;
 
-use bitvec::vec::BitVec;
 use keratin_log::Keratin;
 use keratin_log::util::unix_millis;
 use rangemap::{RangeMap, RangeSet};
@@ -32,9 +31,7 @@ use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 pub type Offset = u64;
 pub type UnixMillis = u64;
 
-pub const ACK_WINDOW: usize = 16384; // fixed bounded memory
-
-pub const FORMAT_VERSION: u64 = 3;
+pub const FORMAT_VERSION: u64 = 4;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -324,13 +321,12 @@ pub struct QueueInternalState {
     last_snapshot_timestamp: u64,
     last_snapshot_event_offset: u64,
 
-    // ----- ACK state -----
-    // Lowest offset that is NOT ACKed (frontier).
-    settled_until: Offset,
-
-    // Bounded window of out-of-order ACKs for offsets in [ack_window_base, ack_window_base + ACK_WINDOW)
-    ack_window_base: Offset,
-    ack_bits: BitVec,
+    // ----- settlement state -----
+    // Terminal settlements (ack, terminal nack, DLQ commit) as offset ranges,
+    // stored from 0. The contiguous run covering offset 0 is the frontier
+    // (`settled_until`, derived); out-of-order settlements live as separate ranges
+    // above it and coalesce into the frontier as it advances. Mirrors `ready`.
+    settled: RangeSet<Offset>,
 
     // ----- inflight -----
     // offset -> deadline_ts
@@ -462,26 +458,9 @@ pub enum QueueCommand {
         global: Option<GlobalDLQ>,
         response: Option<oneshot::Sender<Option<(String, u32, Option<String>)>>>,
     },
-    AdvanceFrontier {
-        response: Option<oneshot::Sender<()>>,
-    },
     Reset {
         response: Option<oneshot::Sender<()>>,
     },
-    SetAckedUntil {
-        offset: Offset,
-        response: Option<oneshot::Sender<()>>,
-    }, // offset
-    SetAckWindow {
-        base: Offset,
-        bits: BitVec,
-        response: Option<oneshot::Sender<()>>,
-    }, // base, bits
-    SetAckWindowFromBytes {
-        base: Offset,
-        bits_bytes: Vec<u8>,
-        response: Option<oneshot::Sender<std::io::Result<()>>>,
-    }, // base, bits_bytes
     EncodeSnapshot {
         last_snapshot_event_offset: u64,
         force: bool,
@@ -554,12 +533,6 @@ pub enum QueueCommand {
     GetNextExpiryHint {
         response: Option<oneshot::Sender<Option<UnixMillis>>>,
     },
-    GetAckWindowBase {
-        response: Option<oneshot::Sender<Offset>>,
-    },
-    GetAckBitsBytes {
-        response: Option<oneshot::Sender<Vec<u8>>>,
-    },
     GetCanonicalQueueState {
         response: Option<oneshot::Sender<CanonicalQueueState>>,
     },
@@ -598,9 +571,6 @@ impl QueueCommand {
             // Put at Express so they can't be blocked if something else is in the queue
             QueueCommand::LoadSnapshot { .. } => CommandPrio::Express,
             QueueCommand::InstallSnapshotState { .. } => CommandPrio::Express,
-            QueueCommand::SetAckedUntil { .. } => CommandPrio::Express,
-            QueueCommand::SetAckWindow { .. } => CommandPrio::Express,
-            QueueCommand::SetAckWindowFromBytes { .. } => CommandPrio::Express,
             QueueCommand::Reset { .. } => CommandPrio::Express,
             QueueCommand::GetDlqTarget { .. } => CommandPrio::Express,
 
@@ -612,8 +582,6 @@ impl QueueCommand {
             QueueCommand::GetSettledUntil { .. } => CommandPrio::Express,
             QueueCommand::GetLowestUnacked { .. } => CommandPrio::Express,
             QueueCommand::GetLowestNotAcked { .. } => CommandPrio::Express,
-            QueueCommand::GetAckWindowBase { .. } => CommandPrio::Express,
-            QueueCommand::GetAckBitsBytes { .. } => CommandPrio::Express,
             QueueCommand::GetCanonicalQueueState { .. } => CommandPrio::Express,
             QueueCommand::DumpInflight { .. } => CommandPrio::Express,
             QueueCommand::GetRetries { .. } => CommandPrio::Express,
@@ -657,7 +625,6 @@ impl QueueCommand {
             // === Background maintenance — wait for quiet periods ===
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
             QueueCommand::CollectTtlExpired { .. } => CommandPrio::Low,
-            QueueCommand::AdvanceFrontier { .. } => CommandPrio::Low,
 
             // === Snapshots — lowest priority, run only when other work is drained ===
             // This assumes snapshot encoding can tolerate being delayed under load.
@@ -692,11 +659,7 @@ impl QueueCommand {
             QueueCommand::ReleaseInflightMany { .. } => "ReleaseInflightMany",
             QueueCommand::Nack { .. } => "Nack",
             QueueCommand::NackMany { .. } => "NackMany",
-            QueueCommand::AdvanceFrontier { .. } => "AdvanceFrontier",
             QueueCommand::Reset { .. } => "Reset",
-            QueueCommand::SetAckedUntil { .. } => "SetAckedUntil",
-            QueueCommand::SetAckWindow { .. } => "SetAckWindow",
-            QueueCommand::SetAckWindowFromBytes { .. } => "SetAckWindowFromBytes",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
             QueueCommand::ExportStateCheckpoint { .. } => "ExportStateCheckpoint",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
@@ -714,8 +677,6 @@ impl QueueCommand {
             QueueCommand::GetNextDeliverable { .. } => "GetNextDeliverable",
             QueueCommand::GetInflightLen { .. } => "GetInflightLen",
             QueueCommand::GetNextExpiryHint { .. } => "GetNextExpiryHint",
-            QueueCommand::GetAckWindowBase { .. } => "GetAckWindowBase",
-            QueueCommand::GetAckBitsBytes { .. } => "GetAckBitsBytes",
             QueueCommand::GetCanonicalQueueState { .. } => "GetCanonicalQueueState",
             QueueCommand::GetStatusReport { .. } => "GetStatusReport",
             QueueCommand::InspectOffsets { .. } => "InspectOffsets",
@@ -1797,46 +1758,10 @@ impl QueueHandleInner {
                     let _ = r.send(result);
                 }
             }
-            QueueCommand::AdvanceFrontier { response } => {
-                state.advance_frontier();
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
-            }
             QueueCommand::Reset { response } => {
                 state.reset();
                 if let Some(r) = response {
                     let _ = r.send(());
-                }
-                dirty = true;
-            }
-            QueueCommand::SetAckedUntil { offset, response } => {
-                state.set_acked_until(offset);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
-            }
-            QueueCommand::SetAckWindow {
-                base,
-                bits,
-                response,
-            } => {
-                state.set_ack_window(base, bits);
-                if let Some(r) = response {
-                    let _ = r.send(());
-                }
-                dirty = true;
-            }
-            QueueCommand::SetAckWindowFromBytes {
-                base,
-                bits_bytes,
-                response,
-            } => {
-                let result = state.set_ack_window_from_bytes(base, &bits_bytes);
-                if let Some(r) = response {
-                    let _ = r.send(result);
                 }
                 dirty = true;
             }
@@ -2009,18 +1934,6 @@ impl QueueHandleInner {
             }
             QueueCommand::GetNextExpiryHint { response } => {
                 let result = state.next_expiry_hint();
-                if let Some(r) = response {
-                    let _ = r.send(result);
-                }
-            }
-            QueueCommand::GetAckWindowBase { response } => {
-                let result = state.ack_window_base();
-                if let Some(r) = response {
-                    let _ = r.send(result);
-                }
-            }
-            QueueCommand::GetAckBitsBytes { response } => {
-                let result = state.ack_bits_bytes();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -2460,15 +2373,6 @@ impl WorkQueueHandle<'_> {
         Ok(())
     }
 
-    pub async fn advance_frontier(&self) -> Result<(), QueueHandleError> {
-        let _owner_operation = self.begin_owner_operation().await?;
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::AdvanceFrontier { response: Some(tx) })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
 }
 
 impl QueueHandleInner {
@@ -2488,52 +2392,6 @@ impl QueueHandleInner {
             }
         }
         rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-}
-
-impl WorkQueueHandle<'_> {
-    pub async fn set_acked_until(&self, offset: Offset) -> Result<(), QueueHandleError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::SetAckedUntil {
-                offset,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
-    pub async fn set_ack_window(&self, base: Offset, bits: BitVec) -> Result<(), QueueHandleError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::SetAckWindow {
-                base,
-                bits,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)?;
-        Ok(())
-    }
-
-    pub async fn set_ack_window_from_bytes(
-        &self,
-        base: Offset,
-        bits_bytes: Vec<u8>,
-    ) -> Result<(), QueueHandleError> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::SetAckWindowFromBytes {
-                base,
-                bits_bytes,
-                response: Some(tx),
-            })
-            .await;
-        rx.await
-            .map_err(|_| QueueHandleError::ActorGone)?
-            .map_err(|error| QueueHandleError::Internal(error.to_string()))?;
         Ok(())
     }
 }
@@ -2844,22 +2702,6 @@ impl WorkQueueHandle<'_> {
         rx.await.unwrap_or(None)
     }
 
-    pub async fn ack_window_base(&self) -> Offset {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::GetAckWindowBase { response: Some(tx) })
-            .await;
-        rx.await.unwrap_or(0)
-    }
-
-    pub async fn ack_bits_bytes(&self) -> Vec<u8> {
-        let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::GetAckBitsBytes { response: Some(tx) })
-            .await;
-        rx.await.unwrap_or_default()
-    }
-
     pub async fn canonical(&self) -> CanonicalQueueState {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -3088,9 +2930,7 @@ impl QueueInternalState {
             partition,
             last_snapshot_timestamp: 0,
             last_snapshot_event_offset: 0,
-            settled_until: 0,
-            ack_window_base: 0,
-            ack_bits: BitVec::repeat(false, ACK_WINDOW),
+            settled: RangeSet::new(),
             inflight: BTreeMap::new(),
             pending_dlq: BTreeMap::new(),
             ready: RangeSet::new(),
@@ -3113,9 +2953,7 @@ impl QueueInternalState {
             partition,
             last_snapshot_timestamp: 0,
             last_snapshot_event_offset: 0,
-            settled_until: 0,
-            ack_window_base: 0,
-            ack_bits: BitVec::repeat(false, ACK_WINDOW),
+            settled: RangeSet::new(),
             inflight: BTreeMap::new(),
             pending_dlq: BTreeMap::new(),
             ready: RangeSet::new(),
@@ -3134,8 +2972,7 @@ impl QueueInternalState {
 
     pub fn debug_info(&self) -> QueueInternalDebugInfo {
         QueueInternalDebugInfo {
-            settled_until: self.settled_until,
-            ack_window_base: self.ack_window_base,
+            settled_until: self.settled_until(),
             ready_count: self.ready.iter().map(|r| (r.end - r.start) as usize).sum(),
             ready_set_fragments: self.ready.len(),
             inflight_count: self.inflight.len(),
@@ -3200,19 +3037,25 @@ impl QueueInternalState {
             .min(min_delayed_enq)
             .min(min_delayed_retry);
         if result == u64::MAX {
-            return self.settled_until;
+            return self.settled_until();
         }
         if result == 0 {
-            return self.settled_until;
+            return self.settled_until();
         }
         result
     }
 
     // ---------------- ACK API ----------------
 
+    /// The ACK frontier: the end of the contiguous settled run covering offset 0,
+    /// or 0 if offset 0 is not settled. Derived from `settled` (single source of
+    /// truth), so it is always current with no separate field to keep in sync.
     #[inline]
     pub fn settled_until(&self) -> Offset {
-        self.settled_until
+        match self.settled.first() {
+            Some(r) if r.start == 0 => r.end,
+            _ => 0,
+        }
     }
 
     // pub fn iter_ready_from(&self, from: Offset) -> impl Iterator<Item = Offset> + '_ {
@@ -3262,20 +3105,10 @@ impl QueueInternalState {
         offs
     }
 
-    /// True if this offset is known ACKed.
+    /// True if this offset is known settled (acked, terminal-nacked, or DLQ'd).
     #[inline]
     pub fn is_acked(&self, offset: Offset) -> bool {
-        if offset < self.settled_until {
-            return true;
-        }
-
-        if offset < self.ack_window_base {
-            // Out of tracked window and >= acked_until implies "unknown / not acked"
-            return false;
-        }
-
-        let idx = (offset - self.ack_window_base) as usize;
-        idx < ACK_WINDOW && self.ack_bits[idx]
+        self.settled.contains(&offset)
     }
 
     #[inline]
@@ -3298,7 +3131,7 @@ impl QueueInternalState {
     }
 
     pub fn ack(&mut self, offset: u64) {
-        if offset < self.settled_until {
+        if self.settled.contains(&offset) {
             // already settled
             self.inflight.remove(&offset); // best-effort cleanup
             return;
@@ -3314,24 +3147,14 @@ impl QueueInternalState {
             self.recompute_hint_if_needed();
         }
 
-        if offset == self.settled_until {
-            self.settled_until += 1;
-            self.advance_frontier();
-            return;
-        }
-
-        let end = self.ack_window_base + ACK_WINDOW as u64;
-        if offset < end {
-            let idx = (offset - self.ack_window_base) as usize;
-            self.ack_bits.set(idx, true);
-        } else {
-            // far settle: leave for persistence/event log (still applied logically by replay later)
-            // (Materialized model can ignore or store it.)
-        }
+        // Record the settlement. Inserting coalesces with adjacent ranges, so an
+        // ack at the frontier extends it and out-of-order acks merge in as the
+        // frontier catches up. No window, no explicit frontier advance.
+        self.settled.insert(offset..offset + 1);
     }
 
     pub fn release_inflight(&mut self, offset: u64) -> bool {
-        if offset < self.settled_until || !self.inflight.contains_key(&offset) {
+        if self.settled.contains(&offset) || !self.inflight.contains_key(&offset) {
             return false;
         }
 
@@ -3357,7 +3180,7 @@ impl QueueInternalState {
         requeue: bool,
         not_before: Option<UnixMillis>,
     ) -> NackOutcome {
-        if offset < self.settled_until {
+        if offset < self.settled_until() {
             self.inflight.remove(&offset);
             return NackOutcome::NoOp;
         }
@@ -3424,7 +3247,7 @@ impl QueueInternalState {
 
     pub fn mark_pending_dlq_many(&mut self, offsets: &[Offset]) {
         for &o in offsets {
-            if o < self.settled_until {
+            if o < self.settled_until() {
                 continue;
             }
             self.inflight.remove(&o);
@@ -3611,46 +3434,9 @@ impl QueueInternalState {
         }
     }
 
-    /// Slide frontier through contiguous acked bits and slide the window accordingly.
-    fn advance_frontier(&mut self) {
-        loop {
-            // Is acked_until represented inside window?
-            if self.settled_until < self.ack_window_base {
-                break;
-            }
-            let idx = (self.settled_until - self.ack_window_base) as usize;
-            if idx >= ACK_WINDOW || !self.ack_bits[idx] {
-                break;
-            }
-            self.ack_bits.set(idx, false);
-            self.settled_until += 1;
-        }
-
-        // Slide the window so its base follows acked_until (keeps bits "near" the frontier).
-        let new_base = self.settled_until;
-        let delta = new_base.saturating_sub(self.ack_window_base);
-        if delta == 0 {
-            return;
-        }
-
-        if delta as usize >= ACK_WINDOW {
-            // We've advanced more than the window; just clear it.
-            self.ack_bits.fill(false);
-            self.ack_window_base = new_base;
-            return;
-        }
-
-        // Rotate left by delta and clear new tail.
-        self.ack_bits.rotate_left(delta as usize);
-        for i in (ACK_WINDOW - delta as usize)..ACK_WINDOW {
-            self.ack_bits.set(i, false);
-        }
-        self.ack_window_base = new_base;
-    }
-
     #[inline]
     pub fn lowest_unacked_offset(&self) -> Offset {
-        self.settled_until
+        self.settled_until()
     }
 
     #[inline]
@@ -3750,7 +3536,7 @@ impl QueueInternalState {
     /// Mark inflight for an offset. If offset is already ACKed, no-op.
     pub fn mark_inflight(&mut self, offset: Offset, deadline: UnixMillis) -> bool {
         // Below frontier is always acked
-        if offset < self.settled_until {
+        if offset < self.settled_until() {
             return false;
         }
 
@@ -3950,7 +3736,7 @@ impl QueueInternalState {
     /// Find next deliverable offset in [from, upper).
     /// Skips inflight and (bounded) acked entries.
     pub fn next_deliverable(&self, from: Offset, upper: Offset) -> Offset {
-        let start = from.max(self.settled_until);
+        let start = from.max(self.settled_until());
 
         for range in self.ready.overlapping(&(start..upper)) {
             let range_start = range.start.max(start);
@@ -3980,83 +3766,16 @@ impl QueueInternalState {
         *self = QueueInternalState::new_with_waker(self.topic.clone(), self.partition, waker);
     }
 
-    // Snapshot/recovery setters (used by recover.rs)
-    pub fn set_acked_until(&mut self, v: Offset) {
-        self.settled_until = v;
-        // keep window consistent with new frontier
-        self.ack_window_base = v;
-        self.ack_bits.fill(false);
-    }
-
-    pub fn set_ack_window(&mut self, base: Offset, bits: BitVec) {
-        self.ack_window_base = base;
-        self.ack_bits = bits;
-        if self.ack_bits.len() != ACK_WINDOW {
-            self.ack_bits.resize(ACK_WINDOW, false);
+    /// Mark every offset below `frontier` settled. Recovery/snapshot helper.
+    pub fn set_settled_frontier(&mut self, frontier: Offset) {
+        if frontier > 0 {
+            self.settled.insert(0..frontier);
         }
-    }
-
-    pub fn ack_window_base(&self) -> u64 {
-        self.ack_window_base
-    }
-
-    pub fn ack_bits_bytes(&self) -> Vec<u8> {
-        // Convert BitVec<usize,Lsb0> → Vec<u8> in a stable packed form
-        self.ack_bits
-            .as_raw_slice()
-            .iter()
-            .flat_map(|w| w.to_le_bytes())
-            .collect()
-    }
-
-    pub fn set_ack_window_from_bytes(&mut self, base: u64, bytes: &[u8]) -> std::io::Result<()> {
-        let word_bytes = std::mem::size_of::<usize>();
-
-        if !bytes.len().is_multiple_of(word_bytes) {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "bad ack window bytes",
-            ));
-        }
-
-        let mut words = Vec::with_capacity(bytes.len() / word_bytes);
-        for chunk in bytes.chunks_exact(word_bytes) {
-            words.push(usize::from_le_bytes(chunk.try_into().map_err(|_| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "failed to convert chunk to usize",
-                )
-            })?));
-        }
-
-        let mut bits = bitvec::vec::BitVec::<usize, bitvec::order::Lsb0>::from_vec(words);
-
-        if bits.len() < ACK_WINDOW {
-            return Err(std::io::Error::new(
-                std::io::ErrorKind::InvalidData,
-                "ack window too small",
-            ));
-        }
-
-        bits.truncate(ACK_WINDOW);
-
-        self.ack_window_base = base;
-        self.ack_bits = bits;
-        Ok(())
     }
 
     // TODO: Add enqueued state?
     pub fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Vec<u8> {
         let start = Instant::now();
-
-        // let last_snapshot_timestamp = self.last_snapshot_timestamp;
-        // let last_snapshot_event_offset = self.last_snapshot_event_offset;
-        // let settled_until = self.settled_until;
-        // let ack_window_base = self.ack_window_base;
-        // let inflight = self.inflight.clone();
-        // let ready = self.ready.clone();
-        // let retries = self.retries.clone();
-        let bits = self.ack_bits_bytes();
 
         let mut out = Vec::new();
 
@@ -4067,13 +3786,13 @@ impl QueueInternalState {
         out.extend_from_slice(&self.last_snapshot_timestamp.to_be_bytes());
         out.extend_from_slice(&last_snapshot_event_offset.to_be_bytes());
 
-        // acked_until
-        out.extend_from_slice(&self.settled_until.to_be_bytes());
-
-        // ack window
-        out.extend_from_slice(&self.ack_window_base.to_be_bytes());
-        out.extend_from_slice(&(bits.len() as u32).to_be_bytes());
-        out.extend_from_slice(&bits);
+        // settled ranges (from 0; the contiguous run covering 0 is the frontier)
+        let settled_ranges: Vec<_> = self.settled.iter().collect();
+        out.extend_from_slice(&(settled_ranges.len() as u64).to_be_bytes());
+        for range in settled_ranges {
+            out.extend_from_slice(&range.start.to_be_bytes());
+            out.extend_from_slice(&range.end.to_be_bytes());
+        }
 
         // inflight
         out.extend_from_slice(&(self.inflight.len() as u64).to_be_bytes());
@@ -4224,17 +3943,15 @@ impl QueueInternalState {
         self.last_snapshot_timestamp = u64::from_be_bytes(take::<8>(&mut bytes)?);
         self.last_snapshot_event_offset = u64::from_be_bytes(take::<8>(&mut bytes)?);
 
-        self.settled_until = u64::from_be_bytes(take::<8>(&mut bytes)?);
-        let base = u64::from_be_bytes(take::<8>(&mut bytes)?);
-
-        // ack window
-        let win_len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
-        if bytes.len() < win_len {
-            return Err(Error::new(ErrorKind::UnexpectedEof, "ack window"));
+        // settled ranges (from 0; the contiguous run covering 0 is the frontier)
+        let settled_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        for _ in 0..settled_len {
+            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            if end > start {
+                self.settled.insert(start..end);
+            }
         }
-        let win = &bytes[..win_len];
-        bytes = &bytes[win_len..];
-        self.set_ack_window_from_bytes(base, win)?;
 
         // inflight
         let inflight_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
@@ -4368,14 +4085,7 @@ impl QueueInternalState {
         }
 
         // --- enforce invariants ---
-        if self.ack_window_base > self.settled_until {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                "ack window base > frontier",
-            ));
-        }
-
-        if self.inflight.keys().any(|&o| o < self.settled_until) {
+        if self.inflight.keys().any(|&o| o < self.settled_until()) {
             return Err(Error::new(ErrorKind::InvalidData, "inflight < frontier"));
         }
 
@@ -4398,9 +4108,7 @@ impl QueueInternalState {
         inflight.sort_unstable();
 
         CanonicalQueueState {
-            acked_until: self.settled_until,
-            ack_window_base: self.ack_window_base,
-            ack_bits: self.ack_bits_bytes(),
+            settled: self.settled.iter().map(|r| (r.start, r.end)).collect(),
             inflight,
         }
     }
@@ -4485,7 +4193,6 @@ pub struct QueueDebugInfo {
 #[derive(Debug, Clone, Default, Serialize)]
 pub struct QueueInternalDebugInfo {
     pub settled_until: Offset,
-    pub ack_window_base: Offset,
     pub ready_count: usize,
     pub ready_set_fragments: usize,
     pub inflight_count: usize,
@@ -4500,23 +4207,12 @@ pub struct QueueInternalDebugInfo {
     pub dlq_max_retries: u32,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
 pub struct CanonicalQueueState {
-    pub acked_until: u64,
-    pub ack_window_base: u64,
-    pub ack_bits: Vec<u8>,
+    /// Settled offset ranges (acked / terminal-nacked / DLQ'd), from 0. The frontier
+    /// is the end of the range covering 0.
+    pub settled: Vec<(u64, u64)>,
     pub inflight: Vec<(u64, u64)>,
-}
-
-impl Default for CanonicalQueueState {
-    fn default() -> Self {
-        Self {
-            acked_until: 0,
-            ack_window_base: 0,
-            ack_bits: vec![0; ACK_WINDOW / 8],
-            inflight: Vec::new(),
-        }
-    }
 }
 
 #[cfg(test)]

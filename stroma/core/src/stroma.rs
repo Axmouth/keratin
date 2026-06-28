@@ -5184,10 +5184,6 @@ impl Stroma {
                     return Err(StromaError::Decode("inflight < ack frontier".into()));
                 }
             }
-
-            if wq.ack_window_base().await > wq.settled_until().await {
-                return Err(StromaError::Decode("ack window base > frontier".into()));
-            }
         }
         Ok(())
     }
