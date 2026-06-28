@@ -2438,7 +2438,7 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn lowest_unacked_offset(
+    pub async fn lowest_unsettled_offset(
         &self,
         tp: &str,
         part: u32,
@@ -2446,7 +2446,7 @@ impl Stroma {
     ) -> Result<Offset> {
         let q = self.queue_handle(tp, part, group).await?;
         let q = q.resolve()?;
-        Ok(q.work_queue()?.lowest_unacked_offset().await)
+        Ok(q.work_queue()?.lowest_unsettled_offset().await)
     }
 
     pub async fn is_inflight_or_settled(
@@ -2746,7 +2746,7 @@ impl Stroma {
         // own retention worker, so it contributes no floor here (0 truncates
         // nothing).
         let safe_msg_truncate = match qh.as_work_queue() {
-            Some(wq) => wq.lowest_not_acked_offset().await,
+            Some(wq) => wq.lowest_not_settled_offset().await,
             None => 0,
         };
         let applied_upto = qh.applied_upto().load(Ordering::Relaxed);
@@ -4947,7 +4947,7 @@ impl Stroma {
             return Ok(0);
         };
         let settled_until = wq.settled_until().await;
-        let min = settled_until.min(wq.lowest_not_acked_offset().await);
+        let min = settled_until.min(wq.lowest_not_settled_offset().await);
 
         Ok(min)
     }
@@ -5117,7 +5117,7 @@ impl Stroma {
         // A stream has no ack frontier and prunes via retention, so it offers no
         // message-log floor here (0 truncates nothing).
         let safe_msg_truncate = match qh.as_work_queue() {
-            Some(wq) => wq.lowest_not_acked_offset().await,
+            Some(wq) => wq.lowest_not_settled_offset().await,
             None => 0,
         };
         let msg_head = msg_log

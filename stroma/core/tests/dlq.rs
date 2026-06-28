@@ -449,7 +449,7 @@ async fn pending_dlq_blocks_msg_truncation_watermark() {
     let q = q.resolve().unwrap();
     let q = q.work_queue().unwrap();
     let pending = q.pending_dlq().await.unwrap();
-    let watermark = q.lowest_not_acked_offset().await;
+    let watermark = q.lowest_not_settled_offset().await;
 
     if pending.iter().any(|(o, _)| o == &off) {
         assert!(

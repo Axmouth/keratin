@@ -512,10 +512,10 @@ pub enum QueueCommand {
         upper: Offset,
         response: Option<oneshot::Sender<Vec<(Offset, u32)>>>,
     }, // max, lease_deadline, upper (exclusive deliverable ceiling)
-    GetLowestUnacked {
+    GetLowestUnsettled {
         response: Option<oneshot::Sender<Offset>>,
     },
-    GetLowestNotAcked {
+    GetLowestNotSettled {
         response: Option<oneshot::Sender<Offset>>,
     },
     GetNextDeliverable {
@@ -576,8 +576,8 @@ impl QueueCommand {
             QueueCommand::InspectOffsets { .. } => CommandPrio::Express,
             QueueCommand::GetInflightLen { .. } => CommandPrio::Express,
             QueueCommand::GetSettledUntil { .. } => CommandPrio::Express,
-            QueueCommand::GetLowestUnacked { .. } => CommandPrio::Express,
-            QueueCommand::GetLowestNotAcked { .. } => CommandPrio::Express,
+            QueueCommand::GetLowestUnsettled { .. } => CommandPrio::Express,
+            QueueCommand::GetLowestNotSettled { .. } => CommandPrio::Express,
             QueueCommand::GetCanonicalQueueState { .. } => CommandPrio::Express,
             QueueCommand::DumpInflight { .. } => CommandPrio::Express,
             QueueCommand::GetRetries { .. } => CommandPrio::Express,
@@ -666,8 +666,8 @@ impl QueueCommand {
             QueueCommand::GetRetries { .. } => "GetRetries",
             QueueCommand::GetSettledUntil { .. } => "GetSettledUntil",
             QueueCommand::PollReadyAndMark { .. } => "PollReadyAndMark",
-            QueueCommand::GetLowestUnacked { .. } => "GetLowestUnacked",
-            QueueCommand::GetLowestNotAcked { .. } => "GetLowestNotAcked",
+            QueueCommand::GetLowestUnsettled { .. } => "GetLowestUnsettled",
+            QueueCommand::GetLowestNotSettled { .. } => "GetLowestNotSettled",
             QueueCommand::GetNextDeliverable { .. } => "GetNextDeliverable",
             QueueCommand::GetInflightLen { .. } => "GetInflightLen",
             QueueCommand::GetNextExpiryHint { .. } => "GetNextExpiryHint",
@@ -1824,7 +1824,7 @@ impl QueueHandleInner {
                 state.last_snapshot_event_offset = last_snapshot_event_offset;
                 state.last_snapshot_timestamp = unix_millis();
 
-                let message_checkpoint_offset = state.lowest_not_acked_offset();
+                let message_checkpoint_offset = state.lowest_not_settled_offset();
                 let clone_start = Instant::now();
                 let state_clone = state.clone();
                 let clone_duration = clone_start.elapsed();
@@ -1899,14 +1899,14 @@ impl QueueHandleInner {
                     let _ = r.send(result);
                 }
             }
-            QueueCommand::GetLowestUnacked { response } => {
-                let result = state.lowest_unacked_offset();
+            QueueCommand::GetLowestUnsettled { response } => {
+                let result = state.lowest_unsettled_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
             }
-            QueueCommand::GetLowestNotAcked { response } => {
-                let result = state.lowest_not_acked_offset();
+            QueueCommand::GetLowestNotSettled { response } => {
+                let result = state.lowest_not_settled_offset();
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
@@ -2525,18 +2525,18 @@ impl WorkQueueHandle<'_> {
         rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
-    pub async fn lowest_unacked_offset(&self) -> Offset {
+    pub async fn lowest_unsettled_offset(&self) -> Offset {
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::GetLowestUnacked { response: Some(tx) })
+            .command_enqueue(QueueCommand::GetLowestUnsettled { response: Some(tx) })
             .await;
         rx.await.unwrap_or(0)
     }
 
-    pub async fn lowest_not_acked_offset(&self) -> Offset {
+    pub async fn lowest_not_settled_offset(&self) -> Offset {
         let (tx, rx) = oneshot::channel();
         let _ = self
-            .command_enqueue(QueueCommand::GetLowestNotAcked { response: Some(tx) })
+            .command_enqueue(QueueCommand::GetLowestNotSettled { response: Some(tx) })
             .await;
         rx.await.unwrap_or(0)
     }
@@ -3298,12 +3298,12 @@ impl QueueInternalState {
     }
 
     #[inline]
-    pub fn lowest_unacked_offset(&self) -> Offset {
+    pub fn lowest_unsettled_offset(&self) -> Offset {
         self.settled_until()
     }
 
     #[inline]
-    pub fn lowest_not_acked_offset(&self) -> Offset {
+    pub fn lowest_not_settled_offset(&self) -> Offset {
         self.safe_message_truncate_before()
     }
 
@@ -3994,7 +3994,7 @@ impl QueueInternalState {
             inflight_count: self.inflight.len(),
             ready_count: self.ready.iter().map(|r| (r.end - r.start) as usize).sum(),
             next_expiry_hint: self.peek_next_expiry_hint(),
-            lowest_unacked: self.lowest_unacked_offset(),
+            lowest_unacked: self.lowest_unsettled_offset(),
         }
     }
 }

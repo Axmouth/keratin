@@ -775,7 +775,7 @@ impl Stroma {
                 snapshot_meta.last_snapshot_event_offset, install.applied_event_offset
             )));
         }
-        let lowest_state_referenced_message = checkpoint_state.lowest_not_acked_offset();
+        let lowest_state_referenced_message = checkpoint_state.lowest_not_settled_offset();
         if install.message_next_offset > lowest_state_referenced_message {
             return Err(StromaError::InvalidArgument(format!(
                 "checkpoint message continuation {} is ahead of lowest state-referenced message {}",
