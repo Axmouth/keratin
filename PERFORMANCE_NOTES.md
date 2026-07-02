@@ -729,3 +729,27 @@ K1 first with before/after runs of the keratin throughput utility plus the
 fibril confirmed scenarios (the end-to-end p50 should drop visibly if the
 interval wait dominates), then K4 and K5 as free wins, then re-measure
 before touching K2 or K3.
+
+### SATA floor sweep (2026-07-03, fibril end-to-end, drive at 50% used)
+
+Confirmed 1KB scenario, same evening, same drive. Old policy = pre
+self-clocking stack. Numbers are p50 confirm / sustained rate at a 150k/s
+target.
+
+| Policy | 50k/s p50 | 150k/s p50 at sustained |
+| --- | ---: | ---: |
+| old interval (5ms) | 18-19ms | 54-59ms at 141k |
+| floor 0 (self-clock) | 34-57ms | 53-104ms at 104-143k |
+| floor 5ms | 23ms | 92ms at 100k |
+| floor 15ms | 72ms | 101ms at 95k |
+
+Reading: run-to-run drive variance dominates most cells, so only two signals
+look real. A 15ms floor is clearly worse (it adds straight wait beyond the
+old interval). Zero floor at low rate trends worse than the old policy on
+this drive, partially recovered at 5ms, which matches back-to-back barriers
+costing something on SATA ext4. Throughput saturation was policy-independent
+(~290-335k/s). Guidance: keep the floor at 0 on fast storage where the
+self-clock earns its latency win, and set roughly the old interval (5ms) on
+slow-fsync storage. Follow-up idea: derive the floor adaptively from an EMA
+of observed fsync duration so slow devices get breathing room without
+configuration. Fast devices converge to 0 on their own.
