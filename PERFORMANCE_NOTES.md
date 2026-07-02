@@ -639,7 +639,7 @@ overhead. Context: the fibril side now sustains 500k+ msg/s at 1KB on tmpfs
 after its delivery-hop batching, and the enqueue-path baseline above
 (~460k/s) suggests this layer is at or near the current end-to-end ceiling.
 
-### K1. Commits wait out the fsync interval even when the fsync thread is idle
+### K1. Commits wait out the fsync interval even when the fsync thread is idle (DONE, dda8555)
 
 Where: `keratin-log/src/writer.rs`, `maybe_commit_due` and
 `post_stage_commit_and_tune`, both gating on
@@ -658,6 +658,14 @@ interval-bound (~5ms per leg) to fsync-cost-bound (microseconds on tmpfs,
 about a millisecond on a SATA SSD), with unchanged behavior at saturation.
 This is the single largest latency lever found in this layer. Guard it with
 a floor setting if fsync rate on hard disks becomes a concern.
+
+Implemented and measured (dda8555): with the self-clocking commit and the
+`min_fsync_interval_ms` floor at its default of 0, the fibril end-to-end
+confirmed p50 fell from 11ms to 4-5ms and publish-to-deliver p50 to 2-4ms
+below the knee, with 400k/s at p50 3-4ms and 500k/s at p50 8-9ms on tmpfs at
+full rate and zero missing. A back-to-back disk A/B on a SATA SSD was within
+drive variance with the new policy slightly ahead, so no floor was needed
+there. All keratin and fibril suites pass.
 
 ### K2. A durable publish confirm chains two group commits
 
