@@ -629,3 +629,95 @@ Possible direction:
 - Keep `Default` for simple setup, but make benchmark and application configs
   easier to evolve.
 - Do this as an API cleanup, not as part of a specific performance experiment.
+
+## Hot-Path Audit (2026-07-03)
+
+A structural pass over the write, confirm, and read paths, same lens as the
+fibril hot-path audit (fibril repo, PERF_AUDIT_HOT_PATHS.md): blocking that
+could happen async, work done N times that could be done once, and per-item
+overhead. Context: the fibril side now sustains 500k+ msg/s at 1KB on tmpfs
+after its delivery-hop batching, and the enqueue-path baseline above
+(~460k/s) suggests this layer is at or near the current end-to-end ceiling.
+
+### K1. Commits wait out the fsync interval even when the fsync thread is idle
+
+Where: `keratin-log/src/writer.rs`, `maybe_commit_due` and
+`post_stage_commit_and_tune`, both gating on
+`last_fsync.elapsed() >= fsync_interval` (default 5ms).
+
+The writer, fsync, and notifier stages are already pipelined, and
+`inflight_fsyncs` is already tracked, but a commit is only ever issued on the
+interval tick. With the fsync thread idle and durability acks pending, a
+publish waits up to 5ms for the tick before its fsync even starts. The
+classic alternative is self-clocking group commit: commit immediately when
+`inflight_fsyncs == 0` and pending acks exist, and let the interval act only
+as a pacing floor while a fsync is already in flight. The batching window
+then becomes the fsync duration itself, which is what group commit wants.
+Expected effect: confirm latency at low and mid load drops from
+interval-bound (~5ms per leg) to fsync-cost-bound (microseconds on tmpfs,
+about a millisecond on a SATA SSD), with unchanged behavior at saturation.
+This is the single largest latency lever found in this layer. Guard it with
+a floor setting if fsync rate on hard disks becomes a concern.
+
+### K2. A durable publish confirm chains two group commits
+
+Where: `stroma/core/src/stroma.rs` `append_message_batch` and
+`MsgBatchCompletion`.
+
+The msg-log batch must be durable before the EnqueueMany event-log batch is
+appended, and the client confirm fires only after both. The ordering is a
+real recovery constraint (an enqueue event must never be durable ahead of its
+message data), so the chain itself is correct. The cost today is two
+interval-bound waits in sequence, which K1 reduces to two fsync durations.
+Collapsing to one leg would need a single-log design or confirm semantics
+tied to the msg leg only, both larger redesigns. Recommendation: fix K1
+first and re-measure before considering this.
+
+### K3. Reader opens segment files per scan
+
+Where: `keratin-log/src/reader.rs`, `scan_from` and `fetch` via `open_log`
+and `open_idx`.
+
+Every delivery poll batch re-opens the segment file, seeks, and scans. Page
+cache makes the data cheap but the open/seek per poll adds syscalls on the
+hottest read path. A small per-reader fd cache (current segment handle plus
+position) would remove them. The fibril optimization log's read-ahead cache
+candidate covers the bigger version of this.
+
+### K4. Per-offset retries lookup in the ready poll
+
+Where: `stroma/core/src/state.rs` `poll_ready_and_mark`.
+
+The ready-range flattening does a `retries.get(&off)` map lookup per offset,
+though most offsets have never been retried. An `is_empty` fast path (skip
+lookups entirely when no retries are outstanding) removes a hash lookup per
+delivered message on the common path.
+
+### K5. Event clone in the apply completion
+
+Where: `stroma/core/src/stroma.rs` `ApplyThenComplete::complete`.
+
+The completion clones the event before applying it although the box is
+consumed. For AckMany that copies the whole ack batch once per settle batch.
+Destructuring instead of cloning is free.
+
+### Positive findings (already the right shape)
+
+- The writer is a three-stage pipeline (stage, fsync, notify) with fsyncs
+  overlapped through a dedicated thread and completions drained without
+  blocking staging.
+- Appends stage into a large write buffer with threshold flushes, and the
+  batcher anchors its linger to the previous flush with adaptive tuning.
+- A publish batch becomes exactly one msg-log append batch plus one
+  EnqueueMany event-log batch regardless of batch size, with per-client
+  completion fan-out.
+- The queue actor's five priority lanes keep control commands from queuing
+  behind bulk work, and ready-state is a range map so contiguous ready spans
+  poll cheaply.
+
+### Suggested order
+
+K1 first with before/after runs of the keratin throughput utility plus the
+fibril confirmed scenarios (the end-to-end p50 should drop visibly if the
+interval wait dominates), then K4 and K5 as free wins, then re-measure
+before touching K2 or K3.
