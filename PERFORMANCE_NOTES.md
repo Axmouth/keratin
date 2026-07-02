@@ -761,3 +761,10 @@ old-policy runs) and the pairs at 150k/s were within a few percent both ways.
 The earlier low-rate delta was drive variance, not the commit policy. The
 floor default stays 0. The adaptive floor remains a nice-to-have for
 auto-tuning on slow devices rather than a needed fix.
+
+Tooling note: a dev-only fsync latency injection (a configurable sleep in the
+fsync worker, feature-gated) would let tmpfs emulate arbitrary device
+profiles (consumer NVMe ~1ms, SATA ~10-30ms) for policy experiments without
+the hardware. Build it together with the adaptive floor work, which is its
+first real consumer. Real-device reference numbers for published claims are
+cheaper to collect on a rented NVMe-backed VM.
