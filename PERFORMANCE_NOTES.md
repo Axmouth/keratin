@@ -753,3 +753,11 @@ self-clock earns its latency win, and set roughly the old interval (5ms) on
 slow-fsync storage. Follow-up idea: derive the floor adaptively from an EMA
 of observed fsync duration so slow devices get breathing room without
 configuration. Fast devices converge to 0 on their own.
+
+Follow-up (same evening): an interleaved floor 0 vs floor 5 A/B (3 pairs,
+alternating per run so drive drift cancels) showed no systematic difference.
+Floor 0 won two of three pairs at 50k/s (14ms p50, better than the earlier
+old-policy runs) and the pairs at 150k/s were within a few percent both ways.
+The earlier low-rate delta was drive variance, not the commit policy. The
+floor default stays 0. The adaptive floor remains a nice-to-have for
+auto-tuning on slow devices rather than a needed fix.
