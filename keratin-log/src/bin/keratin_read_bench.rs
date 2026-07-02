@@ -41,6 +41,7 @@ async fn main() {
         batch_linger_ms: 5,
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 5,
+        min_fsync_interval_ms: 0,
         flush_target_bytes: 32 * 1024 * 1024,
         force_recovery_scan: false,
     };

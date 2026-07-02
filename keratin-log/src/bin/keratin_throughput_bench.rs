@@ -66,6 +66,7 @@ async fn main() {
         batch_linger_ms: linger_ms,
         default_durability: durability,
         fsync_interval_ms: fsync_ms,
+        min_fsync_interval_ms: 0,
         flush_target_bytes: flush_mb * 1024 * 1024,
         force_recovery_scan: has_flag("--force-recovery-scan"),
     };

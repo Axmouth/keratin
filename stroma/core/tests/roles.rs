@@ -16,6 +16,7 @@ fn delayed_fsync_config() -> StromaKeratinConfig {
         default_durability: KDurability::AfterFsync,
         batch_linger_ms: 0,
         fsync_interval_ms: 250,
+        min_fsync_interval_ms: 0,
         ..KeratinConfig::test_default()
     };
     StromaKeratinConfig::from_message_log(log)

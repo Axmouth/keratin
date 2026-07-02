@@ -201,6 +201,18 @@ struct PendingAck {
 }
 
 #[inline]
+/// Whether the writer should commit now because the fsync worker sits idle
+/// with durability acks pending. The idle floor keeps the fsync rate bounded
+/// on storage where that matters, with the default floor of zero the commit
+/// cadence self-clocks on fsync completions.
+fn commit_when_idle(
+    inflight_fsyncs: usize,
+    last_fsync: &Instant,
+    min_fsync_interval: Duration,
+) -> bool {
+    inflight_fsyncs == 0 && last_fsync.elapsed() >= min_fsync_interval
+}
+
 fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
     !pending.is_empty()
 }
@@ -450,6 +462,7 @@ fn writer_loop_inner(
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
+    let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
     let mut last_fsync = Instant::now();
 
     let mut pending: VecDeque<PendingAck> = VecDeque::new();
@@ -526,6 +539,7 @@ fn writer_loop_inner(
             &mut durable_offset,
             &mut last_fsync,
             fsync_interval,
+            min_fsync_interval,
             &notify_tx,
             &fsync_tx,
             &mut inflight_fsyncs,
@@ -537,10 +551,17 @@ fn writer_loop_inner(
         let now = Instant::now();
         let mut wait = Duration::MAX;
 
-        // Cap by fsync deadline when needed.
+        // Cap by the commit deadline when durability acks are pending. With no
+        // fsync in flight the wait only runs to the idle-commit floor, so the
+        // writer self-clocks on fsync completions instead of the interval.
         if pending_needs_fsync(&pending) {
+            let horizon = if inflight_fsyncs == 0 {
+                min_fsync_interval
+            } else {
+                fsync_interval
+            };
             // If checked_add overflows, treat as due now.
-            let fs_deadline = match last_fsync.checked_add(fsync_interval) {
+            let fs_deadline = match last_fsync.checked_add(horizon) {
                 Some(d) => d,
                 None => now,
             };
@@ -1115,13 +1136,16 @@ fn maybe_commit_due(
     _durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
+    min_fsync_interval: Duration,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
-    let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
+    let commit_due = needs_commit
+        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval)
+            || last_fsync.elapsed() >= fsync_interval);
 
     if !commit_due {
         return;
@@ -1186,9 +1210,12 @@ fn post_stage_commit_and_tune(
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) {
-    // Commit scheduling (same as original, but factored)
+    // Commit scheduling
     let needs_commit = pending_needs_fsync(pending);
-    let commit_due = needs_commit && last_fsync.elapsed() >= fsync_interval;
+    let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
+    let commit_due = needs_commit
+        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval)
+            || last_fsync.elapsed() >= fsync_interval);
 
     if commit_due {
         let _ = commit(

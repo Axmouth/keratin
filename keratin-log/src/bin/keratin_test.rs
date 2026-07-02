@@ -11,6 +11,7 @@ fn main() {
         batch_linger_ms: 1,
         default_durability: KDurability::AfterFsync,
         fsync_interval_ms: 1,
+        min_fsync_interval_ms: 0,
         flush_target_bytes: 16 * 1024 * 1024,
         force_recovery_scan: false,
     };

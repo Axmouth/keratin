@@ -18,6 +18,7 @@ fn main() {
         max_batch_records: 8192,
         batch_linger_ms: 25,
         fsync_interval_ms: 25,
+        min_fsync_interval_ms: 0,
         flush_target_bytes: 48 * 1024 * 1024,
         default_durability: KDurability::AfterFsync,
         force_recovery_scan: false,
