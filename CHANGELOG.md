@@ -1,13 +1,11 @@
 # Changelog
 
 All notable changes to the Keratin repo (the Keratin append-only log store and
-the Stroma queue and stream state layer built on it) are recorded here. Fibril
-consumes these crates and records only the user-visible effects in its own
-changelog.
+the Stroma queue and stream state layer built on it) are recorded here.
 
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and
 the project follows [Semantic Versioning](https://semver.org/). There are no
-tagged releases yet; earlier history predates this changelog.
+tagged releases yet. Earlier history predates this changelog.
 
 ## [Unreleased]
 
