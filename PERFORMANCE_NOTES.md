@@ -768,3 +768,14 @@ profiles (consumer NVMe ~1ms, SATA ~10-30ms) for policy experiments without
 the hardware. Build it together with the adaptive floor work, which is its
 first real consumer. Real-device reference numbers for published claims are
 cheaper to collect on a rented NVMe-backed VM.
+
+K2 design sketch (2026-07-03): the invariant is that event durability must
+never lead message durability, which is weaker than the current
+implementation (event append waits for msg fsync completion). Cheap phase:
+stage both appends immediately (offsets are deterministic at staging) and
+gate only the event log's fsync job on the msg log's covering fsync having
+succeeded. On msg fsync failure the gate never releases, the event durable
+watermark never advances over the range, recovery truncates the untrusted
+tail as it already does, and both completions fail together. This overlaps
+the two legs under load. The full 2-to-1 barrier reduction still requires the
+single-log design and stays a separate assessment.
