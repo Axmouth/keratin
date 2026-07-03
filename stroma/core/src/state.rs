@@ -2036,7 +2036,10 @@ impl QueueHandleInner {
     /// Blocking counterpart to [`stream_command_enqueue`], for the synchronous
     /// event-apply path (recovery replay and follower ingest), mirroring
     /// `blocking_command_enqueue`.
-    pub(crate) fn blocking_stream_command_enqueue(&self, cmd: StreamCommand) -> std::io::Result<()> {
+    pub(crate) fn blocking_stream_command_enqueue(
+        &self,
+        cmd: StreamCommand,
+    ) -> std::io::Result<()> {
         match &self.engine {
             EngineHandle::Stream(s) => s.blocking_send(cmd).map_err(|_| {
                 std::io::Error::new(
@@ -2253,7 +2256,6 @@ impl WorkQueueHandle<'_> {
             items: Vec::new(),
         })
     }
-
 }
 
 impl QueueHandleInner {
@@ -2985,7 +2987,9 @@ impl QueueInternalState {
 
     #[inline]
     pub fn is_inflight_or_settled(&self, offset: Offset) -> bool {
-        self.is_settled(offset) || self.is_inflight(offset) || self.pending_dlq.contains_key(&offset)
+        self.is_settled(offset)
+            || self.is_inflight(offset)
+            || self.pending_dlq.contains_key(&offset)
     }
 
     #[inline]

@@ -1175,7 +1175,9 @@ impl Stroma {
     /// Persist a partition's engine kind. Written before the partition is first
     /// materialized as a stream (a queue needs no marker). Uses write-temp +
     /// fsync + rename so a crash mid-write never leaves a torn marker that would
-    /// be misread as the wrong engine.
+    /// be misread as the wrong engine. Safe under concurrent identical declares:
+    /// an existing matching marker short-circuits, and the temp name is unique
+    /// per writer so one writer's rename can never consume another's temp file.
     fn write_partition_kind(
         &self,
         tp: &str,
@@ -1183,11 +1185,18 @@ impl Stroma {
         group: Option<&str>,
         kind: PartitionKind,
     ) -> Result<()> {
+        if self.partition_kind_marker(tp, part, group) == Some(kind) {
+            return Ok(());
+        }
         let final_path = self.kind_marker_file(tp, part, group);
         if let Some(parent) = final_path.parent() {
             fs::create_dir_all(parent).map_err(io_err)?;
         }
-        let tmp = final_path.with_extension("kind.new");
+        static KIND_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
+        let tmp = final_path.with_extension(format!(
+            "kind.{}.new",
+            KIND_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
+        ));
         {
             let mut f = fs::OpenOptions::new()
                 .create(true)
@@ -2568,7 +2577,9 @@ impl Stroma {
                 if wq.role() != QueueRole::Owner {
                     return Ok::<Vec<Offset>, StromaError>(Vec::new());
                 }
-                wq.collect_expired(now, want).await.map_err(StromaError::from)
+                wq.collect_expired(now, want)
+                    .await
+                    .map_err(StromaError::from)
             }
             .await;
             let offsets = match collected {

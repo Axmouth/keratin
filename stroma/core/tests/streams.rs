@@ -43,6 +43,35 @@ async fn append(st: &Arc<Stroma>, tp: &str, payload: &[u8]) -> Offset {
         .unwrap()
 }
 
+// Multi-thread runtime: the kind marker write is a synchronous block, so only
+// parallel worker threads can actually interleave it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 8)]
+async fn concurrent_identical_stream_declares_all_succeed() {
+    let (st, _dir) = open_test_stroma().await;
+    // Concurrent identical declares must converge idempotently. The kind
+    // marker write used a shared temp file whose rename the first writer
+    // consumed, failing the others with a spurious io error.
+    for round in 0..16 {
+        let tp = format!("sensors-{round}");
+        let barrier = Arc::new(tokio::sync::Barrier::new(8));
+        let mut tasks = Vec::new();
+        for _ in 0..8 {
+            let st = st.clone();
+            let tp = tp.clone();
+            let barrier = barrier.clone();
+            tasks.push(tokio::spawn(async move {
+                barrier.wait().await;
+                st.create_stream(&tp, 0, None).await
+            }));
+        }
+        for task in tasks {
+            task.await.unwrap().unwrap();
+        }
+        assert_eq!(st.partition_kind(&tp, 0, None), PartitionKind::Stream);
+    }
+    assert_eq!(append(&st, "sensors-0", b"a").await, 0);
+}
+
 #[tokio::test]
 async fn stream_append_assigns_sequential_offsets_and_advances_tail() {
     let (st, _dir) = open_test_stroma().await;
@@ -102,7 +131,11 @@ async fn follower_apply_replicated_stream_batch_advances_tail_and_cursor() {
     .unwrap();
 
     let (head, tail) = st.stream_head_tail("sensors", 0).await.unwrap();
-    assert_eq!((head, tail), (0, 2), "tail advanced to reflect applied records");
+    assert_eq!(
+        (head, tail),
+        (0, 2),
+        "tail advanced to reflect applied records"
+    );
     assert_eq!(
         st.stream_cursor("sensors", 0, "group-a").await.unwrap(),
         Some(2),
@@ -337,7 +370,10 @@ async fn declaring_a_queue_then_a_stream_is_rejected() {
 async fn declaring_a_stream_then_a_queue_is_rejected() {
     let (st, _dir) = open_test_stroma().await;
     st.create_stream("shared", 0, None).await.unwrap();
-    let err = st.declare("shared", 0, None, queue_meta()).await.unwrap_err();
+    let err = st
+        .declare("shared", 0, None, queue_meta())
+        .await
+        .unwrap_err();
     assert!(matches!(err, StromaError::InvalidArgument(_)));
 }
 

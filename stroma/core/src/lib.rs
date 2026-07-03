@@ -32,10 +32,9 @@ pub use state::{
 };
 pub use stream_state::RetentionConfig;
 pub use stroma::{
-    DestroyOutcome, EvictOutcome, FollowerStateCheckpointInstall,
-    EnqueuedStreamAppend, FollowerStateCheckpointInstallOutcome, GlobalDLQ, GlobalDlqSnapshot,
-    GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders, MessageInspectionItem,
-    MessageInspectionPage,
+    DestroyOutcome, EnqueuedStreamAppend, EvictOutcome, FollowerStateCheckpointInstall,
+    FollowerStateCheckpointInstallOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome,
+    MessageContentType, MessageHeaders, MessageInspectionItem, MessageInspectionPage,
     OwnerReplicationBatch, OwnerReplicationRead, OwnerStateCheckpoint, PublishItem, QuarantineInfo,
     QueueDemotionOutcome, QueuePromotionOutcome, ReplicatedEventBatch, ReplicatedMessageBatch,
     ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions,

@@ -184,7 +184,11 @@ async fn inflight_before_enqueue_is_ignored() {
     let offset = ar.base_offset;
 
     // Must still not be inflight unless re-issued
-    assert!(!st.is_inflight_or_settled("t", 0, None, offset).await.unwrap());
+    assert!(
+        !st.is_inflight_or_settled("t", 0, None, offset)
+            .await
+            .unwrap()
+    );
 }
 
 #[tokio::test]
