@@ -646,6 +646,19 @@ impl StromaEvent {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "stroma version"));
         }
 
+        // Each arm reads exactly the fields its event type defines. Decode does
+        // NOT assert the whole record was consumed, so trailing bytes are
+        // ignored by design - this is the forward-compatibility seam. A later
+        // format can append a new optional field to the end of an event and read
+        // it behind an `i < bytes.len()` guard: old readers skip the extra bytes,
+        // new readers find none on old records and fall back to the default, and
+        // neither side needs a STROMA_VER bump. Do not add a fully-consumed check
+        // here - it would make every additive field a breaking change. Bump
+        // STROMA_VER only for non-additive changes (reordering, removing, or
+        // resizing an existing field) and keep the prior version's decode path
+        // when you do. The MarkInflightMany array is the sharp edge: a per-entry
+        // trailing field there needs a parallel count-matched trailing array, not
+        // a field spliced into the fixed-stride entries.
         let ty = rd_u16(bytes, &mut i)?;
         match ty {
             x if x == EventType::Enqueue as u16 => {
@@ -890,6 +903,23 @@ impl StromaEvent {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn decode_tolerates_trailing_bytes() {
+        // Forward-compatibility guard for the additive-field rule documented in
+        // decode(): a record carrying bytes past the fields this version knows
+        // (a field a later format appended) must still decode on the known
+        // prefix. If this ever fails, additive event fields have silently become
+        // breaking changes that force a STROMA_VER bump.
+        let event = StromaEvent::MarkInflight {
+            off: 42,
+            deadline: 1234,
+        };
+        let mut encoded = event.encode().unwrap();
+        encoded.extend_from_slice(&[0xDE, 0xAD, 0xBE, 0xEF]);
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
 
     #[test]
     fn test_enqueue_encode_decode() {
