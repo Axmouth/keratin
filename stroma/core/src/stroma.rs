@@ -3900,7 +3900,7 @@ impl Stroma {
         // stream engine over queue data). The reverse guard lives in `declare`.
         if self.partition_kind_marker(tp, part, None) == Some(PartitionKind::Queue) {
             return Err(StromaError::InvalidArgument(format!(
-                "{tp}/{part} is already declared as a queue, cannot declare it as a plexus stream"
+                "{tp}/{part} is already declared as a queue, cannot declare it as a plexus stream - use a different topic name, or destroy the queue first if it is no longer needed"
             )));
         }
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
@@ -4470,7 +4470,7 @@ impl Stroma {
         // as a stream later) is just as detectable.
         if self.partition_kind_marker(tp, part, group) == Some(PartitionKind::Stream) {
             return Err(StromaError::InvalidArgument(format!(
-                "{tp}/{part} is already declared as a plexus stream, cannot declare it as a queue"
+                "{tp}/{part} is already declared as a plexus stream, cannot declare it as a queue - use a different topic name, or destroy the stream first if it is no longer needed"
             )));
         }
         self.write_partition_kind(tp, part, group, PartitionKind::Queue)?;
