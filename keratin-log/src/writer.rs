@@ -211,6 +211,12 @@ const MAX_INFLIGHT_FSYNCS: usize = 8;
 /// each coalesced fdatasync bigger and slower, so keep one fsync in flight.
 const PIPELINE_COMMIT_RECORDS: u64 = 2048;
 
+/// Whether recent commits are small enough (fsync-count-bound) to pipeline fsyncs
+/// rather than keep a single one in flight. See `PIPELINE_COMMIT_RECORDS`.
+fn should_pipeline(log: &Log) -> bool {
+    log.recent_commit_records < PIPELINE_COMMIT_RECORDS
+}
+
 /// Whether the writer should commit now because the fsync worker has capacity
 /// with durability acks pending. When `pipeline` (recent commits are small) it
 /// allows several in-flight commits so the worker can fuse them into one
@@ -362,6 +368,8 @@ fn notifier_loop(rx: Receiver<NotifyMsg>, tracer: WriterStageTracer) {
 
 #[cfg(not(feature = "writer-stage-trace"))]
 fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
+    // Reused across wakeups so the coalescing buffer is not reallocated per fsync.
+    let mut reqs: Vec<FsyncReq> = Vec::new();
     while let Ok(first) = rx.recv() {
         // SPECULATIVE (fsync fusion): drain every queued request and make them all
         // durable with ONE fdatasync. The requests share the log file and
@@ -369,41 +377,40 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
         // newest job's fds makes every drained request durable. Turns the
         // fsync-count-bound small-batch regime into fat-batch throughput without
         // waiting for a bigger linger.
-        let mut reqs = vec![first];
+        reqs.push(first);
         while let Ok(more) = rx.try_recv() {
             reqs.push(more);
         }
-        let result = reqs.last().expect("at least one request").job.sync();
-        let ok_elapsed = result.as_ref().ok().copied();
-        let err_msg = result.as_ref().err().map(|e| e.to_string());
-        for req in reqs {
-            let through_offset = req.job.through_offset();
-            let done = match (&ok_elapsed, &err_msg) {
-                (Some(elapsed), _) => FsyncDone {
-                    through_offset,
-                    elapsed: *elapsed,
-                    ready: req.ready,
-                    sync_acks: req.sync_acks,
-                    error: None,
-                },
-                (None, Some(msg)) => FsyncDone {
-                    through_offset,
-                    elapsed: Duration::ZERO,
-                    ready: req
-                        .ready
-                        .into_iter()
-                        .map(|item| NotifyItem {
-                            completion: item.completion,
-                            result: Err(IoError::new(msg.clone())),
-                        })
-                        .collect(),
-                    sync_acks: req.sync_acks,
-                    error: Some(msg.clone()),
-                },
-                _ => unreachable!("sync result is either Ok or Err"),
-            };
-            if done_tx.send(done).is_err() {
-                return;
+        // One sync covers every drained request; fan the single result out.
+        match reqs.last().expect("at least one request").job.sync() {
+            Ok(elapsed) => {
+                for req in reqs.drain(..) {
+                    let done = FsyncDone {
+                        through_offset: req.job.through_offset(),
+                        elapsed,
+                        ready: req.ready,
+                        sync_acks: req.sync_acks,
+                        error: None,
+                    };
+                    if done_tx.send(done).is_err() {
+                        return;
+                    }
+                }
+            }
+            Err(e) => {
+                let msg = e.to_string();
+                for req in reqs.drain(..) {
+                    let done = FsyncDone {
+                        through_offset: req.job.through_offset(),
+                        elapsed: Duration::ZERO,
+                        ready: fail_notify_items(req.ready, &msg),
+                        sync_acks: req.sync_acks,
+                        error: Some(msg.clone()),
+                    };
+                    if done_tx.send(done).is_err() {
+                        return;
+                    }
+                }
             }
         }
     }
@@ -1181,7 +1188,7 @@ fn maybe_commit_due(
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
-    let pipeline = log.recent_commit_records < PIPELINE_COMMIT_RECORDS;
+    let pipeline = should_pipeline(log);
     let commit_due = needs_commit
         && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
             || last_fsync.elapsed() >= fsync_interval);
@@ -1251,7 +1258,7 @@ fn post_stage_commit_and_tune(
     // Commit scheduling
     let needs_commit = pending_needs_fsync(pending);
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
-    let pipeline = log.recent_commit_records < PIPELINE_COMMIT_RECORDS;
+    let pipeline = should_pipeline(log);
     let commit_due = needs_commit
         && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
             || last_fsync.elapsed() >= fsync_interval);
