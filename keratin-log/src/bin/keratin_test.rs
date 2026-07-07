@@ -16,6 +16,8 @@ fn main() {
         force_recovery_scan: false,
         tail_cache_bytes: 0,
         segment_preallocate_bytes: 0,
+        max_inflight_fsyncs: 8,
+        pipeline_commit_records: 2048,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

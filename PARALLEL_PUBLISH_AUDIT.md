@@ -12,10 +12,10 @@ Working doc for the `/code-review` findings on the parallel-durable-publish arc
 - **#5 FIXED** — the fusion comment now states the real invariant (roll fsyncs synchronously).
 - **#7 MITIGATED** — a non-enqueue dangling reference now logs loudly (still truncates;
   promoting to a hard quarantine is a possible further hardening).
-- **#6 HELD (judgment call)** — MAX_INFLIGHT_FSYNCS is coupled to the fsync channel bound
-  and PIPELINE_COMMIT_RECORDS is the adaptive threshold; both carry rationale doc comments,
-  so they read as documented implementation constants, not undocumented magic numbers.
-  Awaiting a decision on whether to expose them as config anyway.
+- **#6 FIXED** — `max_inflight_fsyncs` and `pipeline_commit_records` are now
+  `KeratinConfig` fields (the fsync channel is sized from `max_inflight_fsyncs`, so the
+  bound and the gate stay coupled), exposed through `storage.keratin.*` config and
+  `FIBRIL_KERATIN_MAX_INFLIGHT_FSYNCS` / `FIBRIL_KERATIN_PIPELINE_COMMIT_RECORDS` env.
 
 The arc itself (parallel publish + CancelEnqueue recovery, adaptive fsync fusion,
 segment preallocation, DurableFrontier watermark) is committed on `main` in keratin

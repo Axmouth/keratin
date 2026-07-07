@@ -25,7 +25,8 @@ tagged releases yet. Earlier history predates this changelog.
   (fsync-count-bound) the writer pipelines several and the fsync worker coalesces
   them into one fdatasync, lifting small-batch durable throughput several-fold
   without touching latency. Fat, bandwidth-bound commits keep a single fsync in
-  flight.
+  flight. The pipeline depth and the small-vs-fat threshold are configurable via
+  `max_inflight_fsyncs` and `pipeline_commit_records`.
 - Optional segment preallocation (`segment_preallocate_bytes`, off by default):
   preallocate space ahead of the write cursor so durable fsyncs hit
   already-allocated blocks in place instead of extending the file, which cuts the

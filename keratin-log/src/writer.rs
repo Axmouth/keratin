@@ -198,39 +198,28 @@ struct PendingAck {
     result: AppendResult,
 }
 
-/// SPECULATIVE (fsync fusion): how many commits may be in flight to the fsync
-/// worker at once. Above 1 the writer keeps issuing small commits while a fsync
-/// runs; the worker coalesces the whole queue into ONE fdatasync (see
-/// `fsync_loop`), so low-latency small batches reach fat-batch throughput. Bounded
-/// by the fsync channel capacity.
-const MAX_INFLIGHT_FSYNCS: usize = 8;
-
-/// Records-per-commit below which the writer pipelines (fsync-count-bound: the
-/// fixed fsync cost dominates, so coalescing many small commits into one fdatasync
-/// wins). At or above it the commit is bandwidth-bound and pipelining only makes
-/// each coalesced fdatasync bigger and slower, so keep one fsync in flight.
-const PIPELINE_COMMIT_RECORDS: u64 = 2048;
-
 /// Whether recent commits are small enough (fsync-count-bound) to pipeline fsyncs
-/// rather than keep a single one in flight. See `PIPELINE_COMMIT_RECORDS`.
-fn should_pipeline(log: &Log) -> bool {
-    log.recent_commit_records < PIPELINE_COMMIT_RECORDS
+/// rather than keep a single one in flight. `threshold` is
+/// `KeratinConfig::pipeline_commit_records`.
+fn should_pipeline(log: &Log, threshold: u64) -> bool {
+    log.recent_commit_records < threshold
 }
 
 /// Whether the writer should commit now because the fsync worker has capacity
 /// with durability acks pending. When `pipeline` (recent commits are small) it
-/// allows several in-flight commits so the worker can fuse them into one
-/// fdatasync; otherwise it keeps a single fsync in flight (the eager cadence that
-/// makes fat batches, optimal for bandwidth-bound writes). The idle floor keeps
-/// the fsync rate bounded on storage where that matters.
+/// allows up to `max_inflight_fsyncs` in-flight commits so the worker can fuse them
+/// into one fdatasync; otherwise it keeps a single fsync in flight (the eager
+/// cadence that makes fat batches, optimal for bandwidth-bound writes). The idle
+/// floor keeps the fsync rate bounded on storage where that matters.
 #[inline]
 fn commit_when_idle(
     inflight_fsyncs: usize,
     last_fsync: &Instant,
     min_fsync_interval: Duration,
     pipeline: bool,
+    max_inflight_fsyncs: usize,
 ) -> bool {
-    let max_inflight = if pipeline { MAX_INFLIGHT_FSYNCS } else { 1 };
+    let max_inflight = if pipeline { max_inflight_fsyncs.max(1) } else { 1 };
     inflight_fsyncs < max_inflight && last_fsync.elapsed() >= min_fsync_interval
 }
 
@@ -295,8 +284,11 @@ pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> W
         tracing::info!("Notifier loop exited");
     });
 
-    let (fsync_tx, fsync_rx) = crossbeam_channel::bounded::<FsyncReq>(8);
-    let (fsync_done_tx, fsync_done_rx) = crossbeam_channel::bounded::<FsyncDone>(8);
+    // Sized to the in-flight fsync budget so the channel capacity does not cap the
+    // configured pipeline depth below `max_inflight_fsyncs`.
+    let fsync_channel_cap = cfg.max_inflight_fsyncs.max(1);
+    let (fsync_tx, fsync_rx) = crossbeam_channel::bounded::<FsyncReq>(fsync_channel_cap);
+    let (fsync_done_tx, fsync_done_rx) = crossbeam_channel::bounded::<FsyncDone>(fsync_channel_cap);
 
     std::thread::spawn(move || {
         #[cfg(feature = "writer-stage-trace")]
@@ -605,6 +597,8 @@ fn writer_loop_inner(
             &mut last_fsync,
             fsync_interval,
             min_fsync_interval,
+            cfg.max_inflight_fsyncs,
+            cfg.pipeline_commit_records,
             &notify_tx,
             &fsync_tx,
             &mut inflight_fsyncs,
@@ -1189,16 +1183,23 @@ fn maybe_commit_due(
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     min_fsync_interval: Duration,
+    max_inflight_fsyncs: usize,
+    pipeline_commit_records: u64,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
-    let pipeline = should_pipeline(log);
+    let pipeline = should_pipeline(log, pipeline_commit_records);
     let commit_due = needs_commit
-        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
-            || last_fsync.elapsed() >= fsync_interval);
+        && (commit_when_idle(
+            *inflight_fsyncs,
+            last_fsync,
+            min_fsync_interval,
+            pipeline,
+            max_inflight_fsyncs,
+        ) || last_fsync.elapsed() >= fsync_interval);
 
     if !commit_due {
         return;
@@ -1265,10 +1266,15 @@ fn post_stage_commit_and_tune(
     // Commit scheduling
     let needs_commit = pending_needs_fsync(pending);
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
-    let pipeline = should_pipeline(log);
+    let pipeline = should_pipeline(log, cfg.pipeline_commit_records);
     let commit_due = needs_commit
-        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
-            || last_fsync.elapsed() >= fsync_interval);
+        && (commit_when_idle(
+            *inflight_fsyncs,
+            last_fsync,
+            min_fsync_interval,
+            pipeline,
+            cfg.max_inflight_fsyncs,
+        ) || last_fsync.elapsed() >= fsync_interval);
 
     if commit_due {
         let _ = commit(

@@ -32,6 +32,15 @@ pub struct KeratinConfig {
     /// `segment_max_bytes` to preallocate whole segments. Falls back to the extend
     /// path on a filesystem without `fallocate`.
     pub segment_preallocate_bytes: usize,
+    /// How many commits may be in flight to the fsync worker at once. Above 1 the
+    /// writer keeps issuing small commits while a fsync runs and the worker coalesces
+    /// the whole queue into one fdatasync, so low-latency small batches reach
+    /// fat-batch throughput. Effectively bounded by the fsync channel capacity.
+    pub max_inflight_fsyncs: usize,
+    /// Records-per-commit below which the writer pipelines fsyncs: the fixed fsync
+    /// cost dominates, so coalescing many small commits into one fdatasync wins. At
+    /// or above it the commit is bandwidth-bound and a single fsync stays in flight.
+    pub pipeline_commit_records: u64,
     pub force_recovery_scan: bool,
 }
 
@@ -49,6 +58,8 @@ impl Default for KeratinConfig {
             flush_target_bytes: 32 * 1024 * 1024,
             tail_cache_bytes: 64 * 1024 * 1024,
             segment_preallocate_bytes: 0,
+            max_inflight_fsyncs: 8,
+            pipeline_commit_records: 2048,
             force_recovery_scan: false,
         }
     }
