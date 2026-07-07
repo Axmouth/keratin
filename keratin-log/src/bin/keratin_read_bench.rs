@@ -44,6 +44,7 @@ async fn main() {
         min_fsync_interval_ms: 0,
         flush_target_bytes: 32 * 1024 * 1024,
         force_recovery_scan: false,
+        tail_cache_bytes: 0,
     };
 
     let k = Keratin::open(&root, cfg).await.unwrap();

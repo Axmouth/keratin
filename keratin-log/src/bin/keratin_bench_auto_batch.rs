@@ -22,6 +22,7 @@ fn main() {
         flush_target_bytes: 48 * 1024 * 1024,
         default_durability: KDurability::AfterFsync,
         force_recovery_scan: false,
+        tail_cache_bytes: 0,
     };
 
     let rt = tokio::runtime::Runtime::new().unwrap();

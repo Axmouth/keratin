@@ -21,6 +21,7 @@ use crate::{
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
     segment::Segment,
+    tail_cache::TailCache,
     util::fsync_dir,
 };
 
@@ -121,6 +122,13 @@ pub struct Log {
     last_index_at_log_pos: u64,
 
     log_state: Arc<LogState>,
+
+    /// In-memory cache of recent flush batches, served to tail-following reads
+    /// so they avoid scanning the segment file under active fsync/writeback.
+    tail_cache: Arc<TailCache>,
+    /// Exclusive next offset not yet pushed to `tail_cache` (= last cached
+    /// offset + 1). At flush the batch covers `[flushed_through, staged_end+1)`.
+    flushed_through: u64,
 
     // stats
     pub stats: IoStats,
@@ -228,6 +236,7 @@ impl Log {
         segment_max_bytes: u64,
         index_stride_bytes: u32,
         flush_target_bytes: usize,
+        tail_cache_bytes: usize,
         force_recovery_scan: bool,
         log_state: Arc<LogState>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
@@ -261,6 +270,8 @@ impl Log {
                     active: seg,
                     index: idx,
                     next_offset,
+                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    flushed_through: next_offset,
                     manifest,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -307,6 +318,8 @@ impl Log {
                     active,
                     index,
                     next_offset,
+                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    flushed_through: next_offset,
                     last_index_at_log_pos,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -383,6 +396,8 @@ impl Log {
                 active,
                 index,
                 next_offset,
+                tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                flushed_through: next_offset,
                 last_index_at_log_pos,
                 write_buf: Vec::with_capacity(16 * 1024 * 1024),
                 idx_buf: Vec::with_capacity(256 * 1024),
@@ -836,6 +851,22 @@ impl Log {
                 self.active.append_bytes(&self.write_buf)?;
             }
             self.stats.log_write += t.elapsed();
+            // Feed the just-written batch to the tail cache so tail-following
+            // reads serve it from memory instead of scanning this segment while
+            // it is under fsync/writeback. Bytes are the exact on-disk format;
+            // the cache gates reads on the durable watermark, so pushing here
+            // (pre-fsync) never exposes a non-durable record.
+            if self.tail_cache.enabled() {
+                let next = self.staged_end_offset + 1;
+                if next > self.flushed_through {
+                    self.tail_cache.push_batch(
+                        self.flushed_through,
+                        next,
+                        Arc::from(self.write_buf.as_slice()),
+                    );
+                    self.flushed_through = next;
+                }
+            }
             self.write_buf.clear();
         }
 
@@ -1056,6 +1087,12 @@ impl Log {
         self.next_offset
     }
 
+    /// The shared tail cache, for handing to `LogReader`s (they read it, the
+    /// writer populates it at flush).
+    pub fn tail_cache(&self) -> Arc<TailCache> {
+        self.tail_cache.clone()
+    }
+
     pub fn current_epoch(&self) -> u64 {
         self.manifest.epoch
     }
@@ -1254,6 +1291,10 @@ impl Log {
         self.next_offset = next_offset;
         self.staged_end_offset = next_offset.saturating_sub(1);
         self.durable_offset = self.staged_end_offset;
+        self.flushed_through = next_offset;
+        // The log rewound past everything the cache held; drop it so no stale
+        // (rewound-away) offset is ever served from memory.
+        self.tail_cache.clear();
         self.last_index_at_log_pos = self.active.bytes_written;
 
         self.manifest.active_base_offset = next_offset;
@@ -1290,7 +1331,11 @@ impl Log {
         }
         let payloads = &payloads[skip..];
 
-        let reader = LogReader::new(&self.root, self.segment_mapping.clone());
+        let reader = LogReader::new(
+            &self.root,
+            self.segment_mapping.clone(),
+            self.tail_cache.clone(),
+        );
         let got = reader.scan_from(readable_first_offset, payloads.len())?;
         if got.len() != payloads.len() {
             return Err(io::Error::new(

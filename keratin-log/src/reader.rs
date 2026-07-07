@@ -8,6 +8,7 @@ use parking_lot::RwLock;
 
 use crate::Message;
 use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix};
+use crate::tail_cache::TailCache;
 
 #[derive(Debug, Clone)]
 pub struct OwnedRecord {
@@ -31,16 +32,19 @@ impl OwnedRecord {
 pub struct LogReader {
     root: PathBuf,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+    tail_cache: Arc<TailCache>,
 }
 
 impl LogReader {
     pub fn new(
         root: impl AsRef<Path>,
         segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+        tail_cache: Arc<TailCache>,
     ) -> Self {
         Self {
             root: root.as_ref().to_path_buf(),
             segment_mapping,
+            tail_cache,
         }
     }
 
@@ -62,6 +66,18 @@ impl LogReader {
     }
 
     pub fn scan_from(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
+        // Tail-following hot path: if the whole request is in the in-memory tail
+        // cache (recent, durable records), serve it from memory and never touch
+        // the segment file the writer is fsyncing. Only take it when the cache
+        // fully satisfies the request; a partial (below the window, or a request
+        // that reaches past durable) falls through to the file scan for behavior
+        // identical to the uncached path.
+        if let Some(recs) = self.tail_cache.read_from(from, max)
+            && recs.len() == max
+        {
+            return Ok(recs);
+        }
+
         let mut out = Vec::with_capacity(max);
         let mut cur = from;
 
@@ -318,7 +334,7 @@ impl LogReader {
     }
 }
 
-fn to_owned(r: DecodedRecord<'_>) -> OwnedRecord {
+pub(crate) fn to_owned(r: DecodedRecord<'_>) -> OwnedRecord {
     OwnedRecord {
         flags: r.flags,
         timestamp_ms: r.timestamp_ms,

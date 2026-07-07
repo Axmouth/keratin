@@ -9,6 +9,7 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::oneshot;
 
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
+use crate::tail_cache::TailCache;
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::segment::{SegmentInfo, read_segment_created_ts_ms};
@@ -21,6 +22,7 @@ pub struct Keratin {
     tx: crossbeam_channel::Sender<WriterCmd>,
     log_state: Arc<LogState>,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+    tail_cache: Arc<TailCache>,
     _lock: Option<File>,
     shutdown_started: AtomicBool,
     role: AtomicU8,
@@ -153,6 +155,7 @@ impl Keratin {
             cfg.segment_max_bytes,
             cfg.index_stride_bytes,
             cfg.flush_target_bytes,
+            cfg.tail_cache_bytes,
             cfg.force_recovery_scan,
             log_state.clone(),
         )?;
@@ -166,6 +169,7 @@ impl Keratin {
             .store(log.manifest.head_offset, Ordering::SeqCst);
         log_state.epoch.store(log.current_epoch(), Ordering::SeqCst);
 
+        let tail_cache = log.tail_cache();
         let WriterHandle { tx } = crate::writer::spawn_writer(log, cfg, log_state.clone());
 
         Ok(Self {
@@ -173,6 +177,7 @@ impl Keratin {
             tx,
             log_state,
             segment_mapping,
+            tail_cache,
             _lock: Some(lock_file),
             shutdown_started: AtomicBool::new(false),
             role: AtomicU8::new(KeratinRole::Owner.as_u8()),
@@ -180,7 +185,11 @@ impl Keratin {
     }
 
     pub fn reader(&self) -> LogReader {
-        LogReader::new(&self.root, self.segment_mapping.clone())
+        LogReader::new(
+            &self.root,
+            self.segment_mapping.clone(),
+            self.tail_cache.clone(),
+        )
     }
 
     pub fn append_enqueue(

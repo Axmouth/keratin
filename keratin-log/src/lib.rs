@@ -9,6 +9,7 @@ mod reader;
 mod record;
 mod recovery;
 mod segment;
+mod tail_cache;
 pub mod util;
 mod writer;
 #[cfg(feature = "writer-stage-trace")]
