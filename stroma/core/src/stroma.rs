@@ -4759,7 +4759,6 @@ impl Stroma {
             let res: Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> = {
                 let mut out: Vec<(u64, MessageHeaders, Vec<u8>, u32)> =
                     Vec::with_capacity(offs.len());
-                let retries_map: HashMap<u64, u32> = HashMap::from_iter(offs.clone().into_iter());
                 while i < offs.len() {
                     let (start, _retries) = offs[i];
                     let mut len = 1;
@@ -4776,9 +4775,11 @@ impl Stroma {
                         stroma.scan_messages_from(&h, start, len)?;
 
                     // ---- fast path: perfect match ----
+                    // The run is contiguous (start..start+len), matching offs[i..i+len],
+                    // so retries come positionally from offs - no per-poll HashMap.
                     if batch.len() == len {
-                        for (off, payload, headers) in batch {
-                            out.push((off, headers, payload, retries_map[&off]));
+                        for (k, (off, payload, headers)) in batch.into_iter().enumerate() {
+                            out.push((off, headers, payload, offs[i + k].1));
                         }
                     } else {
                         // ---- slow path: handle holes (rare but important) ----
@@ -4791,7 +4792,7 @@ impl Stroma {
                         for j in 0..len {
                             let off = start + j as u64;
                             if let Some((headers, payload)) = map.remove(&off) {
-                                out.push((off, headers, payload, retries_map[&off]));
+                                out.push((off, headers, payload, offs[i + j].1));
                             } else {
                                 // extremely rare: log inconsistency or race
                                 tracing::warn!(
