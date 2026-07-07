@@ -40,7 +40,6 @@ macro_rules! stage_reqs_then_post {
         $pending:expr,
         $reqs:expr,
         $notify_tx:expr,
-        $durable_offset:expr,
         $last_fsync:expr,
         $fsync_interval:expr,
         $fsync_tx:expr,
@@ -71,7 +70,6 @@ macro_rules! stage_reqs_then_post {
             $cfg,
             $state,
             $pending,
-            $durable_offset,
             $last_fsync,
             $fsync_interval,
             total_bytes,
@@ -523,7 +521,6 @@ fn writer_loop_inner(
     let mut last_fsync = Instant::now();
 
     let mut pending: VecDeque<PendingAck> = VecDeque::new();
-    let mut durable_offset = log.durable_watermark();
     let mut inflight_fsyncs = 0usize;
 
     // Adaptive linger
@@ -554,7 +551,6 @@ fn writer_loop_inner(
             &state,
             &notify_tx,
             &fsync_done_rx,
-            &mut durable_offset,
             &mut inflight_fsyncs,
             #[cfg(feature = "writer-stage-trace")]
             &tracer,
@@ -575,7 +571,6 @@ fn writer_loop_inner(
                 &mut pending,
                 reqs,
                 &notify_tx,
-                &mut durable_offset,
                 &mut last_fsync,
                 fsync_interval,
                 &fsync_tx,
@@ -593,7 +588,6 @@ fn writer_loop_inner(
             log,
             &state,
             &mut pending,
-            &mut durable_offset,
             &mut last_fsync,
             fsync_interval,
             min_fsync_interval,
@@ -647,7 +641,6 @@ fn writer_loop_inner(
                     &state,
                     &notify_tx,
                     done,
-                    &mut durable_offset,
                     &mut inflight_fsyncs,
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
@@ -693,7 +686,6 @@ fn writer_loop_inner(
                     &state,
                     &notify_tx,
                     &fsync_done_rx,
-                    &mut durable_offset,
                     &mut inflight_fsyncs,
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
@@ -723,7 +715,6 @@ fn writer_loop_inner(
                             &mut pending,
                             reqs,
                             &notify_tx,
-                            &mut durable_offset,
                             &mut last_fsync,
                             fsync_interval,
                             &fsync_tx,
@@ -780,7 +771,6 @@ fn writer_loop_inner(
                             &cfg,
                             &state,
                             &mut pending,
-                            &mut durable_offset,
                             &mut last_fsync,
                             fsync_interval,
                             total_bytes,
@@ -827,7 +817,6 @@ fn writer_loop_inner(
                         &mut pending,
                         unstaged,
                         &notify_tx,
-                        &mut durable_offset,
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
@@ -884,7 +873,6 @@ fn writer_loop_inner(
                 );
                 let res = log.reset_to_checkpoint(next_offset, crate::util::unix_millis());
                 if res.is_ok() {
-                    durable_offset = log.durable_watermark();
                     last_fsync = Instant::now();
                 }
                 if respond_to.send(res).is_err() {
@@ -902,7 +890,6 @@ fn writer_loop_inner(
                         &mut pending,
                         unstaged,
                         &notify_tx,
-                        &mut durable_offset,
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
@@ -932,7 +919,6 @@ fn writer_loop_inner(
                         &state,
                         &notify_tx,
                         &fsync_done_rx,
-                        &mut durable_offset,
                         &mut inflight_fsyncs,
                         #[cfg(feature = "writer-stage-trace")]
                         &tracer,
@@ -998,7 +984,6 @@ fn writer_loop_inner(
                         &mut pending,
                         unstaged,
                         &notify_tx,
-                        &mut durable_offset,
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
@@ -1038,7 +1023,6 @@ fn writer_loop_inner(
                     &state,
                     &notify_tx,
                     &fsync_done_rx,
-                    &mut durable_offset,
                     &mut inflight_fsyncs,
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
@@ -1096,9 +1080,7 @@ fn stage_replicated_req(
                 log.flush_buffers()?;
                 log.flush()?;
                 log.fsync()?;
-                state
-                    .durable
-                    .store(log.durable_watermark(), Ordering::Release);
+                state.durable.advance(log.durable_end_exclusive());
             }
         }
     }
@@ -1190,7 +1172,6 @@ fn maybe_commit_due(
     log: &mut Log,
     _state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
-    _durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     min_fsync_interval: Duration,
@@ -1255,7 +1236,6 @@ fn post_stage_commit_and_tune(
     cfg: &KeratinConfig,
     _state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
-    _durable_offset: &mut u64,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
@@ -1367,7 +1347,6 @@ fn drain_fsync_done(
     state: &Arc<LogState>,
     notify_tx: &Sender<NotifyMsg>,
     fsync_done_rx: &Receiver<FsyncDone>,
-    durable_offset: &mut u64,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -1378,7 +1357,6 @@ fn drain_fsync_done(
                 state,
                 notify_tx,
                 done,
-                durable_offset,
                 inflight_fsyncs,
                 #[cfg(feature = "writer-stage-trace")]
                 tracer,
@@ -1393,7 +1371,6 @@ fn wait_for_inflight_fsyncs(
     state: &Arc<LogState>,
     notify_tx: &Sender<NotifyMsg>,
     fsync_done_rx: &Receiver<FsyncDone>,
-    durable_offset: &mut u64,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -1404,7 +1381,6 @@ fn wait_for_inflight_fsyncs(
                 state,
                 notify_tx,
                 done,
-                durable_offset,
                 inflight_fsyncs,
                 #[cfg(feature = "writer-stage-trace")]
                 tracer,
@@ -1419,7 +1395,6 @@ fn handle_fsync_done(
     state: &Arc<LogState>,
     notify_tx: &Sender<NotifyMsg>,
     done: FsyncDone,
-    durable_offset: &mut u64,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -1440,8 +1415,11 @@ fn handle_fsync_done(
 
     match finish_result {
         Ok(()) => {
-            *durable_offset = (*durable_offset).max(done.through_offset);
-            state.durable.store(*durable_offset, Ordering::Release);
+            // Publish the durable frontier (unambiguous for empty vs offset 0);
+            // `log` already applied this fsync via finish_fsync_job. Monotonic
+            // advance: fsync completions may arrive out of order, but the frontier
+            // must never rewind on the steady-state path.
+            state.durable.advance(log.durable_end_exclusive());
             send_notify_items(notify_tx, done.ready);
             answer_sync_acks(done.sync_acks, Ok(()));
         }

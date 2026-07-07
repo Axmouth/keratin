@@ -15,6 +15,7 @@ use parking_lot::RwLock;
 #[cfg(feature = "writer-stage-trace")]
 use crate::writer_stage_trace::WriterStageTracer;
 use crate::{
+    durability::{DurableFrontier, DurableWatermark},
     index::Index,
     manifest::Manifest,
     reader::LogReader,
@@ -69,9 +70,10 @@ pub enum ReplicatedAppendMode {
 pub struct LogState {
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
-    // Inclusive last fsynced offset. Empty logs currently report 0, matching
-    // existing public behavior rather than using a nullable/sentinel value.
-    pub durable: Arc<AtomicU64>,
+    // Exclusive durable frontier, published through a typed wrapper so the
+    // empty-vs-"offset 0 durable" encoding lives in one place. See
+    // `DurableWatermark` and `Log::durable_end_exclusive`.
+    pub durable: DurableWatermark,
     pub epoch: Arc<AtomicU64>,
 }
 
@@ -95,11 +97,11 @@ impl FsyncJob {
 }
 
 impl LogState {
-    pub fn new(head: u64, tail: u64, durable: u64) -> Self {
+    pub fn new(head: u64, tail: u64, durable: DurableFrontier) -> Self {
         Self {
             head: Arc::new(AtomicU64::new(head)),
             tail: Arc::new(AtomicU64::new(tail)),
-            durable: Arc::new(AtomicU64::new(durable)),
+            durable: DurableWatermark::new(durable),
             epoch: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -1106,8 +1108,13 @@ impl Log {
         Ok(())
     }
 
-    pub fn durable_watermark(&self) -> u64 {
-        self.durable_offset
+    /// The exclusive durable frontier published to readers. The internal
+    /// `durable_offset` is an inclusive last-fsynced offset where `0` is ambiguous
+    /// between an empty log and "offset 0 durable"; the frontier removes that
+    /// ambiguity. Capping at `next_offset` keeps an empty log (sentinel `0`) at
+    /// frontier `0`.
+    pub fn durable_end_exclusive(&self) -> DurableFrontier {
+        DurableFrontier::from_exclusive(self.durable_offset.saturating_add(1).min(self.next_offset))
     }
 
     pub fn next_offset(&self) -> u64 {
@@ -1338,9 +1345,8 @@ impl Log {
 
         self.log_state.head.store(next_offset, Ordering::Release);
         self.log_state.tail.store(next_offset, Ordering::Release);
-        self.log_state
-            .durable
-            .store(self.durable_offset, Ordering::Release);
+        // Truncation/checkpoint reset: the durable set can legitimately shrink.
+        self.log_state.durable.reset(self.durable_end_exclusive());
 
         Ok(())
     }

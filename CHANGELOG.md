@@ -26,6 +26,12 @@ tagged releases yet. Earlier history predates this changelog.
   them into one fdatasync, lifting small-batch durable throughput several-fold
   without touching latency. Fat, bandwidth-bound commits keep a single fsync in
   flight.
+- Optional segment preallocation (`segment_preallocate_bytes`, off by default):
+  preallocate space ahead of the write cursor so durable fsyncs hit
+  already-allocated blocks in place instead of extending the file, which cuts the
+  low-load durable-publish latency floor on consumer NVMe. The durable watermark
+  is published as an unambiguous exclusive frontier so reads stop cleanly at the
+  durable end and never touch the preallocated padding.
 
 ### Changed
 

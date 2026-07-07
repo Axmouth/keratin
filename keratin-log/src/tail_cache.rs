@@ -19,10 +19,10 @@
 
 use std::collections::VecDeque;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
 
 use parking_lot::RwLock;
 
+use crate::durability::{DurableFrontier, DurableWatermark};
 use crate::reader::{OwnedRecord, to_owned};
 use crate::record::decode_record_prefix;
 
@@ -47,15 +47,15 @@ struct Inner {
 #[derive(Debug)]
 pub(crate) struct TailCache {
     inner: RwLock<Inner>,
-    /// Inclusive last-fsynced offset (cloned from `LogState.durable`). Reads never
-    /// serve an offset above this, so nothing non-durable is ever delivered.
-    durable: Arc<AtomicU64>,
+    /// The durable frontier (a clone of `LogState.durable`). Reads never serve an
+    /// offset at or above it, so nothing non-durable is ever delivered.
+    durable: DurableWatermark,
     /// Total cached bytes cap. `0` disables the cache (all reads go to the file).
     byte_budget: usize,
 }
 
 impl TailCache {
-    pub(crate) fn new(durable: Arc<AtomicU64>, byte_budget: usize) -> Self {
+    pub(crate) fn new(durable: DurableWatermark, byte_budget: usize) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 batches: VecDeque::new(),
@@ -68,6 +68,13 @@ impl TailCache {
 
     pub(crate) fn enabled(&self) -> bool {
         self.byte_budget > 0
+    }
+
+    /// The durable frontier the cache and file reader bound their scans by, so
+    /// neither ever serves a written-but-not-yet-durable record or reads the
+    /// preallocated zero padding past the durable data.
+    pub(crate) fn durable_frontier(&self) -> DurableFrontier {
+        self.durable.load()
     }
 
     /// Append a just-flushed batch. Called once per flush (~fsync rate). Evicts
@@ -120,16 +127,9 @@ impl TailCache {
         if self.byte_budget == 0 || max == 0 {
             return None;
         }
-        // `durable` is the inclusive last fsynced offset. `0` is the shared
-        // empty-log / nothing-durable sentinel, indistinguishable from "offset 0
-        // is durable", so we treat it as nothing durable: the exclusive upper
-        // bound is `0`, and that single first record falls to the file until
-        // offset 1 becomes durable. This keeps the "never serve a non-durable
-        // offset" invariant true even though `push_batch` runs pre-fsync.
-        let durable_excl = match self.durable.load(Ordering::Acquire) {
-            0 => 0,
-            d => d.saturating_add(1),
-        };
+        // Gate on the durable frontier so we never serve a non-durable offset
+        // even though `push_batch` runs pre-fsync.
+        let durable_excl = self.durable_frontier().first_non_durable();
         let upper = from.saturating_add(max as u64).min(durable_excl);
         // Hold the lock only long enough to clone the covering batches' byte
         // handles (cheap Arc refcounts). Decoding runs after the guard drops so a
@@ -203,8 +203,13 @@ mod tests {
         (base, base + count, buf.into())
     }
 
-    fn cache(budget: usize, durable: u64) -> TailCache {
-        TailCache::new(Arc::new(AtomicU64::new(durable)), budget)
+    /// `durable_excl` is the exclusive durable frontier (count of durable
+    /// records): `0` = nothing durable, `N` = offsets `0..N` durable.
+    fn cache(budget: usize, durable_excl: u64) -> TailCache {
+        TailCache::new(
+            DurableWatermark::new(DurableFrontier::from_exclusive(durable_excl)),
+            budget,
+        )
     }
 
     #[test]
@@ -217,7 +222,7 @@ mod tests {
 
     #[test]
     fn hit_serves_durable_tail() {
-        let c = cache(1 << 20, 9); // durable through offset 9 inclusive
+        let c = cache(1 << 20, 10); // offsets 0..10 durable (frontier 10)
         let (b, n, bytes) = encode_batch(0, 10, 16);
         c.push_batch(b, n, bytes);
         let recs = c.read_from(0, 10).expect("in window");
@@ -240,7 +245,7 @@ mod tests {
 
     #[test]
     fn durable_gate_caps_the_range() {
-        let c = cache(1 << 20, 4); // only 0..=4 durable
+        let c = cache(1 << 20, 5); // only offsets 0..5 durable (frontier 5)
         let (b, n, bytes) = encode_batch(0, 20, 8);
         c.push_batch(b, n, bytes);
         let recs = c.read_from(0, 20).expect("in window");
@@ -249,23 +254,30 @@ mod tests {
     }
 
     #[test]
-    fn durable_zero_never_serves_offset_zero() {
-        // `durable == 0` is the empty-log / nothing-durable sentinel. Offset 0 is
-        // pushed to the cache pre-fsync, but must not be served until it is
-        // actually durable (offset 1+ advancing durable past the sentinel).
+    fn empty_frontier_serves_nothing_but_offset_zero_alone_is_serveable() {
+        // Frontier `0` means nothing durable: offset 0 is pushed pre-fsync but must
+        // not be served yet.
         let c = cache(1 << 20, 0);
         let (b, n, bytes) = encode_batch(0, 5, 8);
         c.push_batch(b, n, bytes);
+        assert!(c.read_from(0, 5).expect("in window").is_empty());
+
+        // Frontier `1` means offset 0 alone is durable, and the exclusive encoding
+        // (unlike a bare inclusive `0`) can say so: offset 0 is served.
+        let c = cache(1 << 20, 1);
+        let (b, n, bytes) = encode_batch(0, 5, 8);
+        c.push_batch(b, n, bytes);
         let recs = c.read_from(0, 5).expect("in window");
-        assert!(recs.is_empty());
+        assert_eq!(recs.len(), 1);
+        assert_eq!(recs[0].offset, 0);
     }
 
     #[test]
     fn nothing_durable_yet_returns_empty_not_miss() {
-        let c = cache(1 << 20, 0); // durable = 0 (only offset 0 durable)
+        let c = cache(1 << 20, 0); // frontier 0: nothing durable
         let (b, n, bytes) = encode_batch(5, 10, 8); // window starts at 5
         c.push_batch(b, n, bytes);
-        // from=5 is in the window, but durable_excl=1, so nothing at/after 5.
+        // from=5 is in the window, but the frontier is 0, so nothing at/after 5.
         let recs = c.read_from(5, 10).expect("in window");
         assert!(recs.is_empty());
     }

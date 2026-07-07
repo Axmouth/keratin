@@ -7,6 +7,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::Message;
+use crate::durability::DurableFrontier;
 use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix};
 use crate::tail_cache::TailCache;
 
@@ -50,6 +51,11 @@ impl LogReader {
 
     // TODO: Memory cache X oldest entries for hot path of reading from the past
 
+    /// Raw random-access read of a single record by offset. Unlike `scan_from`
+    /// (the delivery path, which serves only durable records), this returns any
+    /// written record for read-your-writes tooling, so it is not gated on the
+    /// durable frontier. It still cannot wander into the preallocated zero padding:
+    /// `scan_forward` stops at the first non-record byte.
     pub fn fetch(&self, offset: u64) -> io::Result<Option<OwnedRecord>> {
         let base = match self.find_segment_base(offset)? {
             Some(b) => b,
@@ -78,10 +84,17 @@ impl LogReader {
             return Ok(recs);
         }
 
+        // Bound the file scan at the durable frontier so it stops at the known end
+        // of durable data and never reads a written-but-not-yet-durable record or
+        // the preallocated zero padding beyond it. An empty / nothing-durable log
+        // (frontier `0`) covers no offset, so the scan never enters the zero-padded
+        // segment.
+        let durable = self.tail_cache.durable_frontier();
+
         let mut out = Vec::with_capacity(max);
         let mut cur = from;
 
-        while out.len() < max {
+        while out.len() < max && durable.covers(cur) {
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
                 None => {
@@ -101,7 +114,7 @@ impl LogReader {
             let before_cur = cur;
             let before_len = out.len();
 
-            self.scan_forward_exact(&mut log, pos, &mut cur, None, &mut out, max)?;
+            self.scan_forward_exact(&mut log, pos, &mut cur, None, &mut out, max, durable)?;
 
             if cur == before_cur && out.len() == before_len {
                 if let Some(next) = self.next_segment_base(base) {
@@ -170,6 +183,7 @@ impl LogReader {
         Ok(best_pos)
     }
 
+    #[allow(clippy::too_many_arguments)]
     fn scan_forward_exact(
         &self,
         file: &mut std::fs::File,
@@ -178,6 +192,7 @@ impl LogReader {
         want: Option<u64>,
         out: &mut Vec<OwnedRecord>,
         max: usize,
+        durable: DurableFrontier,
     ) -> io::Result<()> {
         const SLAB: usize = 4096 * 8; // SSD page aligned
 
@@ -189,6 +204,12 @@ impl LogReader {
         file.seek(SeekFrom::Start(start_pos))?;
 
         while out.len() < max {
+            // Stop at the durable frontier: an offset it covers is fsynced data,
+            // everything at or past it is written-but-not-durable or the
+            // preallocated zero padding, which must not be read.
+            if !durable.covers(*cur) {
+                return Ok(());
+            }
             // Ensure we have enough data to attempt a decode
             if window.len().saturating_sub(consumed) < RECORD_HEADER_LEN {
                 if consumed > 0 {
@@ -243,7 +264,9 @@ impl LogReader {
                 }
 
                 Err(e) => {
-                    // Corruption: resync by shifting one byte forward
+                    // The durable bound above stops the scan before the zero
+                    // padding, so a decode error here is genuine corruption, not
+                    // end-of-data: resync by shifting one byte forward.
                     tracing::error!("{:#?}", e);
                     consumed += 1;
                 }

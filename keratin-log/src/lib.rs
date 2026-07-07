@@ -16,7 +16,7 @@ mod writer;
 mod writer_stage_trace;
 
 pub use config::*;
-pub use durability::KDurability;
+pub use durability::{DurableFrontier, DurableWatermark, KDurability};
 pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};

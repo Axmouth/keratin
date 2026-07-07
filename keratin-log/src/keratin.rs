@@ -14,7 +14,7 @@ use crate::reader::LogReader;
 use crate::record::Message;
 use crate::segment::{SegmentInfo, read_segment_created_ts_ms};
 use crate::writer::{AppendCompletionTarget, AppendPayload, AppendReq, IoError, WriterHandle};
-use crate::{AppendCompletion, KDurability, KeratinConfig};
+use crate::{AppendCompletion, DurableFrontier, KDurability, KeratinConfig};
 
 #[derive(Debug)]
 pub struct Keratin {
@@ -147,7 +147,7 @@ impl Keratin {
 
         let now = crate::util::unix_millis();
 
-        let log_state = Arc::new(LogState::new(0, 0, 0));
+        let log_state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
 
         let (log, segment_mapping) = Log::open(
             &root,
@@ -162,9 +162,8 @@ impl Keratin {
         )?;
 
         log_state.tail.store(log.next_offset(), Ordering::SeqCst); // add getter or read field
-        log_state
-            .durable
-            .store(log.durable_watermark(), Ordering::SeqCst); // already exists
+        // Recovery baseline: authoritatively establish the frontier at startup.
+        log_state.durable.reset(log.durable_end_exclusive());
         log_state
             .head
             .store(log.manifest.head_offset, Ordering::SeqCst);
@@ -341,7 +340,15 @@ impl Keratin {
     }
 
     pub fn durable_offset(&self) -> u64 {
-        self.log_state.durable.load(Ordering::Acquire)
+        // The watermark is the exclusive durable frontier (count of durable
+        // records). Convert back to an inclusive offset for this public accessor.
+        // An empty log (frontier `0`) saturates to `0`, matching the long-standing
+        // inclusive contract (`0` = empty or offset 0).
+        self.log_state
+            .durable
+            .load()
+            .first_non_durable()
+            .saturating_sub(1)
     }
 
     pub fn head_offset(&self) -> u64 {
