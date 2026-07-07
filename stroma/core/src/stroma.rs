@@ -3205,12 +3205,35 @@ impl Stroma {
         // redelivery under the at-least-once contract).
         let mut pending: std::collections::HashSet<Offset> = std::collections::HashSet::new();
         let mut valid_len = 0usize;
-        for (i, (_ev_off, ev)) in scanned.iter().enumerate() {
+        for (i, (ev_off, ev)) in scanned.iter().enumerate() {
             if let StromaEvent::CancelEnqueueMany { offs } = ev {
                 for o in offs {
                     pending.remove(o);
                 }
             } else if ev.max_referenced_msg_offset().is_some_and(|max| max >= msg_tail) {
+                // A dangling ENQUEUE is the expected parallel-publish artifact: its
+                // payload never became durable, so it is unconfirmed and safe to
+                // drop. A non-enqueue event (ack/nack/mark/dead-letter) referencing a
+                // non-durable offset cannot happen in correct operation, since you
+                // cannot settle a message that was never durably enqueued, so it
+                // signals an accounting inconsistency rather than the artifact. Fold
+                // it the same way (truncate) but surface it loudly, not warn-only.
+                let is_enqueue = matches!(
+                    ev,
+                    StromaEvent::Enqueue { .. }
+                        | StromaEvent::EnqueueMany { .. }
+                        | StromaEvent::EnqueueDelayed { .. }
+                        | StromaEvent::EnqueueDelayedMany { .. }
+                );
+                if !is_enqueue {
+                    tracing::error!(
+                        event_offset = ev_off,
+                        msg_tail,
+                        "recovery: a non-enqueue event references a non-durable offset \
+                         at or past msg_tail, which is not the expected dangling-enqueue \
+                         artifact and indicates an accounting inconsistency"
+                    );
+                }
                 // Only walk (and allocate) the per-offset list when this event
                 // actually references the non-durable tail; the common no-crash
                 // case (every reference below msg_tail) skips it entirely.
@@ -4010,9 +4033,20 @@ impl Stroma {
                     // the happy path allocates nothing.
                     let offs: Vec<Offset> = (0..count).map(|i| base + i).collect();
                     let cancel = StromaEvent::CancelEnqueueMany { offs };
-                    let _ = stroma
+                    if let Err(e) = stroma
                         .append_events_durable_leased(qh, vec![cancel], durability, owner_operation)
-                        .await;
+                        .await
+                    {
+                        // The durable Enqueue is now left dangling on a live leader.
+                        // Recovery still folds it away (it references a non-durable
+                        // offset), but log rather than swallow. This is the scenario
+                        // that could stall replication until recovery.
+                        tracing::error!(
+                            base,
+                            count,
+                            "failed to append CancelEnqueueMany for a non-durable batch: {e}"
+                        );
+                    }
                     for ci in completion_items {
                         ci.completion
                             .complete(Err(IoError::new("message payload not durable")));

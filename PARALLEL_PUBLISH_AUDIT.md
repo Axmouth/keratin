@@ -3,8 +3,19 @@
 Working doc for the `/code-review` findings on the parallel-durable-publish arc
 (keratin `git diff fb066de..HEAD`). Persist here until resolved.
 
-**Status: #1 FIXED on branch `fix-parallel-publish-reorder` (option A, the per-partition
-publish-order lock). S2, S3, and the medium findings still OPEN.**
+**Status (branch `fix-parallel-publish-reorder`):**
+- **#1 FIXED** (option A, per-partition publish-order lock).
+- **S2 RESOLVED** — analyzed benign + documented (head-of-line stop is correct and
+  self-healing; nothing durable sits behind a non-durable offset).
+- **S3 FIXED** — the compensating cancel append logs on failure instead of swallowing.
+- **#4 FIXED** — fusion attributes the fdatasync cost to one request, no stats inflation.
+- **#5 FIXED** — the fusion comment now states the real invariant (roll fsyncs synchronously).
+- **#7 MITIGATED** — a non-enqueue dangling reference now logs loudly (still truncates;
+  promoting to a hard quarantine is a possible further hardening).
+- **#6 HELD (judgment call)** — MAX_INFLIGHT_FSYNCS is coupled to the fsync channel bound
+  and PIPELINE_COMMIT_RECORDS is the adaptive threshold; both carry rationale doc comments,
+  so they read as documented implementation constants, not undocumented magic numbers.
+  Awaiting a decision on whether to expose them as config anyway.
 
 The arc itself (parallel publish + CancelEnqueue recovery, adaptive fsync fusion,
 segment preallocation, DurableFrontier watermark) is committed on `main` in keratin

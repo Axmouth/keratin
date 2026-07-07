@@ -372,9 +372,11 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
     let mut reqs: Vec<FsyncReq> = Vec::new();
     while let Ok(first) = rx.recv() {
         // SPECULATIVE (fsync fusion): drain every queued request and make them all
-        // durable with ONE fdatasync. The requests share the log file and
-        // fdatasync flushes everything up to the current position, so syncing the
-        // newest job's fds makes every drained request durable. Turns the
+        // durable with ONE fdatasync on the newest job's fds. Within a segment this
+        // is safe because fdatasync flushes everything written so far. Across a
+        // segment roll it is safe because `roll` fsyncs the outgoing segment
+        // synchronously before swapping the active segment, so any queued job on a
+        // prior segment is already durable by the time it is drained here. Turns the
         // fsync-count-bound small-batch regime into fat-batch throughput without
         // waiting for a bigger linger.
         reqs.push(first);
@@ -384,14 +386,19 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
         // One sync covers every drained request; fan the single result out.
         match reqs.last().expect("at least one request").job.sync() {
             Ok(elapsed) => {
+                // The single fdatasync's cost belongs to the coalesced group, not to
+                // each member: attribute it to the first request and zero to the
+                // rest, so `stats.fsync` is not inflated ~N x under fusion.
+                let mut fsync_elapsed = elapsed;
                 for req in reqs.drain(..) {
                     let done = FsyncDone {
                         through_offset: req.job.through_offset(),
-                        elapsed,
+                        elapsed: fsync_elapsed,
                         ready: req.ready,
                         sync_acks: req.sync_acks,
                         error: None,
                     };
+                    fsync_elapsed = Duration::ZERO;
                     if done_tx.send(done).is_err() {
                         return;
                     }
