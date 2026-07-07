@@ -14,6 +14,18 @@ tagged releases yet. Earlier history predates this changelog.
 - A `min_fsync_interval_ms` config floor on group-commit cadence, for storage
   where per-fsync cost dominates (consumer SATA class). Default `0` keeps the
   self-clocking behavior.
+- Parallel durable publish (Stroma): the message-log and event-log fsyncs
+  overlap instead of serializing (append the enqueue off the message staging
+  offset, confirm and deliver only when both logs are durable), roughly halving
+  the single-node durable publish latency. A message fsync failure annihilates
+  the durable enqueue with a new `CancelEnqueueMany` event so live and recovered
+  state stay consistent. Immediate publishes take this path; delayed publishes
+  keep the serial path for now.
+- Adaptive fsync fusion (Keratin writer): when recent commits are small
+  (fsync-count-bound) the writer pipelines several and the fsync worker coalesces
+  them into one fdatasync, lifting small-batch durable throughput several-fold
+  without touching latency; fat, bandwidth-bound commits keep a single fsync in
+  flight.
 
 ### Changed
 
@@ -21,6 +33,11 @@ tagged releases yet. Earlier history predates this changelog.
   worker is idle instead of waiting out the fsync interval tick, so the
   durability latency floor is no longer interval-bound. The interval remains
   the ceiling while an fsync is in flight.
+- Recovery folds the event log to its net state (an enqueue annihilated by a
+  later cancel is dropped) and auto-truncates a dangling forward reference - the
+  expected artifact of the parallel-append path, always unconfirmed - instead of
+  quarantining the partition. A genuinely corrupt record still follows the
+  mismatch policy (quarantine by default).
 - Ack tracking uses a settled `RangeSet` instead of a bounded bitset, removing
   the ack-window size limit.
 - Work-queue and stream partition handles are split at the type level, so a

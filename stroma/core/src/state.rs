@@ -389,6 +389,10 @@ pub enum QueueCommand {
         reqs: Vec<EnqueueEventMeta>,
         response: Option<oneshot::Sender<()>>,
     }, // list[offset, retries]
+    CancelEnqueueMany {
+        offs: Vec<Offset>,
+        response: Option<oneshot::Sender<()>>,
+    }, // annihilate enqueues whose payload never became durable
     EnqueueDelayed {
         offset: Offset,
         not_before: UnixMillis,
@@ -614,6 +618,10 @@ impl QueueCommand {
             // Under overload, throttling publish is correct. Natural backpressure upstream.
             QueueCommand::Enqueue { .. } => CommandPrio::Medium,
             QueueCommand::EnqueueMany { .. } => CommandPrio::Medium,
+            // Same priority as EnqueueMany so a cancel never overtakes the enqueue
+            // it annihilates (Medium is FIFO, and the cancel is always enqueued
+            // after its enqueue).
+            QueueCommand::CancelEnqueueMany { .. } => CommandPrio::Medium,
             QueueCommand::EnqueueDelayed { .. } => CommandPrio::Medium,
             QueueCommand::EnqueueDelayedMany { .. } => CommandPrio::Medium,
 
@@ -647,6 +655,7 @@ impl QueueCommand {
             QueueCommand::Shutdown { .. } => "Shutdown",
             QueueCommand::Enqueue { .. } => "Enqueue",
             QueueCommand::EnqueueMany { .. } => "EnqueueMany",
+            QueueCommand::CancelEnqueueMany { .. } => "CancelEnqueueMany",
             QueueCommand::MarkInflight { .. } => "MarkInflight",
             QueueCommand::MarkInflightMany { .. } => "MarkInflightMany",
             QueueCommand::Ack { .. } => "Ack",
@@ -1553,6 +1562,13 @@ impl QueueHandleInner {
                     let _ = r.send(());
                 }
                 dirty = !reqs.is_empty();
+            }
+            QueueCommand::CancelEnqueueMany { offs, response } => {
+                state.cancel_enqueue_many(&offs);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+                dirty = !offs.is_empty();
             }
             QueueCommand::EnqueueDelayed {
                 offset,
@@ -3339,6 +3355,24 @@ impl QueueInternalState {
         }
     }
 
+    /// Undo enqueues for offsets whose message payload never became durable (the
+    /// parallel append cancel path). Removes them from the ready set and every
+    /// per-offset tracker so they are never delivered. Only ever targets
+    /// never-settled tail offsets (the producer was not confirmed); a settled
+    /// offset is left untouched.
+    pub fn cancel_enqueue_many(&mut self, offs: &[Offset]) {
+        for &o in offs {
+            if o < self.settled_until() {
+                continue;
+            }
+            self.inflight.remove(&o);
+            self.ready.remove(o..o + 1);
+            self.retries.remove(&o);
+            self.ttl_deadlines.remove(o..o + 1);
+        }
+        self.recompute_hint_if_needed();
+    }
+
     /// Record a message's drop deadline (message TTL) and wake the deadline
     /// worker if this is the new earliest deadline.
     fn set_ttl_deadline(&mut self, offset: Offset, deadline: UnixMillis) {
@@ -4213,6 +4247,25 @@ mod tests {
 
         s.ack(5);
         assert!(!s.has_history(5));
+    }
+
+    #[test]
+    fn cancel_enqueue_removes_only_the_targeted_offset() {
+        let mut s = QueueInternalState::new("test".into(), 0);
+
+        s.enqueue(5, 0, None);
+        s.enqueue(6, 0, None);
+        assert!(s.is_ready(5));
+        assert!(s.is_ready(6));
+
+        s.cancel_enqueue_many(&[5]);
+
+        // The cancelled offset is annihilated: not ready and no history, as if it
+        // had never been enqueued.
+        assert!(!s.is_ready(5));
+        assert!(!s.has_history(5));
+        // The sibling enqueue is untouched.
+        assert!(s.is_ready(6));
     }
 
     #[test]

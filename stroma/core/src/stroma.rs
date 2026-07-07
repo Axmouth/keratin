@@ -1910,6 +1910,13 @@ impl Stroma {
                 };
                 qh.blocking_command_enqueue(command)?;
             }
+            StromaEvent::CancelEnqueueMany { offs } => {
+                let command = QueueCommand::CancelEnqueueMany {
+                    offs,
+                    response: None,
+                };
+                qh.blocking_command_enqueue(command)?;
+            }
             StromaEvent::EnqueueDelayed { off, not_before } => {
                 let command = QueueCommand::EnqueueDelayed {
                     offset: off,
@@ -2086,6 +2093,16 @@ impl Stroma {
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::EnqueueMany {
                     reqs,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            StromaEvent::CancelEnqueueMany { offs } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::CancelEnqueueMany {
+                    offs,
                     response: Some(tx),
                 })
                 .await
@@ -2367,6 +2384,67 @@ impl Stroma {
             .observe(start.elapsed());
 
         Ok(new_upto)
+    }
+
+    /// Like `append_events_durable_leased`, but the in-memory apply (which makes
+    /// the enqueued offsets deliverable) is gated on `msg_barrier` - the message
+    /// payload becoming durable. Used by the parallel publish path so an offset is
+    /// never delivered before its payload is durable, even though the event log
+    /// may be fsynced first. Returns `Ok(Some(new_upto))` when both logs are
+    /// durable and the events were applied, `Ok(None)` when the payload did NOT
+    /// become durable (the event append succeeded, so the caller must annihilate
+    /// it with a `CancelEnqueue`), or `Err` on an event-log append failure.
+    async fn append_events_durable_msg_gated(
+        &self,
+        qh: QueueHandle,
+        evs: Vec<StromaEvent>,
+        durability: KDurability,
+        msg_barrier: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
+    ) -> Result<Option<Offset>> {
+        let qh = qh.resolve()?;
+        let start = Instant::now();
+        let event_log = qh.event_log();
+        let mut msgs = Vec::with_capacity(evs.len());
+        for ev in &evs {
+            msgs.push(event_msg(ev)?);
+        }
+        let msgs_count = msgs.len();
+        let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
+
+        // Append the event log and await BOTH durabilities concurrently so the two
+        // fsyncs overlap (join polls both from the first wake - awaiting them
+        // sequentially lets the event round-trip finish before the msg one even
+        // starts to be observed, serializing the pair).
+        let event_fut = event_log.append_batch(msgs, Some(durability));
+        let (event_res, msg_res) = tokio::join!(event_fut, msg_barrier);
+        let ar = event_res.map_err(io_err)?;
+
+        // Gate the in-memory apply on the message payload becoming durable. If it
+        // did not, the event-log Enqueue is durable but must not be applied or
+        // delivered; the caller annihilates it with a CancelEnqueue.
+        match msg_res {
+            Ok(Ok(_)) => {}
+            _ => return Ok(None),
+        }
+
+        self.metrics
+            .event_log_appends
+            .observe(msgs_count, bytes_count);
+        qh.applied_upto()
+            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        qh.set_dirty_snapshot(true);
+
+        for ev in evs.into_iter() {
+            self.apply_event_inmem(ev, &qh).await?;
+        }
+
+        let new_upto = event_log.head_offset();
+        self.metrics
+            .event_log_appends
+            .batches
+            .latency
+            .observe(start.elapsed());
+        Ok(Some(new_upto))
     }
 
     // ---------------- Public API used by Storage shim ----------------
@@ -3087,27 +3165,22 @@ impl Stroma {
     ) -> Result<RecoveryScanOutcome> {
         let reader = event_log.reader();
 
-        let mut events = Vec::new();
-        let mut events_count = 0;
-        let mut mismatch = None;
-
+        // Decode the whole replay range, stopping at the first corrupt record (we
+        // cannot decode past it).
+        let mut scanned: Vec<(u64, StromaEvent)> = Vec::new();
+        let mut corrupt: Option<RecoveryMismatchFound> = None;
         'scan: while cur < tail {
             let batch = reader.scan_from(cur, 10_000).map_err(io_err)?;
             if batch.is_empty() {
                 break;
             }
-
             for rec in batch {
                 let offset = rec.offset;
                 cur = offset + 1;
-
-                // A corrupt event record is the first bad offset: stop here. Same
-                // repair as a dangling ref (truncate at this offset); skipping it
-                // and continuing would silently drop a state transition.
-                let ev = match StromaEvent::decode(&rec.payload) {
-                    Ok(ev) => ev,
+                match StromaEvent::decode(&rec.payload) {
+                    Ok(ev) => scanned.push((offset, ev)),
                     Err(err) => {
-                        mismatch = Some(RecoveryMismatchFound {
+                        corrupt = Some(RecoveryMismatchFound {
                             event_offset: offset,
                             kind: RecoveryMismatchKind::CorruptRecord {
                                 detail: err.to_string(),
@@ -3115,30 +3188,71 @@ impl Stroma {
                         });
                         break 'scan;
                     }
-                };
-
-                // Verify the event does not reference a message the message log
-                // has not durably accepted (a dangling forward reference). The
-                // first such event marks the truncation point: everything from
-                // here is unresolvable, so stop and report it rather than
-                // applying a reference to a message that does not exist.
-                if let Some(max_ref) = ev.max_referenced_msg_offset()
-                    && max_ref >= msg_tail
-                {
-                    mismatch = Some(RecoveryMismatchFound {
-                        event_offset: offset,
-                        kind: RecoveryMismatchKind::DanglingReference {
-                            msg_offset: max_ref,
-                            msg_tail,
-                        },
-                    });
-                    break 'scan;
                 }
-
-                events.push(ev);
-                applied_upto.store(offset, Ordering::Release);
-                events_count += 1;
             }
+        }
+
+        // Fold: the parallel durable-append path can leave the event log with an
+        // Enqueue for an offset whose message payload never became durable - later
+        // annihilated by a `CancelEnqueueMany` (runtime msg-fsync failure) or left
+        // dangling (crash between the two fsyncs). Track the non-durable enqueue
+        // references not yet cancelled; the valid prefix is everything up to the
+        // last point that set is empty. An unresolved tail (a genuine
+        // crash-dangling and everything after it) is truncated - it is always
+        // UNCONFIRMED (confirm requires both logs durable), so dropping it loses
+        // nothing acknowledged. Because msg offsets are monotonic and durability
+        // is a contiguous prefix, the non-durable enqueues form a contiguous
+        // event-log tail, so this never drops a confirmed enqueue (at worst it
+        // drops interleaved acks of already-durable messages, which is at-most
+        // redelivery under the at-least-once contract).
+        let mut pending: std::collections::HashSet<Offset> = std::collections::HashSet::new();
+        let mut valid_len = 0usize;
+        for (i, (_ev_off, ev)) in scanned.iter().enumerate() {
+            if let StromaEvent::CancelEnqueueMany { offs } = ev {
+                for o in offs {
+                    pending.remove(o);
+                }
+            } else {
+                for o in ev.referenced_msg_offsets() {
+                    if o >= msg_tail {
+                        pending.insert(o);
+                    }
+                }
+            }
+            if pending.is_empty() {
+                valid_len = i + 1;
+            }
+        }
+
+        // A dangling suffix (pending never returned to empty) is reported at its
+        // truncation point - the first event of the unresolved tail - and always
+        // precedes any corrupt record (which, if present, is at the very end of
+        // the scan). Everything at or after `valid_len` is dropped.
+        let mismatch = if valid_len < scanned.len() {
+            let (trunc_off, trunc_ev) = &scanned[valid_len];
+            let msg_offset = trunc_ev
+                .referenced_msg_offsets()
+                .into_iter()
+                .filter(|o| *o >= msg_tail)
+                .max()
+                .unwrap_or(msg_tail);
+            Some(RecoveryMismatchFound {
+                event_offset: *trunc_off,
+                kind: RecoveryMismatchKind::DanglingReference {
+                    msg_offset,
+                    msg_tail,
+                },
+            })
+        } else {
+            corrupt
+        };
+
+        let mut events = Vec::with_capacity(valid_len);
+        let mut events_count = 0u64;
+        for (ev_off, ev) in scanned.into_iter().take(valid_len) {
+            applied_upto.store(ev_off, Ordering::Release);
+            events.push(ev);
+            events_count += 1;
         }
 
         Ok(RecoveryScanOutcome {
@@ -3237,56 +3351,76 @@ impl Stroma {
                 ),
             };
 
-            let policy = RecoveryMismatchPolicy::from_u8(
-                self.recovery_mismatch_policy.load(Ordering::Acquire),
-            );
-            match policy {
-                RecoveryMismatchPolicy::Ignore => {
-                    tracing::error!(
-                        "recovery: {tp}/{part}/{group:?}: {reason}; on_mismatch=Ignore -> \
-                         truncating the event log to {} and continuing (POSSIBLE DATA LOSS)",
+            // A dangling reference is the EXPECTED artifact of the parallel
+            // durable-append path (the event log was fsynced ahead of the message
+            // log and a crash lost the message tail). The dangling suffix is
+            // always UNCONFIRMED, so truncate-to-valid and continue - never
+            // quarantine. The mismatch policy governs genuine corruption only.
+            let quarantine_eligible = match &m.kind {
+                RecoveryMismatchKind::DanglingReference { .. } => {
+                    tracing::warn!(
+                        "recovery: {tp}/{part}/{group:?}: {reason}; truncating the event log to \
+                         {} and continuing",
                         m.event_offset
                     );
                     self.truncate_event_log_tail(&h, m.event_offset).await?;
-                    // fall through and apply only the valid prefix in `events`
+                    false
                 }
-                RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
-                    tracing::error!(
-                        "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
-                    );
-                    let was_present = self
-                        .quarantined
-                        .insert(
-                            (
-                                Box::<str>::from(tp),
-                                part,
-                                normalize_group(group).map(Box::<str>::from),
-                            ),
-                            QuarantineInfo {
-                                topic: tp.to_string(),
-                                partition: part,
-                                group: group.map(|g| g.to_string()),
-                                reason: reason.clone(),
-                                truncate_event_offset: m.event_offset,
-                            },
-                        )
-                        .is_some();
-                    if !was_present {
+                RecoveryMismatchKind::CorruptRecord { .. } => true,
+            };
+
+            if quarantine_eligible {
+                let policy = RecoveryMismatchPolicy::from_u8(
+                    self.recovery_mismatch_policy.load(Ordering::Acquire),
+                );
+                match policy {
+                    RecoveryMismatchPolicy::Ignore => {
+                        tracing::error!(
+                            "recovery: {tp}/{part}/{group:?}: {reason}; on_mismatch=Ignore -> \
+                             truncating the event log to {} and continuing (POSSIBLE DATA LOSS)",
+                            m.event_offset
+                        );
+                        self.truncate_event_log_tail(&h, m.event_offset).await?;
+                        // fall through and apply only the valid prefix in `events`
+                    }
+                    RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
+                        tracing::error!(
+                            "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
+                        );
+                        let was_present = self
+                            .quarantined
+                            .insert(
+                                (
+                                    Box::<str>::from(tp),
+                                    part,
+                                    normalize_group(group).map(Box::<str>::from),
+                                ),
+                                QuarantineInfo {
+                                    topic: tp.to_string(),
+                                    partition: part,
+                                    group: group.map(|g| g.to_string()),
+                                    reason: reason.clone(),
+                                    truncate_event_offset: m.event_offset,
+                                },
+                            )
+                            .is_some();
+                        if !was_present {
+                            self.metrics
+                                .recovery
+                                .quarantined
+                                .fetch_add(1, Ordering::Relaxed);
+                        }
                         self.metrics
                             .recovery
-                            .quarantined
+                            .quarantines_total
                             .fetch_add(1, Ordering::Relaxed);
+                        return Err(StromaError::RecoveryMismatch {
+                            topic: tp.to_string(),
+                            partition: part,
+                            group: group.map(|g| g.to_string()),
+                            reason,
+                        });
                     }
-                    self.metrics
-                        .recovery
-                        .quarantines_total
-                        .fetch_add(1, Ordering::Relaxed);
-                    return Err(StromaError::RecoveryMismatch {
-                        topic: tp.to_string(),
-                        partition: part,
-                        group: group.map(|g| g.to_string()),
-                        reason,
-                    });
                 }
             }
         }
@@ -3743,26 +3877,100 @@ impl Stroma {
             return Ok(());
         }
 
-        // Custom completion that:
-        //   1. fires when the msg_log batch is durably accepted
-        //   2. emits ONE event_log batch with EnqueueMany
-        //   3. fans out per client completions with their assigned offsets
-        let stroma = self.clone();
-        let msg_completion = MsgBatchCompletion::new(
-            stroma,
-            completion_items,
-            self.keratin_cfg_msg.default_durability,
-            qh,
-            owner_operation,
-        );
+        let durability = self.keratin_cfg_msg.default_durability;
 
+        // Delayed publishes (not_before) take the serial path: the parallel path's
+        // CancelEnqueue only undoes immediate enqueues (extending it to the delayed
+        // heap is a follow-up). Immediate-only batches - the common, latency-
+        // sensitive case - take the parallel path below.
+        let all_immediate = completion_items.iter().all(|ci| ci.meta.not_before.is_none());
+        if !all_immediate {
+            // Serial path: msg-log durable, THEN emit the event log, THEN fan out.
+            let stroma = self.clone();
+            let msg_completion =
+                MsgBatchCompletion::new(stroma, completion_items, durability, qh, owner_operation);
+            msg_log
+                .append_batch_enqueue(messages, Some(durability), msg_completion)
+                .map_err(io_err)?;
+            return Ok(());
+        }
+
+        // Parallel durable append: get the assigned offsets at STAGING and fire the
+        // event-log Enqueue immediately, so the two fsyncs overlap instead of
+        // serializing. The in-memory apply (delivery visibility) and the producer
+        // confirm are BOTH gated on both logs being durable, so nothing is
+        // delivered or confirmed before its payload is durable. On a message fsync
+        // failure the durable Enqueue is annihilated with a CancelEnqueue so live
+        // and recovered state stay consistent (the producer is not confirmed and
+        // retries).
+        let stroma = self.clone();
+        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
+        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
         msg_log
-            .append_batch_enqueue(
-                messages,
-                Some(self.keratin_cfg_msg.default_durability),
-                msg_completion,
-            )
+            .append_batch_enqueue_staged(messages, Some(durability), msg_completion, staged_tx)
             .map_err(io_err)?;
+
+        tokio::spawn(async move {
+            let owner_operation = owner_operation;
+            let base = match staged_rx.await {
+                Ok(off) => off,
+                Err(_) => {
+                    for ci in completion_items {
+                        ci.completion
+                            .complete(Err(IoError::new("staged-offset channel closed")));
+                    }
+                    return;
+                }
+            };
+
+            let reqs: Vec<EnqueueEventMeta> = completion_items
+                .iter()
+                .enumerate()
+                .map(|(i, ci)| EnqueueEventMeta {
+                    off: base + i as u64,
+                    retries: 0,
+                    expire_at: ci.meta.expire_at,
+                })
+                .collect();
+            let offs: Vec<Offset> = reqs.iter().map(|r| r.off).collect();
+            let events = vec![StromaEvent::EnqueueMany { reqs }];
+
+            let outcome = stroma
+                .append_events_durable_msg_gated(qh.clone(), events, durability, msg_rx)
+                .await;
+
+            match outcome {
+                Ok(Some(_)) => {
+                    // Both logs durable, events applied: confirm the producers.
+                    for (i, ci) in completion_items.into_iter().enumerate() {
+                        ci.completion.complete(Ok(AppendResult {
+                            base_offset: base + i as u64,
+                            count: 1,
+                        }));
+                    }
+                }
+                Ok(None) => {
+                    // Message payload not durable: annihilate the durable Enqueue so
+                    // it is never delivered and recovery folds it away.
+                    let cancel = StromaEvent::CancelEnqueueMany { offs };
+                    let _ = stroma
+                        .append_events_durable_leased(qh, vec![cancel], durability, owner_operation)
+                        .await;
+                    for ci in completion_items {
+                        ci.completion
+                            .complete(Err(IoError::new("message payload not durable")));
+                    }
+                }
+                Err(err) => {
+                    // Event-log append failed: no apply, producer retries. A durable
+                    // message with no enqueue event is a harmless orphan payload.
+                    let msg = err.to_string();
+                    for ci in completion_items {
+                        ci.completion.complete(Err(IoError::new(msg.clone())));
+                    }
+                }
+            }
+        });
 
         Ok(())
     }
@@ -7694,7 +7902,7 @@ mod tests {
     /// a message the message log never durably accepted, default to quarantining
     /// just that partition (broker stays usable), and be repairable.
     #[tokio::test]
-    async fn recovery_quarantines_and_repairs_dangling_event_reference() {
+    async fn recovery_auto_truncates_dangling_event_reference() {
         let dir = test_dir!("recovery_dangling_event_ref");
         let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
@@ -7724,40 +7932,18 @@ mod tests {
         // A different partition stays healthy: blast radius is the one queue.
         stroma.queue_handle("healthy", 0, None).await.unwrap();
 
-        // Re-recovery detects the dangling reference and fails loud.
-        let err = stroma.queue_handle("t", 0, None).await.unwrap_err();
-        assert!(
-            matches!(err, StromaError::RecoveryMismatch { .. }),
-            "expected RecoveryMismatch, got {err:?}"
-        );
-        assert!(stroma.is_quarantined("t", 0, None));
-        // The healthy partition is unaffected.
-        assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
-
-        // Subsequent access reports the partition as quarantined.
-        assert!(matches!(
-            stroma.queue_handle("t", 0, None).await.unwrap_err(),
-            StromaError::QueueQuarantined { .. }
-        ));
-        assert_eq!(stroma.quarantined_partitions().len(), 1);
-        // Metric: gauge up, monotonic counter incremented.
-        assert_eq!(
-            stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
-            1
-        );
-        assert_eq!(
-            stroma
-                .metrics
-                .recovery
-                .quarantines_total
-                .load(Ordering::Relaxed),
-            1
-        );
-
-        // Repair (truncate-to-valid) clears the quarantine.
-        stroma.repair_partition("t", 0, None).await.unwrap();
+        // Re-recovery now AUTO-TRUNCATES the dangling suffix instead of
+        // quarantining: a dangling reference is the expected artifact of the
+        // parallel durable-append path (the event log fsynced ahead of the
+        // message log, crash lost the message tail), and it is always UNCONFIRMED,
+        // so it is dropped and the partition recovers cleanly with no operator
+        // intervention. (Genuine corruption still quarantines - see the corrupt
+        // record test.)
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        assert!(qh.recovery_complete());
         assert!(!stroma.is_quarantined("t", 0, None));
-        // Metric: gauge back to zero (counter stays).
+        assert_eq!(stroma.quarantined_partitions().len(), 0);
         assert_eq!(
             stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
             0
@@ -7768,19 +7954,70 @@ mod tests {
                 .recovery
                 .quarantines_total
                 .load(Ordering::Relaxed),
-            1
+            0
         );
-
-        // It now recovers cleanly (the dangling suffix was dropped) and works.
-        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
-        let qh = qh.resolve().unwrap();
-        assert!(qh.recovery_complete());
+        // The healthy partition is unaffected.
+        assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
 
         shutdown_stroma(
-            "recovery_quarantines_and_repairs_dangling_event_reference",
+            "recovery_auto_truncates_dangling_event_reference",
             &stroma,
         )
         .await;
+    }
+
+    /// The recovery fold: an Enqueue for a non-durable offset that is later
+    /// annihilated by a CancelEnqueueMany (the runtime msg-fsync-failure path)
+    /// must NOT be treated as a dangling reference. The pair folds to nothing, so
+    /// recovery keeps the whole event log (no truncation) and does not quarantine.
+    #[tokio::test]
+    async fn recovery_folds_cancel_against_dangling_enqueue() {
+        let dir = test_dir!("recovery_fold_cancel");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+
+        // Inject Enqueue(0) [references offset 0, which the empty msg log does not
+        // have durably] followed by CancelEnqueueMany([0]) that annihilates it.
+        {
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = qh.resolve().unwrap();
+            let enqueue = StromaEvent::Enqueue {
+                off: 0,
+                retries: 0,
+                expire_at: None,
+            };
+            let cancel = StromaEvent::CancelEnqueueMany { offs: vec![0] };
+            qh.event_log()
+                .append_batch(
+                    vec![event_msg(&enqueue).unwrap(), event_msg(&cancel).unwrap()],
+                    None,
+                )
+                .await
+                .unwrap();
+        }
+        assert_eq!(
+            stroma.unmaterialize("t", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        );
+
+        // Recovery folds the pair: no dangling, no quarantine, and the event log
+        // is left intact (both events kept, not truncated).
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        assert!(qh.recovery_complete());
+        assert!(!stroma.is_quarantined("t", 0, None));
+        assert_eq!(
+            qh.event_log().next_offset(),
+            2,
+            "the fold must not truncate the event log"
+        );
+        assert_eq!(
+            stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
+            0
+        );
+
+        shutdown_stroma("recovery_folds_cancel_against_dangling_enqueue", &stroma).await;
     }
 
     /// A corrupt (undecodable) event record is the genuinely mid-log failure and
