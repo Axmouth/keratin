@@ -230,6 +230,9 @@ fn encode_append_payloads_into(
 }
 
 impl Log {
+    // Cohesive open-time parameters, kept as primitives so this low-level layer
+    // stays independent of the higher-level KeratinConfig struct.
+    #[allow(clippy::too_many_arguments)]
     pub fn open(
         root: impl AsRef<Path>,
         now_ms: u64,
@@ -858,14 +861,12 @@ impl Log {
             // (pre-fsync) never exposes a non-durable record.
             if self.tail_cache.enabled() {
                 let next = self.staged_end_offset + 1;
-                if next > self.flushed_through {
-                    self.tail_cache.push_batch(
-                        self.flushed_through,
-                        next,
-                        Arc::from(self.write_buf.as_slice()),
-                    );
-                    self.flushed_through = next;
-                }
+                self.tail_cache.push_batch(
+                    self.flushed_through,
+                    next,
+                    Arc::from(self.write_buf.as_slice()),
+                );
+                self.flushed_through = next;
             }
             self.write_buf.clear();
         }

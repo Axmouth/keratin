@@ -122,35 +122,42 @@ impl TailCache {
         // bound is `durable + 1`. (An empty log reports 0 and the cache is empty,
         // so `front()?` below returns None -> file path.)
         let durable_excl = self.durable.load(Ordering::Acquire).saturating_add(1);
-        let inner = self.inner.read();
-        let oldest = inner.batches.front()?.base_offset;
-        if from < oldest {
-            return None; // below the window: lagging consumer reads the file
-        }
         let upper = from.saturating_add(max as u64).min(durable_excl);
-        let mut out = Vec::new();
-        if upper <= from {
-            return Some(out); // in-window but nothing durable at/after `from` yet
-        }
-        for b in &inner.batches {
-            if b.next_offset <= from {
-                continue; // batch entirely before `from`
+        // Hold the lock only long enough to clone the covering batches' byte
+        // handles (cheap Arc refcounts). Decoding runs after the guard drops so a
+        // long read never blocks the writer's `push_batch`.
+        let bufs: Vec<Arc<[u8]>> = {
+            let inner = self.inner.read();
+            let oldest = inner.batches.front()?.base_offset;
+            if from < oldest {
+                return None; // below the window: lagging consumer reads the file
             }
-            if b.base_offset >= upper {
-                break; // batch entirely at/after the upper bound
+            if upper <= from {
+                return Some(Vec::new()); // in-window but nothing durable at/after `from` yet
             }
-            let buf: &[u8] = &b.bytes;
+            inner
+                .batches
+                .iter()
+                .filter(|b| b.next_offset > from && b.base_offset < upper)
+                .map(|b| b.bytes.clone())
+                .collect()
+        };
+        // Records are contiguous and ascending, so the loop returns as soon as it
+        // has the `upper - from` records requested.
+        let mut out = Vec::with_capacity((upper - from) as usize);
+        for buf in &bufs {
+            let buf: &[u8] = buf;
             let mut pos = 0usize;
             while pos < buf.len() {
                 match decode_record_prefix(&buf[pos..]) {
                     Ok((rec, used)) => {
-                        if rec.offset >= from && rec.offset < upper {
+                        if rec.offset >= from {
                             out.push(to_owned(rec));
+                            if from + out.len() as u64 >= upper {
+                                return Some(out);
+                            }
                         }
                         pos += used;
-                        if (from + out.len() as u64) >= upper {
-                            return Some(out);
-                        }
                     }
                     // Cached batches are complete and valid; a decode error means
                     // corruption in memory. Stop and let the caller re-request
