@@ -129,6 +129,14 @@ pub struct Log {
     /// Exclusive next offset not yet pushed to `tail_cache` (= last cached
     /// offset + 1). At flush the batch covers `[flushed_through, staged_end+1)`.
     flushed_through: u64,
+    /// EWMA of records per commit. Small commits are fsync-count-bound (the fixed
+    /// fsync cost dominates), so the writer pipelines more commits for the fsync
+    /// worker to coalesce; fat commits are bandwidth-bound, so it keeps a single
+    /// fsync in flight (coalescing bigger writes only makes each fsync slower).
+    /// Updated in `commit`.
+    pub(crate) recent_commit_records: u64,
+    /// `through_offset` of the previous commit, to size the next one.
+    pub(crate) last_commit_through: u64,
 
     // stats
     pub stats: IoStats,
@@ -275,6 +283,8 @@ impl Log {
                     next_offset,
                     tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
                     flushed_through: next_offset,
+                    last_commit_through: next_offset,
+                    recent_commit_records: 0,
                     manifest,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -323,6 +333,8 @@ impl Log {
                     next_offset,
                     tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
                     flushed_through: next_offset,
+                    last_commit_through: next_offset,
+                    recent_commit_records: 0,
                     last_index_at_log_pos,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -401,6 +413,8 @@ impl Log {
                 next_offset,
                 tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
                 flushed_through: next_offset,
+                last_commit_through: next_offset,
+                recent_commit_records: 0,
                 last_index_at_log_pos,
                 write_buf: Vec::with_capacity(16 * 1024 * 1024),
                 idx_buf: Vec::with_capacity(256 * 1024),
