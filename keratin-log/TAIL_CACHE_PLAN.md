@@ -1,5 +1,16 @@
 # Tail-read cache for keratin-log
 
+> **Status: shipped.** The **Safety invariants (as-built)** and **Review
+> follow-ups** sections at the bottom are the authoritative contract; the code
+> (`src/tail_cache.rs`) is the source of truth. Some mechanism details in the
+> plan below were superseded in implementation: the flush hook tracks
+> `Log::flushed_through` rather than `write_buf_base_offset`; it keeps an
+> `Arc::from(write_buf)` copy rather than `mem::take` (the flushed batch is
+> usually small under group commit, so copying `len` bytes beats moving the
+> full-capacity buffer and reallocating one per flush); the read entry point is
+> `read_from` (not `read_into`); and `scan_from` serves the cache only on full
+> coverage (`recs.len() == max`) rather than stitching a partial suffix.
+
 ## Why
 
 Measured: under mixed publish+deliver on the **same partition**, delivery throughput
@@ -163,3 +174,71 @@ Removes the fsync/writeback read contention for tail-following delivery: mixed
 publish+deliver throughput recovers toward the drain-alone ceiling (~48% -> ~8% drown
 on nvme measured as the gap to close). No change to the runtime, the actor, or the
 queue state.
+
+## Safety invariants (as-built)
+
+The contract the cache must uphold. These are enforced in `src/tail_cache.rs` and
+locked by the unit tests there plus `tests/tail_cache.rs`.
+
+1. **A miss is always correct.** The cache is never a source of truth. Any miss
+   (below the cached window, disabled, or an in-memory decode error) falls
+   through to the unchanged file scan.
+2. **Never serve a non-durable offset.** `read_from` caps the returned range at
+   the durable watermark. `durable == 0` doubles as the empty-log /
+   nothing-durable sentinel, so it is treated as nothing durable: offset 0 is not
+   served from cache until offset 1+ advances durable past the sentinel. This
+   keeps the invariant true even though `push_batch` runs pre-fsync.
+3. **Invalidate on every backward move of the log.** The cache must be `clear()`ed
+   whenever the tail rewinds. The only runtime backward move is
+   `Log::reset_to_checkpoint` (the follower divergence-recovery path, routed
+   through the writer), which clears. `truncate_before` is head-side retention
+   only (it raises `head_offset` and deletes sealed segments below it, never the
+   active tail), so it needs no clear: delivery never requests below `head`, so
+   any below-head entries the cache still holds are never read. The `push_batch`
+   contiguity guard (drop-all on a non-contiguous base) is the backstop if a
+   future backward-move site ever forgets to clear.
+4. **Contiguity.** Batches are pushed contiguous and ascending (each `base` equals
+   the previous `next`, tracked by `Log::flushed_through`). `read_from` relies on
+   this to binary-search the covering batch and to return a contiguous run.
+5. **Bytes, not records.** The cache holds the exact encoded wire bytes and
+   decodes on read via the same `decode_record_prefix` the file path uses, so
+   cache-served and file-served records are byte-identical (locked by the
+   `cache_read_matches_file_read` integration test).
+6. **Cache/file durable asymmetry.** The file scan path is NOT durable-gated (it
+   returns whatever has been appended to the segment, possibly past durable); the
+   cache path IS. `scan_from` bridges this by taking the cache result only when it
+   fully covers the request (`recs.len() == max`) which, because the cache caps at
+   durable, can only happen when the whole range is durable, so the two paths
+   return identical records. Production delivery (`poll_ready` ->
+   `scan_messages_from`) requests exactly the durable-ready count, so the cache
+   hits. A fixed-page reader that overshoots durable (the e2e bench when caught
+   up) falls to the file. See follow-up 1.
+7. **Node-local.** `tail_cache_bytes` is a per-node, non-replicated knob (a
+   hardware-dependent memory/latency tradeoff, per settings-discipline). Event
+   logs run with it at `0`.
+
+## Review follow-ups (open)
+
+Design findings from the post-ship review, not yet actioned:
+
+1. **Unify `scan_from` on a durable-gated file path**, then serve the cached
+   durable prefix and let the caller re-poll, replacing the all-or-nothing
+   `recs.len() == max` gate. This lets fixed-page tail-followers (and the
+   validating bench) hit the cache in the caught-up steady state, and closes the
+   asymmetry in invariant 6 (a replica scan can currently ship
+   flushed-but-unsynced records to followers via the file path). Behavior change:
+   needs broker-side verification and its own review.
+2. **Stream partitions.** Durable stream msg-logs carry the tail cache but serve
+   their live tail from the broker `StreamRing`, so the cache is populated yet
+   rarely read. Consider `tail_cache_bytes = 0` for stream partitions (as event
+   logs already do), or decide which layer owns tail residency.
+3. **Skip CRC on cache hits.** `decode_record_prefix` re-CRC32Cs trusted
+   in-memory bytes on every read. A no-CRC decode variant for the cache path
+   would cut per-record CPU (scales with fan-out). Bench first.
+4. **Records vs bytes cache.** A hit still pays full decode + two `Vec`
+   allocations per record (`to_owned`). Caching decoded/`Arc` records would also
+   attack the deliver-path CPU cost, at higher memory. Assess after 1 and 3.
+5. **Single-batch overshoot.** `push_batch` keeps at least one batch even if it
+   alone exceeds `tail_cache_bytes` (only reachable if a flush is larger than the
+   whole budget, i.e. `tail_cache_bytes < flush_target_bytes`). The bounded-cap
+   contract is soft under that misconfiguration; document or clamp.
