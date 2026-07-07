@@ -232,3 +232,49 @@ impl ReceivedMessage {
         })
     }
 }
+
+#[cfg(test)]
+mod decode_prefix_tests {
+    use super::*;
+
+    /// A zero run (the preallocated, unwritten segment tail) must decode as
+    /// BadMagic, never as a valid record. `scan_last_good` relies on this to stop
+    /// cleanly at the last real record instead of walking into the padding.
+    #[test]
+    fn zeros_decode_as_bad_magic() {
+        let err = decode_record_prefix(&[0u8; 64]).unwrap_err();
+        assert!(matches!(err, RecordError::BadMagic(0)), "got {err:?}");
+    }
+
+    /// Fewer than the fixed header bytes is Truncated (need more), not a decode of
+    /// garbage.
+    #[test]
+    fn short_buffer_is_truncated() {
+        let err = decode_record_prefix(&[0u8; 8]).unwrap_err();
+        assert!(matches!(err, RecordError::Truncated), "got {err:?}");
+    }
+
+    /// A record whose header is intact but whose CRC region is zero-filled (a
+    /// crash mid-write into preallocated space) must fail the CRC, so recovery
+    /// discards it.
+    #[test]
+    fn valid_header_zero_crc_is_crc_mismatch() {
+        let mut buf = Vec::new();
+        encode_record(
+            &mut buf,
+            &Record {
+                flags: 0,
+                timestamp_ms: 42,
+                offset: 7,
+                headers: b"h",
+                payload: &[1, 2, 3, 4],
+            },
+        )
+        .unwrap();
+        // Zero the last 4 bytes (the CRC), as a preallocated tail would leave it.
+        let n = buf.len();
+        buf[n - 4..].fill(0);
+        let err = decode_record_prefix(&buf).unwrap_err();
+        assert!(matches!(err, RecordError::CrcMismatch), "got {err:?}");
+    }
+}
