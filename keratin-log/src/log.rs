@@ -137,6 +137,9 @@ pub struct Log {
     pub(crate) recent_commit_records: u64,
     /// `through_offset` of the previous commit, to size the next one.
     pub(crate) last_commit_through: u64,
+    /// Bytes to preallocate ahead of the active segment's write cursor (`0` =
+    /// off). Applied to the active segment and to each new segment on roll.
+    prealloc_chunk: u64,
 
     // stats
     pub stats: IoStats,
@@ -248,10 +251,12 @@ impl Log {
         index_stride_bytes: u32,
         flush_target_bytes: usize,
         tail_cache_bytes: usize,
+        segment_preallocate_bytes: usize,
         force_recovery_scan: bool,
         log_state: Arc<LogState>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
+        let prealloc_chunk = segment_preallocate_bytes as u64;
         fs::create_dir_all(root.join("segments"))?;
         fs::create_dir_all(root.join("tmp"))?;
 
@@ -264,7 +269,8 @@ impl Log {
 
         // If no segments exist, create first with base=0.
         if bases.is_empty() {
-            let (seg, idx, seg_path) = create_segment_pair(&root, 0, now_ms)?;
+            let (mut seg, idx, seg_path) = create_segment_pair(&root, 0, now_ms)?;
+            seg.enable_prealloc(prealloc_chunk);
             manifest.active_base_offset = 0;
             manifest.next_offset = 0;
             manifest.clean_shutdown = false;
@@ -285,6 +291,7 @@ impl Log {
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
+                    prealloc_chunk,
                     manifest,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -313,8 +320,9 @@ impl Log {
         {
             let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter(bases.clone())));
             let active_base = manifest.active_base_offset;
-            let (active, index, seg_path) =
+            let (mut active, index, seg_path) =
                 open_or_create_segment_pair(&root, active_base, now_ms)?;
+            active.enable_prealloc(prealloc_chunk);
             segment_mapping.write().insert(active_base, seg_path);
 
             let next_offset = manifest.next_offset;
@@ -335,6 +343,7 @@ impl Log {
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
+                    prealloc_chunk,
                     last_index_at_log_pos,
                     write_buf: Vec::with_capacity(16 * 1024 * 1024),
                     idx_buf: Vec::with_capacity(256 * 1024),
@@ -386,7 +395,9 @@ impl Log {
 
         // Choose active segment: last base.
         let (active_base, _active_base_path) = bases.last().expect("Already checked empty").clone();
-        let (active, index, seg_path) = open_or_create_segment_pair(&root, active_base, now_ms)?;
+        let (mut active, index, seg_path) =
+            open_or_create_segment_pair(&root, active_base, now_ms)?;
+        active.enable_prealloc(prealloc_chunk);
 
         segment_mapping.write().insert(active_base, seg_path);
 
@@ -415,6 +426,7 @@ impl Log {
                 flushed_through: next_offset,
                 last_commit_through: next_offset,
                 recent_commit_records: 0,
+                prealloc_chunk,
                 last_index_at_log_pos,
                 write_buf: Vec::with_capacity(16 * 1024 * 1024),
                 idx_buf: Vec::with_capacity(256 * 1024),
@@ -1149,8 +1161,13 @@ impl Log {
         // 2) fsync to seal it durably (conservative)
         self.fsync()?;
 
+        // The outgoing segment is sealed: reclaim any preallocated padding so it
+        // is not left on disk for the segment's lifetime.
+        self.active.trim_to_written()?;
+
         let new_base = self.next_offset;
-        let (seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
+        let (mut seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
+        seg.enable_prealloc(self.prealloc_chunk);
         self.active = seg;
         self.index = idx;
 
@@ -1296,7 +1313,8 @@ impl Log {
 
         self.segment_mapping.write().clear();
 
-        let (seg, idx, seg_path) = create_segment_pair(&self.root, next_offset, now_ms)?;
+        let (mut seg, idx, seg_path) = create_segment_pair(&self.root, next_offset, now_ms)?;
+        seg.enable_prealloc(self.prealloc_chunk);
         self.active = seg;
         self.index = idx;
         self.segment_mapping.write().insert(next_offset, seg_path);
@@ -1380,6 +1398,11 @@ impl Log {
         self.flush_buffers()?;
         self.flush()?;
         self.fsync_files_and_update_manifest()?;
+        // Trim the preallocated padding so the next clean open sees file size ==
+        // data size and needs no scan. Made durable before the clean flag, so a
+        // crash in between just falls back to the recovery scan.
+        self.active.trim_to_written()?;
+        self.active.fsync()?;
         self.manifest.clean_shutdown = true;
         self.store_manifest()?;
         Ok(())

@@ -48,6 +48,7 @@ async fn main() {
         flush_target_bytes: 128 * 1024 * 1024,
         force_recovery_scan: false,
         tail_cache_bytes: 0,
+        segment_preallocate_bytes: 0,
     };
 
     let k = Arc::new(Keratin::open(&root.root, cfg).await.unwrap());

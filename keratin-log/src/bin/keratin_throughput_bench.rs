@@ -70,6 +70,7 @@ async fn main() {
         flush_target_bytes: flush_mb * 1024 * 1024,
         force_recovery_scan: has_flag("--force-recovery-scan"),
         tail_cache_bytes: 0,
+        segment_preallocate_bytes: 0,
     };
 
     let k = Arc::new(Keratin::open(&root, cfg).await.unwrap());

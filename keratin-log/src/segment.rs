@@ -8,7 +8,17 @@ pub const LOG_HEADER_LEN: u32 = 8 + 2 + 2 + 4 + 8 + 8 + 32 + 4;
 pub struct Segment {
     pub base_offset: u64,
     file: File,
+    /// Logical bytes written (header + records). The authoritative write cursor
+    /// and end-of-data, independent of the physical file size. With
+    /// preallocation the file is larger than this (zero-padded tail).
     pub bytes_written: u64,
+    /// Physically allocated size of the file. `>= bytes_written`. When
+    /// preallocation is off this tracks `bytes_written` (file grows with writes).
+    alloc_end: u64,
+    /// Preallocate this many bytes ahead of the write cursor (`0` = off). Set on
+    /// the active segment. Turned off automatically if the filesystem rejects
+    /// `fallocate`.
+    prealloc_chunk: u64,
 }
 
 impl Segment {
@@ -35,6 +45,8 @@ impl Segment {
             base_offset,
             file,
             bytes_written: header_len as u64,
+            alloc_end: header_len as u64,
+            prealloc_chunk: 0,
         })
     }
 
@@ -63,17 +75,71 @@ impl Segment {
         Ok(Self {
             base_offset: base,
             file,
+            // On a padded segment (crash with preallocation) this is temporarily
+            // the padded size; the recovery scan corrects it to the logical tail
+            // via `set_len`. On a clean open the padding was trimmed at shutdown,
+            // so len == data size.
             bytes_written: len,
+            alloc_end: len,
+            prealloc_chunk: 0,
         })
     }
 
     pub fn append_bytes(&mut self, data: &[u8]) -> io::Result<u64> {
-        // returns start position where this append begins
-        // TODO: Seek to last successful write end? To overwrite corrupted
-        let start = self.file.seek(SeekFrom::End(0))?;
+        // Preallocate ahead of the cursor so the write lands in already-allocated
+        // blocks. fdatasync of an in-place write skips the block-allocation
+        // metadata flush that an extending write pays.
+        if self.prealloc_chunk > 0 {
+            let need = self.bytes_written + data.len() as u64;
+            if need > self.alloc_end {
+                self.grow_alloc(need);
+            }
+        }
+        // Write at the logical cursor, not SeekFrom::End: with preallocation the
+        // file end is past the data (zero padding).
+        let start = self.bytes_written;
+        self.file.seek(SeekFrom::Start(start))?;
         self.file.write_all(data)?;
         self.bytes_written += data.len() as u64;
         Ok(start)
+    }
+
+    /// Enable preallocation on this (active) segment: keep `chunk` bytes allocated
+    /// ahead of the write cursor. A filesystem that rejects `fallocate` silently
+    /// disables it (writes just extend the file, correctness unchanged).
+    pub fn enable_prealloc(&mut self, chunk: u64) {
+        if chunk == 0 {
+            return;
+        }
+        self.prealloc_chunk = chunk;
+        let need = self.bytes_written + chunk;
+        if need > self.alloc_end {
+            self.grow_alloc(need);
+        }
+    }
+
+    /// Grow the physical allocation to at least `need`, rounded up to a chunk
+    /// boundary. Best-effort: on failure (e.g. filesystem without fallocate)
+    /// preallocation is turned off and writes fall back to plain extend.
+    fn grow_alloc(&mut self, need: u64) {
+        use fs2::FileExt;
+        let chunk = self.prealloc_chunk.max(1);
+        let target = need.div_ceil(chunk).saturating_mul(chunk).max(need);
+        match self.file.allocate(target) {
+            Ok(()) => self.alloc_end = target,
+            Err(_) => self.prealloc_chunk = 0,
+        }
+    }
+
+    /// Trim the physical file down to the logical bytes written, removing any
+    /// preallocated padding. Called on clean shutdown so the next clean open sees
+    /// file size == data size and needs no scan.
+    pub fn trim_to_written(&mut self) -> io::Result<()> {
+        if self.alloc_end > self.bytes_written {
+            self.file.set_len(self.bytes_written)?;
+            self.alloc_end = self.bytes_written;
+        }
+        Ok(())
     }
 
     pub fn flush(&mut self) -> io::Result<()> {
@@ -91,6 +157,7 @@ impl Segment {
     pub fn set_len(&mut self, new_len: u64) -> io::Result<()> {
         self.file.set_len(new_len)?;
         self.bytes_written = new_len;
+        self.alloc_end = new_len;
         Ok(())
     }
 

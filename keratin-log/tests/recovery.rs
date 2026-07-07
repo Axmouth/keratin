@@ -406,3 +406,76 @@ async fn staged_offset_fires_with_assigned_offset_before_durable() {
     let durable = done_rx.await.unwrap().unwrap();
     assert_eq!(durable.base_offset, staged_offset);
 }
+
+fn prealloc_config() -> KeratinConfig {
+    KeratinConfig {
+        // Preallocate 1 MiB ahead of the write cursor.
+        segment_preallocate_bytes: 1024 * 1024,
+        ..KeratinConfig::test_default()
+    }
+}
+
+/// With preallocation on, records append into the preallocated region, read back
+/// correctly, survive a clean reopen (padding trimmed at shutdown), and appending
+/// continues afterward.
+#[tokio::test]
+async fn preallocated_segment_clean_lifecycle() {
+    let dir = test_dir!("prealloc_clean");
+    let cfg = prealloc_config();
+    {
+        let k = Keratin::open(&dir.root, cfg).await.unwrap();
+        for i in 0..100u32 {
+            k.append_batch(vec![message(format!("m{i}"))], None)
+                .await
+                .unwrap();
+        }
+        k.sync().await.unwrap();
+        let got = k.reader().scan_from(0, 200).unwrap();
+        assert_eq!(got.len(), 100);
+        assert_eq!(got[0].payload, b"m0");
+        assert_eq!(got[99].payload, b"m99");
+        k.shutdown().await.unwrap();
+    }
+    {
+        let k = Keratin::open(&dir.root, cfg).await.unwrap();
+        let got = k.reader().scan_from(0, 200).unwrap();
+        assert_eq!(got.len(), 100, "records survive a clean reopen with preallocation");
+        assert_eq!(got[50].payload, b"m50");
+        k.append_batch(vec![message("m100".to_string())], None)
+            .await
+            .unwrap();
+        k.sync().await.unwrap();
+        assert_eq!(k.reader().scan_from(0, 200).unwrap().len(), 101);
+        k.shutdown().await.unwrap();
+    }
+}
+
+/// A crash with preallocation leaves the active segment zero-padded and the
+/// manifest dirty. Recovery scans past the padding to the last valid record, so
+/// every confirmed record survives.
+#[tokio::test]
+async fn preallocated_segment_recovers_after_crash() {
+    let dir = test_dir!("prealloc_crash");
+    let cfg = prealloc_config();
+    {
+        let k = Keratin::open(&dir.root, cfg).await.unwrap();
+        for i in 0..50u32 {
+            k.append_batch(vec![message(format!("c{i}"))], None)
+                .await
+                .unwrap();
+        }
+        k.sync().await.unwrap(); // durable
+        k.force_close().await.unwrap(); // crash: padding remains, manifest dirty
+    }
+    {
+        let k = Keratin::open(&dir.root, cfg).await.unwrap();
+        let got = k.reader().scan_from(0, 100).unwrap();
+        assert_eq!(
+            got.len(),
+            50,
+            "confirmed records survive a crash with preallocation padding"
+        );
+        assert_eq!(got[49].payload, b"c49");
+        k.shutdown().await.unwrap();
+    }
+}
