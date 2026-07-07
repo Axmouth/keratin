@@ -36,7 +36,7 @@ pub struct LogReader {
 }
 
 impl LogReader {
-    pub fn new(
+    pub(crate) fn new(
         root: impl AsRef<Path>,
         segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
         tail_cache: Arc<TailCache>,
