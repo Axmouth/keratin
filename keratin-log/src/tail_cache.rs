@@ -13,7 +13,9 @@
 //! offsets (lagging consumers) miss and fall back to the file scan.
 //!
 //! It is a pure cache: a miss is always correct, and it only ever serves offsets
-//! at or below the durable watermark, so durability semantics are unchanged.
+//! at or below the durable watermark (with `durable == 0` treated as nothing
+//! durable, since it doubles as the empty-log sentinel), so durability semantics
+//! are unchanged.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -118,10 +120,16 @@ impl TailCache {
         if self.byte_budget == 0 || max == 0 {
             return None;
         }
-        // `durable` is the inclusive last fsynced offset, so the exclusive upper
-        // bound is `durable + 1`. (An empty log reports 0 and the cache is empty,
-        // so `front()?` below returns None -> file path.)
-        let durable_excl = self.durable.load(Ordering::Acquire).saturating_add(1);
+        // `durable` is the inclusive last fsynced offset. `0` is the shared
+        // empty-log / nothing-durable sentinel, indistinguishable from "offset 0
+        // is durable", so we treat it as nothing durable: the exclusive upper
+        // bound is `0`, and that single first record falls to the file until
+        // offset 1 becomes durable. This keeps the "never serve a non-durable
+        // offset" invariant true even though `push_batch` runs pre-fsync.
+        let durable_excl = match self.durable.load(Ordering::Acquire) {
+            0 => 0,
+            d => d.saturating_add(1),
+        };
         let upper = from.saturating_add(max as u64).min(durable_excl);
         // Hold the lock only long enough to clone the covering batches' byte
         // handles (cheap Arc refcounts). Decoding runs after the guard drops so a
@@ -135,10 +143,15 @@ impl TailCache {
             if upper <= from {
                 return Some(Vec::new()); // in-window but nothing durable at/after `from` yet
             }
+            // Batches are contiguous and ascending by offset, so binary-search to
+            // the first one that can cover `from` instead of scanning the ring
+            // (which grows to thousands of entries under small group-commit
+            // flushes). `take_while` then stops at the first batch past `upper`.
+            let start = inner.batches.partition_point(|b| b.next_offset <= from);
             inner
                 .batches
-                .iter()
-                .filter(|b| b.next_offset > from && b.base_offset < upper)
+                .range(start..)
+                .take_while(|b| b.base_offset < upper)
                 .map(|b| b.bytes.clone())
                 .collect()
         };
@@ -233,6 +246,18 @@ mod tests {
         let recs = c.read_from(0, 20).expect("in window");
         assert_eq!(recs.len(), 5); // offsets 0..=4
         assert_eq!(recs.last().unwrap().offset, 4);
+    }
+
+    #[test]
+    fn durable_zero_never_serves_offset_zero() {
+        // `durable == 0` is the empty-log / nothing-durable sentinel. Offset 0 is
+        // pushed to the cache pre-fsync, but must not be served until it is
+        // actually durable (offset 1+ advancing durable past the sentinel).
+        let c = cache(1 << 20, 0);
+        let (b, n, bytes) = encode_batch(0, 5, 8);
+        c.push_batch(b, n, bytes);
+        let recs = c.read_from(0, 5).expect("in window");
+        assert!(recs.is_empty());
     }
 
     #[test]
