@@ -19,8 +19,10 @@ tagged releases yet. Earlier history predates this changelog.
   offset, confirm and deliver only when both logs are durable), roughly halving
   the single-node durable publish latency. A message fsync failure annihilates
   the durable enqueue with a new `CancelEnqueueMany` event so live and recovered
-  state stay consistent. Immediate publishes take this path. Delayed publishes
-  keep the serial path for now.
+  state stay consistent (including dropping a not-yet-fired delayed enqueue).
+  Both immediate and delayed publishes take this path. Event-log appends are
+  serialized per partition so a crash can never strand a confirmed publish behind
+  a non-durable one.
 - Adaptive fsync fusion (Keratin writer): when recent commits are small
   (fsync-count-bound) the writer pipelines several and the fsync worker coalesces
   them into one fdatasync, lifting small-batch durable throughput several-fold

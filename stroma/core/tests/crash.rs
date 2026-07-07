@@ -258,3 +258,49 @@ async fn parallel_publish_batch_confirmed_survives_restart() {
         assert!(st2.is_ready("t", 0, None, off).await.unwrap());
     }
 }
+
+/// A delayed publish (`not_before`) now takes the parallel path too. It is confirmed
+/// only once both logs are durable, stays undelivered until its deadline, survives a
+/// restart still delayed, and fires once the deadline passes.
+#[tokio::test]
+async fn delayed_publish_confirmed_survives_restart() {
+    use stroma_core::PublishItem;
+    let (st, dir) = open_test_stroma().await;
+
+    let (c, rx) = KeratinAppendCompletion::pair();
+    let item = PublishItem {
+        headers: MessageHeaders {
+            published: Default::default(),
+            publish_received: Default::default(),
+            content_type: None,
+            extra: Default::default(),
+        },
+        payload: b"later".to_vec(),
+        completion: c,
+        not_before: Some(1000),
+        expire_at: None,
+    };
+    st.append_message_batch("t", 0, None, vec![item])
+        .await
+        .unwrap();
+    let off = rx.await.unwrap().unwrap().base_offset;
+
+    // Confirmed but delayed: not deliverable before its not_before.
+    assert!(!st.is_ready("t", 0, None, off).await.unwrap());
+    st.shutdown().await.unwrap();
+    drop(st);
+
+    // Survives the restart, still delayed.
+    let st2 = Stroma::open(
+        &dir.root,
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
+    assert!(!st2.is_ready("t", 0, None, off).await.unwrap());
+
+    // Fires once the deadline passes.
+    st2.requeue_expired(1000, 10).await.unwrap();
+    assert!(st2.is_ready("t", 0, None, off).await.unwrap());
+}

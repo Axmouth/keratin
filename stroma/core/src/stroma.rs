@@ -352,141 +352,6 @@ struct CompletionItem {
     completion: Box<dyn AppendCompletion<IoError> + Send>,
 }
 
-/// Completion for the msg_log batch in append_message_batch.
-/// Once msg-log durability is reached, emits one EnqueueMany event_log entry,
-/// then fans out per client completions with assigned offsets.
-struct MsgBatchCompletion {
-    stroma: Stroma,
-    items: Vec<CompletionItem>,
-    durability: KDurability,
-    runtime: tokio::runtime::Handle,
-    qh: QueueHandle,
-    owner_operation: OwnerOperationLease,
-}
-
-impl MsgBatchCompletion {
-    fn new(
-        stroma: Stroma,
-        items: Vec<CompletionItem>,
-        durability: KDurability,
-        qh: QueueHandle,
-        owner_operation: OwnerOperationLease,
-    ) -> Box<Self> {
-        Box::new(Self {
-            stroma,
-            items,
-            durability,
-            runtime: tokio::runtime::Handle::current(),
-            qh,
-            owner_operation,
-        })
-    }
-}
-
-impl AppendCompletion<IoError> for MsgBatchCompletion {
-    fn complete(self: Box<Self>, res: std::result::Result<AppendResult, IoError>) {
-        let Self {
-            stroma,
-            items,
-            durability,
-            runtime,
-            qh,
-            owner_operation,
-        } = *self;
-
-        let ar = match res {
-            Ok(ar) => ar,
-            Err(err) => {
-                let err_msg = err.to_string();
-                for CompletionItem {
-                    meta: _,
-                    completion: c,
-                } in items
-                {
-                    c.complete(Err(IoError::new(err_msg.clone())));
-                }
-                return;
-            }
-        };
-
-        let base = ar.base_offset;
-        let count = ar.count as u64;
-
-        if count != items.len() as u64 {
-            tracing::error!(
-                "msg-log batch returned count={} but we had {} completions",
-                count,
-                items.len()
-            );
-            // Continue anyway with whichever is smaller, fan out will not go past either
-        }
-
-        // Build EnqueueMany events for the event log
-        let mut immediate = Vec::new();
-        let mut delayed = Vec::new();
-        for (i, CompletionItem { meta, .. }) in items.iter().enumerate() {
-            let off = base + i as u64;
-            match meta.not_before {
-                None => immediate.push(EnqueueEventMeta {
-                    off,
-                    retries: 0,
-                    expire_at: meta.expire_at,
-                }),
-                // Delayed publishes do not carry a TTL yet - EnqueueDelayed has no
-                // expire_at field. Combining delay + TTL is a follow-up.
-                Some(nb) => delayed.push(EnqueueDelayedEventMeta {
-                    off,
-                    not_before: nb,
-                }),
-            }
-        }
-
-        let mut events = Vec::with_capacity(2);
-        if !immediate.is_empty() {
-            events.push(StromaEvent::EnqueueMany { reqs: immediate });
-        }
-        if !delayed.is_empty() {
-            events.push(StromaEvent::EnqueueDelayedMany { reqs: delayed });
-        }
-
-        // Spawn the event_log append + fan-out. We are inside a sync completion
-        // callback (called from the writer thread), so we cannot await directly.
-        // The completion thread should not block, we hand off to the runtime
-        runtime.spawn(async move {
-            match stroma
-                .append_events_durable_leased(qh.clone(), events, durability, owner_operation)
-                .await
-            {
-                Ok(_) => {
-                    for (
-                        i,
-                        CompletionItem {
-                            meta: _,
-                            completion: c,
-                        },
-                    ) in items.into_iter().enumerate()
-                    {
-                        c.complete(Ok(AppendResult {
-                            base_offset: base + i as u64,
-                            count: 1,
-                        }));
-                    }
-                }
-                Err(err) => {
-                    let err_msg = err.to_string();
-                    for CompletionItem {
-                        meta: _,
-                        completion: c,
-                    } in items
-                    {
-                        c.complete(Err(IoError::new(err_msg.clone())));
-                    }
-                }
-            }
-        });
-    }
-}
-
 #[derive(Debug)]
 pub struct TaskGroup {
     token: CancellationToken,
@@ -3902,30 +3767,15 @@ impl Stroma {
 
         let durability = self.keratin_cfg_msg.default_durability;
 
-        // Delayed publishes (not_before) take the serial path: the parallel path's
-        // CancelEnqueue only undoes immediate enqueues (extending it to the delayed
-        // heap is a follow-up). Immediate-only batches - the common, latency-
-        // sensitive case - take the parallel path below.
-        let all_immediate = completion_items.iter().all(|ci| ci.meta.not_before.is_none());
-        if !all_immediate {
-            // Serial path: msg-log durable, THEN emit the event log, THEN fan out.
-            let stroma = self.clone();
-            let msg_completion =
-                MsgBatchCompletion::new(stroma, completion_items, durability, qh, owner_operation);
-            msg_log
-                .append_batch_enqueue(messages, Some(durability), msg_completion)
-                .map_err(io_err)?;
-            return Ok(());
-        }
-
-        // Parallel durable append: get the assigned offsets at STAGING and fire the
-        // event-log Enqueue immediately, so the two fsyncs overlap instead of
-        // serializing. The in-memory apply (delivery visibility) and the producer
-        // confirm are BOTH gated on both logs being durable, so nothing is
-        // delivered or confirmed before its payload is durable. On a message fsync
-        // failure the durable Enqueue is annihilated with a CancelEnqueue so live
-        // and recovered state stay consistent (the producer is not confirmed and
-        // retries).
+        // Parallel durable append (immediate AND delayed publishes): get the
+        // assigned offsets at STAGING and fire the event-log Enqueue immediately, so
+        // the two fsyncs overlap instead of serializing. The in-memory apply
+        // (delivery visibility) and the producer confirm are BOTH gated on both logs
+        // being durable, so nothing is delivered or confirmed before its payload is
+        // durable. On a message fsync failure the durable Enqueue is annihilated
+        // with a CancelEnqueue (which now also drops a not-yet-fired delayed
+        // enqueue) so live and recovered state stay consistent (the producer is not
+        // confirmed and retries).
         let stroma = self.clone();
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
@@ -3958,17 +3808,34 @@ impl Stroma {
                 return Ok(());
             }
         };
-        let reqs: Vec<EnqueueEventMeta> = completion_items
-            .iter()
-            .enumerate()
-            .map(|(i, ci)| EnqueueEventMeta {
-                off: base + i as u64,
-                retries: 0,
-                expire_at: ci.meta.expire_at,
-            })
-            .collect();
-        let count = reqs.len() as u64;
-        let events = vec![StromaEvent::EnqueueMany { reqs }];
+        // Split the batch into immediate and delayed enqueues (a delayed publish
+        // does not carry a TTL yet, matching the serial path). Both event kinds are
+        // appended together under the ordering lock, so they stay in msg-offset order
+        // and a crash-at-seam leaves both dangling for the fold to drop.
+        let mut immediate = Vec::new();
+        let mut delayed = Vec::new();
+        for (i, ci) in completion_items.iter().enumerate() {
+            let off = base + i as u64;
+            match ci.meta.not_before {
+                None => immediate.push(EnqueueEventMeta {
+                    off,
+                    retries: 0,
+                    expire_at: ci.meta.expire_at,
+                }),
+                Some(nb) => delayed.push(EnqueueDelayedEventMeta {
+                    off,
+                    not_before: nb,
+                }),
+            }
+        }
+        let count = completion_items.len() as u64;
+        let mut events = Vec::with_capacity(2);
+        if !immediate.is_empty() {
+            events.push(StromaEvent::EnqueueMany { reqs: immediate });
+        }
+        if !delayed.is_empty() {
+            events.push(StromaEvent::EnqueueDelayedMany { reqs: delayed });
+        }
 
         // Encode the event and issue the event-log append SEND under the lock, so
         // the send order matches the msg-offset order established above.

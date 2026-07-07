@@ -3377,14 +3377,23 @@ impl QueueInternalState {
     /// never-settled tail offsets (the producer was not confirmed); a settled
     /// offset is left untouched.
     pub fn cancel_enqueue_many(&mut self, offs: &[Offset]) {
+        let settled = self.settled_until();
         for &o in offs {
-            if o < self.settled_until() {
+            if o < settled {
                 continue;
             }
             self.inflight.remove(&o);
             self.ready.remove(o..o + 1);
             self.retries.remove(&o);
             self.ttl_deadlines.remove(o..o + 1);
+        }
+        // Also drop any not-yet-fired DELAYED enqueues for these offsets, so a
+        // cancelled non-durable delayed publish never fires later. A delayed
+        // enqueue lives only in this heap until its not_before passes.
+        if !self.delayed_enqueue_heap.is_empty() {
+            let cancel: std::collections::HashSet<Offset> =
+                offs.iter().copied().filter(|&o| o >= settled).collect();
+            self.delayed_enqueue_heap.retain(|(_, o)| !cancel.contains(o));
         }
         self.recompute_hint_if_needed();
     }
@@ -5492,6 +5501,25 @@ mod tests {
         let _ = s.collect_expired(250, 100);
         assert!(s.is_ready(6));
         assert_eq!(s.delayed_enqueue_heap.len(), 0);
+    }
+
+    #[test]
+    fn cancel_enqueue_many_drops_delayed_heap() {
+        let mut s = QueueInternalState::new("t".into(), 0);
+        s.enqueue_delayed(5, 100);
+        s.enqueue_delayed(6, 200);
+        s.enqueue_delayed(7, 300);
+        assert_eq!(s.delayed_enqueue_heap.len(), 3);
+
+        // A cancelled non-durable delayed batch is removed from the heap, so those
+        // offsets never fire later; the survivor still does.
+        s.cancel_enqueue_many(&[5, 7]);
+        assert_eq!(s.delayed_enqueue_heap.len(), 1);
+
+        let _ = s.collect_expired(1000, 100);
+        assert!(s.is_ready(6));
+        assert!(!s.is_ready(5));
+        assert!(!s.is_ready(7));
     }
 
     #[test]
