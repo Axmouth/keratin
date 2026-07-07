@@ -15,6 +15,7 @@ pub enum EventType {
     EnqueueMany = 1,
     EnqueueDelayed = 2,
     EnqueueDelayedMany = 3,
+    CancelEnqueueMany = 4,
     MarkInflight = 10,
     MarkInflightMany = 11,
     Ack = 20,
@@ -228,6 +229,15 @@ pub enum StromaEvent {
     EnqueueDelayedMany {
         reqs: Vec<EnqueueDelayedEventMeta>,
     },
+    /// Annihilates a previously-emitted enqueue for offsets whose message
+    /// payload never became durable (the parallel msg/event append path where the
+    /// msg fsync failed after the event log already recorded the enqueue). Folded
+    /// against `EnqueueMany` during recovery and apply, so a cancelled offset is
+    /// never delivered and never triggers a dangling-reference check. Only ever
+    /// targets never-delivered offsets (the producer was not confirmed).
+    CancelEnqueueMany {
+        offs: Vec<Offset>,
+    },
     MarkInflight {
         off: Offset,
         deadline: UnixMillis,
@@ -428,7 +438,45 @@ impl StromaEvent {
             // boundary is a delete directive, likewise not a durable reference.
             | StromaEvent::CursorCommit { .. }
             | StromaEvent::CursorCommitBatch { .. }
+            // A cancel is an annihilation directive for an offset whose payload may
+            // legitimately be non-durable (that is the whole point), so it must NOT
+            // itself trigger the dangling-reference check. Recovery folds it against
+            // the matching enqueue before validating survivors.
+            | StromaEvent::CancelEnqueueMany { .. }
             | StromaEvent::StreamTruncate { .. } => None,
+        }
+    }
+
+    /// Every message offset this event references, in no particular order. Used
+    /// by recovery's fold to track which non-durable enqueues are still
+    /// outstanding (not yet cancelled). Mirrors `max_referenced_msg_offset`'s
+    /// coverage; events with no message reference return empty. A cancel returns
+    /// its offsets too, but recovery handles cancels specially (removal), so it
+    /// never feeds them through this.
+    pub fn referenced_msg_offsets(&self) -> Vec<Offset> {
+        match self {
+            StromaEvent::Enqueue { off, .. }
+            | StromaEvent::EnqueueDelayed { off, .. }
+            | StromaEvent::MarkInflight { off, .. }
+            | StromaEvent::Ack { off }
+            | StromaEvent::Nack { off, .. } => vec![*off],
+            StromaEvent::EnqueueMany { reqs } => reqs.iter().map(|r| r.off).collect(),
+            StromaEvent::EnqueueDelayedMany { reqs } => reqs.iter().map(|r| r.off).collect(),
+            StromaEvent::MarkInflightMany { reqs } => reqs.iter().map(|r| r.off).collect(),
+            StromaEvent::AckMany { reqs } | StromaEvent::ReleaseInflightMany { reqs } => {
+                reqs.iter().map(|r| r.off).collect()
+            }
+            StromaEvent::NackMany { reqs } => reqs.iter().map(|r| r.off).collect(),
+            StromaEvent::DeadLetter { reqs } => reqs.iter().map(|r| r.off).collect(),
+            StromaEvent::DeadLetterCommit { offs } | StromaEvent::CancelEnqueueMany { offs } => {
+                offs.clone()
+            }
+            StromaEvent::Declare(_)
+            | StromaEvent::ResetQueue { .. }
+            | StromaEvent::Snapshot { .. }
+            | StromaEvent::CursorCommit { .. }
+            | StromaEvent::CursorCommitBatch { .. }
+            | StromaEvent::StreamTruncate { .. } => Vec::new(),
         }
     }
 
@@ -470,6 +518,13 @@ impl StromaEvent {
                 for req in reqs {
                     put_u64(&mut out, req.off);
                     put_u64(&mut out, req.not_before);
+                }
+            }
+            StromaEvent::CancelEnqueueMany { offs } => {
+                put_u16(&mut out, EventType::CancelEnqueueMany as u16);
+                put_u32(&mut out, offs.len() as u32);
+                for o in offs {
+                    put_u64(&mut out, *o);
                 }
             }
             StromaEvent::MarkInflight { off, deadline } => {
@@ -700,6 +755,14 @@ impl StromaEvent {
                     reqs.push(EnqueueDelayedEventMeta { off, not_before });
                 }
                 Ok(StromaEvent::EnqueueDelayedMany { reqs })
+            }
+            x if x == EventType::CancelEnqueueMany as u16 => {
+                let count = rd_u32(bytes, &mut i)? as usize;
+                let mut offs = Vec::with_capacity(count);
+                for _ in 0..count {
+                    offs.push(rd_u64(bytes, &mut i)?);
+                }
+                Ok(StromaEvent::CancelEnqueueMany { offs })
             }
             x if x == EventType::MarkInflight as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
@@ -940,6 +1003,27 @@ mod tests {
             retries: 0,
             expire_at: None,
         };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+    }
+
+    #[test]
+    fn test_cancel_enqueue_many_round_trips() {
+        let event = StromaEvent::CancelEnqueueMany {
+            offs: vec![3, 4, 5, 9],
+        };
+        let encoded = event.encode().unwrap();
+        let decoded = StromaEvent::decode(&encoded).unwrap();
+        assert_eq!(event, decoded);
+        // A cancel is an annihilation directive, not a durable reference, so it
+        // never triggers the recovery dangling-reference check.
+        assert_eq!(event.max_referenced_msg_offset(), None);
+    }
+
+    #[test]
+    fn test_cancel_enqueue_many_empty_round_trips() {
+        let event = StromaEvent::CancelEnqueueMany { offs: vec![] };
         let encoded = event.encode().unwrap();
         let decoded = StromaEvent::decode(&encoded).unwrap();
         assert_eq!(event, decoded);
