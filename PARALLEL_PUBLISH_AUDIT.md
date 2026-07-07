@@ -3,7 +3,10 @@
 Working doc for the `/code-review` findings on the parallel-durable-publish arc
 (keratin `git diff fb066de..HEAD`). Persist here until resolved.
 
-**Status (branch `fix-parallel-publish-reorder`):**
+**Status: ALL RESOLVED, merged to keratin `main` (through `e0fe575`) + fibril `main`.**
+Latency re-check post-findings matched the pre-findings numbers (no regression).
+
+**Detail:**
 - **#1 FIXED** (option A, per-partition publish-order lock).
 - **S2 RESOLVED** — analyzed benign + documented (head-of-line stop is correct and
   self-healing; nothing durable sits behind a non-durable offset).
