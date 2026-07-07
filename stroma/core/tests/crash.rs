@@ -204,3 +204,57 @@ async fn expiry_is_durable_across_restart() {
 
     assert!(st2.is_ready("t", 0, None, off).await.unwrap());
 }
+
+/// End-to-end for the parallel durable-append path: a batch of immediate
+/// publishes, each confirmed only on BOTH logs being durable, must all survive a
+/// restart and be deliverable. Guards the confirmed <=> durable <=> delivered
+/// invariant across the parallel append + fold recovery.
+#[tokio::test]
+async fn parallel_publish_batch_confirmed_survives_restart() {
+    use stroma_core::PublishItem;
+    let (st, dir) = open_test_stroma().await;
+
+    let mut rxs = Vec::new();
+    let items: Vec<PublishItem> = (0..8u8)
+        .map(|i| {
+            let (c, rx) = KeratinAppendCompletion::pair();
+            rxs.push(rx);
+            PublishItem {
+                headers: MessageHeaders {
+                    published: Default::default(),
+                    publish_received: Default::default(),
+                    content_type: None,
+                    extra: Default::default(),
+                },
+                payload: vec![i],
+                completion: c,
+                not_before: None,
+                expire_at: None,
+            }
+        })
+        .collect();
+    st.append_message_batch("t", 0, None, items).await.unwrap();
+
+    // Await every confirmation (fires only once both logs are durable).
+    let mut offsets = Vec::new();
+    for rx in rxs {
+        offsets.push(rx.await.unwrap().unwrap().base_offset);
+    }
+    assert_eq!(offsets.len(), 8);
+
+    st.shutdown().await.unwrap();
+    drop(st);
+
+    let st2 = Stroma::open(
+        &dir.root,
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
+
+    // Every confirmed message survived the restart and is deliverable.
+    for off in offsets {
+        assert!(st2.is_ready("t", 0, None, off).await.unwrap());
+    }
+}
