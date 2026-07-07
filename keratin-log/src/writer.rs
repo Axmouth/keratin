@@ -200,17 +200,34 @@ struct PendingAck {
     result: AppendResult,
 }
 
+/// SPECULATIVE (fsync fusion): how many commits may be in flight to the fsync
+/// worker at once. Above 1 the writer keeps issuing small commits while a fsync
+/// runs; the worker coalesces the whole queue into ONE fdatasync (see
+/// `fsync_loop`), so low-latency small batches reach fat-batch throughput. Bounded
+/// by the fsync channel capacity.
+const MAX_INFLIGHT_FSYNCS: usize = 8;
+
+/// Records-per-commit below which the writer pipelines (fsync-count-bound: the
+/// fixed fsync cost dominates, so coalescing many small commits into one fdatasync
+/// wins). At or above it the commit is bandwidth-bound and pipelining only makes
+/// each coalesced fdatasync bigger and slower, so keep one fsync in flight.
+const PIPELINE_COMMIT_RECORDS: u64 = 2048;
+
+/// Whether the writer should commit now because the fsync worker has capacity
+/// with durability acks pending. When `pipeline` (recent commits are small) it
+/// allows several in-flight commits so the worker can fuse them into one
+/// fdatasync; otherwise it keeps a single fsync in flight (the eager cadence that
+/// makes fat batches, optimal for bandwidth-bound writes). The idle floor keeps
+/// the fsync rate bounded on storage where that matters.
 #[inline]
-/// Whether the writer should commit now because the fsync worker sits idle
-/// with durability acks pending. The idle floor keeps the fsync rate bounded
-/// on storage where that matters, with the default floor of zero the commit
-/// cadence self-clocks on fsync completions.
 fn commit_when_idle(
     inflight_fsyncs: usize,
     last_fsync: &Instant,
     min_fsync_interval: Duration,
+    pipeline: bool,
 ) -> bool {
-    inflight_fsyncs == 0 && last_fsync.elapsed() >= min_fsync_interval
+    let max_inflight = if pipeline { MAX_INFLIGHT_FSYNCS } else { 1 };
+    inflight_fsyncs < max_inflight && last_fsync.elapsed() >= min_fsync_interval
 }
 
 fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
@@ -347,12 +364,49 @@ fn notifier_loop(rx: Receiver<NotifyMsg>, tracer: WriterStageTracer) {
 
 #[cfg(not(feature = "writer-stage-trace"))]
 fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
-    while let Ok(req) = rx.recv() {
-        let through_offset = req.job.through_offset();
-        let result = req.job.sync();
-        let done = fsync_done_from_result(through_offset, req.ready, req.sync_acks, result);
-        if done_tx.send(done).is_err() {
-            break;
+    while let Ok(first) = rx.recv() {
+        // SPECULATIVE (fsync fusion): drain every queued request and make them all
+        // durable with ONE fdatasync. The requests share the log file and
+        // fdatasync flushes everything up to the current position, so syncing the
+        // newest job's fds makes every drained request durable. Turns the
+        // fsync-count-bound small-batch regime into fat-batch throughput without
+        // waiting for a bigger linger.
+        let mut reqs = vec![first];
+        while let Ok(more) = rx.try_recv() {
+            reqs.push(more);
+        }
+        let result = reqs.last().expect("at least one request").job.sync();
+        let ok_elapsed = result.as_ref().ok().copied();
+        let err_msg = result.as_ref().err().map(|e| e.to_string());
+        for req in reqs {
+            let through_offset = req.job.through_offset();
+            let done = match (&ok_elapsed, &err_msg) {
+                (Some(elapsed), _) => FsyncDone {
+                    through_offset,
+                    elapsed: *elapsed,
+                    ready: req.ready,
+                    sync_acks: req.sync_acks,
+                    error: None,
+                },
+                (None, Some(msg)) => FsyncDone {
+                    through_offset,
+                    elapsed: Duration::ZERO,
+                    ready: req
+                        .ready
+                        .into_iter()
+                        .map(|item| NotifyItem {
+                            completion: item.completion,
+                            result: Err(IoError::new(msg.clone())),
+                        })
+                        .collect(),
+                    sync_acks: req.sync_acks,
+                    error: Some(msg.clone()),
+                },
+                _ => unreachable!("sync result is either Ok or Err"),
+            };
+            if done_tx.send(done).is_err() {
+                return;
+            }
         }
     }
 }
@@ -1143,8 +1197,9 @@ fn maybe_commit_due(
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
+    let pipeline = log.recent_commit_records < PIPELINE_COMMIT_RECORDS;
     let commit_due = needs_commit
-        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval)
+        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
             || last_fsync.elapsed() >= fsync_interval);
 
     if !commit_due {
@@ -1213,8 +1268,9 @@ fn post_stage_commit_and_tune(
     // Commit scheduling
     let needs_commit = pending_needs_fsync(pending);
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
+    let pipeline = log.recent_commit_records < PIPELINE_COMMIT_RECORDS;
     let commit_due = needs_commit
-        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval)
+        && (commit_when_idle(*inflight_fsyncs, last_fsync, min_fsync_interval, pipeline)
             || last_fsync.elapsed() >= fsync_interval);
 
     if commit_due {
@@ -1453,6 +1509,13 @@ fn commit(
 
     let mut ready = Vec::new();
     let through_offset = job.through_offset();
+
+    // Track the per-commit record count (EWMA) to gate fsync pipelining. Driven by
+    // the linger/batcher (how much accrues per commit), not by the gate, so it does
+    // not oscillate with the pipelining decision.
+    let commit_records = through_offset.saturating_sub(log.last_commit_through);
+    log.last_commit_through = through_offset;
+    log.recent_commit_records = (log.recent_commit_records * 3 + commit_records) / 4;
 
     while let Some(front) = pending.front() {
         if front.end_offset <= through_offset {
