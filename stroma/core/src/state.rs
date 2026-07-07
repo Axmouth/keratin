@@ -1003,6 +1003,15 @@ pub struct QueueHandleInner {
     owner_operations_paused: Arc<AtomicBool>,
     owner_operations_resumed: Arc<Notify>,
 
+    // Serializes the parallel-publish event-log APPEND per partition so events
+    // reach the event log in msg-offset order. The recovery fold and the owner
+    // replication gate both assume event-log order matches msg-offset order;
+    // without this, concurrent publishes race to append their EnqueueMany and a
+    // crash that strands a middle publish can truncate a confirmed one. Held only
+    // across staging + the event send, never the fsync waits, so the two fsyncs
+    // still overlap.
+    publish_event_order: Arc<tokio::sync::Mutex<()>>,
+
     // Hot-path cache of the per-queue default message TTL (ms). 0 = none.
     // Populated by the actor on Declare and snapshot load so the publish path
     // can resolve a default deadline without a command roundtrip.
@@ -1236,6 +1245,7 @@ impl QueueHandleInner {
             owner_operations_drained,
             owner_operations_paused,
             owner_operations_resumed,
+            publish_event_order: Arc::new(tokio::sync::Mutex::new(())),
             default_message_ttl_ms: Arc::new(AtomicU64::new(0)),
             global_dlq,
             metrics,
@@ -2674,6 +2684,12 @@ impl QueueHandleInner {
 
     pub fn event_log(&self) -> Arc<Keratin> {
         self.event_log.clone()
+    }
+
+    /// Per-partition lock serializing the parallel-publish event-log append order.
+    /// See the field docs on `QueueHandleInner`.
+    pub(crate) fn publish_event_order(&self) -> Arc<tokio::sync::Mutex<()>> {
+        self.publish_event_order.clone()
     }
 
     pub fn applied_upto(&self) -> Arc<AtomicU64> {

@@ -2386,38 +2386,36 @@ impl Stroma {
         Ok(new_upto)
     }
 
-    /// Like `append_events_durable_leased`, but the in-memory apply (which makes
-    /// the enqueued offsets deliverable) is gated on `msg_barrier` - the message
-    /// payload becoming durable. Used by the parallel publish path so an offset is
-    /// never delivered before its payload is durable, even though the event log
-    /// may be fsynced first. Returns `Ok(Some(new_upto))` when both logs are
-    /// durable and the events were applied, `Ok(None)` when the payload did NOT
-    /// become durable (the event append succeeded, so the caller must annihilate
-    /// it with a `CancelEnqueue`), or `Err` on an event-log append failure.
-    async fn append_events_durable_msg_gated(
+    /// Await the event-log and msg-log durabilities (both already appended)
+    /// concurrently so the two fsyncs overlap, then apply the events in memory
+    /// gated on `msg_barrier` - the message payload becoming durable - so an offset
+    /// is never delivered before its payload is durable even though the event log
+    /// may be fsynced first. Returns `Ok(Some(new_upto))` when both logs are durable
+    /// and the events were applied, `Ok(None)` when the payload did NOT become
+    /// durable (the caller annihilates the durable Enqueue with a `CancelEnqueue`),
+    /// or `Err` on an event-log append failure. The event append itself is issued
+    /// by the caller under the per-partition publish-order lock, so the event log
+    /// stays in msg-offset order.
+    async fn gate_and_apply_enqueue(
         &self,
         qh: QueueHandle,
         evs: Vec<StromaEvent>,
-        durability: KDurability,
+        event_rx: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
         msg_barrier: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
+        msgs_count: usize,
+        bytes_count: usize,
     ) -> Result<Option<Offset>> {
         let qh = qh.resolve()?;
         let start = Instant::now();
         let event_log = qh.event_log();
-        let mut msgs = Vec::with_capacity(evs.len());
-        for ev in &evs {
-            msgs.push(event_msg(ev)?);
-        }
-        let msgs_count = msgs.len();
-        let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
 
-        // Append the event log and await BOTH durabilities concurrently so the two
-        // fsyncs overlap (join polls both from the first wake - awaiting them
-        // sequentially lets the event round-trip finish before the msg one even
-        // starts to be observed, serializing the pair).
-        let event_fut = event_log.append_batch(msgs, Some(durability));
-        let (event_res, msg_res) = tokio::join!(event_fut, msg_barrier);
-        let ar = event_res.map_err(io_err)?;
+        // Await BOTH durabilities concurrently so the two fsyncs overlap (join polls
+        // both from the first wake - awaiting them sequentially serializes the pair).
+        let (event_res, msg_res) = tokio::join!(event_rx, msg_barrier);
+        let ar = match event_res {
+            Ok(inner) => inner.map_err(io_err)?,
+            Err(_) => return Err(io_err("event writer dropped")),
+        };
 
         // Gate the in-memory apply on the message payload becoming durable. If it
         // did not, the event-log Enqueue is durable but must not be applied or
@@ -3908,37 +3906,91 @@ impl Stroma {
         let stroma = self.clone();
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
+
+        // Resolve once for the per-partition ordering lock + the event log.
+        let (order_lock, event_log) = {
+            let r = qh.resolve()?;
+            (r.publish_event_order(), r.event_log())
+        };
+
+        // Hold the per-partition publish-order lock across staging + the event-log
+        // SEND, so EnqueueMany events reach the event log in msg-offset order.
+        // Concurrent publishes would otherwise race to append their event, and a
+        // crash stranding a middle publish could truncate a confirmed one on the
+        // fold. The lock is released before the durability waits, so the msg and
+        // event fsyncs still overlap.
+        let order_guard = order_lock.lock_owned().await;
         msg_log
             .append_batch_enqueue_staged(messages, Some(durability), msg_completion, staged_tx)
             .map_err(io_err)?;
+        // Every path past this point must complete the producers: the messages are
+        // staged, so a silent drop would hang them.
+        let base = match staged_rx.await {
+            Ok(off) => off,
+            Err(_) => {
+                for ci in completion_items {
+                    ci.completion
+                        .complete(Err(IoError::new("staged-offset channel closed")));
+                }
+                return Ok(());
+            }
+        };
+        let reqs: Vec<EnqueueEventMeta> = completion_items
+            .iter()
+            .enumerate()
+            .map(|(i, ci)| EnqueueEventMeta {
+                off: base + i as u64,
+                retries: 0,
+                expire_at: ci.meta.expire_at,
+            })
+            .collect();
+        let count = reqs.len() as u64;
+        let events = vec![StromaEvent::EnqueueMany { reqs }];
+
+        // Encode the event and issue the event-log append SEND under the lock, so
+        // the send order matches the msg-offset order established above.
+        let mut event_msgs = Vec::with_capacity(events.len());
+        let mut encode_err = None;
+        for ev in &events {
+            match event_msg(ev) {
+                Ok(m) => event_msgs.push(m),
+                Err(e) => {
+                    encode_err = Some(e.to_string());
+                    break;
+                }
+            }
+        }
+        let msgs_count = event_msgs.len();
+        let bytes_count: usize = event_msgs.iter().map(|m| m.bytes_len()).sum();
+        let event_rx = match encode_err {
+            None => event_log
+                .append_batch_enqueue_receiver(event_msgs, Some(durability))
+                .map_err(|e| e.to_string()),
+            Some(e) => Err(e),
+        };
+        let event_rx = match event_rx {
+            Ok(rx) => rx,
+            Err(msg) => {
+                drop(order_guard);
+                for ci in completion_items {
+                    ci.completion.complete(Err(IoError::new(msg.clone())));
+                }
+                return Ok(());
+            }
+        };
+        drop(order_guard); // ordering established; release before the fsync waits
 
         tokio::spawn(async move {
             let owner_operation = owner_operation;
-            let base = match staged_rx.await {
-                Ok(off) => off,
-                Err(_) => {
-                    for ci in completion_items {
-                        ci.completion
-                            .complete(Err(IoError::new("staged-offset channel closed")));
-                    }
-                    return;
-                }
-            };
-
-            let reqs: Vec<EnqueueEventMeta> = completion_items
-                .iter()
-                .enumerate()
-                .map(|(i, ci)| EnqueueEventMeta {
-                    off: base + i as u64,
-                    retries: 0,
-                    expire_at: ci.meta.expire_at,
-                })
-                .collect();
-            let count = reqs.len() as u64;
-            let events = vec![StromaEvent::EnqueueMany { reqs }];
-
             let outcome = stroma
-                .append_events_durable_msg_gated(qh.clone(), events, durability, msg_rx)
+                .gate_and_apply_enqueue(
+                    qh.clone(),
+                    events,
+                    event_rx,
+                    msg_rx,
+                    msgs_count,
+                    bytes_count,
+                )
                 .await;
 
             match outcome {
