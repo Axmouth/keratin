@@ -424,7 +424,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: Writer
     }
 }
 
-// Only the trace-instrumented fsync loop builds FsyncDone via this helper; the
+// Only the trace-instrumented fsync loop builds FsyncDone via this helper. The
 // default loop constructs it inline while coalescing the queued requests.
 #[cfg(feature = "writer-stage-trace")]
 fn fsync_done_from_result(

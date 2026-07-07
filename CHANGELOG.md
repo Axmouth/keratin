@@ -19,12 +19,12 @@ tagged releases yet. Earlier history predates this changelog.
   offset, confirm and deliver only when both logs are durable), roughly halving
   the single-node durable publish latency. A message fsync failure annihilates
   the durable enqueue with a new `CancelEnqueueMany` event so live and recovered
-  state stay consistent. Immediate publishes take this path; delayed publishes
+  state stay consistent. Immediate publishes take this path. Delayed publishes
   keep the serial path for now.
 - Adaptive fsync fusion (Keratin writer): when recent commits are small
   (fsync-count-bound) the writer pipelines several and the fsync worker coalesces
   them into one fdatasync, lifting small-batch durable throughput several-fold
-  without touching latency; fat, bandwidth-bound commits keep a single fsync in
+  without touching latency. Fat, bandwidth-bound commits keep a single fsync in
   flight.
 
 ### Changed
@@ -34,8 +34,8 @@ tagged releases yet. Earlier history predates this changelog.
   durability latency floor is no longer interval-bound. The interval remains
   the ceiling while an fsync is in flight.
 - Recovery folds the event log to its net state (an enqueue annihilated by a
-  later cancel is dropped) and auto-truncates a dangling forward reference - the
-  expected artifact of the parallel-append path, always unconfirmed - instead of
+  later cancel is dropped) and auto-truncates a dangling forward reference (the
+  expected, always-unconfirmed artifact of the parallel-append path) instead of
   quarantining the partition. A genuinely corrupt record still follows the
   mismatch policy (quarantine by default).
 - Ack tracking uses a settled `RangeSet` instead of a bounded bitset, removing
