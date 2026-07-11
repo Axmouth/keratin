@@ -433,6 +433,17 @@ pub enum MessageContentType {
     Custom(Box<str>),
 }
 
+/// One queue's share of the on-disk footprint (partitions aggregated under
+/// topic + group), split by log. Produced by `estimate_disk_used_breakdown`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct DiskUsedBreakdownEntry {
+    pub topic: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub group: Option<String>,
+    pub message_bytes: u64,
+    pub event_bytes: u64,
+}
+
 impl MessageContentType {
     pub fn from_header(value: impl Into<String>) -> Self {
         let value = value.into();
@@ -5166,15 +5177,46 @@ impl Stroma {
     }
 
     pub async fn estimate_disk_used(&self) -> Result<u64> {
-        let mut total = 0;
+        Ok(self
+            .estimate_disk_used_breakdown()
+            .await?
+            .into_iter()
+            .map(|entry| entry.message_bytes + entry.event_bytes)
+            .sum())
+    }
+
+    /// Disk use per queue (partitions aggregated under topic + group), split
+    /// into message-log and event-log bytes. The same walk as the total, so an
+    /// observability caller pays one pass for both.
+    pub async fn estimate_disk_used_breakdown(&self) -> Result<Vec<DiskUsedBreakdownEntry>> {
+        let mut per_queue: HashMap<(Box<str>, Option<Box<str>>), (u64, u64)> = HashMap::new();
         let keys = self.queue_keys_snapshot();
         for (tp, part, group) in keys {
             let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
             let qh = qh.resolve()?;
-            total += qh.event_log().estimate_disk_used().await.map_err(io_err)?;
-            total += qh.msg_log().estimate_disk_used().await.map_err(io_err)?;
+            let event = qh.event_log().estimate_disk_used().await.map_err(io_err)?;
+            let message = qh.msg_log().estimate_disk_used().await.map_err(io_err)?;
+            let slot = per_queue.entry((tp, group)).or_insert((0, 0));
+            slot.0 += message;
+            slot.1 += event;
         }
-        Ok(total)
+        let mut entries: Vec<DiskUsedBreakdownEntry> = per_queue
+            .into_iter()
+            .map(
+                |((topic, group), (message_bytes, event_bytes))| DiskUsedBreakdownEntry {
+                    topic: topic.to_string(),
+                    group: group.map(|g| g.to_string()),
+                    message_bytes,
+                    event_bytes,
+                },
+            )
+            .collect();
+        entries.sort_by(|a, b| {
+            (b.message_bytes + b.event_bytes)
+                .cmp(&(a.message_bytes + a.event_bytes))
+                .then_with(|| a.topic.cmp(&b.topic))
+        });
+        Ok(entries)
     }
 
     pub async fn get_queues_stats(
