@@ -54,6 +54,16 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A rare deadlock between the writer thread and the fsync worker under
+  saturated storage. The interval-due commit path could push fsync requests
+  past the bounded pipeline and park the writer in the send, while the fused
+  fsync drain could owe more completions than the equally bounded done channel
+  accepts - each thread then waited on the other forever, wedging every
+  subsequent append (publishes stalled until restart while the control plane
+  stayed healthy). Scheduled commits now respect the pipeline capacity as a
+  hard cap, and every fsync handoff drains completions until a slot is free,
+  so neither side can ever block the other. Reproduced and verified with the
+  new `wedge_stress` example under drive saturation.
 - The partition kind marker write used one shared temp file, so concurrent
   identical stream declares raced renames and failed spuriously. The temp
   name is unique per writer and a matching marker short-circuits.

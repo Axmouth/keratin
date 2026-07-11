@@ -43,6 +43,7 @@ macro_rules! stage_reqs_then_post {
         $last_fsync:expr,
         $fsync_interval:expr,
         $fsync_tx:expr,
+        $fsync_done_rx:expr,
         $inflight_fsyncs:expr,
         $linger:expr,
         $linger_min:expr,
@@ -75,6 +76,7 @@ macro_rules! stage_reqs_then_post {
             total_bytes,
             $notify_tx,
             $fsync_tx,
+            $fsync_done_rx,
             $inflight_fsyncs,
             $linger,
             $linger_min,
@@ -580,6 +582,7 @@ fn writer_loop_inner(
                 &mut last_fsync,
                 fsync_interval,
                 &fsync_tx,
+                &fsync_done_rx,
                 &mut inflight_fsyncs,
                 &mut linger,
                 linger_min,
@@ -601,6 +604,7 @@ fn writer_loop_inner(
             cfg.pipeline_commit_records,
             &notify_tx,
             &fsync_tx,
+            &fsync_done_rx,
             &mut inflight_fsyncs,
             #[cfg(feature = "writer-stage-trace")]
             &tracer,
@@ -671,11 +675,14 @@ fn writer_loop_inner(
                     let work_id = tracer.next_work_id();
                     if let Err(e) = commit(
                         log,
+                        &state,
                         &mut pending,
                         &mut last_fsync,
                         &notify_tx,
                         &fsync_tx,
+                        &fsync_done_rx,
                         &mut inflight_fsyncs,
+                        cfg.max_inflight_fsyncs,
                         #[cfg(feature = "writer-stage-trace")]
                         &tracer,
                         #[cfg(feature = "writer-stage-trace")]
@@ -726,6 +733,7 @@ fn writer_loop_inner(
                             &mut last_fsync,
                             fsync_interval,
                             &fsync_tx,
+                            &fsync_done_rx,
                             &mut inflight_fsyncs,
                             &mut linger,
                             linger_min,
@@ -784,6 +792,7 @@ fn writer_loop_inner(
                             total_bytes,
                             &notify_tx,
                             &fsync_tx,
+                            &fsync_done_rx,
                             &mut inflight_fsyncs,
                             &mut linger,
                             linger_min,
@@ -828,6 +837,7 @@ fn writer_loop_inner(
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
+                        &fsync_done_rx,
                         &mut inflight_fsyncs,
                         &mut linger,
                         linger_min,
@@ -901,6 +911,7 @@ fn writer_loop_inner(
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
+                        &fsync_done_rx,
                         &mut inflight_fsyncs,
                         &mut linger,
                         linger_min,
@@ -911,11 +922,14 @@ fn writer_loop_inner(
                 let work_id = tracer.next_work_id();
                 let res = commit(
                     log,
+                    &state,
                     &mut pending,
                     &mut last_fsync,
                     &notify_tx,
                     &fsync_tx,
+                    &fsync_done_rx,
                     &mut inflight_fsyncs,
+                    cfg.max_inflight_fsyncs,
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
                     #[cfg(feature = "writer-stage-trace")]
@@ -950,6 +964,21 @@ fn writer_loop_inner(
                 // responder when the fsync lands.
                 #[cfg(feature = "writer-stage-trace")]
                 let work_id = tracer.next_work_id();
+                // Same no-park rule as commit: a slot must be free before the
+                // send below, or the writer can deadlock with the fsync worker.
+                if let Err(e) = ensure_fsync_slot(
+                    log,
+                    &state,
+                    &notify_tx,
+                    &fsync_done_rx,
+                    &mut inflight_fsyncs,
+                    cfg.max_inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                ) {
+                    let _ = respond_to.send(Err(e));
+                    continue;
+                }
                 #[cfg(feature = "writer-stage-trace")]
                 let job = log.prepare_fsync_job_traced(&tracer, work_id);
                 #[cfg(not(feature = "writer-stage-trace"))]
@@ -995,6 +1024,7 @@ fn writer_loop_inner(
                         &mut last_fsync,
                         fsync_interval,
                         &fsync_tx,
+                        &fsync_done_rx,
                         &mut inflight_fsyncs,
                         &mut linger,
                         linger_min,
@@ -1007,11 +1037,14 @@ fn writer_loop_inner(
                     let work_id = tracer.next_work_id();
                     if let Err(e) = commit(
                         log,
+                        &state,
                         &mut pending,
                         &mut last_fsync,
                         &notify_tx,
                         &fsync_tx,
+                        &fsync_done_rx,
                         &mut inflight_fsyncs,
+                        cfg.max_inflight_fsyncs,
                         #[cfg(feature = "writer-stage-trace")]
                         &tracer,
                         #[cfg(feature = "writer-stage-trace")]
@@ -1176,9 +1209,10 @@ fn stage_reqs(
 }
 
 /// Commit if due, retry a few times and fail all pending waiters on repeated errors.
+#[allow(clippy::too_many_arguments)]
 fn maybe_commit_due(
     log: &mut Log,
-    _state: &Arc<LogState>,
+    state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
@@ -1187,11 +1221,17 @@ fn maybe_commit_due(
     pipeline_commit_records: u64,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     let needs_commit = pending_needs_fsync(pending);
     let pipeline = should_pipeline(log, pipeline_commit_records);
+    // The interval branch may exceed the pipelining soft cap (one in-flight
+    // fsync in the fat-batch regime) but never the hard channel capacity: a
+    // commit past it cannot make durability progress (the fused fsync already
+    // covers the whole queue) and only risks parking the writer in the send.
+    let hard_cap = max_inflight_fsyncs.max(1);
     let commit_due = needs_commit
         && (commit_when_idle(
             *inflight_fsyncs,
@@ -1199,7 +1239,7 @@ fn maybe_commit_due(
             min_fsync_interval,
             pipeline,
             max_inflight_fsyncs,
-        ) || last_fsync.elapsed() >= fsync_interval);
+        ) || (last_fsync.elapsed() >= fsync_interval && *inflight_fsyncs < hard_cap));
 
     if !commit_due {
         return;
@@ -1211,11 +1251,14 @@ fn maybe_commit_due(
     let mut error_count = 0;
     while let Err(e) = commit(
         log,
+        state,
         pending,
         last_fsync,
         notify_tx,
         fsync_tx,
+        fsync_done_rx,
         inflight_fsyncs,
+        max_inflight_fsyncs,
         #[cfg(feature = "writer-stage-trace")]
         tracer,
         #[cfg(feature = "writer-stage-trace")]
@@ -1249,13 +1292,14 @@ fn maybe_commit_due(
 fn post_stage_commit_and_tune(
     log: &mut Log,
     cfg: &KeratinConfig,
-    _state: &Arc<LogState>,
+    state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
     inflight_fsyncs: &mut usize,
     linger: &mut Duration,
     linger_min: Duration,
@@ -1267,6 +1311,8 @@ fn post_stage_commit_and_tune(
     let needs_commit = pending_needs_fsync(pending);
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
     let pipeline = should_pipeline(log, cfg.pipeline_commit_records);
+    // Interval branch hard-capped for the same reason as in maybe_commit_due.
+    let hard_cap = cfg.max_inflight_fsyncs.max(1);
     let commit_due = needs_commit
         && (commit_when_idle(
             *inflight_fsyncs,
@@ -1274,16 +1320,19 @@ fn post_stage_commit_and_tune(
             min_fsync_interval,
             pipeline,
             cfg.max_inflight_fsyncs,
-        ) || last_fsync.elapsed() >= fsync_interval);
+        ) || (last_fsync.elapsed() >= fsync_interval && *inflight_fsyncs < hard_cap));
 
     if commit_due {
         let _ = commit(
             log,
+            state,
             pending,
             last_fsync,
             notify_tx,
             fsync_tx,
+            fsync_done_rx,
             inflight_fsyncs,
+            cfg.max_inflight_fsyncs,
             #[cfg(feature = "writer-stage-trace")]
             tracer,
             #[cfg(feature = "writer-stage-trace")]
@@ -1410,6 +1459,48 @@ fn wait_for_inflight_fsyncs(
     }
 }
 
+/// Block until the fsync pipeline has a free slot, draining completions while
+/// waiting. Every `fsync_tx` send must run behind this gate. The channel holds
+/// `max_inflight` requests, and a blocking send on a full channel can deadlock
+/// the writer with the fsync worker: the worker's fused drain can owe more
+/// FsyncDones than the equally bounded done channel accepts, leaving each
+/// thread parked in a send only the other can unblock. Draining here keeps the
+/// done channel moving and holds the in-flight count at or under the cap, so
+/// queue occupancy (which never exceeds that count) always leaves the send
+/// after this gate a free slot. On the scheduled commit paths the callers
+/// already gate on the cap, so this loop takes zero iterations. It only waits
+/// on the unconditional paths (Sync, epoch advance, shutdown).
+fn ensure_fsync_slot(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    inflight_fsyncs: &mut usize,
+    max_inflight: usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) -> io::Result<()> {
+    while *inflight_fsyncs >= max_inflight.max(1) {
+        match fsync_done_rx.recv() {
+            Ok(done) => handle_fsync_done(
+                log,
+                state,
+                notify_tx,
+                done,
+                inflight_fsyncs,
+                #[cfg(feature = "writer-stage-trace")]
+                tracer,
+            ),
+            Err(_) => {
+                return Err(io::Error::new(
+                    io::ErrorKind::BrokenPipe,
+                    "fsync worker disconnected",
+                ));
+            }
+        }
+    }
+    Ok(())
+}
+
 fn handle_fsync_done(
     log: &mut Log,
     state: &Arc<LogState>,
@@ -1492,16 +1583,33 @@ fn fail_notify_items(items: Vec<NotifyItem>, err_msg: impl AsRef<str>) -> Vec<No
         .collect()
 }
 
+#[allow(clippy::too_many_arguments)]
 fn commit(
     log: &mut Log,
+    state: &Arc<LogState>,
     pending: &mut VecDeque<PendingAck>,
     last_fsync: &mut Instant,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
     inflight_fsyncs: &mut usize,
+    max_inflight: usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> Result<(), io::Error> {
+    // Gate before preparing so the job covers everything staged by the time a
+    // slot frees, and so the send below can never park (see ensure_fsync_slot).
+    ensure_fsync_slot(
+        log,
+        state,
+        notify_tx,
+        fsync_done_rx,
+        inflight_fsyncs,
+        max_inflight,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+    )?;
+
     #[cfg(feature = "writer-stage-trace")]
     let job = log.prepare_fsync_job_traced(tracer, work_id)?;
     #[cfg(not(feature = "writer-stage-trace"))]
