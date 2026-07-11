@@ -39,7 +39,10 @@ tagged releases yet. Earlier history predates this changelog.
 - A per-queue disk-use breakdown (`estimate_disk_used_breakdown` on Stroma):
   each queue's on-disk footprint split into message-log and event-log bytes,
   from the same walk as the existing total. Feeds the Fibril dashboard's
-  storage breakdown.
+  storage breakdown. Covers every partition on disk: unloaded (evicted)
+  queues are measured straight from their directories without waking them,
+  so their bytes stay visible - this also corrects the pre-existing total,
+  which only counted loaded queues.
 
 ### Changed
 

@@ -433,6 +433,26 @@ pub enum MessageContentType {
     Custom(Box<str>),
 }
 
+/// Total size of the files under `path`, recursively. Unreadable entries
+/// count as zero: this feeds an observability estimate, not accounting.
+fn dir_size_bytes(path: &std::path::Path) -> u64 {
+    let Ok(entries) = std::fs::read_dir(path) else {
+        return 0;
+    };
+    let mut total = 0;
+    for entry in entries.flatten() {
+        let Ok(kind) = entry.file_type() else {
+            continue;
+        };
+        if kind.is_dir() {
+            total += dir_size_bytes(&entry.path());
+        } else if let Ok(meta) = entry.metadata() {
+            total += meta.len();
+        }
+    }
+    total
+}
+
 /// One queue's share of the on-disk footprint (partitions aggregated under
 /// topic + group), split by log. Produced by `estimate_disk_used_breakdown`.
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -5186,16 +5206,32 @@ impl Stroma {
     }
 
     /// Disk use per queue (partitions aggregated under topic + group), split
-    /// into message-log and event-log bytes. The same walk as the total, so an
-    /// observability caller pays one pass for both.
+    /// into message-log and event-log bytes. Covers every partition on disk:
+    /// loaded partitions report through their logs, unloaded ones are measured
+    /// straight from their directories so an evicted queue's bytes stay
+    /// visible without waking it.
     pub async fn estimate_disk_used_breakdown(&self) -> Result<Vec<DiskUsedBreakdownEntry>> {
-        let mut per_queue: HashMap<(Box<str>, Option<Box<str>>), (u64, u64)> = HashMap::new();
-        let keys = self.queue_keys_snapshot();
-        for (tp, part, group) in keys {
-            let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
-            let qh = qh.resolve()?;
-            let event = qh.event_log().estimate_disk_used().await.map_err(io_err)?;
-            let message = qh.msg_log().estimate_disk_used().await.map_err(io_err)?;
+        let loaded: HashSet<(String, u32, Option<String>)> = self
+            .queue_keys_snapshot()
+            .into_iter()
+            .map(|(tp, part, group)| (tp.to_string(), part, group.map(|g| g.to_string())))
+            .collect();
+
+        let mut per_queue: HashMap<(String, Option<String>), (u64, u64)> = HashMap::new();
+        for (group, tp, part) in self.discover_partitions()? {
+            let (message, event) = if loaded.contains(&(tp.clone(), part, group.clone())) {
+                let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
+                let qh = qh.resolve()?;
+                (
+                    qh.msg_log().estimate_disk_used().await.map_err(io_err)?,
+                    qh.event_log().estimate_disk_used().await.map_err(io_err)?,
+                )
+            } else {
+                (
+                    dir_size_bytes(&self.msg_tp_part_dir(&tp, part, group.as_deref())),
+                    dir_size_bytes(&self.tp_part_dir(&tp, part, group.as_deref())),
+                )
+            };
             let slot = per_queue.entry((tp, group)).or_insert((0, 0));
             slot.0 += message;
             slot.1 += event;
@@ -5204,8 +5240,8 @@ impl Stroma {
             .into_iter()
             .map(
                 |((topic, group), (message_bytes, event_bytes))| DiskUsedBreakdownEntry {
-                    topic: topic.to_string(),
-                    group: group.map(|g| g.to_string()),
+                    topic,
+                    group,
                     message_bytes,
                     event_bytes,
                 },
