@@ -2786,6 +2786,15 @@ impl StreamHandle<'_> {
         Ok(())
     }
 
+    /// List every durable named cursor as (name, offset), name-sorted.
+    pub async fn cursors(&self) -> Result<Vec<(String, Offset)>, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.stream_command_enqueue(StreamCommand::ListCursors { response: tx })
+            .await
+            .map_err(|err| QueueHandleError::Internal(err.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
     /// Read a durable named cursor position, or `None` if it has none.
     pub async fn cursor(&self, name: &str) -> Result<Option<Offset>, QueueHandleError> {
         let (tx, rx) = oneshot::channel();

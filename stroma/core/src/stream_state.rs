@@ -107,6 +107,15 @@ impl StreamState {
         self.cursors.remove(name)
     }
 
+    /// All durable cursors as (name, offset) pairs, name-sorted - the
+    /// admin's per-stream subscriber view reads this.
+    pub fn cursors_snapshot(&self) -> Vec<(String, Offset)> {
+        let mut out: Vec<(String, Offset)> =
+            self.cursors.iter().map(|(k, v)| (k.clone(), *v)).collect();
+        out.sort_by(|a, b| a.0.cmp(&b.0));
+        out
+    }
+
     pub fn cursor_count(&self) -> usize {
         self.cursors.len()
     }
@@ -322,6 +331,10 @@ pub enum StreamCommand {
         name: String,
         response: oneshot::Sender<Option<Offset>>,
     },
+    /// List every durable cursor as (name, offset), name-sorted.
+    ListCursors {
+        response: oneshot::Sender<Vec<(String, Offset)>>,
+    },
     /// Forget a durable cursor (consumer retired or explicit delete).
     RemoveCursor {
         name: String,
@@ -400,6 +413,9 @@ pub async fn run_stream_control(mut state: StreamState, mut rx: mpsc::Receiver<S
             }
             StreamCommand::GetCursor { name, response } => {
                 let _ = response.send(state.cursor(&name));
+            }
+            StreamCommand::ListCursors { response } => {
+                let _ = response.send(state.cursors_snapshot());
             }
             StreamCommand::RemoveCursor { name, response } => {
                 let removed = state.remove_cursor(&name);

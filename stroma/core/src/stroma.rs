@@ -4299,6 +4299,12 @@ impl Stroma {
         Ok(qh.resolve()?.stream()?.cursor(name).await?)
     }
 
+    /// List a stream's durable cursors as (name, offset), name-sorted.
+    pub async fn stream_cursors(&self, tp: &str, part: u32) -> Result<Vec<(String, Offset)>> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        Ok(qh.resolve()?.stream()?.cursors().await?)
+    }
+
     /// Read a stream's current head/tail watermarks (lowest retained offset and
     /// one past the last appended offset).
     pub async fn stream_head_tail(&self, tp: &str, part: u32) -> Result<(Offset, Offset)> {

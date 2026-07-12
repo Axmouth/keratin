@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Stream durable cursors are enumerable: `cursors_snapshot()` on the stream
+  state, a `ListCursors` stream command, `cursors()` on the queue handle's
+  stream view, and `stream_cursors(tp, part)` on Stroma - all (name, offset)
+  pairs, name-sorted. Feeds the admin dashboard's per-stream subscriber
+  view.
 - A `min_fsync_interval_ms` config floor on group-commit cadence, for storage
   where per-fsync cost dominates (consumer SATA class). Default `0` keeps the
   self-clocking behavior.
