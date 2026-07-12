@@ -35,7 +35,6 @@ tagged releases yet. Earlier history predates this changelog.
   low-load durable-publish latency floor on consumer NVMe. The durable watermark
   is published as an unambiguous exclusive frontier so reads stop cleanly at the
   durable end and never touch the preallocated padding.
-
 - A per-queue disk-use breakdown (`estimate_disk_used_breakdown` on Stroma):
   each queue's on-disk footprint split into message-log and event-log bytes,
   from the same walk as the existing total. Feeds the Fibril dashboard's
