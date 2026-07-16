@@ -11,6 +11,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A queue publish routed at a plexus stream partition is refused before
+  anything is appended. It used to append the message and a queue-kind
+  enqueue event durably and only then fail the in-memory apply, leaving
+  events in the stream's log that every later recovery tripped over - the
+  partition could never open again. Recovery now also skips such
+  wrong-kind events with an error log instead of refusing the partition,
+  so logs poisoned by older brokers heal on the next boot (the skipped
+  events were never applied or confirmed to any producer).
 - The per-second IO stats line is a tracing event instead of a raw print,
   so embedders can filter it. It prints once a second per active writer,
   which adds up fast with many partitions.

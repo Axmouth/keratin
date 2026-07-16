@@ -1783,8 +1783,44 @@ impl Stroma {
 
     // ---------------- Event apply rules ----------------
 
+    /// Which partition kind an event belongs to. Cursor commits and stream
+    /// truncation are the stream-side events, snapshots apply to either kind
+    /// (None), everything else drives queue state.
+    fn event_partition_kind(ev: &StromaEvent) -> Option<PartitionKind> {
+        match ev {
+            StromaEvent::CursorCommit { .. }
+            | StromaEvent::CursorCommitBatch { .. }
+            | StromaEvent::StreamTruncate { .. } => Some(PartitionKind::Stream),
+            StromaEvent::Snapshot { .. } => None,
+            _ => Some(PartitionKind::Queue),
+        }
+    }
+
+    /// True when `ev` cannot apply to this partition's kind. Such an event is
+    /// durable log poison from a mis-routed append (guarded against at append
+    /// time now, but older logs can carry them): it was never applied and its
+    /// producer was never confirmed, so skipping it is safe - and refusing to
+    /// open the partition over it would brick recovery forever.
+    fn skip_wrong_kind_event(ev: &StromaEvent, qh: &QueueHandleInner) -> bool {
+        let Some(event_kind) = Self::event_partition_kind(ev) else {
+            return false;
+        };
+        if event_kind == qh.kind() {
+            return false;
+        }
+        tracing::error!(
+            "skipping a {event_kind:?}-kind event in a {:?} partition's log \
+             (poison from a mis-routed append, never confirmed to its producer)",
+            qh.kind()
+        );
+        true
+    }
+
     fn enqueue_event_inmem(&self, ev: StromaEvent, qh: &QueueHandleInner) -> std::io::Result<()> {
         tracing::debug!("Applying event: {ev:?}");
+        if Self::skip_wrong_kind_event(&ev, qh) {
+            return Ok(());
+        }
         match ev {
             StromaEvent::Enqueue {
                 off,
@@ -1968,6 +2004,9 @@ impl Stroma {
         qh: &QueueHandleInner,
     ) -> Result<()> {
         tracing::debug!("Applying event: {ev:?}");
+        if Self::skip_wrong_kind_event(&ev, qh) {
+            return Ok(());
+        }
         match ev {
             StromaEvent::Enqueue {
                 off,
@@ -3744,6 +3783,18 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, group).await?;
         let (owner_operation, msg_log, default_ttl_ms) = {
             let h = qh.resolve()?;
+            // Refuse BEFORE anything is appended: a queue publish routed at a
+            // stream partition (a client or broker that has not yet learned
+            // the topic's kind) must fail cleanly. Appending first and letting
+            // the in-memory apply reject it would leave queue-kind events
+            // durably poisoning the stream's log, and every later recovery
+            // would trip over them.
+            if h.as_stream().is_some() {
+                return Err(StromaError::InvalidArgument(format!(
+                    "{tp}/{part} is a plexus stream - a queue publish cannot append to it. \
+                     Publish through the stream API, or use a different topic name"
+                )));
+            }
             (
                 h.begin_owner_operation().await?,
                 h.msg_log(),
@@ -4017,6 +4068,15 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, group).await?;
         let (owner_operation, msg_log) = {
             let h = qh.resolve()?;
+            // Same guard as the batch path: refuse before anything is
+            // appended, or queue-kind events would durably poison the
+            // stream's log for every later recovery.
+            if h.as_stream().is_some() {
+                return Err(StromaError::InvalidArgument(format!(
+                    "{tp}/{part} is a plexus stream - a queue publish cannot append to it. \
+                     Publish through the stream API, or use a different topic name"
+                )));
+            }
             (h.begin_owner_operation().await?, h.msg_log())
         };
         let message = Message {
@@ -7435,6 +7495,73 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn poisoned_queue_event_in_a_stream_log_does_not_brick_recovery() {
+        let dir = test_dir!("stream_log_poison");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        stroma.create_stream("sensors", 0, None).await.unwrap();
+        let headers = MessageHeaders {
+            published: unix_millis(),
+            publish_received: unix_millis(),
+            content_type: None,
+            extra: Default::default(),
+        };
+        let off = stroma
+            .append_stream_record("sensors", 0, &headers, b"r1".to_vec())
+            .await
+            .unwrap();
+        stroma
+            .commit_stream_cursor("sensors", 0, "reader", off)
+            .await
+            .unwrap();
+
+        // Inject what an older broker could write: a queue-kind enqueue event
+        // in the stream partition's log (a mis-routed publish - the append
+        // guard refuses this now, but existing logs can carry it).
+        {
+            let qh = stroma.queue_handle("sensors", 0, None).await.unwrap();
+            let h = qh.resolve().unwrap();
+            let poison = StromaEvent::Enqueue {
+                off: 999,
+                retries: 0,
+                expire_at: None,
+            };
+            let (completion, rx) = KeratinAppendCompletion::pair();
+            h.event_log()
+                .append_enqueue(event_msg(&poison).unwrap(), None, completion)
+                .unwrap();
+            rx.await.unwrap().unwrap();
+        }
+        shutdown_stroma("stream_log_poison/shutdown", &stroma).await;
+
+        // Recovery must skip the poison instead of refusing to open, and the
+        // stream's own state must be intact.
+        let reopened = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .expect("a poisoned event log must not brick the engine open");
+        let (_head, tail) = reopened.stream_head_tail("sensors", 0).await.unwrap();
+        assert_eq!(tail, off + 1, "stream tail survives recovery");
+        assert_eq!(
+            reopened
+                .stream_cursor("sensors", 0, "reader")
+                .await
+                .unwrap(),
+            Some(off),
+            "durable cursor survives recovery"
+        );
+        shutdown_stroma("stream_log_poison/reopen", &reopened).await;
     }
 
     #[tokio::test]
