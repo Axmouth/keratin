@@ -918,19 +918,12 @@ impl Log {
             self.idx_buf.clear();
         }
 
-        // periodic stat print (keep it here so it measures real IO)
+        // Periodic stat line (kept here so it measures real IO). A tracing
+        // event rather than a raw print so embedders can filter it: one line
+        // per second PER ACTIVE WRITER adds up fast with many partitions.
         if self.last_stats_dump.elapsed() > Duration::from_secs(1) {
-            let now = std::time::SystemTime::now()
-                .duration_since(std::time::UNIX_EPOCH)
-                .expect("Time went backwards");
-
-            let total_secs = now.as_secs();
-            let millis = now.subsec_millis();
-
-            println!(
-                "{}.{:03} : KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms bytes={} kbytes/batch={} rec/batch={}",
-                total_secs,
-                millis,
+            tracing::info!(
+                "KERATIN IO: batches={} recs={} encode={}ms log={}ms idx={}ms fsync={}ms manifest={}ms bytes={} kbytes/batch={} rec/batch={}",
                 self.stats.batches,
                 self.stats.records,
                 self.stats.encode.as_millis(),

@@ -11,6 +11,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- The per-second IO stats line is a tracing event instead of a raw print,
+  so embedders can filter it. It prints once a second per active writer,
+  which adds up fast with many partitions.
+
 - A stray directory in a topic's on-disk tree no longer refuses to open the
   whole storage engine. The partition scan used to fail on any name that
   did not parse as a partition number - including the `.trash-` leftovers a
