@@ -2864,7 +2864,23 @@ impl Stroma {
                 #[cfg(test)]
                 stroma.snapshot_worker_ticks.notify_waiters();
                 if let Err(err) = res {
-                    tracing::error!("Error during periodic snapshot: {err}");
+                    // A partition being torn down mid-tick (destroy renames its
+                    // dirs aside, shutdown closes its logs) surfaces here as a
+                    // file-not-found once, then the next tick's resolve ends
+                    // this task. That race is expected - say so instead of
+                    // alarming, and name the partition either way.
+                    match qh.resolve() {
+                        Ok(h) => tracing::error!(
+                            "Error during periodic snapshot of {}/{} (group {:?}): {err}",
+                            h.topic(),
+                            h.partition(),
+                            h.group(),
+                        ),
+                        Err(_) => tracing::info!(
+                            "periodic snapshot lost its partition mid-tick \
+                             (evicted or destroyed - the task exits): {err}"
+                        ),
+                    }
                 }
             }
         });
