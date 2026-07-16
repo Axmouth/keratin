@@ -5453,9 +5453,31 @@ fn collect_parts_decoded(
         }
 
         let part_str = part_ent.file_name().to_string_lossy().to_string();
-        let part = part_str
-            .parse::<u32>()
-            .map_err(|_| StromaError::Decode(format!("bad partition dir: {part_str}")))?;
+        let Ok(part) = part_str.parse::<u32>() else {
+            // Not a partition dir. A `<n>.trash-<uuid>` sibling is a destroy
+            // that crashed between its atomic rename-aside and the unhurried
+            // delete - finish the delete now. Anything else is unknown:
+            // leave it in place for a human, but never refuse to open the
+            // whole engine over a stray directory name.
+            if part_str.contains(".trash-") {
+                tracing::info!(
+                    "removing interrupted-destroy leftover {:?}",
+                    part_ent.path()
+                );
+                if let Err(err) = fs::remove_dir_all(part_ent.path()) {
+                    tracing::warn!(
+                        "could not remove destroy leftover {:?}: {err}",
+                        part_ent.path()
+                    );
+                }
+            } else {
+                tracing::warn!(
+                    "ignoring unrecognized dir {:?} while scanning partitions of `{tp_enc}`",
+                    part_ent.path()
+                );
+            }
+            continue;
+        };
 
         out.push((group.clone(), tp_enc.clone(), part));
     }
@@ -7413,6 +7435,55 @@ mod tests {
             &stroma,
         )
         .await;
+    }
+
+    #[tokio::test]
+    async fn stray_dirs_do_not_brick_the_partition_scan() {
+        let dir = test_dir!("stray_dirs_scan");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        stroma.materialize("orders", 0, None).await.unwrap();
+
+        // A destroy that crashed between its atomic rename-aside and the
+        // unhurried delete, plus a directory of unknown provenance (seen in
+        // the wild as a literal `deleted`). Neither may refuse the engine.
+        let topic_dir = stroma
+            .tp_part_dir("orders", 0, None)
+            .parent()
+            .expect("partition dir has a topic parent")
+            .to_path_buf();
+        let trash = topic_dir.join("0.trash-0198aa");
+        fs::create_dir_all(&trash).unwrap();
+        let stray = topic_dir.join("deleted");
+        fs::create_dir_all(&stray).unwrap();
+        shutdown_stroma("stray_dirs/shutdown", &stroma).await;
+
+        let reopened = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig::default(),
+        )
+        .await
+        .expect("stray dirs must not fail the engine open");
+        let parts = reopened.discover_partitions().unwrap();
+        assert!(
+            parts.contains(&(None, "orders".to_string(), 0)),
+            "real partition survives the scan: {parts:?}"
+        );
+        assert!(
+            !trash.exists(),
+            "the interrupted destroy is finished at scan time"
+        );
+        assert!(
+            stray.exists(),
+            "an unknown dir is preserved for a human, not deleted"
+        );
+        shutdown_stroma("stray_dirs/reopen", &reopened).await;
     }
 
     #[tokio::test]

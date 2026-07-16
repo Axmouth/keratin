@@ -9,6 +9,15 @@ tagged releases yet. Earlier history predates this changelog.
 
 ## [Unreleased]
 
+### Fixed
+
+- A stray directory in a topic's on-disk tree no longer refuses to open the
+  whole storage engine. The partition scan used to fail on any name that
+  did not parse as a partition number - including the `.trash-` leftovers a
+  destroy that crashed mid-delete leaves behind. The scan now finishes
+  interrupted destroys and skips unknown directories with a warning,
+  leaving them in place for a human.
+
 ### Added
 
 - Stream durable cursors are enumerable: `cursors_snapshot()` on the stream
