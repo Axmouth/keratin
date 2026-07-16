@@ -764,6 +764,9 @@ pub struct Stroma {
     /// serving corrupt state; `repair_partition` clears it. Default policy keeps
     /// the rest of the broker running (blast radius = the one queue).
     quarantined: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), QuarantineInfo>>,
+    // Stray dirs found by the partition scan, so each warns once per process
+    // instead of on every catalogue sweep.
+    scan_warned: Arc<DashMap<PathBuf, ()>>,
 
     /// `RecoveryMismatchPolicy` (Quarantine default / Refuse / Ignore), settable
     /// at startup. Shared so a clone observes a runtime change.
@@ -820,6 +823,7 @@ impl Stroma {
             deadline_waker: Arc::new(Notify::new()),
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
             quarantined: Arc::new(DashMap::new()),
+            scan_warned: Arc::new(DashMap::new()),
             recovery_mismatch_policy: Arc::new(AtomicU8::new(
                 RecoveryMismatchPolicy::default().as_u8(),
             )),
@@ -3517,7 +3521,7 @@ impl Stroma {
             if has_partition_dirs {
                 // ---- legacy: lvl1 = topic ----
                 let tp = Self::dec_component(&lvl1_name_enc)?;
-                collect_parts_decoded(None, tp, &lvl1_path, &mut out)?;
+                collect_parts_decoded(None, tp, &lvl1_path, &mut out, &self.scan_warned)?;
             } else {
                 // ---- grouped: lvl1 = group ----
                 let group = Self::dec_component(&lvl1_name_enc)?;
@@ -3531,7 +3535,13 @@ impl Stroma {
                     let tp_enc = tp_ent.file_name().to_string_lossy().to_string();
                     let tp = Self::dec_component(&tp_enc)?;
 
-                    collect_parts_decoded(Some(group.clone()), tp, &tp_ent.path(), &mut out)?;
+                    collect_parts_decoded(
+                        Some(group.clone()),
+                        tp,
+                        &tp_ent.path(),
+                        &mut out,
+                        &self.scan_warned,
+                    )?;
                 }
             }
         }
@@ -5505,6 +5515,7 @@ fn collect_parts_decoded(
     tp_enc: String,
     tp_dir: &Path,
     out: &mut Vec<(Option<String>, String, u32)>,
+    warned: &DashMap<PathBuf, ()>,
 ) -> Result<()> {
     for part_ent in fs::read_dir(tp_dir).map_err(io_err)? {
         let part_ent = part_ent.map_err(io_err)?;
@@ -5530,7 +5541,9 @@ fn collect_parts_decoded(
                         part_ent.path()
                     );
                 }
-            } else {
+            } else if warned.insert(part_ent.path(), ()).is_none() {
+                // Once per process: the scan reruns on every catalogue sweep
+                // and a stray dir would otherwise warn forever.
                 tracing::warn!(
                     "ignoring unrecognized dir {:?} while scanning partitions of `{tp_enc}`",
                     part_ent.path()
