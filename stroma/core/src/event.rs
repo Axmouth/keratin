@@ -188,7 +188,7 @@ pub struct DeadLetterMeta {
 
 /// Settings update; None = leave unchanged.
 /// Add fields here as new settings are introduced.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct DeclareMeta {
     pub dlq_policy: Option<DLQDiscardPolicyWire>,
     pub dlq_max_retries: Option<u32>,
@@ -199,7 +199,7 @@ pub struct DeclareMeta {
 
 /// Wire form of DLQDiscardPolicy. Mirrors state::DLQDiscardPolicy
 /// but lives in event.rs so this module stays free of state imports.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum DLQDiscardPolicyWire {
     Discard,
     GlobalDQL,
