@@ -188,28 +188,6 @@ impl Stroma {
         Ok(())
     }
 
-    pub async fn stop_queue_follower_for_transition(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> Result<()> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
-        let role = qh.role();
-        if role != QueueRole::Follower {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Follower,
-                actual: role,
-            });
-        }
-
-        qh.freeze();
-        qh.msg_log().freeze();
-        qh.event_log().freeze();
-        Ok(())
-    }
-
     pub async fn become_queue_owner(
         &self,
         topic: &str,

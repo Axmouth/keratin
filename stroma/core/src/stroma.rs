@@ -1719,14 +1719,59 @@ impl Stroma {
         Ok(trashed)
     }
 
+    /// Freeze an existing follower after its replication worker has stopped.
+    /// An absent or cold partition stays unmaterialized; cleanup can arrive
+    /// after the repartition reclaimer has already deleted its storage.
+    pub async fn stop_queue_follower_for_transition(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        // Cleanup must not reopen storage after repartition retirement. Serialize
+        // lookup and freezing with destroy/evict so an absent handle stays cold.
+        let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        let qh = {
+            let current = self.queue_handles.load();
+            slot_lookup_no_alloc(current.as_ref(), topic, part, group)
+                .and_then(|slot| slot.handle.get().cloned())
+        };
+        let Some(qh) = qh else {
+            return Ok(());
+        };
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+
+        qh.freeze();
+        qh.msg_log().freeze();
+        qh.event_log().freeze();
+        Ok(())
+    }
+
+    /// Drain and freeze an existing owner without reopening a cold or deleted
+    /// partition. Serialized with storage destruction and eviction.
     pub async fn freeze_queue_for_transition(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
     ) -> Result<()> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
+        // Cleanup must not reopen storage after repartition retirement. Serialize
+        // lookup and freezing with destroy/evict so an absent handle stays cold.
+        let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        let qh = {
+            let current = self.queue_handles.load();
+            slot_lookup_no_alloc(current.as_ref(), topic, part, group)
+                .and_then(|slot| slot.handle.get().cloned())
+        };
+        let Some(qh) = qh else {
+            return Ok(());
+        };
         qh.freeze_owner_and_wait_operations().await?;
         qh.msg_log().freeze();
         qh.event_log().freeze();

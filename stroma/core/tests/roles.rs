@@ -42,6 +42,35 @@ async fn open_delayed_fsync_stroma(name: &str) -> (Stroma, TempDir) {
     (stroma, dir)
 }
 
+#[tokio::test]
+async fn late_role_cleanup_does_not_recreate_retired_partitions() {
+    let (st, _dir) = open_test_stroma("late_role_cleanup_after_retirement").await;
+    st.become_queue_follower("retired-follower", 0, None)
+        .await
+        .unwrap();
+    st.become_queue_owner("retired-owner", 0, None)
+        .await
+        .unwrap();
+    for topic in ["retired-follower", "retired-owner"] {
+        assert_eq!(
+            st.destroy_partition(topic, 0, None).await.unwrap(),
+            stroma_core::DestroyOutcome::Destroyed
+        );
+        assert!(!st.is_materialized(topic, 0, None));
+    }
+    // The assignment watcher may observe removal after the shrink reclaimer.
+    st.stop_queue_follower_for_transition("retired-follower", 0, None)
+        .await
+        .expect("stopping a retired follower must not recreate an owner");
+    st.freeze_queue_for_transition("retired-owner", 0, None)
+        .await
+        .unwrap();
+    assert!(!st.is_materialized("retired-follower", 0, None));
+    assert!(!st.is_materialized("retired-owner", 0, None));
+    assert!(st.discover_partitions().unwrap().is_empty());
+    st.shutdown().await.unwrap();
+}
+
 async fn wait_for_active_owner_operation(qh: &QueueHandleInner) {
     let start = Instant::now();
     while start.elapsed() < Duration::from_secs(1) {
