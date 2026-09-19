@@ -41,6 +41,10 @@ pub struct KeratinConfig {
     /// cost dominates, so coalescing many small commits into one fdatasync wins. At
     /// or above it the commit is bandwidth-bound and a single fsync stays in flight.
     pub pipeline_commit_records: u64,
+    /// Startup capacity factor for the writer input and notification channels.
+    /// Each channel has `64 * factor` eagerly allocated slots per log. Accepted
+    /// range: 1..=128; 128 preserves the original 8,192-slot capacities.
+    pub writer_buffer_factor: usize,
     pub force_recovery_scan: bool,
 }
 
@@ -60,12 +64,23 @@ impl Default for KeratinConfig {
             segment_preallocate_bytes: 0,
             max_inflight_fsyncs: 8,
             pipeline_commit_records: 2048,
+            writer_buffer_factor: 128,
             force_recovery_scan: false,
         }
     }
 }
 
 impl KeratinConfig {
+    pub(crate) fn writer_channel_capacity(&self) -> std::io::Result<usize> {
+        if !(1..=128).contains(&self.writer_buffer_factor) {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "writer_buffer_factor must be in 1..=128",
+            ));
+        }
+        Ok(64 * self.writer_buffer_factor)
+    }
+
     pub fn test_default() -> Self {
         Self::default()
     }

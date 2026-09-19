@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Startup `KeratinConfig.writer_buffer_factor` controls the eagerly allocated
+  writer input and notification channels: 64 slots per factor unit, range
+  1–128, default 128 (8,192 slots each). Smaller factors apply backpressure
+  earlier; fsync pipeline capacity remains independent.
+
 - Bounded, payload-free replication conflict diagnostics: recent control
   operations, record identities and offset context help reconstruct overlap
   failures without retaining message bodies. Diagnostics do not alter repair

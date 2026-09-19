@@ -13,6 +13,7 @@ fn main() {
         fsync_interval_ms: 1,
         min_fsync_interval_ms: 0,
         flush_target_bytes: 16 * 1024 * 1024,
+        writer_buffer_factor: 128,
         force_recovery_scan: false,
         tail_cache_bytes: 0,
         segment_preallocate_bytes: 0,

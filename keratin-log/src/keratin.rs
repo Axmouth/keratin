@@ -131,6 +131,8 @@ pub enum WriterCmd {
 
 impl Keratin {
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> std::io::Result<Self> {
+        // Reject invalid capacities before creating directories or opening logs.
+        let writer_channel_capacity = cfg.writer_channel_capacity()?;
         let root = root.as_ref().to_path_buf();
 
         std::fs::create_dir_all(&root)?;
@@ -186,7 +188,8 @@ impl Keratin {
             log.next_offset(),
         );
         let tail_cache = log.tail_cache();
-        let WriterHandle { tx } = crate::writer::spawn_writer(log, cfg, log_state.clone());
+        let WriterHandle { tx } =
+            crate::writer::spawn_writer(log, cfg, log_state.clone(), writer_channel_capacity);
 
         Ok(Self {
             root,
@@ -651,6 +654,77 @@ impl Drop for Keratin {
             "released Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
+    }
+}
+
+#[cfg(test)]
+mod writer_buffer_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn writer_buffer_factor_rejects_invalid_values_before_open() {
+        let dir = crate::test_dir!("invalid_writer_buffer_factor");
+        let unopened = dir.root.join("unopened");
+        for factor in [0, 129, usize::MAX] {
+            let cfg = KeratinConfig {
+                writer_buffer_factor: factor,
+                ..KeratinConfig::default()
+            };
+            let error = Keratin::open(&unopened, cfg).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!unopened.exists());
+        }
+    }
+
+    #[tokio::test]
+    async fn small_writer_buffers_preserve_durable_completions_and_reopen() {
+        let dir = crate::test_dir!("small_writer_buffers");
+        let cfg = KeratinConfig {
+            writer_buffer_factor: 1,
+            ..KeratinConfig::default()
+        };
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
+        assert_eq!(log.tx.capacity(), Some(64));
+        // More pending completions than either channel can hold. The notifier
+        // must continue draining while the writer applies backpressure.
+        let receipts: Vec<_> = (0u64..2048)
+            .map(|i| {
+                log.append_enqueue_receiver(
+                    Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: i.to_le_bytes().to_vec(),
+                    },
+                    Some(KDurability::AfterFsync),
+                )
+                .unwrap()
+            })
+            .collect();
+        for (i, receipt) in receipts.into_iter().enumerate() {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(10), receipt)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+            assert_eq!(result.base_offset, i as u64);
+            assert_eq!(result.count, 1);
+        }
+        log.shutdown().await.unwrap();
+        drop(log);
+
+        // Capacity is local startup configuration, not part of the log format.
+        let reopened = Keratin::open(&dir.root, KeratinConfig::default())
+            .await
+            .unwrap();
+        assert_eq!(reopened.tx.capacity(), Some(8192));
+        assert_eq!(reopened.next_offset(), 2048);
+        let records = reopened.reader().scan_from(0, 2048).unwrap();
+        assert_eq!(records.len(), 2048);
+        for (i, record) in records.iter().enumerate() {
+            assert_eq!(record.offset, i as u64);
+            assert_eq!(record.payload, (i as u64).to_le_bytes());
+        }
+        reopened.shutdown().await.unwrap();
     }
 }
 

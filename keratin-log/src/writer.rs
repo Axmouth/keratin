@@ -280,8 +280,13 @@ enum WriterEvent {
     FsyncDisconnected,
 }
 
-pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> WriterHandle {
-    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(8192);
+pub fn spawn_writer(
+    mut log: Log,
+    cfg: KeratinConfig,
+    state: Arc<LogState>,
+    channel_capacity: usize,
+) -> WriterHandle {
+    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(channel_capacity);
 
     #[cfg(feature = "writer-stage-trace")]
     let tracer = WriterStageTracer::from_env();
@@ -312,7 +317,7 @@ pub fn spawn_writer(mut log: Log, cfg: KeratinConfig, state: Arc<LogState>) -> W
         tracing::info!("Fsync loop exited");
     });
 
-    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(8192);
+    let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(channel_capacity);
 
     std::thread::spawn(move || {
         #[cfg(feature = "writer-stage-trace")]
