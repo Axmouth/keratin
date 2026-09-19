@@ -244,6 +244,11 @@ async fn replicated_append_rejects_mismatched_already_present_batch() {
         .expect_err("already-present replicated ranges must match existing records");
 
     assert!(err.to_string().contains("replicated overlap mismatch"));
+    let diagnostic = err.overlap_diagnostic().expect("typed overlap coordinates");
+    assert_eq!(diagnostic.offset, 1);
+    assert_eq!(diagnostic.existing_offset, 1);
+    assert_eq!(diagnostic.compared_first, 0);
+    assert_eq!(diagnostic.compared_count, 2);
     assert_eq!(k.next_offset(), 2);
     let got = k.reader().scan_from(0, 10).unwrap();
     assert_eq!(got.len(), 2);
@@ -666,4 +671,58 @@ async fn wal_high_contention_storm() {
     for (i, r) in got.iter().enumerate() {
         assert_eq!(r.offset as usize, i);
     }
+}
+
+#[tokio::test]
+async fn overlap_diagnostic_keeps_coordinates_and_control_history_without_contents() {
+    use keratin_log::LogControlKind;
+    let dir = test_dir!("overlap_diagnostic_coordinates");
+    let k = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    k.append_batch(vec![msg("PRIVATE-PAYLOAD")], None)
+        .await
+        .unwrap();
+    k.record_control_event(LogControlKind::DeclareCommitted, k.next_offset());
+    k.become_follower();
+    k.advance_epoch(7).await.unwrap();
+    let error = k
+        .append_replicated_batch(7, 0, vec![msg("OTHER-PRIVATE-PAYLOAD")], None)
+        .await
+        .unwrap_err();
+    let diagnostic = error
+        .overlap_diagnostic()
+        .expect("typed diagnostic survives writer response");
+    assert_eq!(
+        (diagnostic.offset, diagnostic.local_next, diagnostic.epoch),
+        (0, 1, 7)
+    );
+    assert_eq!(
+        (diagnostic.compared_first, diagnostic.compared_count),
+        (0, 1)
+    );
+    assert!(diagnostic.payloads_differ && diagnostic.emit_details);
+    let kinds: Vec<_> = diagnostic.control_history.iter().map(|e| e.kind).collect();
+    assert_eq!(
+        kinds,
+        vec![
+            LogControlKind::Opened,
+            LogControlKind::DeclareCommitted,
+            LogControlKind::Follower,
+            LogControlKind::EpochAdvanced
+        ]
+    );
+    assert!(error.clone().overlap_diagnostic().is_some());
+    eprintln!("overlap control history: {diagnostic:#?}");
+    let text = format!("{error:?}");
+    assert!(!text.contains("PRIVATE-PAYLOAD"));
+    let again = k
+        .append_replicated_batch(7, 0, vec![msg("OTHER-PRIVATE-PAYLOAD")], None)
+        .await
+        .unwrap_err();
+    let repeated = again.overlap_diagnostic().unwrap();
+    assert_eq!(repeated.report_id, diagnostic.report_id);
+    assert!(!repeated.emit_details && repeated.control_history.is_empty());
+    assert_eq!(k.next_offset(), 1, "diagnostics must not modify the log");
+    k.shutdown().await.unwrap();
 }

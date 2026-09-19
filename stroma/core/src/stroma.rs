@@ -4811,6 +4811,12 @@ impl Stroma {
 
         self.ensure_queue(tp, part, group).await?;
 
+        let handle = self.queue_handle(tp, part, group).await?;
+        let event_log = handle.resolve()?.event_log();
+        event_log.record_control_event(
+            keratin_log::LogControlKind::DeclareRequested,
+            event_log.next_offset(),
+        );
         let _upto = self
             .append_events_durable(
                 tp,
@@ -4821,6 +4827,10 @@ impl Stroma {
             )
             .await?;
 
+        event_log.record_control_event(
+            keratin_log::LogControlKind::DeclareCommitted,
+            event_log.next_offset(),
+        );
         Ok(())
     }
 
@@ -6385,6 +6395,74 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn follower_checkpoint_rejects_either_epoch_mismatch_before_resetting_any_log() {
+        let dir = test_dir!("checkpoint_epoch_pair");
+        let stroma = Stroma::open(
+            &dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        publish_one(&stroma, "topic", 0, None).await;
+        let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let qh = qh.resolve().unwrap();
+        let old_snapshot = qh.encode_snapshot(0).await.unwrap();
+        publish_one(&stroma, "topic", 0, None).await;
+        stroma
+            .become_queue_follower_with_epoch("topic", 0, None, 7)
+            .await
+            .unwrap();
+        let message_records = qh.msg_log().reader().scan_from(0, 10).unwrap();
+        let event_records = qh.event_log().reader().scan_from(0, 10).unwrap();
+        let before_state = qh.full_debug_info().await;
+        for (message_epoch, event_epoch) in [(6, 7), (7, 6), (8, 7), (7, 8), (6, 6)] {
+            let error = stroma
+                .install_follower_state_checkpoint(
+                    "topic",
+                    0,
+                    None,
+                    FollowerStateCheckpointInstall {
+                        message_epoch,
+                        event_epoch,
+                        message_next_offset: 0,
+                        event_next_offset: 1,
+                        applied_event_offset: 0,
+                        state_snapshot: old_snapshot.clone(),
+                    },
+                )
+                .await
+                .unwrap_err();
+            assert!(
+                matches!(error, StromaError::InvalidArgument(_)),
+                "{error:?}"
+            );
+            assert!(error.to_string().contains("epoch"));
+            for log in [qh.msg_log(), qh.event_log()] {
+                assert_eq!(log.current_epoch(), 7);
+                assert_eq!(log.head_offset(), 0);
+                assert_eq!(log.next_offset(), 2);
+            }
+            for (log, before) in [
+                (qh.msg_log(), &message_records),
+                (qh.event_log(), &event_records),
+            ] {
+                let after = log.reader().scan_from(0, 10).unwrap();
+                assert_eq!(after.len(), before.len());
+                for (a, b) in after.iter().zip(before) {
+                    assert_eq!(a.offset, b.offset);
+                    assert_eq!(a.payload, b.payload);
+                }
+            }
+            let after = qh.full_debug_info().await;
+            assert_eq!(after.applied_upto, before_state.applied_upto);
+            assert_eq!(after.state.ready_count, before_state.state.ready_count);
+            assert_eq!(after.state.settled_until, before_state.state.settled_until);
+        }
+        shutdown_stroma("checkpoint_epoch_pair", &stroma).await;
+    }
+
+    #[tokio::test]
     async fn follower_state_checkpoint_install_rejects_owner_role() {
         let dir = test_dir!("follower_state_checkpoint_rejects_owner");
         let stroma = Stroma::open(
@@ -6406,6 +6484,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    message_epoch: 0,
+                    event_epoch: 0,
                     message_next_offset: 0,
                     event_next_offset: 1,
                     applied_event_offset: 0,
@@ -6451,6 +6531,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    message_epoch: 0,
+                    event_epoch: 0,
                     message_next_offset: 1,
                     event_next_offset: 2,
                     applied_event_offset: 1,
@@ -6491,6 +6573,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    message_epoch: 0,
+                    event_epoch: 0,
                     message_next_offset: 2,
                     event_next_offset: 2,
                     applied_event_offset: 1,
@@ -6539,6 +6623,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    message_epoch: 0,
+                    event_epoch: 0,
                     message_next_offset: 0,
                     event_next_offset: 2,
                     applied_event_offset: 1,
@@ -6795,6 +6881,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    message_epoch: checkpoint.message_epoch,
+                    event_epoch: checkpoint.event_epoch,
                     message_next_offset: checkpoint.message_checkpoint_offset,
                     event_next_offset: checkpoint.event_next_offset,
                     applied_event_offset: checkpoint.applied_event_offset,

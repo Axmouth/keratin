@@ -1,6 +1,7 @@
 mod batcher;
 mod config;
 mod durability;
+mod diagnostics;
 mod index;
 mod keratin;
 mod log;
@@ -16,6 +17,7 @@ mod writer;
 mod writer_stage_trace;
 
 pub use config::*;
+pub use diagnostics::{LogControlEvent, LogControlKind, ReplicationOverlapDiagnostic, CONTROL_HISTORY_LIMIT};
 pub use durability::{DurableFrontier, DurableWatermark, KDurability};
 pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};

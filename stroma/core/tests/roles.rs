@@ -758,14 +758,45 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
 #[tokio::test]
 async fn independent_declaration_prefix_is_rejected_by_replication() {
     let (st, _dir) = open_test_stroma("independent_declare_prefix").await;
-    st.declare("topic", 0, None, Default::default()).await.unwrap();
+    st.declare("topic", 0, None, Default::default())
+        .await
+        .unwrap();
     st.become_queue_follower("topic", 0, None).await.unwrap();
-    let error = st.apply_replicated_queue_batch("topic", 0, None, None,
-        Some(ReplicatedEventBatch {
-            epoch: 0, first_offset: 0,
-            events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
-            durability: Some(KDurability::AfterFsync),
-        })).await.unwrap_err();
-    assert!(error.to_string().contains("replicated overlap mismatch at offset 0"), "{error}");
+    let error = st
+        .apply_replicated_queue_batch(
+            "topic",
+            0,
+            None,
+            None,
+            Some(ReplicatedEventBatch {
+                epoch: 0,
+                first_offset: 0,
+                events: vec![StromaEvent::Enqueue {
+                    off: 0,
+                    retries: 0,
+                    expire_at: None,
+                }],
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains("replicated overlap mismatch at offset 0"),
+        "{error}"
+    );
+    let detail = error.to_string();
+    eprintln!("{detail}");
+    assert!(detail.contains("log=events"), "{detail}");
+    assert!(
+        detail.contains("Declare") && detail.contains("Enqueue"),
+        "{detail}"
+    );
+    assert!(
+        detail.contains("event_offset: 0") && detail.contains("max_message_offset: Some(0)"),
+        "{detail}"
+    );
     st.shutdown().await.unwrap();
 }

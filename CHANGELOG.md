@@ -9,7 +9,19 @@ tagged releases yet. Earlier history predates this changelog.
 
 ## [Unreleased]
 
+### Added
+
+- Bounded, payload-free replication conflict diagnostics: recent control
+  operations, record identities and offset context help reconstruct overlap
+  failures without retaining message bodies. Diagnostics do not alter repair
+  policy or add ordinary append-path history recording.
+
 ### Fixed
+
+- Remote checkpoint resets must match the writer's exact epoch. Stroma validates
+  both source epochs before resetting either log, and each writer checks again
+  in command order. Stale or future checkpoints cannot replace fenced history.
+  The multi-log/state installation is not yet interruption-safe as a whole.
 
 - A queue publish routed at a plexus stream partition is refused before
   anything is appended. It used to append the message and a queue-kind

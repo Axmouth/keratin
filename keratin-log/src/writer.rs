@@ -95,14 +95,21 @@ macro_rules! stage_reqs_then_post {
 
 #[derive(Debug, Clone)]
 pub struct IoError {
-    msg: String,
+    // Keep the error no larger than the former String-only representation;
+    // success-path channel items must not grow for failure diagnostics.
+    msg: Arc<str>,
+    overlap: Option<Arc<crate::ReplicationOverlapDiagnostic>>,
 }
 
 impl IoError {
     pub fn new(msg: impl ToString) -> Self {
         Self {
-            msg: msg.to_string(),
+            msg: msg.to_string().into(),
+            overlap: None,
         }
+    }
+    pub fn overlap_diagnostic(&self) -> Option<&crate::ReplicationOverlapDiagnostic> {
+        self.overlap.as_deref()
     }
 }
 
@@ -118,7 +125,12 @@ impl std::fmt::Display for IoError {
 impl From<io::Error> for IoError {
     fn from(value: io::Error) -> Self {
         Self {
-            msg: value.to_string(),
+            overlap: value
+                .get_ref()
+                .and_then(|e| e.downcast_ref::<crate::ReplicationOverlapDiagnostic>())
+                .cloned()
+                .map(Arc::new),
+            msg: value.to_string().into(),
         }
     }
 }
@@ -880,8 +892,23 @@ fn writer_loop_inner(
             }
             WriterCmd::ResetToCheckpoint {
                 next_offset,
+                expected_epoch,
                 respond_to,
             } => {
+                // Ordered with AdvanceEpoch on this writer. Reject before
+                // touching either persisted records or pending completions.
+                if let Some(expected) = expected_epoch {
+                    let current = log.current_epoch();
+                    if expected != current {
+                        let _ = respond_to.send(Err(io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            format!(
+                                "checkpoint epoch {expected} does not match local epoch {current}"
+                            ),
+                        )));
+                        continue;
+                    }
+                }
                 shutdown_fail_reqs(batcher.flush(), "writer reset to checkpoint", &notify_tx);
                 fail_all_pending(
                     &mut pending,
@@ -1371,7 +1398,8 @@ fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<Notify
         items.push(NotifyItem {
             completion: r.completion,
             result: Err(IoError {
-                msg: msg.to_string(),
+                msg: msg.to_string().into(),
+                overlap: None,
             }),
         });
     }
@@ -1687,7 +1715,8 @@ fn fail_all_pending(
         items.push(NotifyItem {
             completion: p.respond_to,
             result: Err(IoError {
-                msg: err_msg.as_ref().to_string(),
+                msg: err_msg.as_ref().to_string().into(),
+                overlap: None,
             }),
         });
     }

@@ -112,6 +112,10 @@ pub struct ReplicatedQueueApplyOutcome {
 /// the follower can safely promote.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FollowerStateCheckpointInstall {
+    /// Exact source epochs. Assignment/replication fencing must establish these
+    /// locally before checkpoint installation; installation cannot advance them.
+    pub message_epoch: u64,
+    pub event_epoch: u64,
     pub message_next_offset: Offset,
     pub event_next_offset: Offset,
     pub applied_event_offset: Offset,
@@ -653,7 +657,8 @@ impl Stroma {
 
         let message_log = match messages {
             Some(batch) => {
-                let msg_next = batch.first_offset + batch.records.len() as u64;
+                let count = batch.records.len();
+                let msg_next = batch.first_offset + count as u64;
                 let outcome = qh
                     .msg_log()
                     .append_replicated_batch(
@@ -662,8 +667,24 @@ impl Stroma {
                         batch.records,
                         batch.durability,
                     )
-                    .await
-                    .map_err(io_err)?;
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(crate::replication_diagnostics::overlap_error(
+                            error,
+                            qh.msg_log(),
+                            topic,
+                            part,
+                            group,
+                            batch.epoch,
+                            batch.first_offset,
+                            count,
+                            None,
+                        )
+                        .await);
+                    }
+                };
                 if advance_stream_tail && replicated_append_outcome_allows_state_apply(&outcome) {
                     let (tx, rx) = tokio::sync::oneshot::channel();
                     qh.stream_command_enqueue(StreamCommand::AdvanceTail {
@@ -697,8 +718,24 @@ impl Stroma {
                         records,
                         batch.durability,
                     )
-                    .await
-                    .map_err(io_err)?;
+                    .await;
+                let outcome = match outcome {
+                    Ok(outcome) => outcome,
+                    Err(error) => {
+                        return Err(crate::replication_diagnostics::overlap_error(
+                            error,
+                            qh.event_log(),
+                            topic,
+                            part,
+                            group,
+                            batch.epoch,
+                            batch.first_offset,
+                            batch.events.len(),
+                            Some(&batch.events),
+                        )
+                        .await);
+                    }
+                };
                 if replicated_append_outcome_allows_state_apply(&outcome) {
                     // NOTE: we intentionally do NOT fail here if an event
                     // references a message offset not yet received. Ship order is
@@ -770,15 +807,40 @@ impl Stroma {
                 actual: role,
             });
         }
+        let local_message_epoch = qh.msg_log().current_epoch();
+        let local_event_epoch = qh.event_log().current_epoch();
+        if install.message_epoch != local_message_epoch || install.event_epoch != local_event_epoch
+        {
+            tracing::warn!(
+                topic,
+                partition = part,
+                group,
+                checkpoint_message_epoch = install.message_epoch,
+                checkpoint_event_epoch = install.event_epoch,
+                local_message_epoch,
+                local_event_epoch,
+                "checkpoint rejected before reset: epoch mismatch"
+            );
+            return Err(StromaError::InvalidArgument(format!(
+                "checkpoint epochs ({}, {}) do not match local epochs ({local_message_epoch}, {local_event_epoch})",
+                install.message_epoch, install.event_epoch,
+            )));
+        }
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
 
         qh.msg_log()
-            .destructive_reset_to_checkpoint(install.message_next_offset)
+            .destructive_reset_to_checkpoint_at_epoch(
+                install.message_next_offset,
+                install.message_epoch,
+            )
             .await
             .map_err(io_err)?;
         qh.event_log()
-            .destructive_reset_to_checkpoint(install.event_next_offset)
+            .destructive_reset_to_checkpoint_at_epoch(
+                install.event_next_offset,
+                install.event_epoch,
+            )
             .await
             .map_err(io_err)?;
 

@@ -9,10 +9,10 @@ use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::oneshot;
 
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
-use crate::tail_cache::TailCache;
 use crate::reader::LogReader;
 use crate::record::Message;
 use crate::segment::{SegmentInfo, read_segment_created_ts_ms};
+use crate::tail_cache::TailCache;
 use crate::writer::{AppendCompletionTarget, AppendPayload, AppendReq, IoError, WriterHandle};
 use crate::{AppendCompletion, DurableFrontier, KDurability, KeratinConfig};
 
@@ -79,7 +79,17 @@ pub trait KeratinReplicaExt {
         durability: Option<KDurability>,
     ) -> Result<ReplicatedAppendOutcome, IoError>;
 
+    /// Local maintenance reset (for example, truncating a corrupt local tail).
+    /// Remote checkpoints must use the epoch-fenced variant below.
     async fn destructive_reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()>;
+
+    /// Reset only if the writer is still at the checkpoint's exact epoch.
+    /// Checkpoint transfer must not advance the assignment fencing epoch.
+    async fn destructive_reset_to_checkpoint_at_epoch(
+        &self,
+        next_offset: u64,
+        expected_epoch: u64,
+    ) -> std::io::Result<()>;
 }
 
 pub enum WriterCmd {
@@ -98,6 +108,7 @@ pub enum WriterCmd {
     },
     ResetToCheckpoint {
         next_offset: u64,
+        expected_epoch: Option<u64>,
         respond_to: oneshot::Sender<io::Result<()>>,
     },
     AdvanceEpoch {
@@ -169,6 +180,11 @@ impl Keratin {
             .store(log.manifest.head_offset, Ordering::SeqCst);
         log_state.epoch.store(log.current_epoch(), Ordering::SeqCst);
 
+        log_state.diagnostics.lock().record(
+            crate::LogControlKind::Opened,
+            log.current_epoch(),
+            log.next_offset(),
+        );
         let tail_cache = log.tail_cache();
         let WriterHandle { tx } = crate::writer::spawn_writer(log, cfg, log_state.clone());
 
@@ -433,18 +449,29 @@ impl Keratin {
     }
 
     pub fn become_owner(&self) {
-        self.role
-            .store(KeratinRole::Owner.as_u8(), Ordering::Release);
+        self.set_role(KeratinRole::Owner, crate::LogControlKind::Owner);
     }
 
     pub fn become_follower(&self) {
-        self.role
-            .store(KeratinRole::Follower.as_u8(), Ordering::Release);
+        self.set_role(KeratinRole::Follower, crate::LogControlKind::Follower);
     }
 
     pub fn freeze(&self) {
-        self.role
-            .store(KeratinRole::Frozen.as_u8(), Ordering::Release);
+        self.set_role(KeratinRole::Frozen, crate::LogControlKind::Frozen);
+    }
+
+    fn set_role(&self, role: KeratinRole, kind: crate::LogControlKind) {
+        if self.role.swap(role.as_u8(), Ordering::AcqRel) != role.as_u8() {
+            self.record_control_event(kind, self.next_offset());
+        }
+    }
+
+    /// Record rare control operations only. Never called for ordinary appends.
+    pub fn record_control_event(&self, kind: crate::LogControlKind, offset: u64) {
+        self.log_state
+            .diagnostics
+            .lock()
+            .record(kind, self.current_epoch(), offset);
     }
 
     fn ensure_role(&self, expected: KeratinRole, op: &str) -> Result<(), IoError> {
@@ -490,6 +517,25 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    async fn reset_checkpoint_inner(
+        &self,
+        next_offset: u64,
+        expected_epoch: Option<u64>,
+    ) -> io::Result<()> {
+        self.ensure_role(KeratinRole::Follower, "destructive_reset_to_checkpoint")
+            .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ResetToCheckpoint {
+                next_offset,
+                expected_epoch,
+                respond_to,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     /// Force to close without waiting for writer to acknowledge shutdown (for testing)
@@ -549,17 +595,16 @@ impl KeratinReplicaExt for Keratin {
     }
 
     async fn destructive_reset_to_checkpoint(&self, next_offset: u64) -> std::io::Result<()> {
-        self.ensure_role(KeratinRole::Follower, "destructive_reset_to_checkpoint")
-            .map_err(|err| std::io::Error::new(std::io::ErrorKind::PermissionDenied, err))?;
-        let (respond_to, rx) = oneshot::channel();
-        self.tx
-            .send(WriterCmd::ResetToCheckpoint {
-                next_offset,
-                respond_to,
-            })
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
-        rx.await
-            .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+        self.reset_checkpoint_inner(next_offset, None).await
+    }
+
+    async fn destructive_reset_to_checkpoint_at_epoch(
+        &self,
+        next_offset: u64,
+        expected_epoch: u64,
+    ) -> std::io::Result<()> {
+        self.reset_checkpoint_inner(next_offset, Some(expected_epoch))
+            .await
     }
 }
 
@@ -606,5 +651,85 @@ impl Drop for Keratin {
             "released Keratin lock at {}",
             self.root.join(".keratin.lock").display()
         );
+    }
+}
+
+#[cfg(test)]
+mod checkpoint_epoch_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn checkpoint_reset_checks_epoch_in_writer_order() {
+        let dir = crate::test_dir!("checkpoint_writer_epoch_order");
+        let cfg = KeratinConfig::test_default();
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
+        log.become_follower();
+        log.append_replicated_batch(
+            0,
+            0,
+            vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: b"preserved".to_vec(),
+            }],
+            Some(KDurability::AfterFsync),
+        )
+        .await
+        .unwrap();
+        let observed_epoch = log.current_epoch();
+
+        // The caller saw epoch 0, but an epoch change is ahead of its reset on
+        // the writer queue. A caller-side check alone would miss this ordering.
+        let (advanced, advanced_rx) = oneshot::channel();
+        log.tx
+            .send(WriterCmd::AdvanceEpoch {
+                epoch: 1,
+                respond_to: advanced,
+            })
+            .unwrap();
+        let (reset, reset_rx) = oneshot::channel();
+        log.tx
+            .send(WriterCmd::ResetToCheckpoint {
+                next_offset: 0,
+                expected_epoch: Some(observed_epoch),
+                respond_to: reset,
+            })
+            .unwrap();
+        assert_eq!(advanced_rx.await.unwrap().unwrap(), 1);
+        let error = reset_rx.await.unwrap().unwrap_err();
+        assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+        assert_eq!(log.head_offset(), 0);
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(
+            log.reader().scan_from(0, 2).unwrap()[0].payload,
+            b"preserved"
+        );
+        drop(log);
+
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
+        assert_eq!(log.current_epoch(), 1);
+        assert_eq!(log.next_offset(), 1);
+        assert_eq!(
+            log.reader().scan_from(0, 2).unwrap()[0].payload,
+            b"preserved"
+        );
+        log.become_follower();
+        assert!(
+            log.destructive_reset_to_checkpoint_at_epoch(0, 2)
+                .await
+                .is_err()
+        );
+        assert_eq!(log.current_epoch(), 1);
+        assert_eq!(log.next_offset(), 1);
+        log.destructive_reset_to_checkpoint_at_epoch(0, 1)
+            .await
+            .unwrap();
+        assert_eq!(log.next_offset(), 0);
+        assert_eq!(log.current_epoch(), 1);
+        drop(log);
+
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
+        assert_eq!(log.next_offset(), 0);
+        assert_eq!(log.current_epoch(), 1);
     }
 }

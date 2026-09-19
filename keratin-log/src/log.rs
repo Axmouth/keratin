@@ -10,7 +10,8 @@ use std::{
     time::{Duration, Instant},
 };
 
-use parking_lot::RwLock;
+use crate::diagnostics::{LogControlKind, LogDiagnostics, ReplicationOverlapDiagnostic};
+use parking_lot::{Mutex, RwLock};
 
 #[cfg(feature = "writer-stage-trace")]
 use crate::writer_stage_trace::WriterStageTracer;
@@ -68,6 +69,7 @@ pub enum ReplicatedAppendMode {
 
 #[derive(Debug, Clone)]
 pub struct LogState {
+    pub(crate) diagnostics: Arc<Mutex<LogDiagnostics>>,
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
     // Exclusive durable frontier, published through a typed wrapper so the
@@ -99,6 +101,7 @@ impl FsyncJob {
 impl LogState {
     pub fn new(head: u64, tail: u64, durable: DurableFrontier) -> Self {
         Self {
+            diagnostics: Arc::new(Mutex::new(LogDiagnostics::default())),
             head: Arc::new(AtomicU64::new(head)),
             tail: Arc::new(AtomicU64::new(tail)),
             durable: DurableWatermark::new(durable),
@@ -1145,6 +1148,11 @@ impl Log {
         self.manifest.active_base_offset = self.active.base_offset;
         self.manifest.store_atomic(&self.root)?;
         self.log_state.epoch.store(epoch, Ordering::Release);
+        self.log_state.diagnostics.lock().record(
+            LogControlKind::EpochAdvanced,
+            epoch,
+            self.next_offset,
+        );
 
         Ok(epoch)
     }
@@ -1289,6 +1297,11 @@ impl Log {
         self.manifest.store_atomic(&self.root)?;
         self.log_state.head.store(new_head, Ordering::Release);
 
+        self.log_state.diagnostics.lock().record(
+            LogControlKind::Truncated,
+            self.manifest.epoch,
+            new_head,
+        );
         Ok(new_head)
     }
 
@@ -1341,6 +1354,11 @@ impl Log {
         // Truncation/checkpoint reset: the durable set can legitimately shrink.
         self.log_state.durable.reset(self.durable_end_exclusive());
 
+        self.log_state.diagnostics.lock().record(
+            LogControlKind::CheckpointReset,
+            self.manifest.epoch,
+            next_offset,
+        );
         Ok(())
     }
 
@@ -1383,10 +1401,30 @@ impl Log {
                 || existing.headers != incoming.headers
                 || existing.payload != incoming.payload
             {
-                return Err(io::Error::new(
-                    io::ErrorKind::InvalidData,
-                    format!("replicated overlap mismatch at offset {expected_offset}"),
-                ));
+                let (report_id, emit_details, suppressed_reports, control_history) =
+                    self.log_state.diagnostics.lock().capture(Instant::now());
+                let diagnostic = ReplicationOverlapDiagnostic {
+                    report_id,
+                    offset: expected_offset,
+                    existing_offset: existing.offset,
+                    epoch: self.manifest.epoch,
+                    local_head: head_offset,
+                    local_next: self.next_offset,
+                    local_durable_next: self.durable_end_exclusive().first_non_durable(),
+                    compared_first: readable_first_offset,
+                    compared_count: payloads.len(),
+                    flags_differ: existing.flags != incoming.flags,
+                    headers_differ: existing.headers != incoming.headers,
+                    payloads_differ: existing.payload != incoming.payload,
+                    emit_details,
+                    suppressed_reports,
+                    control_history,
+                };
+                if emit_details {
+                    tracing::error!(log_root = %self.root.display(), diagnostic = ?diagnostic,
+                        "replication overlap diagnostic");
+                }
+                return Err(io::Error::new(io::ErrorKind::InvalidData, diagnostic));
             }
         }
 
