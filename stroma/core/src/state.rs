@@ -973,6 +973,81 @@ impl EngineHandle {
     }
 }
 
+/// Reserved under the publication lock, before detached durability tasks run.
+#[derive(Debug, Default)]
+pub(crate) struct PublishOrder {
+    previous_apply: Option<oneshot::Receiver<()>>,
+}
+
+impl PublishOrder {
+    pub(crate) fn reserve_apply(&mut self) -> PublishApplyTurn {
+        let (complete, next) = oneshot::channel();
+        PublishApplyTurn {
+            previous: self.previous_apply.replace(next),
+            complete,
+        }
+    }
+}
+
+pub(crate) struct PublishApplyTurn {
+    previous: Option<oneshot::Receiver<()>>,
+    complete: oneshot::Sender<()>,
+}
+
+impl PublishApplyTurn {
+    pub(crate) async fn wait(&mut self) -> std::io::Result<()> {
+        if let Some(previous) = self.previous.take() {
+            previous.await.map_err(|_| {
+                std::io::Error::other(
+                    "preceding publish application did not complete; queue recovery required",
+                )
+            })?;
+        }
+        Ok(())
+    }
+
+    pub(crate) fn complete(self) {
+        let _ = self.complete.send(());
+    }
+}
+
+#[cfg(test)]
+mod publish_apply_order_tests {
+    use super::PublishOrder;
+
+    #[tokio::test]
+    async fn abandoned_application_fails_the_remaining_chain_closed() {
+        let mut order = PublishOrder::default();
+        let first = order.reserve_apply();
+        let mut second = order.reserve_apply();
+        let mut third = order.reserve_apply();
+        drop(first);
+        assert!(second.wait().await.is_err());
+        drop(second);
+        assert!(third.wait().await.is_err());
+        drop(third);
+        assert!(order.reserve_apply().wait().await.is_err());
+    }
+
+    #[tokio::test]
+    async fn completion_releases_only_the_next_application() {
+        let mut order = PublishOrder::default();
+        let mut first = order.reserve_apply();
+        let mut second = order.reserve_apply();
+        let mut third = order.reserve_apply();
+        first.wait().await.unwrap();
+        let mut second_wait = Box::pin(second.wait());
+        let mut third_wait = Box::pin(third.wait());
+        assert!(futures::poll!(&mut second_wait).is_pending());
+        assert!(futures::poll!(&mut third_wait).is_pending());
+        first.complete();
+        second_wait.await.unwrap();
+        assert!(futures::poll!(&mut third_wait).is_pending());
+        second.complete();
+        third_wait.await.unwrap();
+    }
+}
+
 #[derive(Debug)]
 pub struct QueueHandleInner {
     engine: EngineHandle,
@@ -1010,7 +1085,7 @@ pub struct QueueHandleInner {
     // crash that strands a middle publish can truncate a confirmed one. Held only
     // across staging + the event send, never the fsync waits, so the two fsyncs
     // still overlap.
-    publish_event_order: Arc<tokio::sync::Mutex<()>>,
+    publish_event_order: Arc<tokio::sync::Mutex<PublishOrder>>,
 
     // Hot-path cache of the per-queue default message TTL (ms). 0 = none.
     // Populated by the actor on Declare and snapshot load so the publish path
@@ -1245,7 +1320,7 @@ impl QueueHandleInner {
             owner_operations_drained,
             owner_operations_paused,
             owner_operations_resumed,
-            publish_event_order: Arc::new(tokio::sync::Mutex::new(())),
+            publish_event_order: Arc::new(tokio::sync::Mutex::new(PublishOrder::default())),
             default_message_ttl_ms: Arc::new(AtomicU64::new(0)),
             global_dlq,
             metrics,
@@ -2688,7 +2763,7 @@ impl QueueHandleInner {
 
     /// Per-partition lock serializing the parallel-publish event-log append order.
     /// See the field docs on `QueueHandleInner`.
-    pub(crate) fn publish_event_order(&self) -> Arc<tokio::sync::Mutex<()>> {
+    pub(crate) fn publish_event_order(&self) -> Arc<tokio::sync::Mutex<PublishOrder>> {
         self.publish_event_order.clone()
     }
 
@@ -3402,7 +3477,8 @@ impl QueueInternalState {
         if !self.delayed_enqueue_heap.is_empty() {
             let cancel: std::collections::HashSet<Offset> =
                 offs.iter().copied().filter(|&o| o >= settled).collect();
-            self.delayed_enqueue_heap.retain(|(_, o)| !cancel.contains(o));
+            self.delayed_enqueue_heap
+                .retain(|(_, o)| !cancel.contains(o));
         }
         self.recompute_hint_if_needed();
     }

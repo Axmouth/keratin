@@ -780,6 +780,9 @@ pub struct Stroma {
 
     #[cfg(test)]
     snapshot_worker_ticks: Arc<Notify>,
+
+    #[cfg(test)]
+    publish_apply_pause: Arc<std::sync::Mutex<Option<Arc<PublishApplyPause>>>>,
 }
 
 impl Stroma {
@@ -833,6 +836,8 @@ impl Stroma {
             recovery_event_scan_starts: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             snapshot_worker_ticks: Arc::new(Notify::new()),
+            #[cfg(test)]
+            publish_apply_pause: Arc::new(std::sync::Mutex::new(None)),
         };
 
         st.load_global_dlq_setting().await?;
@@ -3210,7 +3215,10 @@ impl Stroma {
                 for o in offs {
                     pending.remove(o);
                 }
-            } else if ev.max_referenced_msg_offset().is_some_and(|max| max >= msg_tail) {
+            } else if ev
+                .max_referenced_msg_offset()
+                .is_some_and(|max| max >= msg_tail)
+            {
                 // A dangling ENQUEUE is the expected parallel-publish artifact: its
                 // payload never became durable, so it is unconfirmed and safe to
                 // drop. A non-enqueue event (ack/nack/mark/dead-letter) referencing a
@@ -3945,9 +3953,14 @@ impl Stroma {
         // crash stranding a middle publish could truncate a confirmed one on the
         // fold. The lock is released before the durability waits, so the msg and
         // event fsyncs still overlap.
-        let order_guard = order_lock.lock_owned().await;
+        let mut order_guard = order_lock.lock_owned().await;
         msg_log
-            .append_batch_enqueue_staged(messages, Some(durability), msg_completion, staged_tx)
+            .append_batch_enqueue_staged(
+                messages,
+                Some(durability),
+                msg_completion,
+                staged_tx,
+            )
             .map_err(io_err)?;
         // Every path past this point must complete the producers: the messages are
         // staged, so a silent drop would hang them.
@@ -4021,22 +4034,42 @@ impl Stroma {
                 return Ok(());
             }
         };
-        drop(order_guard); // ordering established; release before the fsync waits
+        // Reserve visibility order while append order is still held. Writers
+        // continue staging/flushing later batches while applications wait.
+        let mut apply_turn = order_guard.reserve_apply();
+        drop(order_guard);
+        #[cfg(test)]
+        let apply_pause = self
+            .publish_apply_pause
+            .lock()
+            .unwrap()
+            .clone()
+            .filter(|pause| pause.topic == tp && pause.base == base);
 
         tokio::spawn(async move {
             let owner_operation = owner_operation;
-            let outcome = stroma
-                .gate_and_apply_enqueue(
-                    qh.clone(),
-                    events,
-                    event_rx,
-                    msg_rx,
-                    msgs_count,
-                    bytes_count,
-                )
-                .await;
+            #[cfg(test)]
+            if let Some(pause) = apply_pause {
+                pause.entered.notify_one();
+                pause.release.notified().await;
+            }
+            let outcome = match apply_turn.wait().await {
+                Ok(()) => {
+                    stroma
+                        .gate_and_apply_enqueue(
+                            qh.clone(),
+                            events,
+                            event_rx,
+                            msg_rx,
+                            msgs_count,
+                            bytes_count,
+                        )
+                        .await
+                }
+                Err(err) => Err(io_err(err)),
+            };
 
-            match outcome {
+            let release_next = match outcome {
                 Ok(Some(_)) => {
                     // Both logs durable, events applied: confirm the producers.
                     for (i, ci) in completion_items.into_iter().enumerate() {
@@ -4045,6 +4078,7 @@ impl Stroma {
                             count: 1,
                         }));
                     }
+                    true
                 }
                 Ok(None) => {
                     // Message payload not durable: annihilate the durable Enqueue so
@@ -4053,10 +4087,10 @@ impl Stroma {
                     // the happy path allocates nothing.
                     let offs: Vec<Offset> = (0..count).map(|i| base + i).collect();
                     let cancel = StromaEvent::CancelEnqueueMany { offs };
-                    if let Err(e) = stroma
+                    let cancelled = stroma
                         .append_events_durable_leased(qh, vec![cancel], durability, owner_operation)
-                        .await
-                    {
+                        .await;
+                    if let Err(e) = &cancelled {
                         // The durable Enqueue is now left dangling on a live leader.
                         // Recovery still folds it away (it references a non-durable
                         // offset), but log rather than swallow. This is the scenario
@@ -4071,6 +4105,7 @@ impl Stroma {
                         ci.completion
                             .complete(Err(IoError::new("message payload not durable")));
                     }
+                    cancelled.is_ok()
                 }
                 Err(err) => {
                     // Event-log append failed: no apply, producer retries. A durable
@@ -4079,7 +4114,12 @@ impl Stroma {
                     for ci in completion_items {
                         ci.completion.complete(Err(IoError::new(msg.clone())));
                     }
+                    false
                 }
+            };
+            // An abandoned or failed application cannot release later batches.
+            if release_next {
+                apply_turn.complete();
             }
         });
 
@@ -5787,11 +5827,101 @@ impl Stroma {
 }
 
 #[cfg(test)]
+#[derive(Debug)]
+struct PublishApplyPause {
+    topic: &'static str,
+    base: Offset,
+    entered: Notify,
+    release: Notify,
+}
+
+#[cfg(test)]
 mod tests {
     use keratin_log::{KeratinReplicaExt, test_dir};
 
     use super::*;
     use crate::state::QueueInternalState;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn later_durable_batch_cannot_overtake_paused_earlier_apply() {
+        let dir = test_dir!("publish_apply_order");
+        let st = Stroma::open(
+            &dir.root,
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        let pause = Arc::new(PublishApplyPause {
+            topic: "ordered",
+            base: 0,
+            entered: Notify::new(),
+            release: Notify::new(),
+        });
+        *st.publish_apply_pause.lock().unwrap() = Some(pause.clone());
+        let mut confirms = Vec::new();
+        for id in 0..2 {
+            let (completion, rx) = KeratinAppendCompletion::pair();
+            st.append_message_batch(
+                "ordered",
+                0,
+                None,
+                vec![PublishItem {
+                    headers: MessageHeaders {
+                        published: Default::default(),
+                        publish_received: Default::default(),
+                        content_type: None,
+                        extra: Default::default(),
+                    },
+                    payload: vec![id],
+                    completion,
+                    not_before: None,
+                    expire_at: None,
+                }],
+            )
+            .await
+            .unwrap();
+            confirms.push(rx);
+            if id == 0 {
+                tokio::time::timeout(Duration::from_secs(5), pause.entered.notified())
+                    .await
+                    .unwrap();
+            }
+        }
+        // Both disk writers can finish batch 1 while application of batch 0 is paused.
+        let queue = st.queue_handle("ordered", 0, None).await.unwrap();
+        let handle = queue.resolve().unwrap();
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while handle.msg_log().durable_offset() < 1 || handle.event_log().durable_offset() < 1 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        let mut second = confirms.pop().unwrap();
+        let overtook = tokio::time::timeout(Duration::from_millis(100), &mut second)
+            .await
+            .is_ok();
+        let visible = st.is_ready("ordered", 0, None, 1).await.unwrap();
+        pause.release.notify_one();
+        tokio::time::timeout(Duration::from_secs(5), confirms.pop().unwrap())
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        if !overtook {
+            tokio::time::timeout(Duration::from_secs(5), second)
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        st.shutdown().await.unwrap();
+        assert!(
+            !overtook && !visible,
+            "later batch overtook paused earlier apply: confirmed={overtook}, visible={visible}"
+        );
+    }
 
     async fn test_step<T>(
         label: impl std::fmt::Display,
@@ -7662,13 +7792,9 @@ mod tests {
     #[tokio::test]
     async fn poisoned_queue_event_in_a_stream_log_does_not_brick_recovery() {
         let dir = test_dir!("stream_log_poison");
-        let stroma = Stroma::open(
-            &dir.root,
-            test_keratin_config(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .unwrap();
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
         stroma.create_stream("sensors", 0, None).await.unwrap();
         let headers = MessageHeaders {
             published: unix_millis(),
@@ -7706,13 +7832,9 @@ mod tests {
 
         // Recovery must skip the poison instead of refusing to open, and the
         // stream's own state must be intact.
-        let reopened = Stroma::open(
-            &dir.root,
-            test_keratin_config(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .expect("a poisoned event log must not brick the engine open");
+        let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .expect("a poisoned event log must not brick the engine open");
         let (_head, tail) = reopened.stream_head_tail("sensors", 0).await.unwrap();
         assert_eq!(tail, off + 1, "stream tail survives recovery");
         assert_eq!(
@@ -7729,13 +7851,9 @@ mod tests {
     #[tokio::test]
     async fn stray_dirs_do_not_brick_the_partition_scan() {
         let dir = test_dir!("stray_dirs_scan");
-        let stroma = Stroma::open(
-            &dir.root,
-            test_keratin_config(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .unwrap();
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
         stroma.materialize("orders", 0, None).await.unwrap();
 
         // A destroy that crashed between its atomic rename-aside and the
@@ -7752,13 +7870,9 @@ mod tests {
         fs::create_dir_all(&stray).unwrap();
         shutdown_stroma("stray_dirs/shutdown", &stroma).await;
 
-        let reopened = Stroma::open(
-            &dir.root,
-            test_keratin_config(),
-            SnapshotConfig::default(),
-        )
-        .await
-        .expect("stray dirs must not fail the engine open");
+        let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .expect("stray dirs must not fail the engine open");
         let parts = reopened.discover_partitions().unwrap();
         assert!(
             parts.contains(&(None, "orders".to_string(), 0)),
@@ -8361,11 +8475,7 @@ mod tests {
         // The healthy partition is unaffected.
         assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
 
-        shutdown_stroma(
-            "recovery_auto_truncates_dangling_event_reference",
-            &stroma,
-        )
-        .await;
+        shutdown_stroma("recovery_auto_truncates_dangling_event_reference", &stroma).await;
     }
 
     /// The recovery fold: an Enqueue for a non-durable offset that is later
