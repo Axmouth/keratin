@@ -246,6 +246,39 @@ fn encode_append_payloads_into(
 }
 
 impl Log {
+    /// Complete a reset authorized by an external durable installation journal,
+    /// before normal log open can encounter partially removed segment files.
+    /// The caller must hold the root's exclusive Keratin lock throughout.
+    pub(crate) fn rebuild_checkpoint_files(
+        root: &Path,
+        next_offset: u64,
+        expected_epoch: u64,
+    ) -> io::Result<()> {
+        let mut manifest = Manifest::read_from(&mut File::open(Manifest::path(root))?)?;
+        if manifest.epoch != expected_epoch {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint recovery cannot change the persisted epoch",
+            ));
+        }
+        let segments = root.join("segments");
+        match fs::remove_dir_all(&segments) {
+            Ok(()) => (),
+            Err(err) if err.kind() == io::ErrorKind::NotFound => (),
+            Err(err) => return Err(err),
+        }
+        fs::create_dir_all(&segments)?;
+        let (segment, index, _) = create_segment_pair(root, next_offset, crate::util::unix_millis())?;
+        segment.fsync()?;
+        index.fsync()?;
+        fsync_dir(&segments)?;
+        manifest.active_base_offset = next_offset;
+        manifest.next_offset = next_offset;
+        manifest.head_offset = next_offset;
+        manifest.clean_shutdown = false;
+        manifest.store_atomic(root)
+    }
+
     // Cohesive open-time parameters, kept as primitives so this low-level layer
     // stays independent of the higher-level KeratinConfig struct.
     #[allow(clippy::too_many_arguments)]
@@ -1350,8 +1383,10 @@ impl Log {
         self.manifest.active_base_offset = next_offset;
         self.manifest.next_offset = next_offset;
         self.manifest.head_offset = next_offset;
-        self.manifest.store_atomic(&self.root)?;
+        self.active.fsync()?;
+        self.index.fsync()?;
         fsync_dir(&seg_dir)?;
+        self.manifest.store_atomic(&self.root)?;
 
         self.log_state.head.store(next_offset, Ordering::Release);
         self.log_state.tail.store(next_offset, Ordering::Release);

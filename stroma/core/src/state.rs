@@ -1057,11 +1057,46 @@ mod publish_apply_order_tests {
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryGate {
     sealed: AtomicBool,
+    pub(crate) checkpoint_pending: AtomicBool,
+    // Changes at both ends of an installation so a snapshot encoded before or
+    // during replacement cannot overwrite the installed state afterward.
+    pub(crate) checkpoint_generation: AtomicU64,
+    snapshots_retired: AtomicBool,
     // Held inside blocking I/O, including detached jobs after cancellation.
     pub(crate) snapshot_io: parking_lot::Mutex<()>,
 }
 
 impl RecoveryGate {
+    pub(crate) fn write_snapshot<T>(
+        &self,
+        generation: u64,
+        topic: &str,
+        partition: u32,
+        group: Option<&str>,
+        write: impl FnOnce() -> crate::Result<T>,
+    ) -> crate::Result<T> {
+        let _io = self.snapshot_io.lock();
+        self.ensure_open(topic, partition, group)?;
+        if self.snapshots_retired.load(Ordering::Acquire)
+            || self.checkpoint_generation.load(Ordering::Acquire) != generation
+        {
+            return Err(StromaError::Io(
+                "snapshot superseded by checkpoint installation or teardown".into(),
+            ));
+        }
+        write()
+    }
+
+    pub(crate) async fn retire_snapshots(self: &Arc<Self>) -> crate::Result<()> {
+        self.snapshots_retired.store(true, Ordering::Release);
+        let gate = self.clone();
+        tokio::task::spawn_blocking(move || {
+            let _io = gate.snapshot_io.lock();
+        })
+        .await
+        .map_err(|err| StromaError::Io(err.to_string()))
+    }
+
     pub(crate) fn ensure_open(
         &self,
         topic: &str,
@@ -1074,6 +1109,11 @@ impl RecoveryGate {
                 partition,
                 group: group.map(str::to_owned),
             });
+        }
+        if self.checkpoint_pending.load(Ordering::Acquire) {
+            return Err(StromaError::Io(
+                "checkpoint installation pending; retry recovery".into(),
+            ));
         }
         Ok(())
     }
@@ -1456,7 +1496,9 @@ impl QueueHandleInner {
     }
 
     pub fn role(&self) -> QueueRole {
-        if self.recovery_gate.sealed.load(Ordering::Acquire) {
+        if self.recovery_gate.sealed.load(Ordering::Acquire)
+            || self.recovery_gate.checkpoint_pending.load(Ordering::Acquire)
+        {
             return QueueRole::Frozen;
         }
         QueueRole::from_u8(self.role.load(Ordering::Acquire))

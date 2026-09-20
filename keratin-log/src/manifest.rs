@@ -62,7 +62,7 @@ impl Manifest {
         }
     }
 
-    fn read_from(f: &mut File) -> io::Result<Self> {
+    pub(crate) fn read_from(f: &mut File) -> io::Result<Self> {
         let mut buf = Vec::new();
         f.read_to_end(&mut buf)?;
 

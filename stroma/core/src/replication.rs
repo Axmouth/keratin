@@ -5,14 +5,13 @@
 //! helpers, lifted out of stroma.rs. Re-exported from `stroma` so existing
 //! `stroma_core::` and `crate::stroma::` paths keep resolving.
 
-use std::fs;
 use std::sync::atomic::Ordering;
 
 use keratin_log::{KDurability, Keratin, KeratinReplicaExt, Message, ReplicatedAppendOutcome};
 
 use crate::engine::PartitionKind;
 use crate::event::StromaEvent;
-use crate::state::{QueueInternalState, QueueRole, SnapshotMeta};
+use crate::state::{QueueRole, SnapshotMeta};
 use crate::stream_state::StreamCommand;
 use crate::stroma::{
     QueueDemotionOutcome, QueuePromotionOutcome, Stroma, decode_err, event_msg, io_err,
@@ -110,7 +109,7 @@ pub struct ReplicatedQueueApplyOutcome {
 /// This is not a message transfer. Messages at or after `message_next_offset`
 /// still need to be replicated through the message-log replication path before
 /// the follower can safely promote.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FollowerStateCheckpointInstall {
     /// Exact source epochs. Assignment/replication fencing must establish these
     /// locally before checkpoint installation; installation cannot advance them.
@@ -899,130 +898,6 @@ impl Stroma {
         Ok(ReplicatedQueueApplyOutcome {
             message_log,
             event_log,
-        })
-    }
-
-    pub async fn install_follower_state_checkpoint(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        install: FollowerStateCheckpointInstall,
-    ) -> Result<FollowerStateCheckpointInstallOutcome> {
-        let expected_applied_event_offset = install.event_next_offset.saturating_sub(1);
-        if install.applied_event_offset != expected_applied_event_offset {
-            return Err(StromaError::InvalidArgument(format!(
-                "checkpoint applied event offset {} does not match event continuation {}",
-                install.applied_event_offset, install.event_next_offset
-            )));
-        }
-
-        let mut checkpoint_state = QueueInternalState::new(topic.to_string(), part);
-        let snapshot_meta = checkpoint_state
-            .load_snapshot(&install.state_snapshot)
-            .map_err(|err| StromaError::Decode(format!("checkpoint snapshot invalid: {err}")))?;
-        if snapshot_meta.last_snapshot_event_offset != install.applied_event_offset {
-            return Err(StromaError::InvalidArgument(format!(
-                "checkpoint snapshot event offset {} does not match applied event offset {}",
-                snapshot_meta.last_snapshot_event_offset, install.applied_event_offset
-            )));
-        }
-        let lowest_state_referenced_message = checkpoint_state.lowest_not_settled_offset();
-        if install.message_next_offset > lowest_state_referenced_message {
-            return Err(StromaError::InvalidArgument(format!(
-                "checkpoint message continuation {} is ahead of lowest state-referenced message {}",
-                install.message_next_offset, lowest_state_referenced_message
-            )));
-        }
-
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
-        let mut apply_state = qh.follower_apply_state().await;
-        let role = qh.role();
-        if role != QueueRole::Follower {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Follower,
-                actual: role,
-            });
-        }
-        let local_message_epoch = qh.msg_log().current_epoch();
-        let local_event_epoch = qh.event_log().current_epoch();
-        if install.message_epoch != local_message_epoch || install.event_epoch != local_event_epoch
-        {
-            tracing::warn!(
-                topic,
-                partition = part,
-                group,
-                checkpoint_message_epoch = install.message_epoch,
-                checkpoint_event_epoch = install.event_epoch,
-                local_message_epoch,
-                local_event_epoch,
-                "checkpoint rejected before reset: epoch mismatch"
-            );
-            return Err(StromaError::InvalidArgument(format!(
-                "checkpoint epochs ({}, {}) do not match local epochs ({local_message_epoch}, {local_event_epoch})",
-                install.message_epoch, install.event_epoch,
-            )));
-        }
-        *apply_state = true;
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
-
-        qh.msg_log()
-            .destructive_reset_to_checkpoint_at_epoch(
-                install.message_next_offset,
-                install.message_epoch,
-            )
-            .await
-            .map_err(io_err)?;
-        qh.event_log()
-            .destructive_reset_to_checkpoint_at_epoch(
-                install.event_next_offset,
-                install.event_epoch,
-            )
-            .await
-            .map_err(io_err)?;
-
-        qh.work_queue()?
-            .install_snapshot_state(checkpoint_state, snapshot_meta)
-            .await
-            .map_err(|err| {
-                StromaError::Io(format!(
-                    "checkpoint state install failed for tp={topic} part={part} group={group:?}: {err}"
-                ))
-            })?;
-        qh.applied_upto()
-            .store(install.applied_event_offset, Ordering::Release);
-        qh.set_dirty_snapshot(false);
-
-        let dir = self.snap_dir(topic, part, group);
-        let topic_owned = topic.to_string();
-        let group_owned = group.map(str::to_string);
-        let stroma = self.clone();
-        let state_snapshot = install.state_snapshot.clone();
-        let applied_event_offset = install.applied_event_offset;
-        let recovery_gate = qh.recovery_gate.clone();
-        tokio::task::spawn_blocking(move || {
-            let _snapshot_io = recovery_gate.snapshot_io.lock();
-            recovery_gate.ensure_open(&topic_owned, part, group_owned.as_deref())?;
-            fs::create_dir_all(&dir).map_err(io_err)?;
-            stroma.write_queue_snapshot(
-                &topic_owned,
-                part,
-                group_owned.as_deref(),
-                applied_event_offset,
-                &state_snapshot,
-            )
-        })
-        .await
-        .map_err(|err| StromaError::Io(err.to_string()))??;
-
-        *apply_state = false;
-        Ok(FollowerStateCheckpointInstallOutcome {
-            message_next_offset: install.message_next_offset,
-            event_next_offset: install.event_next_offset,
-            applied_event_offset: install.applied_event_offset,
-            snapshot_meta,
         })
     }
 }

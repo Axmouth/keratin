@@ -130,6 +130,42 @@ pub enum WriterCmd {
 }
 
 impl Keratin {
+    /// Rebuild unopened logs for an interrupted checkpoint installation.
+    ///
+    /// Destructive: the caller must have a durable installation journal which
+    /// prevents ordinary access until the entire checkpoint is installed.
+    /// Entries are (root, checkpoint next offset, expected epoch). All roots are
+    /// locked and all epochs checked before any files are removed. The outer
+    /// journal must remain pending if any rebuild fails.
+    pub async fn rebuild_for_checkpoint_recovery(logs: Vec<(PathBuf, u64, u64)>) -> io::Result<()> {
+        tokio::task::spawn_blocking(move || {
+            let mut locks = Vec::with_capacity(logs.len());
+            for (root, _, expected_epoch) in &logs {
+                let lock = std::fs::OpenOptions::new()
+                    .read(true)
+                    .write(true)
+                    .open(root.join(".keratin.lock"))?;
+                lock.try_lock_exclusive()?;
+                locks.push(lock);
+                let manifest = crate::manifest::Manifest::read_from(&mut File::open(
+                    crate::manifest::Manifest::path(root),
+                )?)?;
+                if manifest.epoch != *expected_epoch {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "checkpoint recovery cannot change the persisted epoch",
+                    ));
+                }
+            }
+            for (root, next_offset, expected_epoch) in &logs {
+                Log::rebuild_checkpoint_files(root, *next_offset, *expected_epoch)?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(io::Error::other)?
+    }
+
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> std::io::Result<Self> {
         // Reject invalid capacities before creating directories or opening logs.
         let writer_channel_capacity = cfg.writer_channel_capacity()?;

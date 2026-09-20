@@ -75,7 +75,7 @@ fn read_intent(path: &Path) -> Result<Option<SealIntent>> {
 // may have been created without a durable parent entry. Retrying this also
 // completes a previous rename whose directory sync failed.
 #[cfg(unix)]
-fn sync_directories(path: &Path) -> Result<()> {
+pub(super) fn sync_directories(path: &Path) -> Result<()> {
     for ancestor in fs::canonicalize(path).map_err(io_err)?.ancestors() {
         fs::File::open(ancestor)
             .and_then(|file| file.sync_all())
@@ -85,7 +85,7 @@ fn sync_directories(path: &Path) -> Result<()> {
 }
 
 #[cfg(not(unix))]
-fn sync_directories(_path: &Path) -> Result<()> {
+pub(super) fn sync_directories(_path: &Path) -> Result<()> {
     Err(StromaError::Unsupported(
         "durable recovery seals require directory-sync support on this platform".into(),
     ))
@@ -187,6 +187,7 @@ impl Stroma {
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        self.ensure_checkpoint_not_pending(topic, part, group)?;
         let path = self.recovery_seal_path(topic, part, group);
         let previous = read_intent(&path)?;
         if let Some(intent) = &previous {

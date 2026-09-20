@@ -52,6 +52,8 @@ use crate::{
 pub use crate::replication::*;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
+#[path = "checkpoint_install.rs"]
+mod checkpoint_install;
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -799,6 +801,9 @@ pub struct Stroma {
     snapshot_worker_ticks: Arc<Notify>,
 
     #[cfg(test)]
+    checkpoint_fault: Arc<std::sync::Mutex<Option<&'static str>>>,
+
+    #[cfg(test)]
     publish_apply_pause: Arc<std::sync::Mutex<Option<Arc<PublishApplyPause>>>>,
 }
 
@@ -853,6 +858,8 @@ impl Stroma {
             recovery_event_scan_starts: Arc::new(std::sync::Mutex::new(Vec::new())),
             #[cfg(test)]
             snapshot_worker_ticks: Arc::new(Notify::new()),
+            #[cfg(test)]
+            checkpoint_fault: Arc::new(std::sync::Mutex::new(None)),
             #[cfg(test)]
             publish_apply_pause: Arc::new(std::sync::Mutex::new(None)),
         };
@@ -1257,6 +1264,7 @@ impl Stroma {
         // queue_handle re-opens and recovers the now-valid log.
         let _lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
         self.ensure_partition_not_sealed(tp, part, group)?;
+        self.ensure_checkpoint_not_pending(tp, part, group)?;
         let event_log = self.event_log_init(tp, part, group).await?;
         let prev_role = event_log.role();
         event_log.become_follower();
@@ -1395,6 +1403,10 @@ impl Stroma {
             if let Some(inner) = slot.handle.get()
                 && !slot.is_evicting()
             {
+                if inner.recovery_gate.checkpoint_pending.load(Ordering::Acquire) {
+                    self.resume_live_checkpoint(tp, part, group, inner).await?;
+                    continue;
+                }
                 inner.ensure_not_recovery_sealed()?;
                 return Ok(self.ticket_for(tp, part, group, inner));
             }
@@ -1423,6 +1435,12 @@ impl Stroma {
                 tokio::task::yield_now().await;
                 continue;
             }
+
+            let _lifecycle = if slot.handle.get().is_none() {
+                self.resume_cold_checkpoint(tp, part, group, _lifecycle).await?
+            } else {
+                _lifecycle
+            };
 
             let qh = slot
                 .handle
@@ -1583,6 +1601,8 @@ impl Stroma {
 
         qh.cancel_background_tasks();
 
+        qh.recovery_gate.retire_snapshots().await?;
+
         // Shut down old handle. Pending writes flush and the logs close. The
         // stream actor exits when the slot drops its sender, so it has no
         // explicit shutdown command.
@@ -1644,6 +1664,7 @@ impl Stroma {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
 
         self.ensure_partition_not_sealed(topic, part, group)?;
+        self.ensure_checkpoint_not_pending(topic, part, group)?;
 
         // 1. Install a destroying tombstone (evicting) so concurrent materialize
         //    parks instead of reopening the dir. Capture the slot we displaced.
@@ -1696,6 +1717,7 @@ impl Stroma {
             // ops error, no hang), so an append in progress is not cut off.
             qh.quiesce_for_teardown().await;
             qh.cancel_background_tasks();
+            qh.recovery_gate.retire_snapshots().await?;
             if let Some(wq) = qh.as_work_queue() {
                 wq.shutdown().await;
             }
@@ -2973,6 +2995,7 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
         let qh = qh.resolve()?;
+        let snapshot_generation = qh.recovery_gate.checkpoint_generation.load(Ordering::Acquire);
         let blob = if let Ok(blob) = qh.encode_snapshot(applied_upto).await {
             blob
         } else {
@@ -2985,10 +3008,10 @@ impl Stroma {
         let stroma = self.clone();
         let recovery_gate = qh.recovery_gate.clone();
         tokio::task::spawn_blocking(move || {
-            let _snapshot_io = recovery_gate.snapshot_io.lock();
-            recovery_gate.ensure_open(&tp, part, group.as_deref())?;
-            fs::create_dir_all(&dir).map_err(io_err)?;
-            stroma.write_queue_snapshot(&tp, part, group.as_deref(), applied_upto, &blob)
+            recovery_gate.write_snapshot(snapshot_generation, &tp, part, group.as_deref(), || {
+                fs::create_dir_all(&dir).map_err(io_err)?;
+                stroma.write_queue_snapshot(&tp, part, group.as_deref(), applied_upto, &blob)
+            })
         })
         .await
         .map_err(|e| StromaError::Io(e.to_string()))??;
@@ -3716,6 +3739,7 @@ impl Stroma {
             if let Some(q) = slot.handle.get() {
                 let q = q.clone();
                 futs.push(async move {
+                    q.recovery_gate.retire_snapshots().await?;
                     if let Some(wq) = q.as_work_queue() {
                         wq.shutdown().await;
                     }
@@ -3785,7 +3809,8 @@ impl Stroma {
             }
 
             let kind = self.read_partition_kind(&tp, *part, group.as_deref());
-            let sealed = self.ensure_partition_not_sealed(&tp, *part, group.as_deref()).is_err();
+            let sealed = self.ensure_partition_not_sealed(&tp, *part, group.as_deref()).is_err()
+                || self.ensure_checkpoint_not_pending(&tp, *part, group.as_deref()).is_err();
             queues.push(QueueDebugInfo {
                 topic: tp.to_string(),
                 partition: *part,
@@ -4343,6 +4368,7 @@ impl Stroma {
     ) -> Result<()> {
         let lifecycle = self.lock_partition_lifecycle(tp, part, None).await;
         self.ensure_partition_not_sealed(tp, part, None)?;
+        self.ensure_checkpoint_not_pending(tp, part, None)?;
         // Reject declaring a queue partition as a stream (it would materialize a
         // stream engine over queue data). The reverse guard lives in `declare`.
         if self.partition_kind_marker(tp, part, None) == Some(PartitionKind::Queue) {
@@ -4920,6 +4946,7 @@ impl Stroma {
     ) -> Result<()> {
         let lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
         self.ensure_partition_not_sealed(tp, part, group)?;
+        self.ensure_checkpoint_not_pending(tp, part, group)?;
         // A topic/partition is one channel kind for life. Reject re-declaring a
         // stream partition as a queue (it would materialize a queue engine over
         // stream data). Stamp the Queue marker so the reverse case (declaring this
