@@ -69,7 +69,8 @@ pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
 
 #[cfg(windows)]
 pub(crate) fn fsync_dir(_path: &Path) -> io::Result<()> {
-    // Windows rename() is already metadata-durable.
+    // Windows directory metadata flushing is not implemented here. Callers
+    // must not treat this no-op as a power-loss durability guarantee.
     Ok(())
 }
 

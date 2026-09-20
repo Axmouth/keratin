@@ -143,6 +143,14 @@ impl Manifest {
     }
 
     pub fn store_atomic(&self, root: &Path) -> io::Result<()> {
+        self.store_atomic_with_rename(root, |from, to| fs::rename(from, to))
+    }
+
+    fn store_atomic_with_rename(
+        &self,
+        root: &Path,
+        rename: impl FnOnce(&Path, &Path) -> io::Result<()>,
+    ) -> io::Result<()> {
         fs::create_dir_all(root.join("tmp"))?;
 
         let tmp = Self::tmp_path(root);
@@ -184,17 +192,16 @@ impl Manifest {
 
         f.write_all(&out)?;
         f.flush()?;
-        f.sync_data()?;
+        f.sync_all()?;
+        drop(f);
 
-        // atomic replace
-        // On Windows, rename over existing can be tricky; simplest: remove then rename.
-        if finalp.exists() {
-            let _ = fs::remove_file(&finalp);
-        }
-
-        fs::rename(&tmp, &finalp)?;
+        // Replace the existing file directly. Unlinking first exposes a missing
+        // manifest on error/crash, which load_or_create would reset to epoch 0.
+        // std::fs::rename also supports replacing an existing file on Windows.
+        rename(&tmp, &finalp)?;
 
         fsync_dir(root)?;
+        fsync_dir(&root.join("tmp"))?;
 
         Ok(())
     }
@@ -226,4 +233,45 @@ fn manifest_dirty_flag_roundtrip() {
     m1.store_atomic(&dir.root).unwrap();
     let m2 = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
     assert!(!m2.clean_shutdown);
+}
+
+#[test]
+fn failed_manifest_rename_preserves_the_previous_fence_and_can_retry() {
+    let dir = crate::test_dir!("manifest_failed_rename");
+    let mut old = Manifest::default_new(123, 4096, 128);
+    old.epoch = 7;
+    old.next_offset = 23;
+    old.store_atomic(&dir.root).unwrap();
+    let mut new = old.clone();
+    new.epoch = 8;
+    new.next_offset = 29;
+    let failure = new.store_atomic_with_rename(&dir.root, |_, _| {
+        Err(io::Error::other("injected rename failure"))
+    });
+    assert!(failure.is_err());
+    let recovered = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
+    assert_eq!(
+        recovered.epoch, 7,
+        "failed replacement must retain the old fence"
+    );
+    assert_eq!(recovered.next_offset, 23);
+    new.store_atomic(&dir.root).unwrap();
+    let recovered = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap();
+    assert_eq!((recovered.epoch, recovered.next_offset), (8, 29));
+}
+
+#[test]
+fn manifest_replacement_keeps_an_open_reader_on_the_previous_generation() {
+    let dir = crate::test_dir!("manifest_open_reader");
+    let mut old = Manifest::default_new(123, 4096, 128);
+    old.epoch = 7;
+    old.store_atomic(&dir.root).unwrap();
+    let mut reader = File::open(Manifest::path(&dir.root)).unwrap();
+    old.epoch = 8;
+    old.store_atomic(&dir.root).unwrap();
+    assert_eq!(Manifest::read_from(&mut reader).unwrap().epoch, 7);
+    assert_eq!(
+        Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap().epoch,
+        8
+    );
 }
