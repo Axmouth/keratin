@@ -1143,10 +1143,14 @@ impl Log {
         self.flush()?;
         self.fsync()?;
 
-        self.manifest.epoch = epoch;
-        self.manifest.next_offset = self.next_offset;
-        self.manifest.active_base_offset = self.active.base_offset;
-        self.manifest.store_atomic(&self.root)?;
+        // Publish the in-memory fence only after persistence succeeds. Otherwise
+        // a failed store makes a same-epoch retry return early without writing.
+        let mut manifest = self.manifest.clone();
+        manifest.epoch = epoch;
+        manifest.next_offset = self.next_offset;
+        manifest.active_base_offset = self.active.base_offset;
+        manifest.store_atomic(&self.root)?;
+        self.manifest = manifest;
         self.log_state.epoch.store(epoch, Ordering::Release);
         self.log_state.diagnostics.lock().record(
             LogControlKind::EpochAdvanced,
@@ -1480,6 +1484,44 @@ impl Log {
 fn seg_log_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.log", base))
 }
+
+#[test]
+fn failed_epoch_persistence_must_not_make_retry_a_successful_noop() {
+    let dir = crate::test_dir!("epoch_persistence_retry");
+    let cfg = crate::KeratinConfig::test_default();
+    let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+    let (mut log, _) = Log::open(
+        &dir.root,
+        0,
+        cfg.segment_max_bytes,
+        cfg.index_stride_bytes,
+        cfg.flush_target_bytes,
+        cfg.tail_cache_bytes,
+        cfg.segment_preallocate_bytes,
+        false,
+        state.clone(),
+    )
+    .unwrap();
+    // Isolate the explicit epoch-store failure from periodic manifest updates.
+    log.manifest_flush_interval = Duration::MAX;
+    let blocked = Manifest::tmp_path(&dir.root);
+    fs::create_dir(&blocked).unwrap();
+    assert!(log.advance_epoch(3).is_err());
+    assert!(
+        log.advance_epoch(3).is_err(),
+        "retry must still attempt persistence"
+    );
+    assert_eq!(log.current_epoch(), 0);
+    assert_eq!(state.epoch.load(Ordering::Acquire), 0);
+    fs::remove_dir(&blocked).unwrap();
+    assert_eq!(log.advance_epoch(3).unwrap(), 3);
+    let stored =
+        Manifest::load_or_create(&dir.root, 0, cfg.segment_max_bytes, cfg.index_stride_bytes)
+            .unwrap();
+    assert_eq!(stored.epoch, 3);
+    assert_eq!(state.epoch.load(Ordering::Acquire), 3);
+}
+
 fn seg_idx_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.idx", base))
 }
