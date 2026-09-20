@@ -1,5 +1,7 @@
 # Keratin
 
+This experimental branch preserves [speculative queue delivery](experiments/SPECULATIVE_DELIVERY.md); it remains disabled by default and has open adoption gates.
+
 **Durability, Layer by Layer.**
 
 *The tough outer layer for your inner state.*

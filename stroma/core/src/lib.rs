@@ -34,7 +34,7 @@ pub use state::{
 pub use stream_state::RetentionConfig;
 pub use stroma::{
     DestroyOutcome, DiskUsedBreakdownEntry, EnqueuedStreamAppend, EvictOutcome,
-    FollowerStateCheckpointInstall,
+    ExperimentalStageObserver, FollowerStateCheckpointInstall,
     FollowerStateCheckpointInstallOutcome, GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome,
     MessageContentType, MessageHeaders, MessageInspectionItem, MessageInspectionPage,
     OwnerReplicationBatch, OwnerReplicationRead, OwnerStateCheckpoint, PublishItem, QuarantineInfo,

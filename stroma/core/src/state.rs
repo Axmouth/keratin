@@ -321,6 +321,11 @@ pub struct QueueInternalState {
     last_snapshot_timestamp: u64,
     last_snapshot_event_offset: u64,
 
+    // Volatile staged publications, excluded from snapshots. None is not yet
+    // dispatched; Some(deadline) transfers an existing speculative lease at commit.
+    speculative_pending:
+        BTreeMap<Offset, Option<(UnixMillis, tokio_util::sync::CancellationToken)>>,
+
     // ----- settlement state -----
     // Terminal settlements (ack, terminal nack, DLQ commit) as offset ranges,
     // stored from 0. The contiguous run covering offset 0 is the frontier
@@ -376,6 +381,20 @@ pub struct QueueInternalState {
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
 #[derive(Debug)]
 pub enum QueueCommand {
+    ExperimentalStage {
+        base: Offset,
+        count: usize,
+        reserve: usize,
+        deadline: UnixMillis,
+        cancel: tokio_util::sync::CancellationToken,
+        response: oneshot::Sender<usize>,
+    },
+    ExperimentalAbandon {
+        base: Offset,
+        count: usize,
+        discard: bool,
+        response: oneshot::Sender<()>,
+    },
     Shutdown {
         response: Option<oneshot::Sender<()>>,
     },
@@ -472,7 +491,7 @@ pub enum QueueCommand {
     },
     ExportStateCheckpoint {
         last_snapshot_event_offset: u64,
-        response: Option<oneshot::Sender<QueueStateCheckpointSnapshot>>,
+        response: Option<oneshot::Sender<Option<QueueStateCheckpointSnapshot>>>,
     },
     LoadSnapshot {
         data: Vec<u8>,
@@ -616,6 +635,9 @@ impl QueueCommand {
 
             // === Producer path — must accept writes but yield to delivery/settlement ===
             // Under overload, throttling publish is correct. Natural backpressure upstream.
+            QueueCommand::ExperimentalStage { .. } | QueueCommand::ExperimentalAbandon { .. } => {
+                CommandPrio::Medium
+            }
             QueueCommand::Enqueue { .. } => CommandPrio::Medium,
             QueueCommand::EnqueueMany { .. } => CommandPrio::Medium,
             // Same priority as EnqueueMany so a cancel never overtakes the enqueue
@@ -653,6 +675,8 @@ impl QueueCommand {
     pub fn variant_name(&self) -> &str {
         match self {
             QueueCommand::Shutdown { .. } => "Shutdown",
+            QueueCommand::ExperimentalStage { .. } => "ExperimentalStage",
+            QueueCommand::ExperimentalAbandon { .. } => "ExperimentalAbandon",
             QueueCommand::Enqueue { .. } => "Enqueue",
             QueueCommand::EnqueueMany { .. } => "EnqueueMany",
             QueueCommand::CancelEnqueueMany { .. } => "CancelEnqueueMany",
@@ -1622,6 +1646,35 @@ impl QueueHandleInner {
         let prio = cmd.prio();
 
         match cmd {
+            QueueCommand::ExperimentalStage {
+                base,
+                count,
+                reserve,
+                deadline,
+                cancel,
+                response,
+            } => {
+                let n = state.experimental_stage(base, count, reserve, deadline, cancel);
+                let _ = response.send(n);
+            }
+            QueueCommand::ExperimentalAbandon {
+                base,
+                count,
+                discard,
+                response,
+            } => {
+                for off in base..base + count as u64 {
+                    if discard {
+                        state.speculative_pending.remove(&off);
+                    } else if let Some(lease) = state.speculative_pending.get_mut(&off) {
+                        *lease = None;
+                    } else {
+                        state.release_inflight(off);
+                    }
+                }
+                let _ = response.send(());
+            }
+
             QueueCommand::Shutdown { response } => {
                 // No more commands will be processed after this, so we can ignore the rest of the channel.
                 if let Some(r) = response {
@@ -1865,6 +1918,13 @@ impl QueueHandleInner {
                 force,
                 response,
             } => {
+                if !state.speculative_pending.is_empty() {
+                    if let Some(r) = response {
+                        let _ = r.send(None);
+                    }
+                    return (Some(true), false);
+                }
+
                 let trigger_time = Instant::now();
                 handle.metrics.snapshot.attempts.incr();
 
@@ -1919,6 +1979,13 @@ impl QueueHandleInner {
                 last_snapshot_event_offset,
                 response,
             } => {
+                if !state.speculative_pending.is_empty() {
+                    if let Some(r) = response {
+                        let _ = r.send(None);
+                    }
+                    return (Some(true), false);
+                }
+
                 let trigger_time = Instant::now();
                 handle.metrics.snapshot.attempts.incr();
 
@@ -1954,10 +2021,10 @@ impl QueueHandleInner {
                     metrics_bg.snapshot.total_latency.observe(total);
 
                     if let Some(r) = response {
-                        let _ = r.send(QueueStateCheckpointSnapshot {
+                        let _ = r.send(Some(QueueStateCheckpointSnapshot {
                             message_checkpoint_offset,
                             state_snapshot: blob,
-                        });
+                        }));
                     }
                 });
             }
@@ -2431,12 +2498,14 @@ impl QueueHandleInner {
                 rx.await.map_err(|_| QueueHandleError::ActorGone)
             }
         };
-        self.last_snapshot_event_offset.store(
-            last_snapshot_event_offset,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        self.last_snapshot_timestamp
-            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        if result.is_ok() {
+            self.last_snapshot_event_offset.store(
+                last_snapshot_event_offset,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.last_snapshot_timestamp
+                .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        }
         self.creating_snapshot
             .store(false, std::sync::atomic::Ordering::SeqCst);
         result
@@ -2458,15 +2527,18 @@ impl WorkQueueHandle<'_> {
             })
             .await;
         let res = rx.await;
-        self.last_snapshot_event_offset.store(
-            last_snapshot_event_offset,
-            std::sync::atomic::Ordering::Relaxed,
-        );
-        self.last_snapshot_timestamp
-            .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        if matches!(&res, Ok(Some(_))) {
+            self.last_snapshot_event_offset.store(
+                last_snapshot_event_offset,
+                std::sync::atomic::Ordering::Relaxed,
+            );
+            self.last_snapshot_timestamp
+                .store(unix_millis(), std::sync::atomic::Ordering::Relaxed);
+        }
         self.creating_snapshot
             .store(false, std::sync::atomic::Ordering::SeqCst);
-        res.map_err(|_| QueueHandleError::ActorGone)
+        res.map_err(|_| QueueHandleError::ActorGone)?
+            .ok_or(QueueHandleError::SnapshotNotCreated)
     }
 }
 
@@ -2607,6 +2679,47 @@ impl WorkQueueHandle<'_> {
             .command_enqueue(QueueCommand::GetSettledUntil { response: Some(tx) })
             .await;
         rx.await.unwrap_or(0)
+    }
+
+    /// Experiment only. The caller retains the original publish owner-operation lease.
+    pub async fn experimental_stage(
+        &self,
+        base: Offset,
+        count: usize,
+        reserve: usize,
+        deadline: UnixMillis,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> Result<usize, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_enqueue(QueueCommand::ExperimentalStage {
+            base,
+            count,
+            reserve,
+            deadline,
+            cancel,
+            response: tx,
+        })
+        .await
+        .map_err(|e| QueueHandleError::Internal(e.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
+    pub async fn experimental_abandon(
+        &self,
+        base: Offset,
+        count: usize,
+        discard: bool,
+    ) -> Result<(), QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_enqueue(QueueCommand::ExperimentalAbandon {
+            base,
+            count,
+            discard,
+            response: tx,
+        })
+        .await
+        .map_err(|e| QueueHandleError::Internal(e.to_string()))?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
     pub async fn poll_ready_and_mark(
@@ -2915,6 +3028,7 @@ impl QueueInternalState {
             partition,
             last_snapshot_timestamp: 0,
             last_snapshot_event_offset: 0,
+            speculative_pending: BTreeMap::new(),
             settled: RangeSet::new(),
             inflight: BTreeMap::new(),
             pending_dlq: BTreeMap::new(),
@@ -2938,6 +3052,7 @@ impl QueueInternalState {
             partition,
             last_snapshot_timestamp: 0,
             last_snapshot_event_offset: 0,
+            speculative_pending: BTreeMap::new(),
             settled: RangeSet::new(),
             inflight: BTreeMap::new(),
             pending_dlq: BTreeMap::new(),
@@ -3051,6 +3166,34 @@ impl QueueInternalState {
     //         .flat_map(|range| range.start.max(from)..range.end)
     // }
 
+    pub fn experimental_stage(
+        &mut self,
+        base: Offset,
+        count: usize,
+        reserve: usize,
+        deadline: UnixMillis,
+        cancel: tokio_util::sync::CancellationToken,
+    ) -> usize {
+        let clear =
+            self.ready.is_empty() && !self.speculative_pending.values().any(Option::is_none);
+        let n = if clear { reserve.min(count) } else { 0 };
+        for i in 0..count {
+            assert!(
+                self.speculative_pending
+                    .insert(
+                        base + i as u64,
+                        if i < n {
+                            Some((deadline, cancel.clone()))
+                        } else {
+                            None
+                        }
+                    )
+                    .is_none()
+            );
+        }
+        n
+    }
+
     pub fn poll_ready_and_mark(
         &mut self,
         max: usize,
@@ -3069,6 +3212,11 @@ impl QueueInternalState {
         // `upper` is an exclusive deliverable ceiling: a replica-durable queue
         // passes its committed-replicated watermark so consumers never see an
         // offset that is not yet durable on enough replicas. u64::MAX disables it.
+        let pending = self
+            .speculative_pending
+            .iter()
+            .find_map(|(&off, lease)| lease.is_none().then_some(off));
+        let upper = pending.map_or(upper, |off| upper.min(off));
         let range = from..upper;
         // Iterate overlapping ranges from `from` onwards, flatten to individual
         // offsets, capping each interval's end at `upper` (a ready interval can
@@ -3434,6 +3582,7 @@ impl QueueInternalState {
     pub fn enqueue(&mut self, offset: Offset, retries: u32, expire_at: Option<UnixMillis>) {
         // We assume it is only used on messages that have been properly stored earlier
         // TODO: possibly use different checks as ack window has limited trust
+        let speculative_deadline = self.speculative_pending.remove(&offset).flatten();
         if self.is_settled(offset) {
             return;
         }
@@ -3446,6 +3595,11 @@ impl QueueInternalState {
         // message keeps its first deadline across ready->inflight->ready.
         if let Some(deadline) = expire_at {
             self.set_ttl_deadline(offset, deadline);
+        }
+        if let Some((deadline, cancel)) = speculative_deadline {
+            if !cancel.is_cancelled() {
+                self.mark_inflight(offset, deadline);
+            }
         }
     }
 
@@ -3463,6 +3617,7 @@ impl QueueInternalState {
     pub fn cancel_enqueue_many(&mut self, offs: &[Offset]) {
         let settled = self.settled_until();
         for &o in offs {
+            self.speculative_pending.remove(&o);
             if o < settled {
                 continue;
             }
@@ -3525,6 +3680,7 @@ impl QueueInternalState {
     }
 
     pub fn enqueue_delayed(&mut self, offset: Offset, not_before: u64) {
+        self.speculative_pending.remove(&offset);
         let was_earlier_or_empty = self
             .delayed_enqueue_heap
             .peek()

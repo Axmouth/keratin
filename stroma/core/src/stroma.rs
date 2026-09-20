@@ -72,6 +72,25 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     })
 }
 
+/// Isolated broker experiment: called under publication ordering and owner lease,
+/// after offsets/event-send, before durable enqueue application. It must register
+/// all staged offsets, including those ineligible for speculative dispatch.
+#[async_trait::async_trait]
+pub trait ExperimentalStageObserver: Send + Sync {
+    fn staging_complete(&self) {}
+    fn durable_applied(&self) {}
+    async fn before_apply(&self) -> bool {
+        true
+    }
+    async fn staged(
+        &self,
+        queue: QueueHandle,
+        base: Offset,
+        count: usize,
+        eligible: bool,
+    ) -> Result<()>;
+}
+
 pub struct PublishItem {
     pub headers: MessageHeaders,
     pub payload: Vec<u8>,
@@ -2393,6 +2412,7 @@ impl Stroma {
         msg_barrier: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
         msgs_count: usize,
         bytes_count: usize,
+        experimental_failure: bool,
     ) -> Result<Option<Offset>> {
         let qh = qh.resolve()?;
         let start = Instant::now();
@@ -2405,6 +2425,10 @@ impl Stroma {
             Ok(inner) => inner.map_err(io_err)?,
             Err(_) => return Err(io_err("event writer dropped")),
         };
+
+        if experimental_failure {
+            return Ok(None);
+        }
 
         // Gate the in-memory apply on the message payload becoming durable. If it
         // did not, the event-log Enqueue is durable but must not be applied or
@@ -3855,6 +3879,19 @@ impl Stroma {
         group: Option<&str>,
         items: Vec<PublishItem>,
     ) -> Result<()> {
+        self.append_message_batch_observed(tp, part, group, items, None)
+            .await
+    }
+
+    pub async fn append_message_batch_observed(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        items: Vec<PublishItem>,
+        observer: Option<Arc<dyn ExperimentalStageObserver>>,
+    ) -> Result<()> {
+        let original_count = items.len();
         if items.is_empty() {
             return Ok(());
         }
@@ -3974,6 +4011,9 @@ impl Stroma {
                 return Ok(());
             }
         };
+        if let Some(observer) = &observer {
+            observer.staging_complete();
+        }
         // Split the batch into immediate and delayed enqueues (a delayed publish
         // does not carry a TTL yet, matching the serial path). Both event kinds are
         // appended together under the ordering lock, so they stay in msg-offset order
@@ -4034,10 +4074,24 @@ impl Stroma {
                 return Ok(());
             }
         };
-        // Reserve visibility order while append order is still held. Writers
-        // continue staging/flushing later batches while applications wait.
+        if let Some(observer) = &observer {
+            let eligible = completion_items.len() == original_count
+                && completion_items
+                    .iter()
+                    .all(|ci| ci.meta.not_before.is_none() && ci.meta.expire_at.is_none());
+            if let Err(err) = observer
+                .staged(qh.clone(), base, count as usize, eligible)
+                .await
+            {
+                tracing::error!(base, count, "experimental staging observer failed: {err}");
+            }
+        }
+        // Reserve application order before releasing publication order. Only
+        // visibility/confirmation waits for the predecessor; both log writers
+        // continue staging and flushing later batches in parallel.
         let mut apply_turn = order_guard.reserve_apply();
         drop(order_guard);
+
         #[cfg(test)]
         let apply_pause = self
             .publish_apply_pause
@@ -4053,6 +4107,11 @@ impl Stroma {
                 pause.entered.notify_one();
                 pause.release.notified().await;
             }
+            let experimental_failure = if let Some(observer) = &observer {
+                !observer.before_apply().await
+            } else {
+                false
+            };
             let outcome = match apply_turn.wait().await {
                 Ok(()) => {
                     stroma
@@ -4063,14 +4122,27 @@ impl Stroma {
                             msg_rx,
                             msgs_count,
                             bytes_count,
+                            experimental_failure,
                         )
                         .await
                 }
                 Err(err) => Err(io_err(err)),
             };
 
+            if observer.is_some() && !matches!(&outcome, Ok(Some(_))) {
+                if let Ok(handle) = qh.resolve() {
+                    let _ = handle
+                        .work_queue()
+                        .expect("queue publish")
+                        .experimental_abandon(base, count as usize, true)
+                        .await;
+                }
+            }
             let release_next = match outcome {
                 Ok(Some(_)) => {
+                    if let Some(observer) = &observer {
+                        observer.durable_applied();
+                    }
                     // Both logs durable, events applied: confirm the producers.
                     for (i, ci) in completion_items.into_iter().enumerate() {
                         ci.completion.complete(Ok(AppendResult {
@@ -4117,7 +4189,8 @@ impl Stroma {
                     false
                 }
             };
-            // An abandoned or failed application cannot release later batches.
+            // Dropping an incomplete turn fails subsequent applications closed.
+            // A failed cancellation must not let later deliveries skip the gap.
             if release_next {
                 apply_turn.complete();
             }
@@ -4621,12 +4694,37 @@ impl Stroma {
         reqs: Vec<AckEventMeta>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
+        self.ack_enqueue_many_fenced(tp, part, group, reqs, completion, None)
+            .await
+    }
+
+    pub async fn ack_enqueue_many_fenced(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<AckEventMeta>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+        fence: Option<(QueueHandle, u64, CancellationToken)>,
+    ) -> Result<()> {
         let ev = StromaEvent::AckMany { reqs };
 
-        let qh = self.queue_handle(tp, part, group).await?;
+        let qh = if let Some((handle, _, _)) = &fence {
+            handle.clone()
+        } else {
+            self.queue_handle(tp, part, group).await?
+        };
         let (owner_operation, event_log) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.event_log())
+            {
+                let lease = h.begin_owner_operation().await?;
+                if let Some((_, generation, cancel)) = &fence {
+                    if h.role_generation() != *generation || cancel.is_cancelled() {
+                        return Err(StromaError::Io("stale speculative settlement".into()));
+                    }
+                }
+                (lease, h.event_log())
+            }
         };
         let event_msg = event_msg(&ev)?;
         let outter_completion =
@@ -4722,9 +4820,40 @@ impl Stroma {
         reason_override: Option<DeadLetterReason>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
-        let qh = self.queue_handle(tp, part, group).await?;
+        self.nack_enqueue_many_with_reason_fenced(
+            tp,
+            part,
+            group,
+            reqs,
+            reason_override,
+            completion,
+            None,
+        )
+        .await
+    }
+
+    pub async fn nack_enqueue_many_with_reason_fenced(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        reqs: Vec<NackEventMeta>,
+        reason_override: Option<DeadLetterReason>,
+        completion: Box<dyn AppendCompletion<IoError> + Send>,
+        fence: Option<(QueueHandle, u64, CancellationToken)>,
+    ) -> Result<()> {
+        let qh = if let Some((handle, _, _)) = &fence {
+            handle.clone()
+        } else {
+            self.queue_handle(tp, part, group).await?
+        };
         let h = qh.resolve()?;
         let owner_operation = h.begin_owner_operation().await?;
+        if let Some((_, generation, cancel)) = &fence {
+            if h.role_generation() != *generation || cancel.is_cancelled() {
+                return Err(StromaError::Io("stale speculative settlement".into()));
+            }
+        }
         let event_log = h.event_log();
 
         // Phase 1: durable Nack write
