@@ -51,8 +51,7 @@ async fn cache_read_matches_file_read() {
 
     // Several separate appends so the cache holds multiple flush batches.
     for start in (0..500).step_by(50) {
-        k_on
-            .append_batch(batch(start..start + 50), None)
+        k_on.append_batch(batch(start..start + 50), None)
             .await
             .unwrap();
         k_off
@@ -64,7 +63,19 @@ async fn cache_read_matches_file_read() {
     k_off.sync().await.unwrap();
 
     // Full scan, tail scan, mid-range window, and a single record all agree.
-    for (from, max) in [(0usize, 500usize), (450, 50), (123, 40), (499, 1), (0, 1)] {
+    for (from, max) in [
+        (0usize, 500usize),
+        (450, 50),
+        (123, 40),
+        (499, 1),
+        (0, 1),
+        (450, 2048),
+        (0, 1024),
+        (499, 2048),
+        (500, 2048),
+        (501, 1),
+        (0, 0),
+    ] {
         let on = read_pairs(&k_on, from as u64, max);
         let off = read_pairs(&k_off, from as u64, max);
         assert_eq!(on, off, "cache vs file mismatch at from={from} max={max}");
@@ -99,10 +110,7 @@ async fn read_after_reset_serves_new_not_stale() {
     k.destructive_reset_to_checkpoint(0).await.unwrap();
 
     let fresh: Vec<Message> = (0..100).map(|i| message(format!("fresh-{i}"))).collect();
-    let out = k
-        .append_replicated_batch(2, 0, fresh, None)
-        .await
-        .unwrap();
+    let out = k.append_replicated_batch(2, 0, fresh, None).await.unwrap();
     assert!(matches!(out, ReplicatedAppendOutcome::Applied(_)));
     k.sync().await.unwrap();
 
@@ -153,4 +161,44 @@ async fn replicated_suffix_then_read_is_contiguous() {
     assert_eq!(straddle[9].0, 44);
 
     k.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn short_tail_matches_files_across_rollover_eviction_and_reopen() {
+    for budget in [512, 1 << 20] {
+        let on_dir = test_dir!("short_tail_roll_on");
+        let off_dir = test_dir!("short_tail_roll_off");
+        let config = |cache| KeratinConfig {
+            segment_max_bytes: 1024,
+            tail_cache_bytes: cache,
+            ..KeratinConfig::test_default()
+        };
+        let on = Keratin::open(&on_dir.root, config(budget)).await.unwrap();
+        let off = Keratin::open(&off_dir.root, config(0)).await.unwrap();
+        for base in (0..32).step_by(4) {
+            let messages = || (base..base + 4).map(|id| message(vec![id; 256])).collect();
+            on.append_batch(messages(), None).await.unwrap();
+            off.append_batch(messages(), None).await.unwrap();
+        }
+        let segments = std::fs::read_dir(on_dir.root.join("segments"))
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .unwrap()
+                    .path()
+                    .extension()
+                    .is_some_and(|e| e == "log")
+            })
+            .count();
+        assert!(segments > 1, "fixture must roll segments");
+        for from in [0, 3, 16, 28, 31, 32] {
+            assert_eq!(read_pairs(&on, from, 2048), read_pairs(&off, from, 2048));
+        }
+        on.shutdown().await.unwrap();
+        let reopened = Keratin::open(&on_dir.root, config(budget)).await.unwrap();
+        assert_eq!(read_pairs(&reopened, 28, 2048), read_pairs(&off, 28, 2048));
+        reopened.shutdown().await.unwrap();
+        off.shutdown().await.unwrap();
+    }
 }

@@ -72,15 +72,10 @@ impl LogReader {
     }
 
     pub fn scan_from(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
-        // Tail-following hot path: if the whole request is in the in-memory tail
-        // cache (recent, durable records), serve it from memory and never touch
-        // the segment file the writer is fsyncing. Only take it when the cache
-        // fully satisfies the request; a partial (below the window, or a request
-        // that reaches past durable) falls through to the file scan for behavior
-        // identical to the uncached path.
-        if let Some(recs) = self.tail_cache.read_from(from, max)
-            && recs.len() == max
-        {
+        // A hit covers the entire requested range up to the captured durable
+        // frontier. Tail-following requests can therefore finish from memory
+        // even when fewer than `max` records are currently durable.
+        if let Some(recs) = self.tail_cache.read_from(from, max) {
             return Ok(recs);
         }
 

@@ -13,9 +13,8 @@
 //! offsets (lagging consumers) miss and fall back to the file scan.
 //!
 //! It is a pure cache: a miss is always correct, and it only ever serves offsets
-//! at or below the durable watermark (with `durable == 0` treated as nothing
-//! durable, since it doubles as the empty-log sentinel), so durability semantics
-//! are unchanged.
+//! below the exclusive durable frontier (`0` means nothing durable, `1` includes
+//! offset zero), so durability semantics are unchanged.
 
 use std::collections::VecDeque;
 use std::sync::Arc;
@@ -118,11 +117,11 @@ impl TailCache {
     /// Serve records `[from, from + max)` from the cache, gated on the durable
     /// watermark.
     ///
-    /// - `None`: `from` is below the cached window (or the cache is empty /
-    ///   disabled). The caller must read from the file.
-    /// - `Some(recs)`: the cache covers `from`. `recs` holds the contiguous
-    ///   durable records at/after `from` (possibly empty if nothing at/after
-    ///   `from` is durable yet), capped at `max`.
+    /// - `None`: the requested durable range is not completely cached, the cache
+    ///   is disabled, or decoding/offset validation failed. Read from the file.
+    /// - `Some(recs)`: every record in `[from, min(from + max, durable))` at the
+    ///   captured frontier. This can be shorter than `max`, or empty when `from`
+    ///   is at/past the frontier; a cache hit never returns a partial range.
     pub(crate) fn read_from(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
         if self.byte_budget == 0 || max == 0 {
             return None;
@@ -134,7 +133,7 @@ impl TailCache {
         // Hold the lock only long enough to clone the covering batches' byte
         // handles (cheap Arc refcounts). Decoding runs after the guard drops so a
         // long read never blocks the writer's `push_batch`.
-        let bufs: Vec<Arc<[u8]>> = {
+        let bufs: Vec<(u64, u64, Arc<[u8]>)> = {
             let inner = self.inner.read();
             let oldest = inner.batches.front()?.base_offset;
             if from < oldest {
@@ -148,38 +147,50 @@ impl TailCache {
             // (which grows to thousands of entries under small group-commit
             // flushes). `take_while` then stops at the first batch past `upper`.
             let start = inner.batches.partition_point(|b| b.next_offset <= from);
+            if inner.batches.get(start)?.base_offset > from
+                || inner.batches.back()?.next_offset < upper
+            {
+                return None;
+            }
             inner
                 .batches
                 .range(start..)
                 .take_while(|b| b.base_offset < upper)
-                .map(|b| b.bytes.clone())
+                .map(|b| (b.base_offset, b.next_offset, b.bytes.clone()))
                 .collect()
         };
         // Records are contiguous and ascending, so the loop returns as soon as it
         // has the `upper - from` records requested.
         let mut out = Vec::with_capacity((upper - from) as usize);
-        for buf in &bufs {
-            let buf: &[u8] = buf;
+        let mut expected = from;
+        for (base, next, buf) in &bufs {
+            let mut decoded_next = *base;
             let mut pos = 0usize;
             while pos < buf.len() {
-                match decode_record_prefix(&buf[pos..]) {
-                    Ok((rec, used)) => {
-                        if rec.offset >= from {
-                            out.push(to_owned(rec));
-                            if from + out.len() as u64 >= upper {
-                                return Some(out);
-                            }
-                        }
-                        pos += used;
-                    }
-                    // Cached batches are complete and valid; a decode error means
-                    // corruption in memory. Stop and let the caller re-request
-                    // (the file path re-validates).
-                    Err(_) => break,
+                // A damaged cache must miss, even after a valid prefix. The file
+                // path performs its normal validation of the durable records.
+                let (rec, used) = decode_record_prefix(&buf[pos..]).ok()?;
+                if rec.offset != decoded_next || rec.offset >= *next {
+                    return None;
                 }
+                decoded_next += 1;
+                if rec.offset >= from {
+                    if rec.offset != expected {
+                        return None;
+                    }
+                    out.push(to_owned(rec));
+                    expected += 1;
+                    if expected == upper {
+                        return Some(out);
+                    }
+                }
+                pos += used;
+            }
+            if decoded_next != *next {
+                return None;
             }
         }
-        Some(out)
+        None
     }
 }
 
@@ -343,5 +354,61 @@ mod tests {
         assert!(c.read_from(0, 10).is_none()); // old batch gone
         let recs = c.read_from(100, 10).expect("new window");
         assert_eq!(recs[0].offset, 100);
+    }
+    #[test]
+    fn short_durable_tail_is_served_without_a_segment_file() {
+        let c = Arc::new(cache(1 << 20, 1));
+        let (base, next, bytes) = encode_batch(0, 3, 8);
+        c.push_batch(base, next, bytes);
+        let reader = crate::reader::LogReader::new(
+            "unused-cache-only-root",
+            Arc::new(RwLock::new(std::collections::BTreeMap::new())),
+            c.clone(),
+        );
+        let records = reader.scan_from(0, 2048).unwrap();
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0].offset, 0);
+        assert_eq!(records[0].payload, vec![0; 8]);
+        assert!(reader.scan_from(1, 2048).unwrap().is_empty());
+        c.durable.advance(DurableFrontier::from_exclusive(3));
+        assert_eq!(reader.scan_from(0, 2048).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn incomplete_cached_tail_is_a_miss() {
+        let c = cache(1 << 20, 20);
+        let (base, next, bytes) = encode_batch(0, 3, 8);
+        c.push_batch(base, next, bytes);
+        assert!(c.read_from(0, 20).is_none());
+        assert!(c.read_from(3, 20).is_none());
+        assert_eq!(c.read_from(0, 3).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn corrupt_or_truncated_cached_record_is_a_miss() {
+        for truncate in [false, true] {
+            let c = cache(1 << 20, 3);
+            let (base, next, bytes) = encode_batch(0, 3, 8);
+            let mut bytes = bytes.to_vec();
+            if truncate {
+                bytes.pop();
+            } else {
+                *bytes.last_mut().unwrap() ^= 1;
+            }
+            c.push_batch(base, next, bytes.into());
+            assert!(c.read_from(0, 2048).is_none());
+        }
+    }
+
+    #[test]
+    fn incorrect_cached_offsets_are_a_miss() {
+        for second_offset in [0, 2] {
+            let c = cache(1 << 20, 2);
+            let (_, _, first) = encode_batch(0, 1, 8);
+            let (_, _, second) = encode_batch(second_offset, 1, 8);
+            let bytes: Vec<_> = first.iter().chain(second.iter()).copied().collect();
+            c.push_batch(0, 2, bytes.into());
+            assert!(c.read_from(0, 2).is_none());
+        }
     }
 }
