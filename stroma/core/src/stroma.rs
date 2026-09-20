@@ -72,6 +72,20 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     })
 }
 
+/// The exact two-log dependency of one successfully applied queue batch.
+/// Frontiers are exclusive; epochs identify the log histories that contain it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct QueuePublishCommit {
+    pub message_next: Offset,
+    pub event_next: Offset,
+    pub message_epoch: u64,
+    pub event_epoch: u64,
+}
+
+/// Called once, before individual successful completions, after both logs and
+/// queue application complete. The callback must do bounded, nonblocking work.
+pub type QueuePublishObserver = Box<dyn FnOnce(QueuePublishCommit) + Send>;
+
 pub struct PublishItem {
     pub headers: MessageHeaders,
     pub payload: Vec<u8>,
@@ -2396,8 +2410,6 @@ impl Stroma {
     ) -> Result<Option<Offset>> {
         let qh = qh.resolve()?;
         let start = Instant::now();
-        let event_log = qh.event_log();
-
         // Await BOTH durabilities concurrently so the two fsyncs overlap (join polls
         // both from the first wake - awaiting them sequentially serializes the pair).
         let (event_res, msg_res) = tokio::join!(event_rx, msg_barrier);
@@ -2425,13 +2437,13 @@ impl Stroma {
             self.apply_event_inmem(ev, &qh).await?;
         }
 
-        let new_upto = event_log.head_offset();
+        let event_next = ar.base_offset + ar.count as u64;
         self.metrics
             .event_log_appends
             .batches
             .latency
             .observe(start.elapsed());
-        Ok(Some(new_upto))
+        Ok(Some(event_next))
     }
 
     // ---------------- Public API used by Storage shim ----------------
@@ -3322,14 +3334,36 @@ impl Stroma {
 
         let mut cur = 0u64;
 
-        if let Some((applied_upto, blob)) =
-            self.read_queue_snapshot(&self.snap_file(tp, part, group))?
+        // Legacy snapshots encode an inclusive applied offset, so zero also
+        // represents an empty checkpoint. If event zero is still retained,
+        // rebuild from the log instead of possibly skipping the first enqueue.
+        // Compacted checkpoints have a positive event head and retain their blob.
+        if let Some((applied_upto, blob)) = self
+            .read_queue_snapshot(&self.snap_file(tp, part, group))?
+            .filter(|(applied, _)| *applied != 0 || event_log.head_offset() != 0)
         {
             h.load_snapshot(blob).await.map_err(|err| {
                 StromaError::Io(format!(
                     "snapshot load failed for tp={tp} part={part} group={group:?}: {err}"
                 ))
             })?;
+            // A checkpoint can be durable before its payload backfill. Preserve
+            // the state for follower catch-up, but never reopen it as an owner.
+            if let Some(wq) = h.as_work_queue() {
+                let required = wq.required_message_next().await.map_err(io_err)?;
+                if h.msg_log().next_offset() < required {
+                    tracing::warn!(
+                        tp,
+                        part,
+                        required,
+                        message_next = h.msg_log().next_offset(),
+                        "checkpoint payload backfill incomplete; recovery keeps queue as follower"
+                    );
+                    h.become_follower();
+                    h.msg_log().become_follower();
+                    h.event_log().become_follower();
+                }
+            }
             h.applied_upto().store(applied_upto, Ordering::Release);
             cur = applied_upto.saturating_add(1);
         }
@@ -3855,6 +3889,20 @@ impl Stroma {
         group: Option<&str>,
         items: Vec<PublishItem>,
     ) -> Result<()> {
+        self.append_message_batch_observed(tp, part, group, items, None)
+            .await
+    }
+
+    /// Append with an optional exact queue-dependency observer. Existing callers
+    /// retain the ordinary per-message completion interface.
+    pub async fn append_message_batch_observed(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        items: Vec<PublishItem>,
+        observer: Option<QueuePublishObserver>,
+    ) -> Result<()> {
         if items.is_empty() {
             return Ok(());
         }
@@ -3955,12 +4003,7 @@ impl Stroma {
         // event fsyncs still overlap.
         let mut order_guard = order_lock.lock_owned().await;
         msg_log
-            .append_batch_enqueue_staged(
-                messages,
-                Some(durability),
-                msg_completion,
-                staged_tx,
-            )
+            .append_batch_enqueue_staged(messages, Some(durability), msg_completion, staged_tx)
             .map_err(io_err)?;
         // Every path past this point must complete the producers: the messages are
         // staged, so a silent drop would hang them.
@@ -4036,6 +4079,8 @@ impl Stroma {
         };
         // Reserve visibility order while append order is still held. Writers
         // continue staging/flushing later batches while applications wait.
+        let message_epoch = msg_log.current_epoch();
+        let event_epoch = event_log.current_epoch();
         let mut apply_turn = order_guard.reserve_apply();
         drop(order_guard);
         #[cfg(test)]
@@ -4070,7 +4115,15 @@ impl Stroma {
             };
 
             let release_next = match outcome {
-                Ok(Some(_)) => {
+                Ok(Some(event_next)) => {
+                    if let Some(observer) = observer {
+                        observer(QueuePublishCommit {
+                            message_next: base + count,
+                            event_next,
+                            message_epoch,
+                            event_epoch,
+                        });
+                    }
                     // Both logs durable, events applied: confirm the producers.
                     for (i, ci) in completion_items.into_iter().enumerate() {
                         ci.completion.complete(Ok(AppendResult {
@@ -6780,6 +6833,52 @@ mod tests {
             }
         );
 
+        // Local-tail promotion and the direct owner role API must enforce the
+        // snapshot dependency even without externally supplied target tails.
+        assert!(matches!(
+            follower
+                .promote_queue_follower_to_local_tail("topic", 0, None, 1)
+                .await
+                .unwrap(),
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2
+            }
+        ));
+        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
+        assert!(matches!(
+            follower
+                .promote_queue_follower_if_caught_up("topic", 0, None, 0, 2)
+                .await
+                .unwrap(),
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2
+            }
+        ));
+        shutdown_stroma("checkpoint_before_backfill", &follower).await;
+        drop(follower);
+        let follower = Stroma::open(
+            &follower_dir.root,
+            test_keratin_config(),
+            SnapshotConfig { every_events: 1 },
+        )
+        .await
+        .unwrap();
+        let h = follower.queue_handle("topic", 0, None).await.unwrap();
+        assert_eq!(h.resolve().unwrap().role(), QueueRole::Follower);
+        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
+        assert!(matches!(
+            follower
+                .promote_queue_follower_to_local_tail("topic", 0, None, 1)
+                .await
+                .unwrap(),
+            QueuePromotionOutcome::MessageLogBehind {
+                local_next_offset: 0,
+                expected_next_offset: 2
+            }
+        ));
+
         let message_read = owner
             .read_owner_message_records("topic", 0, None, 0, 10)
             .await
@@ -7181,6 +7280,173 @@ mod tests {
 
         shutdown_stroma("owner_replication_pull_owner", &owner).await;
         shutdown_stroma("owner_replication_pull_follower", &follower).await;
+    }
+
+    #[tokio::test]
+    async fn parallel_follower_partial_failure_drains_both_writers_and_blocks_promotion() {
+        for fail_messages in [true, false] {
+            let dir = test_dir!("parallel_follower_partial");
+            let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+                .await
+                .unwrap();
+            stroma.become_queue_follower("t", 0, None).await.unwrap();
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let h = qh.resolve().unwrap();
+            if fail_messages {
+                h.msg_log().shutdown().await.unwrap();
+            } else {
+                h.event_log().shutdown().await.unwrap();
+            }
+            let result = stroma
+                .apply_replicated_queue_batch(
+                    "t",
+                    0,
+                    None,
+                    Some(ReplicatedMessageBatch {
+                        epoch: 0,
+                        first_offset: 0,
+                        records: vec![Message {
+                            flags: 0,
+                            headers: vec![],
+                            payload: b"payload".to_vec(),
+                        }],
+                        durability: None,
+                    }),
+                    Some(ReplicatedEventBatch {
+                        epoch: 0,
+                        first_offset: 0,
+                        events: vec![StromaEvent::EnqueueMany {
+                            reqs: vec![EnqueueEventMeta {
+                                off: 0,
+                                retries: 0,
+                                expire_at: None,
+                            }],
+                        }],
+                        durability: None,
+                    }),
+                )
+                .await;
+            assert!(result.is_err());
+            // The other writer's completion was drained before returning error.
+            assert_eq!(h.msg_log().next_offset(), if fail_messages { 0 } else { 1 });
+            assert_eq!(
+                h.event_log().next_offset(),
+                if fail_messages { 1 } else { 0 }
+            );
+            assert_eq!(h.full_debug_info().await.state.ready_count, 0);
+            assert!(
+                stroma
+                    .promote_queue_follower_to_local_tail("t", 0, None, 1)
+                    .await
+                    .is_err()
+            );
+            assert!(
+                stroma
+                    .promote_queue_follower_if_caught_up(
+                        "t",
+                        0,
+                        None,
+                        h.msg_log().next_offset(),
+                        h.event_log().next_offset()
+                    )
+                    .await
+                    .is_err()
+            );
+            assert!(stroma.become_queue_owner("t", 0, None).await.is_err());
+            assert_eq!(h.role(), QueueRole::Follower);
+            drop(h);
+            shutdown_stroma("parallel_partial", &stroma).await;
+            drop(stroma);
+            let reopened =
+                Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+                    .await
+                    .unwrap();
+            let reopened_qh = reopened.queue_handle("t", 0, None).await.unwrap();
+            let h = reopened_qh.resolve().unwrap();
+            assert_eq!(
+                h.full_debug_info().await.state.ready_count,
+                0,
+                "unconfirmed partial batch cannot reappear as queue work"
+            );
+            drop(h);
+            shutdown_stroma("parallel_partial_reopen", &reopened).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn recovery_replays_event_zero_after_an_empty_checkpoint() {
+        let dir = test_dir!("empty_checkpoint_event_zero");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        stroma.become_queue_follower("t", 0, None).await.unwrap();
+        let snapshot = QueueInternalState::new("t".into(), 0).encode_snapshot(0);
+        stroma
+            .install_follower_state_checkpoint(
+                "t",
+                0,
+                None,
+                FollowerStateCheckpointInstall {
+                    message_epoch: 0,
+                    event_epoch: 0,
+                    message_next_offset: 0,
+                    event_next_offset: 0,
+                    applied_event_offset: 0,
+                    state_snapshot: snapshot,
+                },
+            )
+            .await
+            .unwrap();
+        stroma
+            .apply_replicated_queue_batch(
+                "t",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: 0,
+                    first_offset: 0,
+                    records: vec![Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: b"first".to_vec(),
+                    }],
+                    durability: None,
+                }),
+                Some(ReplicatedEventBatch {
+                    epoch: 0,
+                    first_offset: 0,
+                    events: vec![StromaEvent::EnqueueMany {
+                        reqs: vec![EnqueueEventMeta {
+                            off: 0,
+                            retries: 0,
+                            expire_at: None,
+                        }],
+                    }],
+                    durability: None,
+                }),
+            )
+            .await
+            .unwrap();
+        // Keep the old empty checkpoint: emulate a crash after both logs commit
+        // and before a newer state snapshot replaces it.
+        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+        qh.resolve().unwrap().set_dirty_snapshot(false);
+        shutdown_stroma("empty_checkpoint_before_restart", &stroma).await;
+        drop(stroma);
+        let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        let qh = reopened.queue_handle("t", 0, None).await.unwrap();
+        assert_eq!(
+            qh.resolve()
+                .unwrap()
+                .full_debug_info()
+                .await
+                .state
+                .ready_count,
+            1
+        );
+        shutdown_stroma("empty_checkpoint_after_restart", &reopened).await;
     }
 
     #[tokio::test]

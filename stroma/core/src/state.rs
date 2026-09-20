@@ -519,6 +519,9 @@ pub enum QueueCommand {
     GetLowestUnsettled {
         response: Option<oneshot::Sender<Offset>>,
     },
+    GetRequiredMessageNext {
+        response: oneshot::Sender<Offset>,
+    },
     GetLowestNotSettled {
         response: Option<oneshot::Sender<Offset>>,
     },
@@ -634,6 +637,7 @@ impl QueueCommand {
             // If you need snapshots to run on schedule regardless of load, raise this.
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
             QueueCommand::ExportStateCheckpoint { .. } => CommandPrio::SuperLow,
+            QueueCommand::GetRequiredMessageNext { .. } => CommandPrio::SuperLow,
             // SuperLow: shutdown drains all queued commands before exiting. Each queued
             // command may have a oneshot response sender that callers are awaiting, if
             // shutdown jumped ahead (Express), those callers would see their rx future
@@ -677,6 +681,7 @@ impl QueueCommand {
             QueueCommand::PollReadyAndMark { .. } => "PollReadyAndMark",
             QueueCommand::GetLowestUnsettled { .. } => "GetLowestUnsettled",
             QueueCommand::GetLowestNotSettled { .. } => "GetLowestNotSettled",
+            QueueCommand::GetRequiredMessageNext { .. } => "GetRequiredMessageNext",
             QueueCommand::GetNextDeliverable { .. } => "GetNextDeliverable",
             QueueCommand::GetInflightLen { .. } => "GetInflightLen",
             QueueCommand::GetNextExpiryHint { .. } => "GetNextExpiryHint",
@@ -1086,6 +1091,9 @@ pub struct QueueHandleInner {
     // across staging + the event send, never the fsync waits, so the two fsyncs
     // still overlap.
     publish_event_order: Arc<tokio::sync::Mutex<PublishOrder>>,
+    /// Serializes follower apply, checkpoint install and promotion. True means
+    /// an apply/install was interrupted or failed and requires recovery/resync.
+    follower_apply: tokio::sync::Mutex<bool>,
 
     // Hot-path cache of the per-queue default message TTL (ms). 0 = none.
     // Populated by the actor on Declare and snapshot load so the publish path
@@ -1321,6 +1329,7 @@ impl QueueHandleInner {
             owner_operations_paused,
             owner_operations_resumed,
             publish_event_order: Arc::new(tokio::sync::Mutex::new(PublishOrder::default())),
+            follower_apply: tokio::sync::Mutex::new(false),
             default_message_ttl_ms: Arc::new(AtomicU64::new(0)),
             global_dlq,
             metrics,
@@ -1816,6 +1825,9 @@ impl QueueHandleInner {
                 if let Some(r) = response {
                     let _ = r.send(result);
                 }
+            }
+            QueueCommand::GetRequiredMessageNext { response } => {
+                let _ = response.send(state.required_message_next());
             }
             QueueCommand::GetSettledUntil { response } => {
                 let result = state.settled_until();
@@ -2601,6 +2613,15 @@ impl WorkQueueHandle<'_> {
         rx.await.unwrap_or(0)
     }
 
+    /// Drain prior state mutations before checking a promotion dependency.
+    pub(crate) async fn required_message_next(&self) -> Result<Offset, QueueHandleError> {
+        let (tx, rx) = oneshot::channel();
+        self.command_enqueue(QueueCommand::GetRequiredMessageNext { response: tx })
+            .await
+            .map_err(|_| QueueHandleError::ActorGone)?;
+        rx.await.map_err(|_| QueueHandleError::ActorGone)
+    }
+
     pub async fn settled_until(&self) -> Offset {
         let (tx, rx) = oneshot::channel();
         let _ = self
@@ -2763,6 +2784,10 @@ impl QueueHandleInner {
 
     /// Per-partition lock serializing the parallel-publish event-log append order.
     /// See the field docs on `QueueHandleInner`.
+    pub(crate) async fn follower_apply_state(&self) -> tokio::sync::MutexGuard<'_, bool> {
+        self.follower_apply.lock().await
+    }
+
     pub(crate) fn publish_event_order(&self) -> Arc<tokio::sync::Mutex<PublishOrder>> {
         self.publish_event_order.clone()
     }
@@ -2971,6 +2996,35 @@ impl QueueInternalState {
             dlq_policy: format!("{:?}", self.dlq_policy),
             dlq_max_retries: self.dlq_discard_max_retries,
         }
+    }
+
+    /// Exclusive message frontier required by all persisted queue state. Settled
+    /// offsets also constrain offset reuse after promotion; delayed and DLQ
+    /// entries must be included even when the ready set is empty.
+    pub(crate) fn required_message_next(&self) -> Offset {
+        let ranges = [
+            self.ready.last().map(|r| r.end),
+            self.settled.last().map(|r| r.end),
+        ];
+        let indexed = self
+            .inflight
+            .keys()
+            .chain(self.pending_dlq.keys())
+            .chain(self.retries.keys())
+            .copied()
+            .map(|off| off.saturating_add(1));
+        let delayed = self
+            .delayed_enqueue_heap
+            .iter()
+            .chain(self.delayed_retry_heap.iter())
+            .map(|(_, off)| off.saturating_add(1));
+        ranges
+            .into_iter()
+            .flatten()
+            .chain(indexed)
+            .chain(delayed)
+            .max()
+            .unwrap_or(0)
     }
 
     #[inline]

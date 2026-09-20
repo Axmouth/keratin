@@ -200,9 +200,47 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(crate::StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before promotion"
+                    .into(),
+            ));
+        }
+
+        if qh.role() != QueueRole::Owner
+            && let Some(wq) = qh.as_work_queue()
+        {
+            let required = wq.required_message_next().await.map_err(io_err)?;
+            if qh.msg_log().next_offset() < required {
+                return Err(crate::StromaError::InvalidArgument(format!(
+                    "queue payload backfill incomplete: message next {} requires {required}",
+                    qh.msg_log().next_offset()
+                )));
+            }
+        }
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
+        Ok(())
+    }
+
+    /// Client admission may fence an existing owner, but cannot promote a
+    /// follower while its assignment transition/backfill is still in progress.
+    pub async fn ensure_queue_owner_epoch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        epoch: Option<u64>,
+    ) -> Result<()> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let h = qh.resolve()?;
+        let _operation = h.begin_owner_operation().await?;
+        if let Some(epoch) = epoch {
+            h.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
+            h.event_log().advance_epoch(epoch).await.map_err(io_err)?;
+        }
         Ok(())
     }
 
@@ -257,6 +295,25 @@ impl Stroma {
     /// store and to keep stream call sites readable.
     pub async fn advance_stream_epoch(&self, topic: &str, part: u32, epoch: u64) -> Result<u64> {
         self.advance_queue_epoch(topic, part, None, epoch).await
+    }
+
+    /// Current durable queue log frontiers, for a conservative dependency on a
+    /// recovered backlog before new publications supply exact batch boundaries.
+    pub async fn queue_durable_frontiers(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<crate::QueuePublishCommit> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let h = qh.resolve()?;
+        let _pause = h.pause_owner_operations_and_wait().await?;
+        Ok(crate::QueuePublishCommit {
+            message_next: h.msg_log().next_offset(),
+            event_next: h.event_log().next_offset(),
+            message_epoch: h.msg_log().current_epoch(),
+            event_epoch: h.event_log().current_epoch(),
+        })
     }
 
     /// A stream follower's next offsets for both logs: `(record_next,
@@ -327,6 +384,14 @@ impl Stroma {
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(crate::StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before promotion"
+                    .into(),
+            ));
+        }
+
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -376,6 +441,15 @@ impl Stroma {
             });
         }
 
+        if let Some(wq) = qh.as_work_queue() {
+            let required = wq.required_message_next().await.map_err(io_err)?;
+            if message_next_offset < required {
+                return Ok(QueuePromotionOutcome::MessageLogBehind {
+                    local_next_offset: message_next_offset,
+                    expected_next_offset: required,
+                });
+            }
+        }
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
@@ -402,6 +476,14 @@ impl Stroma {
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(crate::StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before promotion"
+                    .into(),
+            ));
+        }
+
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -425,6 +507,15 @@ impl Stroma {
             });
         }
 
+        if let Some(wq) = qh.as_work_queue() {
+            let required = wq.required_message_next().await.map_err(io_err)?;
+            if message_next_offset < required {
+                return Ok(QueuePromotionOutcome::MessageLogBehind {
+                    local_next_offset: message_next_offset,
+                    expected_next_offset: required,
+                });
+            }
+        }
         // Persist the fencing epoch BEFORE serving as owner: from here on,
         // replicated traffic from the previous (older-epoch) owner is
         // rejected by both logs.
@@ -645,6 +736,12 @@ impl Stroma {
     ) -> Result<ReplicatedQueueApplyOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let mut apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(crate::StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before retry".into(),
+            ));
+        }
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -655,23 +752,41 @@ impl Stroma {
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
 
-        let message_log = match messages {
-            Some(batch) => {
-                let count = batch.records.len();
-                let msg_next = batch.first_offset + count as u64;
-                let outcome = qh
-                    .msg_log()
-                    .append_replicated_batch(
-                        batch.epoch,
-                        batch.first_offset,
-                        batch.records,
-                        batch.durability,
-                    )
-                    .await;
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        return Err(crate::replication_diagnostics::overlap_error(
+        // Encode before either append so an encoding failure cannot leave one
+        // side queued. Reject obvious epoch/gap cases through the serial path;
+        // ordinary contiguous traffic overlaps the two independent writers.
+        let event_records = events
+            .as_ref()
+            .map(|batch| {
+                batch
+                    .events
+                    .iter()
+                    .map(event_msg)
+                    .collect::<Result<Vec<_>>>()
+            })
+            .transpose()?;
+        let parallel = matches!((&messages, &events), (Some(m), Some(e))
+            if m.epoch == qh.msg_log().current_epoch() && e.epoch == qh.event_log().current_epoch()
+                && m.first_offset <= qh.msg_log().next_offset() && e.first_offset <= qh.event_log().next_offset());
+        let message_next = messages
+            .as_ref()
+            .map(|b| b.first_offset + b.records.len() as u64);
+        let append_messages = async {
+            match messages {
+                Some(batch) => {
+                    let count = batch.records.len();
+                    match qh
+                        .msg_log()
+                        .append_replicated_batch(
+                            batch.epoch,
+                            batch.first_offset,
+                            batch.records,
+                            batch.durability,
+                        )
+                        .await
+                    {
+                        Ok(outcome) => Ok(Some(outcome)),
+                        Err(error) => Err(crate::replication_diagnostics::overlap_error(
                             error,
                             qh.msg_log(),
                             topic,
@@ -682,47 +797,27 @@ impl Stroma {
                             count,
                             None,
                         )
-                        .await);
+                        .await),
                     }
-                };
-                if advance_stream_tail && replicated_append_outcome_allows_state_apply(&outcome) {
-                    let (tx, rx) = tokio::sync::oneshot::channel();
-                    qh.stream_command_enqueue(StreamCommand::AdvanceTail {
-                        next_offset: msg_next,
-                        response: Some(tx),
-                    })
-                    .await
-                    .map_err(io_err)?;
-                    rx.await.map_err(|_| StromaError::QueueActorGone)?;
                 }
-                Some(outcome)
+                None => Ok(None),
             }
-            None => None,
         };
-
-        let message_append_allows_events = message_log
-            .as_ref()
-            .is_none_or(replicated_append_outcome_allows_state_apply);
-
-        let event_log = match events {
-            Some(batch) if message_append_allows_events => {
-                let mut records = Vec::with_capacity(batch.events.len());
-                for event in &batch.events {
-                    records.push(event_msg(event)?);
-                }
-                let outcome = qh
-                    .event_log()
-                    .append_replicated_batch(
-                        batch.epoch,
-                        batch.first_offset,
-                        records,
-                        batch.durability,
-                    )
-                    .await;
-                let outcome = match outcome {
-                    Ok(outcome) => outcome,
-                    Err(error) => {
-                        return Err(crate::replication_diagnostics::overlap_error(
+        let append_events = async {
+            match (&events, event_records) {
+                (Some(batch), Some(records)) => {
+                    match qh
+                        .event_log()
+                        .append_replicated_batch(
+                            batch.epoch,
+                            batch.first_offset,
+                            records,
+                            batch.durability,
+                        )
+                        .await
+                    {
+                        Ok(outcome) => Ok(Some(outcome)),
+                        Err(error) => Err(crate::replication_diagnostics::overlap_error(
                             error,
                             qh.event_log(),
                             topic,
@@ -733,32 +828,65 @@ impl Stroma {
                             batch.events.len(),
                             Some(&batch.events),
                         )
-                        .await);
-                    }
-                };
-                if replicated_append_outcome_allows_state_apply(&outcome) {
-                    // NOTE: we intentionally do NOT fail here if an event
-                    // references a message offset not yet received. Ship order is
-                    // message-batch then event-batch, but a follower may briefly
-                    // hold events ahead of their messages DURING CATCH-UP - the
-                    // plan allows this transient. The steady-state invariant
-                    // (events never reference unreceived messages) is enforced
-                    // where consistency is actually required: at recovery
-                    // (persisted-log scan -> quarantine) and at promotion
-                    // (follower_promotion_refuses_partial_replication), not on the
-                    // transient catch-up apply path.
-                    for (idx, event) in batch.events.into_iter().enumerate() {
-                        self.apply_event_inmem(event, &qh).await?;
-                        qh.applied_upto()
-                            .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
+                        .await),
                     }
                 }
-                Some(outcome)
+                _ => Ok(None),
             }
-            Some(_) => None,
-            None => None,
         };
-
+        *apply_state = true;
+        let (message_log, event_log) = if parallel {
+            // Cancellation leaves this guard dirty too. Both completions MUST be
+            // drained: try_join would return early while the other writer still
+            // owns an accepted append. No actor state changes until both finish.
+            let (message, event) = tokio::join!(append_messages, append_events);
+            if let Err(error) = &event {
+                tracing::error!(topic, part, error = %error, "follower event append failed; resync required");
+            }
+            (message?, event?)
+        } else {
+            let message = append_messages.await?;
+            let event = if message
+                .as_ref()
+                .is_none_or(replicated_append_outcome_allows_state_apply)
+            {
+                append_events.await?
+            } else {
+                drop(append_events);
+                None
+            };
+            (message, event)
+        };
+        let messages_allowed = message_log
+            .as_ref()
+            .is_none_or(replicated_append_outcome_allows_state_apply);
+        let events_allowed = event_log
+            .as_ref()
+            .is_none_or(replicated_append_outcome_allows_state_apply);
+        if messages_allowed && events_allowed {
+            if advance_stream_tail && let Some(next_offset) = message_next {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.stream_command_enqueue(StreamCommand::AdvanceTail {
+                    next_offset,
+                    response: Some(tx),
+                })
+                .await
+                .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            if let Some(batch) = events {
+                for (idx, event) in batch.events.into_iter().enumerate() {
+                    self.apply_event_inmem(event, &qh).await?;
+                    qh.applied_upto()
+                        .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
+                }
+            }
+            *apply_state = false;
+        } else if !parallel {
+            // A rejected serial preflight did not issue the dependent event
+            // append. Errors and cancellation return above with the flag set.
+            *apply_state = false;
+        }
         Ok(ReplicatedQueueApplyOutcome {
             message_log,
             event_log,
@@ -800,6 +928,7 @@ impl Stroma {
 
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let mut apply_state = qh.follower_apply_state().await;
         let role = qh.role();
         if role != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole {
@@ -826,6 +955,7 @@ impl Stroma {
                 install.message_epoch, install.event_epoch,
             )));
         }
+        *apply_state = true;
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
 
@@ -875,6 +1005,7 @@ impl Stroma {
         .await
         .map_err(|err| StromaError::Io(err.to_string()))??;
 
+        *apply_state = false;
         Ok(FollowerStateCheckpointInstallOutcome {
             message_next_offset: install.message_next_offset,
             event_next_offset: install.event_next_offset,
