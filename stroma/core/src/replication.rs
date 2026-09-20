@@ -155,6 +155,8 @@ impl Stroma {
     ) -> Result<QueueDemotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         qh.freeze_owner_and_wait_operations().await?;
         qh.msg_log().freeze();
         qh.event_log().freeze();
@@ -186,6 +188,8 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         qh.become_follower();
         qh.msg_log().become_follower();
         qh.event_log().become_follower();
@@ -201,6 +205,7 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let apply_state = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         if *apply_state {
             return Err(crate::StromaError::Io(
                 "incomplete follower apply; recover or install a checkpoint before promotion"
@@ -259,6 +264,8 @@ impl Stroma {
     ) -> Result<u64> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
         qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
         Ok(epoch)
@@ -385,6 +392,7 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let apply_state = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         if *apply_state {
             return Err(crate::StromaError::Io(
                 "incomplete follower apply; recover or install a checkpoint before promotion"
@@ -477,6 +485,7 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let apply_state = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         if *apply_state {
             return Err(crate::StromaError::Io(
                 "incomplete follower apply; recover or install a checkpoint before promotion"
@@ -992,7 +1001,10 @@ impl Stroma {
         let stroma = self.clone();
         let state_snapshot = install.state_snapshot.clone();
         let applied_event_offset = install.applied_event_offset;
+        let recovery_gate = qh.recovery_gate.clone();
         tokio::task::spawn_blocking(move || {
+            let _snapshot_io = recovery_gate.snapshot_io.lock();
+            recovery_gate.ensure_open(&topic_owned, part, group_owned.as_deref())?;
             fs::create_dir_all(&dir).map_err(io_err)?;
             stroma.write_queue_snapshot(
                 &topic_owned,

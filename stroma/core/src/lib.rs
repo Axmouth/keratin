@@ -39,8 +39,8 @@ pub use stroma::{
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
     QueuePublishCommit, QueuePublishObserver, ReplicatedEventBatch, ReplicatedMessageBatch,
-    ReplicatedQueueApplyOutcome, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions,
-    TaskGroup,
+    RecoverySealRequest, ReplicatedQueueApplyOutcome, SealedReplicaFrontiers, SnapshotConfig,
+    Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;
@@ -115,6 +115,13 @@ pub enum StromaError {
         partition: u32,
         group: Option<String>,
         reason: String,
+    },
+
+    #[error("partition {topic}/{partition}/{group:?} is sealed for replica recovery")]
+    RecoverySealed {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
     },
 
     #[error("internal: {0}")]

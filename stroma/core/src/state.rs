@@ -1053,6 +1053,32 @@ mod publish_apply_order_tests {
     }
 }
 
+/// Shared with blocking snapshot jobs without pinning a queue incarnation.
+#[derive(Debug, Default)]
+pub(crate) struct RecoveryGate {
+    sealed: AtomicBool,
+    // Held inside blocking I/O, including detached jobs after cancellation.
+    pub(crate) snapshot_io: parking_lot::Mutex<()>,
+}
+
+impl RecoveryGate {
+    pub(crate) fn ensure_open(
+        &self,
+        topic: &str,
+        partition: u32,
+        group: Option<&str>,
+    ) -> crate::Result<()> {
+        if self.sealed.load(Ordering::Acquire) {
+            return Err(StromaError::RecoverySealed {
+                topic: topic.to_owned(),
+                partition,
+                group: group.map(str::to_owned),
+            });
+        }
+        Ok(())
+    }
+}
+
 #[derive(Debug)]
 pub struct QueueHandleInner {
     engine: EngineHandle,
@@ -1077,6 +1103,7 @@ pub struct QueueHandleInner {
     snapshot_task_started: Arc<AtomicBool>,
     background_tasks: CancellationToken,
     role: Arc<AtomicU8>,
+    pub(crate) recovery_gate: Arc<RecoveryGate>,
     role_generation: Arc<AtomicU64>,
     owner_operations: Arc<AtomicU64>,
     owner_operations_drained: Arc<Notify>,
@@ -1323,6 +1350,7 @@ impl QueueHandleInner {
             snapshot_task_started,
             background_tasks,
             role,
+            recovery_gate: Arc::new(RecoveryGate::default()),
             role_generation,
             owner_operations,
             owner_operations_drained,
@@ -1416,7 +1444,21 @@ impl QueueHandleInner {
         self.recovery_notify.notify_waiters();
     }
 
+    pub(crate) fn ensure_not_recovery_sealed(&self) -> crate::Result<()> {
+        self.recovery_gate
+            .ensure_open(&self.topic, self.partition, self.group.as_deref())
+    }
+
+    pub(crate) fn begin_recovery_seal(&self) {
+        self.recovery_gate.sealed.store(true, Ordering::Release);
+        self.freeze();
+        self.owner_operations_resumed.notify_waiters();
+    }
+
     pub fn role(&self) -> QueueRole {
+        if self.recovery_gate.sealed.load(Ordering::Acquire) {
+            return QueueRole::Frozen;
+        }
         QueueRole::from_u8(self.role.load(Ordering::Acquire))
     }
 

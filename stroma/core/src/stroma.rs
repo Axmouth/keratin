@@ -50,6 +50,9 @@ use crate::{
 // re-export so existing `stroma_core::` and `crate::stroma::` paths keep resolving
 // (clustering-module separation).
 pub use crate::replication::*;
+#[path = "recovery_seal.rs"]
+mod recovery_seal;
+pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {
     StromaError::Io(e.to_string())
@@ -1253,6 +1256,7 @@ impl Stroma {
         // the event log just to truncate its suffix and close it again. The next
         // queue_handle re-opens and recovers the now-valid log.
         let _lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
+        self.ensure_partition_not_sealed(tp, part, group)?;
         let event_log = self.event_log_init(tp, part, group).await?;
         let prev_role = event_log.role();
         event_log.become_follower();
@@ -1391,6 +1395,7 @@ impl Stroma {
             if let Some(inner) = slot.handle.get()
                 && !slot.is_evicting()
             {
+                inner.ensure_not_recovery_sealed()?;
                 return Ok(self.ticket_for(tp, part, group, inner));
             }
 
@@ -1422,6 +1427,7 @@ impl Stroma {
             let qh = slot
                 .handle
                 .get_or_try_init(|| async {
+                    self.ensure_partition_not_sealed(tp, part, group)?;
                     let msg_log = self.msg_log_init(tp, part, group).await?;
                     let event_log = self.event_log_init(tp, part, group).await?;
 
@@ -1637,6 +1643,8 @@ impl Stroma {
         // shutdown + rename below cannot overlap an in-flight open of the same dir.
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
 
+        self.ensure_partition_not_sealed(topic, part, group)?;
+
         // 1. Install a destroying tombstone (evicting) so concurrent materialize
         //    parks instead of reopening the dir. Capture the slot we displaced.
         let tombstone = Arc::new(QueueSlot {
@@ -1651,6 +1659,10 @@ impl Stroma {
         let prev = loop {
             let current = self.queue_handles.load();
             let existing = slot_lookup_no_alloc(&current, topic, part, group).cloned();
+
+            if let Some(handle) = existing.as_ref().and_then(|slot| slot.handle.get()) {
+                handle.ensure_not_recovery_sealed()?;
+            }
 
             // Guard: never discard inflight (leased, un-acked) work. The
             // repartition caller only destroys drained partitions; this keeps
@@ -2815,6 +2827,10 @@ impl Stroma {
     /// offset so events already covered by the snapshot are not read again.
     async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        if qh.ensure_not_recovery_sealed().is_err() {
+            return Ok(());
+        }
         if qh.creating_snapshot() {
             tracing::info!("Snapshot already in progress, skipping..");
             return Ok::<(), StromaError>(());
@@ -2967,7 +2983,10 @@ impl Stroma {
         let dir = self.snap_dir(tp, part, group);
         let (tp, group) = (tp.to_string(), group.map(|s| s.to_string()));
         let stroma = self.clone();
+        let recovery_gate = qh.recovery_gate.clone();
         tokio::task::spawn_blocking(move || {
+            let _snapshot_io = recovery_gate.snapshot_io.lock();
+            recovery_gate.ensure_open(&tp, part, group.as_deref())?;
             fs::create_dir_all(&dir).map_err(io_err)?;
             stroma.write_queue_snapshot(&tp, part, group.as_deref(), applied_upto, &blob)
         })
@@ -3766,6 +3785,7 @@ impl Stroma {
             }
 
             let kind = self.read_partition_kind(&tp, *part, group.as_deref());
+            let sealed = self.ensure_partition_not_sealed(&tp, *part, group.as_deref()).is_err();
             queues.push(QueueDebugInfo {
                 topic: tp.to_string(),
                 partition: *part,
@@ -3779,7 +3799,11 @@ impl Stroma {
                 last_snapshot_event_offset: 0,
                 dirty_since_snapshot: false,
                 creating_snapshot: false,
-                role: QueueRole::Owner,
+                role: if sealed {
+                    QueueRole::Frozen
+                } else {
+                    QueueRole::Owner
+                },
                 role_generation: 0,
                 state: QueueInternalDebugInfo::default(),
             });
@@ -4317,6 +4341,8 @@ impl Stroma {
         part: u32,
         retention: Option<RetentionConfig>,
     ) -> Result<()> {
+        let lifecycle = self.lock_partition_lifecycle(tp, part, None).await;
+        self.ensure_partition_not_sealed(tp, part, None)?;
         // Reject declaring a queue partition as a stream (it would materialize a
         // stream engine over queue data). The reverse guard lives in `declare`.
         if self.partition_kind_marker(tp, part, None) == Some(PartitionKind::Queue) {
@@ -4325,6 +4351,7 @@ impl Stroma {
             )));
         }
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
+        drop(lifecycle);
         let qh = self.queue_handle(tp, part, None).await?;
         if let Some(retention) = retention {
             qh.resolve()?.stream()?.set_retention(retention).await?;
@@ -4891,6 +4918,8 @@ impl Stroma {
         group: Option<&str>,
         meta: DeclareMeta,
     ) -> Result<()> {
+        let lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
+        self.ensure_partition_not_sealed(tp, part, group)?;
         // A topic/partition is one channel kind for life. Reject re-declaring a
         // stream partition as a queue (it would materialize a queue engine over
         // stream data). Stamp the Queue marker so the reverse case (declaring this
@@ -4902,6 +4931,7 @@ impl Stroma {
         }
         self.write_partition_kind(tp, part, group, PartitionKind::Queue)?;
 
+        drop(lifecycle);
         self.ensure_queue(tp, part, group).await?;
 
         let handle = self.queue_handle(tp, part, group).await?;
@@ -5355,12 +5385,11 @@ impl Stroma {
         group: Option<&str>,
         before: Offset,
     ) -> Result<u64> {
-        let msg_log = self
-            .queue_handle(tp, part, group)
-            .await?
-            .resolve()?
-            .msg_log();
-        msg_log.truncate_before(before).await.map_err(io_err)
+        let ticket = self.queue_handle(tp, part, group).await?;
+        let qh = ticket.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
+        qh.msg_log().truncate_before(before).await.map_err(io_err)
     }
 
     pub async fn cleanup_topic_partition(
@@ -5578,12 +5607,12 @@ impl Stroma {
     }
 
     pub async fn snapshot_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
-        let upto = self
-            .applied_upto_entry(tp, part, group)
-            .await?
-            .load(Ordering::Acquire);
-        self.write_snapshots_for_partition(tp, part, group, upto)
-            .await
+        let ticket = self.queue_handle(tp, part, group).await?;
+        let qh = ticket.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
+        let upto = qh.applied_upto().load(Ordering::Acquire);
+        self.write_snapshots_for_partition(tp, part, group, upto).await
     }
 
     pub async fn truncate_partition_log(
@@ -5592,6 +5621,8 @@ impl Stroma {
         before_event: Offset,
     ) -> Result<u64> {
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         let tp = qh.topic();
         let part = qh.partition();
         let group = qh.group();
