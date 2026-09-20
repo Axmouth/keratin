@@ -38,9 +38,9 @@ pub use stroma::{
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
-    QueuePublishCommit, QueuePublishObserver, ReplicatedEventBatch, ReplicatedMessageBatch,
-    RecoverySealRequest, ReplicatedQueueApplyOutcome, SealedReplicaFrontiers, SnapshotConfig,
-    Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
+    QueuePublishCommit, QueuePublishObserver, RecoverySealRequest, ReplicatedEventBatch,
+    ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, RetainedHistoryIdentity,
+    SealedReplicaFrontiers, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;

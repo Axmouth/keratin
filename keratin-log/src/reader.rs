@@ -79,6 +79,11 @@ impl LogReader {
             return Ok(recs);
         }
 
+        self.scan_from_disk(from, max)
+    }
+
+    /// Verify retained durable records without trusting cached record contents.
+    pub fn scan_from_disk(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
         // Bound the file scan at the durable frontier so it stops at the known end
         // of durable data and never reads a written-but-not-yet-durable record or
         // the preallocated zero padding beyond it. An empty / nothing-durable log

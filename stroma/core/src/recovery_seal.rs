@@ -35,6 +35,7 @@ struct SealIntent {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct SealedReplicaFrontiers {
     pub request: RecoverySealRequest,
+    pub history: RetainedHistoryIdentity,
     pub message_head: u64,
     pub message_next: u64,
     pub event_head: u64,
@@ -162,6 +163,26 @@ impl Stroma {
         group: Option<&str>,
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
+        self.seal_replica_for_recovery_checked(
+            topic,
+            part,
+            group,
+            self.read_partition_kind(topic, part, group),
+            request,
+        )
+        .await
+    }
+
+    /// Bind the protocol resource kind under the lifecycle lock, before any
+    /// file is opened or fenced. Queues and streams share storage paths.
+    pub async fn seal_replica_for_recovery_checked(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        expected_kind: PartitionKind,
+        request: RecoverySealRequest,
+    ) -> Result<SealedReplicaFrontiers> {
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
                 "durable recovery seals require directory-sync support on this platform".into(),
@@ -172,7 +193,7 @@ impl Stroma {
         let group = normalize_group(group).map(str::to_owned);
         tokio::spawn(async move {
             stroma
-                .seal_replica_inner(&topic, part, group.as_deref(), request)
+                .seal_replica_inner(&topic, part, group.as_deref(), expected_kind, request)
                 .await
         })
         .await
@@ -184,9 +205,17 @@ impl Stroma {
         topic: &str,
         part: u32,
         group: Option<&str>,
+        expected_kind: PartitionKind,
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        let actual = self.read_partition_kind(topic, part, group);
+        if actual != expected_kind {
+            return Err(StromaError::WrongPartitionKind {
+                expected: expected_kind,
+                actual,
+            });
+        }
         self.ensure_checkpoint_not_pending(topic, part, group)?;
         let path = self.recovery_seal_path(topic, part, group);
         let previous = read_intent(&path)?;
@@ -274,6 +303,24 @@ impl Stroma {
             );
             message_result.map_err(io_err)?;
             event_result.map_err(io_err)?;
+            let stroma = self.clone();
+            let topic_owned = topic.to_owned();
+            let group_owned = group.map(str::to_owned);
+            let request_owned = request.clone();
+            let message_copy = messages.clone();
+            let event_copy = events.clone();
+            let history = tokio::task::spawn_blocking(move || {
+                stroma.persist_retained_history(
+                    &topic_owned,
+                    part,
+                    group_owned.as_deref(),
+                    request_owned,
+                    &message_copy,
+                    &event_copy,
+                )
+            })
+            .await
+            .map_err(io_err)??;
             tracing::info!(
                 topic,
                 partition = part,
@@ -281,10 +328,12 @@ impl Stroma {
                 fence_epoch = request.fence_epoch,
                 message_next = messages.next_offset(),
                 event_next = events.next_offset(),
+                history = %blake3::Hash::from_bytes(history.id),
                 "replica sealed; local bounds require recovery history validation"
             );
             Ok(SealedReplicaFrontiers {
                 request,
+                history,
                 message_head: messages.head_offset(),
                 message_next: messages.next_offset(),
                 event_head: events.head_offset(),

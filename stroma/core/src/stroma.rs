@@ -50,8 +50,11 @@ use crate::{
 // re-export so existing `stroma_core::` and `crate::stroma::` paths keep resolving
 // (clustering-module separation).
 pub use crate::replication::*;
+#[path = "recovery_history.rs"]
+mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
+pub use recovery_history::RetainedHistoryIdentity;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
