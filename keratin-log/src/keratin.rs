@@ -172,6 +172,24 @@ impl Keratin {
     }
 
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> std::io::Result<Self> {
+        Self::open_with_history_guard(root, cfg, false).await
+    }
+
+    /// Reopen accepted history without silently repairing/reusing a damaged tail.
+    /// Valid complete records and zero preallocation are supported. Missing files,
+    /// pending suffix repair and nonzero damaged tails require coordinated recovery.
+    pub async fn open_preserving_history(
+        root: impl AsRef<Path>,
+        cfg: KeratinConfig,
+    ) -> std::io::Result<Self> {
+        Self::open_with_history_guard(root, cfg, true).await
+    }
+
+    async fn open_with_history_guard(
+        root: impl AsRef<Path>,
+        cfg: KeratinConfig,
+        preserve_history: bool,
+    ) -> std::io::Result<Self> {
         // Reject invalid capacities before creating directories or opening logs.
         let writer_channel_capacity = cfg.writer_channel_capacity()?;
         let root = root.as_ref().to_path_buf();
@@ -212,6 +230,7 @@ impl Keratin {
             cfg.tail_cache_bytes,
             cfg.segment_preallocate_bytes,
             cfg.force_recovery_scan,
+            preserve_history,
             log_state.clone(),
         )?;
 

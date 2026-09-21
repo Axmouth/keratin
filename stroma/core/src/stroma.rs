@@ -1238,9 +1238,12 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
-        let k = Keratin::open(dir, self.keratin_cfg_event)
-            .await
-            .map_err(io_err)?;
+        let k = if self.storage_history_binding(tp, part, group)?.is_some() {
+            Keratin::open_preserving_history(dir, self.keratin_cfg_event).await
+        } else {
+            Keratin::open(dir, self.keratin_cfg_event).await
+        }
+        .map_err(io_err)?;
         tracing::info!("Initialized event log: (`{tp}` `{part}` `{group:?}`)");
 
         Ok(Arc::new(k))
@@ -1251,9 +1254,12 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
-        let k = Keratin::open(dir, self.keratin_cfg_msg)
-            .await
-            .map_err(io_err)?;
+        let k = if self.storage_history_binding(tp, part, group)?.is_some() {
+            Keratin::open_preserving_history(dir, self.keratin_cfg_msg).await
+        } else {
+            Keratin::open(dir, self.keratin_cfg_msg).await
+        }
+        .map_err(io_err)?;
         tracing::info!("Initialized message log: (`{tp}` `{part}` `{group:?}`)");
 
         Ok(Arc::new(k))
@@ -1308,6 +1314,7 @@ impl Stroma {
         let _lifecycle = self.lock_partition_lifecycle(tp, part, group).await;
         self.ensure_partition_not_sealed(tp, part, group)?;
         self.ensure_checkpoint_not_pending(tp, part, group)?;
+        self.require_unbound_storage_history(tp, part, group)?;
         let event_log = self.event_log_init(tp, part, group).await?;
         let prev_role = event_log.role();
         event_log.become_follower();
@@ -3531,6 +3538,9 @@ impl Stroma {
         .map_err(|err| StromaError::Io(err.to_string()))??;
 
         if let Some(m) = mismatch {
+            // Reusing offsets after local repair would fork the accepted writer
+            // session. Preserve these bytes for coordinated recovery instead.
+            self.require_unbound_storage_history(tp, part, group)?;
             let reason = match &m.kind {
                 RecoveryMismatchKind::DanglingReference {
                     msg_offset,

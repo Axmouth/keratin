@@ -175,6 +175,27 @@ impl Stroma {
             .map(|r| r.map(|r| r.binding))
     }
 
+    /// Read the original durable storage receipt for sealed-history evidence.
+    /// A restarted process may report it while remaining barred from writing.
+    pub(super) fn durable_storage_history_receipt(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<Option<PreparedStorageHistory>> {
+        self.checked_storage_history(topic, part, group)
+            .map(|receipt| {
+                receipt.map(|r| PreparedStorageHistory {
+                    topic: r.topic,
+                    partition: r.partition,
+                    group: r.group,
+                    stream: r.stream,
+                    binding: r.binding,
+                    storage_instance: r.storage_session,
+                })
+            })
+    }
+
     pub(super) fn ensure_storage_history_admitted(
         &self,
         topic: &str,
@@ -637,18 +658,22 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(stroma.current_next_offset("q", 0, None).await.unwrap(), 1);
-        assert!(stroma
-            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-            .await
-            .is_err());
+        assert!(
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
         stroma.shutdown().await.unwrap();
         drop(stroma);
         let reopened = open(&dir.root).await;
         assert!(reopened.verify_prepared_storage_history(&prepared).is_err());
-        assert!(reopened
-            .admit_prepared_storage_history(prepared)
-            .await
-            .is_err());
+        assert!(
+            reopened
+                .admit_prepared_storage_history(prepared)
+                .await
+                .is_err()
+        );
         assert!(reopened.admitted_histories.is_empty());
         reopened.shutdown().await.unwrap();
     }
@@ -662,18 +687,70 @@ mod tests {
             .await
             .unwrap();
         fs::write(stroma.snap_file("q", 0, None), b"unverified snapshot").unwrap();
-        assert!(stroma
-            .admit_prepared_storage_history(prepared.clone())
-            .await
-            .is_err());
+        assert!(
+            stroma
+                .admit_prepared_storage_history(prepared.clone())
+                .await
+                .is_err()
+        );
         fs::remove_file(stroma.snap_file("q", 0, None)).unwrap();
         fs::remove_file(stroma.storage_history_path("q", 0, None)).unwrap();
-        assert!(stroma
-            .admit_prepared_storage_history(prepared)
-            .await
-            .is_err());
+        assert!(
+            stroma
+                .admit_prepared_storage_history(prepared)
+                .await
+                .is_err()
+        );
         assert!(stroma.admitted_histories.is_empty());
         assert!(!stroma.storage_history_path("q", 0, None).exists());
+        stroma.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn accepted_history_cannot_repair_and_reuse_event_offsets_during_reopen() {
+        let dir = keratin_log::test_dir!("bound_history_no_local_repair");
+        let stroma = open(&dir.root).await;
+        initialize(&stroma).await.unwrap();
+        stroma
+            .ensure_queue_owner_epoch("q", 0, None, Some(7))
+            .await
+            .unwrap();
+        let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
+        let handle = ticket.resolve().unwrap();
+        // Model an event append whose payload append did not complete. This
+        // suffix is normally repaired locally; a bound writer must reconcile
+        // its replicas before reusing this offset in the same accepted history.
+        handle
+            .event_log()
+            .append_batch(
+                vec![Message {
+                    flags: 0,
+                    headers: vec![],
+                    payload: StromaEvent::Enqueue {
+                        off: 0,
+                        retries: 0,
+                        expire_at: None,
+                    }
+                    .encode()
+                    .unwrap(),
+                }],
+                Some(KDurability::AfterFsync),
+            )
+            .await
+            .unwrap();
+        drop(handle);
+        drop(ticket);
+        assert!(matches!(
+            stroma.evict("q", 0, None).await.unwrap(),
+            EvictOutcome::Evicted
+        ));
+        let segment = keratin_log::util::latest_segment(&stroma.tp_part_dir("q", 0, None)).unwrap();
+        let before = fs::read(&segment).unwrap();
+        assert!(matches!(
+            stroma.materialize("q", 0, None).await,
+            Err(StromaError::HistoryAdmissionRequired { .. })
+        ));
+        assert_eq!(fs::read(&segment).unwrap(), before);
         stroma.shutdown().await.unwrap();
     }
 
@@ -721,6 +798,10 @@ mod tests {
             .become_queue_owner_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
+        let original = stroma
+            .durable_storage_history_receipt("q", 0, None)
+            .unwrap()
+            .unwrap();
         let receipt = fs::read(stroma.storage_history_path("q", 0, None)).unwrap();
         stroma.shutdown().await.unwrap();
         drop(stroma);
@@ -764,7 +845,38 @@ mod tests {
             .await
             .unwrap();
         assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
+        assert_eq!(sealed.history.version, 2);
+        assert_eq!(sealed.history.storage_history, Some(original));
+        let request = RecoveryReadRequest {
+            seal: sealed.request.clone(),
+            history_id: sealed.history.id,
+            source: RecoveryReadSource::Messages,
+            from: 0,
+            max_records: 8,
+            max_bytes: 65536,
+        };
+        let page = reopened
+            .read_sealed_replica("q", 0, None, PartitionKind::Queue, request.clone())
+            .await
+            .unwrap();
+        assert_eq!(page.records[0].payload, b"retained");
+        fs::remove_file(reopened.storage_history_path("q", 0, None)).unwrap();
+        assert!(
+            reopened
+                .read_sealed_replica("q", 0, None, PartitionKind::Queue, request)
+                .await
+                .is_err()
+        );
+        fs::write(reopened.storage_history_path("q", 0, None), receipt).unwrap();
         reopened.shutdown().await.unwrap();
+        drop(reopened);
+        let again = open(&dir.root).await;
+        let repeated = again
+            .seal_replica_for_recovery("q", 0, None, sealed.request.clone())
+            .await
+            .unwrap();
+        assert_eq!(repeated, sealed);
+        again.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -796,10 +908,12 @@ mod tests {
             reopened.storage_history_binding("q", 0, None).unwrap(),
             Some(binding())
         );
-        assert!(reopened
-            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-            .await
-            .is_err());
+        assert!(
+            reopened
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
         reopened.shutdown().await.unwrap();
     }
 
@@ -812,10 +926,12 @@ mod tests {
             .await
             .unwrap();
         fs::write(stroma.snap_file("q", 0, None), b"preexisting snapshot").unwrap();
-        assert!(stroma
-            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-            .await
-            .is_err());
+        assert!(
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
         assert!(stroma.admitted_histories.is_empty());
         stroma.shutdown().await.unwrap();
     }
@@ -825,10 +941,12 @@ mod tests {
         let dir = keratin_log::test_dir!("history_prepare_closed");
         let stroma = open(&dir.root).await;
         initialize(&stroma).await.unwrap();
-        assert!(stroma
-            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-            .await
-            .is_err());
+        assert!(
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
         stroma
             .prepare_empty_storage_history("other", 0, None, PartitionKind::Queue, binding())
             .await
@@ -1043,6 +1161,13 @@ mod tests {
         stroma
             .write_partition_kind("q", 0, None, PartitionKind::Queue)
             .unwrap();
+        // The real preparation opens both empty logs before publishing a receipt.
+        let messages = stroma.msg_log_init("q", 0, None).await.unwrap();
+        let events = stroma.event_log_init("q", 0, None).await.unwrap();
+        messages.shutdown().await.unwrap();
+        events.shutdown().await.unwrap();
+        drop(messages);
+        drop(events);
         let receipt = Receipt {
             topic: "q".into(),
             partition: 0,
@@ -1127,10 +1252,12 @@ mod tests {
                 .await,
             Err(StromaError::HistoryAdmissionRequired { .. })
         ));
-        assert!(!stroma
-            .snap_dir("q", 0, None)
-            .join("checkpoint.install")
-            .exists());
+        assert!(
+            !stroma
+                .snap_dir("q", 0, None)
+                .join("checkpoint.install")
+                .exists()
+        );
         assert_eq!(
             stroma.storage_history_binding("q", 0, None).unwrap(),
             Some(binding())

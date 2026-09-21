@@ -291,12 +291,22 @@ impl Log {
         tail_cache_bytes: usize,
         segment_preallocate_bytes: usize,
         force_recovery_scan: bool,
+        preserve_history: bool,
         log_state: Arc<LogState>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
         let prealloc_chunk = segment_preallocate_bytes as u64;
         // A journaled cut must finish before discovery can mistake an
         // interrupted repair for a normal dirty shutdown or an empty log.
+        if preserve_history
+            && (root.join(crate::suffix_repair::JOURNAL).try_exists()?
+                || !Manifest::path(&root).try_exists()?)
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bound history has pending repair or missing manifest",
+            ));
+        }
         crate::suffix_repair::resume(&root)?;
         fs::create_dir_all(root.join("segments"))?;
         fs::create_dir_all(root.join("tmp"))?;
@@ -307,6 +317,49 @@ impl Log {
         // Discover segments by filename.
         let mut bases = list_segment_bases(&root.join("segments"))?;
         bases.sort_unstable();
+
+        // Validate the entire bound history before any truncation/index repair.
+        // The regular recovery pass can then trim zero padding using these scans.
+        let mut verified_scans = Vec::new();
+        if preserve_history {
+            if bases.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bound history has no segments",
+                ));
+            }
+            let mut next = bases[0].0;
+            for (base, _) in &bases {
+                if *base != next {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "bound history has a segment gap",
+                    ));
+                }
+                let file = std::fs::File::open(seg_log_path(&root, *base))?;
+                let seg = Segment::open(file, *base)?;
+                let scan = crate::recovery::scan_preserving_history(
+                    seg.file_ref(),
+                    crate::segment::LOG_HEADER_LEN as u64,
+                    64 * 1024,
+                    *base,
+                )?;
+                next = match scan.last_offset {
+                    Some(offset) => offset.checked_add(1).ok_or_else(|| {
+                        io::Error::new(io::ErrorKind::InvalidData, "bound history offset overflow")
+                    })?,
+                    None => *base,
+                };
+                verified_scans.push(scan);
+            }
+            if next < manifest.next_offset || bases[0].0 > manifest.head_offset {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "bound history does not cover persisted manifest bounds",
+                ));
+            }
+        }
+        let mut verified_scans = verified_scans.into_iter();
 
         // If no segments exist, create first with base=0.
         if bases.is_empty() {
@@ -350,7 +403,8 @@ impl Log {
             ));
         }
 
-        if !force_recovery_scan
+        if !preserve_history
+            && !force_recovery_scan
             && manifest.clean_shutdown
             && manifest.segment_max_bytes == segment_max_bytes
             && manifest.index_stride_bytes == index_stride_bytes
@@ -412,7 +466,10 @@ impl Log {
             let mut seg = Segment::open(f, *base)?;
             // Scan from header_len; our Segment header is fixed size:
             let header_len = (8 + 2 + 2 + 4 + 8 + 8 + 32 + 4) as u64;
-            let scan = scan_last_good(seg.file_ref(), header_len, 64 * 1024)?;
+            let scan = match verified_scans.next() {
+                Some(scan) => scan,
+                None => scan_last_good(seg.file_ref(), header_len, 64 * 1024)?,
+            };
             if scan.last_good_pos < seg.bytes_written {
                 // truncate partial tail
                 seg.set_len(scan.last_good_pos)?;
@@ -1570,6 +1627,7 @@ fn failed_epoch_persistence_must_not_make_retry_a_successful_noop() {
         cfg.flush_target_bytes,
         cfg.tail_cache_bytes,
         cfg.segment_preallocate_bytes,
+        false,
         false,
         state.clone(),
     )

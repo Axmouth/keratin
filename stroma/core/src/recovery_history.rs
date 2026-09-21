@@ -10,6 +10,10 @@ const MAGIC: &[u8; 8] = b"RHIST\0\0\x01";
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedHistoryIdentity {
     pub version: u32,
+    /// Present for version two: original receipt, included in the content ID.
+    /// Its storage instance remains the original instance after a cold reopen.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub storage_history: Option<PreparedStorageHistory>,
     pub id: [u8; 32],
     pub message_digest: [u8; 32],
     pub event_digest: [u8; 32],
@@ -28,6 +32,15 @@ struct Receipt {
     stream: bool,
     request: RecoverySealRequest,
     history: RetainedHistoryIdentity,
+}
+
+impl RetainedHistoryIdentity {
+    pub fn valid_version(&self) -> bool {
+        matches!(
+            (self.version, self.storage_history.is_some()),
+            (1, false) | (2, true)
+        )
+    }
 }
 
 fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
@@ -118,7 +131,9 @@ impl Stroma {
             || receipt.stream != stream
             || &receipt.request != request
             || receipt.history.id != expected_id
-            || receipt.history.version != 1
+            || !receipt.history.valid_version()
+            || receipt.history.storage_history
+                != self.durable_storage_history_receipt(topic, part, group)?
             || receipt.history.message_head > receipt.history.message_next
             || receipt.history.event_head > receipt.history.event_next
         {
@@ -160,8 +175,10 @@ impl Stroma {
             Some(_) => Some(*blake3::hash(&fs::read(snapshot).map_err(io_err)?).as_bytes()),
             None => None,
         };
+        let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
         let mut history = RetainedHistoryIdentity {
-            version: 1,
+            version: if storage_history.is_some() { 2 } else { 1 },
+            storage_history,
             id: [0; 32],
             message_digest: log_digest(messages)?,
             event_digest: log_digest(events)?,

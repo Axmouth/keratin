@@ -36,19 +36,30 @@ async fn forced_recovery_appends_contiguously_after_multichunk_records() {
     let cfg = force_scan_config();
     let payloads = [vec![1; 1000], vec![2; 180_000], vec![3; 65_530]];
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
-    log.append_batch(payloads.iter().cloned().map(message).collect(), Some(KDurability::AfterFsync))
-        .await.unwrap();
+    log.append_batch(
+        payloads.iter().cloned().map(message).collect(),
+        Some(KDurability::AfterFsync),
+    )
+    .await
+    .unwrap();
     log.shutdown().await.unwrap();
     drop(log);
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
-    log.append_batch(vec![message(b"after-recovery".to_vec())], Some(KDurability::AfterFsync)).await.unwrap();
+    log.append_batch(
+        vec![message(b"after-recovery".to_vec())],
+        Some(KDurability::AfterFsync),
+    )
+    .await
+    .unwrap();
     log.shutdown().await.unwrap();
     drop(log);
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
     let records = log.reader().scan_from_disk(0, 10).unwrap();
     assert_eq!(records.len(), 4);
     assert_contiguous_offsets(&records);
-    for (record, payload) in records.iter().zip(payloads) { assert_eq!(record.payload, payload); }
+    for (record, payload) in records.iter().zip(payloads) {
+        assert_eq!(record.payload, payload);
+    }
     assert_eq!(records[3].payload, b"after-recovery");
     log.shutdown().await.unwrap();
 }
@@ -462,7 +473,11 @@ async fn preallocated_segment_clean_lifecycle() {
     {
         let k = Keratin::open(&dir.root, cfg).await.unwrap();
         let got = k.reader().scan_from(0, 200).unwrap();
-        assert_eq!(got.len(), 100, "records survive a clean reopen with preallocation");
+        assert_eq!(
+            got.len(),
+            100,
+            "records survive a clean reopen with preallocation"
+        );
         assert_eq!(got[50].payload, b"m50");
         k.append_batch(vec![message("m100".to_string())], None)
             .await
@@ -500,5 +515,65 @@ async fn preallocated_segment_recovers_after_crash() {
         );
         assert_eq!(got[49].payload, b"c49");
         k.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test]
+async fn accepted_history_reopen_preserves_padding_and_rejects_damage_without_mutation() {
+    for damage in [0, 1, 2, 3] {
+        let dir = test_dir!("bound_recovery_preserves_bytes");
+        let cfg = KeratinConfig {
+            segment_preallocate_bytes: if damage == 0 { 1024 * 1024 } else { 0 },
+            ..KeratinConfig::test_default()
+        };
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
+        log.append_batch(
+            vec![message(vec![6; 180_000])],
+            Some(KDurability::AfterFsync),
+        )
+        .await
+        .unwrap();
+        log.shutdown().await.unwrap();
+        drop(log);
+        let segment = util::latest_segment(&dir.root).unwrap();
+        let mut bytes = std::fs::read(&segment).unwrap();
+        match damage {
+            0 => {}
+            1 => {
+                bytes.truncate(bytes.len() - 8);
+            }
+            2 => {
+                let last = bytes.len() - 1;
+                bytes[last] ^= 1;
+            }
+            _ => bytes.extend_from_slice(b"partial write"),
+        }
+        std::fs::write(&segment, &bytes).unwrap();
+        let manifest = std::fs::read(dir.root.join("manifest.bin")).unwrap();
+        let opened = Keratin::open_preserving_history(&dir.root, cfg).await;
+        if damage == 0 {
+            let log = opened.unwrap();
+            assert_eq!(log.next_offset(), 1);
+            log.append_batch(
+                vec![message(b"next".to_vec())],
+                Some(KDurability::AfterFsync),
+            )
+            .await
+            .unwrap();
+            log.shutdown().await.unwrap();
+            drop(log);
+            let log = Keratin::open_preserving_history(&dir.root, cfg)
+                .await
+                .unwrap();
+            assert_eq!(log.reader().scan_from_disk(0, 8).unwrap().len(), 2);
+            log.shutdown().await.unwrap();
+        } else {
+            assert!(opened.is_err(), "damage {damage}");
+            assert_eq!(std::fs::read(&segment).unwrap(), bytes);
+            assert_eq!(
+                std::fs::read(dir.root.join("manifest.bin")).unwrap(),
+                manifest
+            );
+        }
     }
 }

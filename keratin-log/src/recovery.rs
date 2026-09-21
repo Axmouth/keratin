@@ -3,6 +3,7 @@ use std::io::{self, Read, Seek, SeekFrom};
 
 use crate::record::{RecordError, decode_record_prefix};
 
+#[derive(Clone, Copy)]
 pub struct ScanResult {
     pub last_good_pos: u64,
     pub last_offset: Option<u64>,
@@ -10,7 +11,43 @@ pub struct ScanResult {
 
 /// Sequentially scan the log file from `start_pos` and find last valid record boundary.
 /// This is used on startup to repair after crash.
-pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::Result<ScanResult> {
+pub fn scan_last_good(file: &File, start_pos: u64, buf_size: usize) -> io::Result<ScanResult> {
+    scan_last_good_inner(file, start_pos, buf_size, None)
+}
+
+/// Validate a bound history without discarding partial/corrupt nonzero bytes.
+/// Only zero preallocation after the final complete record may be discarded.
+pub(crate) fn scan_preserving_history(
+    file: &File,
+    start_pos: u64,
+    buf_size: usize,
+    base: u64,
+) -> io::Result<ScanResult> {
+    let scan = scan_last_good_inner(file, start_pos, buf_size, Some(base))?;
+    let mut file = file;
+    file.seek(SeekFrom::Start(scan.last_good_pos))?;
+    let mut buffer = vec![0; buf_size.max(1)];
+    loop {
+        let n = file.read(&mut buffer)?;
+        if n == 0 {
+            break;
+        }
+        if buffer[..n].iter().any(|byte| *byte != 0) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "bound history contains a partial or corrupt record; coordinated recovery required",
+            ));
+        }
+    }
+    Ok(scan)
+}
+
+fn scan_last_good_inner(
+    mut file: &File,
+    start_pos: u64,
+    buf_size: usize,
+    mut expected: Option<u64>,
+) -> io::Result<ScanResult> {
     // NOTE: simple implementation: read chunks and decode record-by-record.
     // For v0 correctness, easiest is to read progressively and maintain a window buffer.
 
@@ -41,6 +78,20 @@ pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::R
             }
             match decode_record_prefix(slice) {
                 Ok((rec, used)) => {
+                    if let Some(offset) = expected {
+                        if rec.offset != offset {
+                            return Err(io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "bound history has noncontiguous record offsets",
+                            ));
+                        }
+                        expected = Some(offset.checked_add(1).ok_or_else(|| {
+                            io::Error::new(
+                                io::ErrorKind::InvalidData,
+                                "bound history offset overflow",
+                            )
+                        })?);
+                    }
                     consumed += used;
                     last_good_pos = window_start + consumed as u64;
                     last_offset = Some(rec.offset);
@@ -99,7 +150,10 @@ mod tests {
 
     /// Scan `data` written to a real file (scan_last_good takes `&File`).
     fn scan_bytes(data: &[u8]) -> ScanResult {
-        let uniq = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let uniq = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .unwrap()
+            .as_nanos();
         let path = std::env::temp_dir().join(format!("keratin_scan_probe_{uniq}"));
         std::fs::write(&path, data).unwrap();
         let file = std::fs::File::open(&path).unwrap();
@@ -140,7 +194,10 @@ mod tests {
         data.extend_from_slice(&[0u8; 8192]);
 
         let res = scan_bytes(&data);
-        assert_eq!(res.last_good_pos, records_end, "partial record must be discarded");
+        assert_eq!(
+            res.last_good_pos, records_end,
+            "partial record must be discarded"
+        );
         assert_eq!(res.last_offset, Some(2));
     }
 
@@ -165,7 +222,10 @@ mod tests {
                 let mut padded = bytes.clone();
                 padded.resize(padded.len() + padding, 0);
                 let result = scan_bytes(&padded);
-                assert_eq!(result.last_good_pos, end, "sizes={sizes:?}, padding={padding}");
+                assert_eq!(
+                    result.last_good_pos, end,
+                    "sizes={sizes:?}, padding={padding}"
+                );
                 assert_eq!(result.last_offset, Some(sizes.len() as u64 - 1));
             }
         }

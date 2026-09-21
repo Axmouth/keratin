@@ -291,7 +291,7 @@ impl RecoveryPairInspector {
         }
         for seal in [&left, &right] {
             let history = &seal.history;
-            if history.version != 1
+            if !history.valid_version()
                 || history.message_head > history.message_next
                 || history.event_head > history.event_next
                 || (
@@ -908,6 +908,7 @@ mod tests {
             *cursor.hash.finalize().as_bytes()
         };
         let mut history = RetainedHistoryIdentity {
+            storage_history: None,
             version: 1,
             id: [0; 32],
             message_digest: digest(msg_head, msg),
