@@ -4,6 +4,7 @@ mod global;
 mod metrics;
 mod replication;
 mod replication_diagnostics;
+pub mod recovery_inspection;
 mod state;
 // Some stream-engine helpers (cursor introspection, retention axes) are wired in
 // by later Plexus steps (fibril stream actor, retention worker), so they are
