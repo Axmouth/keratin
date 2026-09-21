@@ -23,6 +23,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Fsync jobs retain an exclusive durable boundary. An empty job can no longer
+  persist a manifest claiming offset zero exists or mark a later offset-zero
+  append durable. Regression coverage includes delayed completion after a new
+  append and strict recovery of empty logs.
+
 - Remote checkpoint resets must match the writer's exact epoch. Stroma validates
   both source epochs before resetting either log, and each writer checks again
   in command order. Stale or future checkpoints cannot replace fenced history.

@@ -80,14 +80,14 @@ pub struct LogState {
 }
 
 pub(crate) struct FsyncJob {
-    through_offset: u64,
+    durable_end: u64,
     active: File,
     index: File,
 }
 
 impl FsyncJob {
-    pub(crate) fn through_offset(&self) -> u64 {
-        self.through_offset
+    pub(crate) fn durable_end(&self) -> u64 {
+        self.durable_end
     }
 
     pub(crate) fn sync(&self) -> io::Result<Duration> {
@@ -115,9 +115,9 @@ pub struct Log {
     write_buf: Vec<u8>, // 16-64MB ideally
     idx_buf: Vec<u8>,   // sparse index buffer
 
-    // watermarks (inclusive)
+    // Staging uses an inclusive offset; durability uses an exclusive boundary.
     staged_end_offset: u64, // last offset staged into buffers
-    durable_offset: u64,    // inclusive last fsynced offset, 0 for an empty log
+    durable_end: u64,       // exclusive durable frontier; zero means empty
 
     root: PathBuf,
     pub manifest: Manifest,
@@ -140,7 +140,7 @@ pub struct Log {
     /// fsync in flight (coalescing bigger writes only makes each fsync slower).
     /// Updated in `commit`.
     pub(crate) recent_commit_records: u64,
-    /// `through_offset` of the previous commit, to size the next one.
+    /// `durable_end` of the previous commit, to size the next one.
     pub(crate) last_commit_through: u64,
     /// Bytes to preallocate ahead of the active segment's write cursor (`0` =
     /// off). Applied to the active segment and to each new segment on roll.
@@ -395,7 +395,7 @@ impl Log {
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     staged_end_offset: initial,
-                    durable_offset: initial,
+                    durable_end: next_offset,
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -448,7 +448,7 @@ impl Log {
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     staged_end_offset: initial,
-                    durable_offset: initial,
+                    durable_end: next_offset,
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -534,7 +534,7 @@ impl Log {
                 manifest_flush_interval: Duration::from_millis(500),
                 last_manifest_flush: Instant::now(),
                 staged_end_offset: initial,
-                durable_offset: initial,
+                durable_end: next_offset,
                 flush_target_bytes,
                 segment_mapping: segment_mapping.clone(),
             },
@@ -1069,7 +1069,7 @@ impl Log {
         self.flush_buffers()?;
 
         Ok(FsyncJob {
-            through_offset: self.staged_end_offset,
+            durable_end: self.next_offset,
             active: self.active.try_clone_file()?,
             index: self.index.try_clone_file()?,
         })
@@ -1078,11 +1078,11 @@ impl Log {
     #[cfg_attr(feature = "writer-stage-trace", allow(dead_code))]
     pub(crate) fn finish_fsync_job(
         &mut self,
-        through_offset: u64,
+        durable_end: u64,
         elapsed: Duration,
     ) -> io::Result<()> {
         self.finish_fsync_job_inner(
-            through_offset,
+            durable_end,
             elapsed,
             #[cfg(feature = "writer-stage-trace")]
             None,
@@ -1092,26 +1092,26 @@ impl Log {
     #[cfg(feature = "writer-stage-trace")]
     pub(crate) fn finish_fsync_job_traced(
         &mut self,
-        through_offset: u64,
+        durable_end: u64,
         elapsed: Duration,
         tracer: &WriterStageTracer,
         work_id: u64,
     ) -> io::Result<()> {
-        self.finish_fsync_job_inner(through_offset, elapsed, Some((tracer, work_id)))
+        self.finish_fsync_job_inner(durable_end, elapsed, Some((tracer, work_id)))
     }
 
     fn finish_fsync_job_inner(
         &mut self,
-        through_offset: u64,
+        durable_end: u64,
         elapsed: Duration,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
         self.stats.fsync += elapsed;
-        self.durable_offset = self.durable_offset.max(through_offset);
+        self.durable_end = self.durable_end.max(durable_end);
         self.manifest.next_offset = self
             .manifest
             .next_offset
-            .max(through_offset.saturating_add(1));
+            .max(durable_end);
         self.manifest.active_base_offset = self.active.base_offset;
 
         // manifest is a hint; persist it on interval
@@ -1181,7 +1181,7 @@ impl Log {
         self.stats.fsync += t.elapsed();
 
         // mark durable
-        self.durable_offset = self.staged_end_offset;
+        self.durable_end = self.next_offset;
 
         self.manifest.next_offset = self.next_offset;
         self.manifest.active_base_offset = self.active.base_offset;
@@ -1197,13 +1197,10 @@ impl Log {
         Ok(())
     }
 
-    /// The exclusive durable frontier published to readers. The internal
-    /// `durable_offset` is an inclusive last-fsynced offset where `0` is ambiguous
-    /// between an empty log and "offset 0 durable"; the frontier removes that
-    /// ambiguity. Capping at `next_offset` keeps an empty log (sentinel `0`) at
-    /// frontier `0`.
+    /// The exclusive durable frontier published to readers. It comes from the
+    /// fsync job's captured end, so an empty job cannot cover a later append.
     pub fn durable_end_exclusive(&self) -> DurableFrontier {
-        DurableFrontier::from_exclusive(self.durable_offset.saturating_add(1).min(self.next_offset))
+        DurableFrontier::from_exclusive(self.durable_end)
     }
 
     pub fn next_offset(&self) -> u64 {
@@ -1425,7 +1422,7 @@ impl Log {
         self.tail_cache.clear();
         self.next_offset = next_offset;
         self.staged_end_offset = next_offset.saturating_sub(1);
-        self.durable_offset = self.staged_end_offset;
+        self.durable_end = self.next_offset;
         self.flushed_through = next_offset;
         self.last_commit_through = next_offset;
         self.recent_commit_records = 0;
@@ -1467,7 +1464,7 @@ impl Log {
         self.idx_buf.clear();
         self.next_offset = next_offset;
         self.staged_end_offset = next_offset.saturating_sub(1);
-        self.durable_offset = self.staged_end_offset;
+        self.durable_end = self.next_offset;
         self.flushed_through = next_offset;
         // The log rewound past everything the cache held; drop it so no stale
         // (rewound-away) offset is ever served from memory.
@@ -1612,6 +1609,58 @@ impl Log {
 
 fn seg_log_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.log", base))
+}
+
+#[test]
+fn empty_fsync_does_not_invent_a_record_or_cover_a_later_append() {
+    let dir = crate::test_dir!("empty_fsync_frontier");
+    let cfg = crate::KeratinConfig::test_default();
+    let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+    let (mut log, _) = Log::open(
+        &dir.root,
+        0,
+        cfg.segment_max_bytes,
+        cfg.index_stride_bytes,
+        cfg.flush_target_bytes,
+        cfg.tail_cache_bytes,
+        cfg.segment_preallocate_bytes,
+        false,
+        false,
+        state,
+    )
+    .unwrap();
+    log.manifest_flush_interval = Duration::ZERO;
+    let empty = log.prepare_fsync_job().unwrap();
+    let elapsed = empty.sync().unwrap();
+    log.finish_fsync_job(empty.durable_end(), elapsed).unwrap();
+    let persisted =
+        Manifest::load_or_create(&dir.root, 0, cfg.segment_max_bytes, cfg.index_stride_bytes)
+            .unwrap();
+    assert_eq!(
+        persisted.next_offset, 0,
+        "an empty fsync must preserve the empty manifest"
+    );
+    let empty = log.prepare_fsync_job().unwrap();
+    let elapsed = empty.sync().unwrap();
+    log.stage_append(
+        &Message {
+            headers: vec![],
+            payload: vec![42],
+            flags: 0,
+        },
+        1,
+    )
+    .unwrap();
+    log.finish_fsync_job(empty.durable_end(), elapsed).unwrap();
+    assert_eq!(
+        log.durable_end_exclusive().first_non_durable(),
+        0,
+        "earlier empty fsync cannot cover the later offset-zero append"
+    );
+    let actual = log.prepare_fsync_job().unwrap();
+    let elapsed = actual.sync().unwrap();
+    log.finish_fsync_job(actual.durable_end(), elapsed).unwrap();
+    assert_eq!(log.durable_end_exclusive().first_non_durable(), 1);
 }
 
 #[test]

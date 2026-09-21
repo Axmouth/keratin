@@ -263,7 +263,7 @@ struct FsyncReq {
 }
 
 struct FsyncDone {
-    through_offset: u64,
+    durable_end: u64,
     elapsed: Duration,
     ready: Vec<NotifyItem>,
     sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
@@ -403,7 +403,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
                 let mut fsync_elapsed = elapsed;
                 for req in reqs.drain(..) {
                     let done = FsyncDone {
-                        through_offset: req.job.through_offset(),
+                        durable_end: req.job.durable_end(),
                         elapsed: fsync_elapsed,
                         ready: req.ready,
                         sync_acks: req.sync_acks,
@@ -419,7 +419,7 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
                 let msg = e.to_string();
                 for req in reqs.drain(..) {
                     let done = FsyncDone {
-                        through_offset: req.job.through_offset(),
+                        durable_end: req.job.durable_end(),
                         elapsed: Duration::ZERO,
                         ready: fail_notify_items(req.ready, &msg),
                         sync_acks: req.sync_acks,
@@ -437,9 +437,9 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>) {
 #[cfg(feature = "writer-stage-trace")]
 fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: WriterStageTracer) {
     while let Ok(req) = rx.recv() {
-        let through_offset = req.job.through_offset();
+        let durable_end = req.job.durable_end();
         let result = trace_writer_stage!(tracer, req.work_id, "fsync", (0, 0), { req.job.sync() });
-        let mut done = fsync_done_from_result(through_offset, req.ready, req.sync_acks, result);
+        let mut done = fsync_done_from_result(durable_end, req.ready, req.sync_acks, result);
         done.work_id = req.work_id;
         if done_tx.send(done).is_err() {
             break;
@@ -451,14 +451,14 @@ fn fsync_loop(rx: Receiver<FsyncReq>, done_tx: Sender<FsyncDone>, tracer: Writer
 // default loop constructs it inline while coalescing the queued requests.
 #[cfg(feature = "writer-stage-trace")]
 fn fsync_done_from_result(
-    through_offset: u64,
+    durable_end: u64,
     ready: Vec<NotifyItem>,
     sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
     result: io::Result<Duration>,
 ) -> FsyncDone {
     match result {
         Ok(elapsed) => FsyncDone {
-            through_offset,
+            durable_end,
             elapsed,
             ready,
             sync_acks,
@@ -469,7 +469,7 @@ fn fsync_done_from_result(
         Err(err) => {
             let msg = err.to_string();
             FsyncDone {
-                through_offset,
+                durable_end,
                 elapsed: Duration::ZERO,
                 ready: ready
                     .into_iter()
@@ -1580,9 +1580,9 @@ fn handle_fsync_done(
 
     #[cfg(feature = "writer-stage-trace")]
     let finish_result =
-        log.finish_fsync_job_traced(done.through_offset, done.elapsed, tracer, done.work_id);
+        log.finish_fsync_job_traced(done.durable_end, done.elapsed, tracer, done.work_id);
     #[cfg(not(feature = "writer-stage-trace"))]
-    let finish_result = log.finish_fsync_job(done.through_offset, done.elapsed);
+    let finish_result = log.finish_fsync_job(done.durable_end, done.elapsed);
 
     match finish_result {
         Ok(()) => {
@@ -1677,17 +1677,17 @@ fn commit(
     *last_fsync = Instant::now();
 
     let mut ready = Vec::new();
-    let through_offset = job.through_offset();
+    let durable_end = job.durable_end();
 
     // Track the per-commit record count (EWMA) to gate fsync pipelining. Driven by
     // the linger/batcher (how much accrues per commit), not by the gate, so it does
     // not oscillate with the pipelining decision.
-    let commit_records = through_offset.saturating_sub(log.last_commit_through);
-    log.last_commit_through = through_offset;
+    let commit_records = durable_end.saturating_sub(log.last_commit_through);
+    log.last_commit_through = durable_end;
     log.recent_commit_records = (log.recent_commit_records * 3 + commit_records) / 4;
 
     while let Some(front) = pending.front() {
-        if front.end_offset <= through_offset {
+        if front.end_offset < durable_end {
             let p = pending
                 .pop_front()
                 .expect("front() returned Some on the previous line");
