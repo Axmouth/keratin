@@ -981,8 +981,8 @@ impl Log {
             // Feed the just-written batch to the tail cache so tail-following
             // reads serve it from memory instead of scanning this segment while
             // it is under fsync/writeback. Bytes are the exact on-disk format;
-            // the cache gates reads on the durable watermark, so pushing here
-            // (pre-fsync) never exposes a non-durable record.
+            // ordinary reads are gated on the durable watermark. Experimental
+            // replication can opt into these written bytes before fsync.
             if self.tail_cache.enabled() {
                 let next = self.staged_end_offset + 1;
                 self.tail_cache.push_batch(

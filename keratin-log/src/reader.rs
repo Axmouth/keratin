@@ -82,6 +82,18 @@ impl LogReader {
         self.scan_from_disk(from, max)
     }
 
+    /// Experimental replication source. Cached bytes may precede owner fsync;
+    /// callers must fence the history and independently gate confirmation on
+    /// owner durability. Never use this for ordinary delivery or recovery proof.
+    /// Misses (including oversized batches) retain durable-only disk behavior.
+    #[cfg(feature = "early-replication-experiment")]
+    pub fn scan_for_replication(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
+        if let Some(records) = self.tail_cache.read_written(from, max) {
+            return Ok(records);
+        }
+        self.scan_from(from, max)
+    }
+
     /// Verify retained durable records without trusting cached record contents.
     pub fn scan_from_disk(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
         // Bound the file scan at the durable frontier so it stops at the known end

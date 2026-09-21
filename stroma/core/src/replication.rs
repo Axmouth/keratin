@@ -629,6 +629,24 @@ impl Stroma {
         })
     }
 
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn subscribe_owner_written(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<(
+        tokio::sync::watch::Receiver<()>,
+        tokio::sync::watch::Receiver<()>,
+    )> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        Ok((
+            qh.msg_log().subscribe_written(),
+            qh.event_log().subscribe_written(),
+        ))
+    }
+
     pub async fn read_owner_message_records(
         &self,
         topic: &str,
@@ -636,6 +654,34 @@ impl Stroma {
         group: Option<&str>,
         from: Offset,
         max: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_message_records_inner(topic, part, group, from, max, false)
+            .await
+    }
+
+    /// Tentative bytes for a fenced, enrolled queue history only. The caller
+    /// retains responsibility for authority and both-log confirmation gates.
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_message_records_early(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_message_records_inner(topic, part, group, from, max, true)
+            .await
+    }
+
+    async fn read_owner_message_records_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        early: bool,
     ) -> Result<OwnerReplicationRead<Message>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
@@ -648,6 +694,7 @@ impl Stroma {
         }
 
         let log = qh.msg_log();
+        let epoch = log.current_epoch();
         let head_offset = log.head_offset();
         if from < head_offset {
             return Ok(owner_replication_checkpoint_required(&log, from));
@@ -661,6 +708,12 @@ impl Stroma {
             let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
                 let reader = read_log.reader();
+                #[cfg(feature = "early-replication-experiment")]
+                if early {
+                    return reader.scan_for_replication(from, max);
+                }
+                #[cfg(not(feature = "early-replication-experiment"))]
+                let _ = early;
                 reader.scan_from(from, max)
             })
             .await
@@ -678,8 +731,13 @@ impl Stroma {
             (records, expected)
         };
 
+        if qh.role() != QueueRole::Owner || log.current_epoch() != epoch {
+            return Err(StromaError::Io(
+                "owner changed during replication read".into(),
+            ));
+        }
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch: log.current_epoch(),
+            epoch,
             requested_offset: from,
             next_offset: batch_next_offset,
             records,
@@ -694,6 +752,34 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_event_records_inner(topic, part, group, from, max, false)
+            .await
+    }
+
+    /// Tentative bytes for a fenced, enrolled queue history only. The caller
+    /// retains responsibility for authority and both-log confirmation gates.
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_event_records_early(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_event_records_inner(topic, part, group, from, max, true)
+            .await
+    }
+
+    async fn read_owner_event_records_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        early: bool,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let role = qh.role();
@@ -705,6 +791,7 @@ impl Stroma {
         }
 
         let log = qh.event_log();
+        let epoch = log.current_epoch();
         let head_offset = log.head_offset();
         if from < head_offset {
             return Ok(owner_replication_checkpoint_required(&log, from));
@@ -718,6 +805,12 @@ impl Stroma {
             let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
                 let reader = read_log.reader();
+                #[cfg(feature = "early-replication-experiment")]
+                if early {
+                    return reader.scan_for_replication(from, max);
+                }
+                #[cfg(not(feature = "early-replication-experiment"))]
+                let _ = early;
                 reader.scan_from(from, max)
             })
             .await
@@ -736,8 +829,13 @@ impl Stroma {
             (records, expected)
         };
 
+        if qh.role() != QueueRole::Owner || log.current_epoch() != epoch {
+            return Err(StromaError::Io(
+                "owner changed during replication read".into(),
+            ));
+        }
         Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch: log.current_epoch(),
+            epoch,
             requested_offset: from,
             next_offset: batch_next_offset,
             records,
