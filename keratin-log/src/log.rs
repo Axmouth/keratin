@@ -22,6 +22,7 @@ use crate::{
     reader::LogReader,
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
+    reusable_buffer::ReusableBuffer,
     segment::Segment,
     tail_cache::TailCache,
     util::fsync_dir,
@@ -110,25 +111,74 @@ impl LogState {
     }
 }
 
-// Separate from channel capacity: buffers grow through the existing reserve path.
-fn initial_staging_capacity(default: usize, small: usize) -> usize {
+// Separate from channel capacity; experiments preserve ordinary build defaults.
+fn staging_buffer(default: usize, small: usize) -> io::Result<ReusableBuffer<u8>> {
     #[cfg(feature = "early-replication-experiment")]
     {
+        static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *ADAPTIVE.get_or_init(|| {
+            std::env::var("FIBRIL_EXPERIMENT_ADAPTIVE_STAGING").as_deref() == Ok("1")
+        }) {
+            static TIMING: std::sync::OnceLock<Result<(Duration, Duration), String>> =
+                std::sync::OnceLock::new();
+            let &(decay, release) = TIMING
+                .get_or_init(|| {
+                    adaptive_staging_timing(
+                        std::env::var("FIBRIL_EXPERIMENT_STAGING_DECAY_SECS")
+                            .ok()
+                            .as_deref(),
+                        std::env::var("FIBRIL_EXPERIMENT_STAGING_IDLE_RELEASE_SECS")
+                            .ok()
+                            .as_deref(),
+                    )
+                    .map_err(|error| error.to_string())
+                })
+                .as_ref()
+                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.clone()))?;
+            return Ok(ReusableBuffer::adaptive(small, decay, release)
+                .with_empty_resize(crate::reusable_buffer::EmptyBufferResize::Replace));
+        }
         static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *SMALL
             .get_or_init(|| std::env::var("FIBRIL_EXPERIMENT_SMALL_STAGING").as_deref() == Ok("1"))
         {
-            return small;
+            return Ok(ReusableBuffer::retained(small));
         }
     }
     let _ = small;
-    default
+    Ok(ReusableBuffer::retained(default))
+}
+
+#[cfg(any(test, feature = "early-replication-experiment"))]
+fn adaptive_staging_timing(
+    decay: Option<&str>,
+    release: Option<&str>,
+) -> io::Result<(Duration, Duration)> {
+    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
+    let decay: u64 = decay
+        .unwrap_or("10")
+        .parse()
+        .map_err(|_| invalid("FIBRIL_EXPERIMENT_STAGING_DECAY_SECS must be a positive integer"))?;
+    let release = match release {
+        Some(value) => value.parse::<u64>().map_err(|_| {
+            invalid("FIBRIL_EXPERIMENT_STAGING_IDLE_RELEASE_SECS must be a positive integer")
+        })?,
+        None => decay
+            .checked_mul(6)
+            .ok_or_else(|| invalid("staging retention duration overflow"))?,
+    };
+    if decay == 0 || release < decay {
+        return Err(invalid(
+            "staging decay must be positive and idle release must be at least the decay interval",
+        ));
+    }
+    Ok((Duration::from_secs(decay), Duration::from_secs(release)))
 }
 
 pub struct Log {
     // buffers
-    write_buf: Vec<u8>, // encoded staging; retains capacity grown for larger batches
-    idx_buf: Vec<u8>,   // sparse index buffer
+    write_buf: ReusableBuffer<u8>, // encoded staging
+    idx_buf: ReusableBuffer<u8>,   // sparse index buffer
 
     // Staging uses an inclusive offset; durability uses an exclusive boundary.
     staged_end_offset: u64, // last offset staged into buffers
@@ -218,10 +268,13 @@ fn encode_append_payloads_into(
     state: &mut AppendPlanState,
     payloads: &[Message],
     now_ms: u64,
-    write_buf: &mut Vec<u8>,
-    idx_buf: &mut Vec<u8>,
+    now: Instant,
+    write_buf: &mut ReusableBuffer<u8>,
+    idx_buf: &mut ReusableBuffer<u8>,
 ) -> io::Result<AppendPlanOutcome> {
     debug_assert!(!payloads.is_empty());
+    let mut write_buf = write_buf.edit(now);
+    let mut idx_buf = idx_buf.edit(now);
 
     let base_offset = state.next_offset;
 
@@ -237,7 +290,7 @@ fn encode_append_payloads_into(
 
         let record_start_pos = state.active_bytes_written + write_buf.len() as u64;
 
-        encode_record(write_buf, &record)
+        encode_record(&mut write_buf, &record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         if (record_start_pos - state.last_index_at_log_pos) >= state.index_stride_bytes as u64 {
@@ -261,6 +314,20 @@ fn encode_append_payloads_into(
 }
 
 impl Log {
+    /// Reclaim empty staging allocations without touching durability or caches.
+    pub(crate) fn maintain_staging(&mut self, now: Instant) {
+        self.write_buf.maintain(now);
+        self.idx_buf.maintain(now);
+    }
+
+    pub(crate) fn staging_maintenance_deadline(&self) -> Option<Instant> {
+        self.write_buf
+            .maintenance_deadline()
+            .into_iter()
+            .chain(self.idx_buf.maintenance_deadline())
+            .min()
+    }
+
     /// Complete a reset authorized by an external durable installation journal,
     /// before normal log open can encounter partially removed segment files.
     /// The caller must hold the root's exclusive Keratin lock throughout.
@@ -402,8 +469,8 @@ impl Log {
                     recent_commit_records: 0,
                     prealloc_chunk,
                     manifest,
-                    write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
-                    idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
+                    write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
+                    idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
                     stats: IoStats::new(),
                     log_state,
                     last_stats_dump: Instant::now(),
@@ -455,8 +522,8 @@ impl Log {
                     recent_commit_records: 0,
                     prealloc_chunk,
                     last_index_at_log_pos,
-                    write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
-                    idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
+                    write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
+                    idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
                     log_state,
                     stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
@@ -541,8 +608,8 @@ impl Log {
                 recent_commit_records: 0,
                 prealloc_chunk,
                 last_index_at_log_pos,
-                write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
-                idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
+                write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
+                idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
                 log_state,
                 stats: IoStats::new(),
                 last_stats_dump: Instant::now(),
@@ -632,10 +699,13 @@ impl Log {
         let base_offset = self.next_offset;
 
         // Reserve to avoid realloc
-        self.write_buf.reserve(estimated);
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
         // Index entries are sparse; reserve modestly
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -645,6 +715,7 @@ impl Log {
             &mut plan_state,
             payloads,
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -655,6 +726,7 @@ impl Log {
                     &mut plan_state,
                     payloads,
                     now_ms,
+                    t_encode,
                     &mut self.write_buf,
                     &mut self.idx_buf,
                 )
@@ -664,6 +736,7 @@ impl Log {
                 &mut plan_state,
                 payloads,
                 now_ms,
+                t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
             )?
@@ -826,9 +899,12 @@ impl Log {
             self.roll(now_ms)?;
         }
 
-        self.write_buf.reserve(estimated);
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -837,6 +913,7 @@ impl Log {
             &mut plan_state,
             payloads,
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -903,10 +980,13 @@ impl Log {
         let base_offset = self.next_offset;
 
         // Reserve to avoid realloc
-        self.write_buf.reserve(estimated);
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
         // Index entries are sparse; reserve modestly
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -916,6 +996,7 @@ impl Log {
             &mut plan_state,
             std::slice::from_ref(payload),
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -926,6 +1007,7 @@ impl Log {
                     &mut plan_state,
                     std::slice::from_ref(payload),
                     now_ms,
+                    t_encode,
                     &mut self.write_buf,
                     &mut self.idx_buf,
                 )
@@ -935,6 +1017,7 @@ impl Log {
                 &mut plan_state,
                 std::slice::from_ref(payload),
                 now_ms,
+                t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
             )?
@@ -1621,6 +1704,102 @@ impl Log {
 }
 
 // ---- helpers
+
+#[test]
+fn adaptive_staging_timing_validates_configuration() {
+    assert_eq!(
+        adaptive_staging_timing(None, None).unwrap(),
+        (Duration::from_secs(10), Duration::from_secs(60))
+    );
+    assert_eq!(
+        adaptive_staging_timing(Some("120"), None).unwrap(),
+        (Duration::from_secs(120), Duration::from_secs(720))
+    );
+    assert_eq!(
+        adaptive_staging_timing(Some("120"), Some("1800")).unwrap(),
+        (Duration::from_secs(120), Duration::from_secs(1800))
+    );
+    for (decay, release) in [
+        ("0", "60"),
+        ("10", "0"),
+        ("60", "10"),
+        ("bad", "60"),
+        ("10", "-1"),
+    ] {
+        assert!(adaptive_staging_timing(Some(decay), Some(release)).is_err());
+    }
+    assert!(adaptive_staging_timing(Some("18446744073709551615"), None).is_err());
+}
+
+#[test]
+fn adaptive_staging_release_preserves_written_cache_fsync_and_next_append() {
+    let dir = crate::test_dir!("adaptive_staging_durability");
+    let cfg = crate::KeratinConfig::test_default();
+    let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+    let (mut log, mapping) = Log::open(
+        &dir.root,
+        0,
+        cfg.segment_max_bytes,
+        1,
+        cfg.flush_target_bytes,
+        cfg.tail_cache_bytes,
+        0,
+        false,
+        false,
+        state,
+    )
+    .unwrap();
+    let reader = LogReader::new(&dir.root, mapping, log.tail_cache.clone());
+    log.write_buf = ReusableBuffer::adaptive(64, Duration::from_secs(10), Duration::from_secs(60));
+    log.idx_buf = ReusableBuffer::adaptive(16, Duration::from_secs(10), Duration::from_secs(60));
+    let message = Message {
+        headers: vec![9; 17],
+        payload: vec![42; 128 * 1024],
+        flags: 0,
+    };
+    log.stage_append(&message, 1).unwrap();
+    let staged_len = log.write_buf.len();
+    let later = Instant::now() + Duration::from_secs(120);
+    log.maintain_staging(later);
+    assert_eq!(
+        log.write_buf.len(),
+        staged_len,
+        "maintenance must preserve unflushed bytes"
+    );
+    // Preparing the job writes and clears staging, but does not acknowledge fsync.
+    let job = log.prepare_fsync_job().unwrap();
+    log.maintain_staging(later + Duration::from_secs(10));
+    assert_eq!(log.write_buf.capacity(), 0);
+    assert_eq!(log.idx_buf.capacity(), 0);
+    assert_eq!(log.staging_maintenance_deadline(), None);
+    assert_eq!(log.durable_end_exclusive().first_non_durable(), 0);
+    assert!(reader.scan_from(0, 2).unwrap().is_empty());
+    #[cfg(feature = "early-replication-experiment")]
+    {
+        let written = reader.scan_for_replication(0, 2).unwrap();
+        assert_eq!(written.len(), 1);
+        assert_eq!(written[0].payload, message.payload);
+    }
+    let elapsed = job.sync().unwrap();
+    log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
+    log.log_state.durable.advance(log.durable_end_exclusive());
+    // Both cache and physical file outlive the released encoding allocation.
+    for record in [
+        reader.scan_from(0, 2).unwrap(),
+        reader.scan_from_disk(0, 2).unwrap(),
+    ] {
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].payload, message.payload);
+        assert_eq!(record[0].headers, message.headers);
+    }
+    assert_eq!(log.stage_append(&message, 2).unwrap().0.base_offset, 1);
+    let job = log.prepare_fsync_job().unwrap();
+    let elapsed = job.sync().unwrap();
+    log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
+    log.log_state.durable.advance(log.durable_end_exclusive());
+    assert_eq!(reader.scan_from_disk(0, 3).unwrap().len(), 2);
+    log.shutdown().unwrap();
+}
 
 fn seg_log_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.log", base))
