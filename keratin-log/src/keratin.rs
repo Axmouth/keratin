@@ -299,6 +299,12 @@ impl Keratin {
         })
     }
 
+    /// Subscribe before reading to avoid losing a pre-fsync replication wake.
+    #[cfg(feature = "early-replication-experiment")]
+    pub fn subscribe_written(&self) -> tokio::sync::watch::Receiver<()> {
+        self.tail_cache.subscribe_written()
+    }
+
     pub fn reader(&self) -> LogReader {
         LogReader::new(
             &self.root,

@@ -6179,6 +6179,10 @@ struct PublishApplyPause {
 #[path = "stroma/event_order_tests.rs"]
 mod event_order_tests;
 
+#[cfg(all(test, feature = "early-replication-experiment"))]
+#[path = "early_replication_tests.rs"]
+mod early_replication_tests;
+
 #[cfg(test)]
 mod tests {
     use keratin_log::{KeratinReplicaExt, test_dir};

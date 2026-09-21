@@ -12,7 +12,7 @@
 //! reads decode from memory and never touch the file under writeback; older
 //! offsets (lagging consumers) miss and fall back to the file scan.
 //!
-//! It is a pure cache: a miss is always correct, and it only ever serves offsets
+//! Ordinary reads use it as a pure cache: a miss is always correct, serving offsets
 //! below the exclusive durable frontier (`0` means nothing durable, `1` includes
 //! offset zero), so durability semantics are unchanged.
 
@@ -46,11 +46,13 @@ struct Inner {
 #[derive(Debug)]
 pub(crate) struct TailCache {
     inner: RwLock<Inner>,
-    /// The durable frontier (a clone of `LogState.durable`). Reads never serve an
-    /// offset at or above it, so nothing non-durable is ever delivered.
+    /// The durable frontier (a clone of `LogState.durable`). Ordinary reads never
+    /// serve an offset at or above it; tentative replication opts in separately.
     durable: DurableWatermark,
     /// Total cached bytes cap. `0` disables the cache (all reads go to the file).
     byte_budget: usize,
+    #[cfg(feature = "early-replication-experiment")]
+    written: tokio::sync::watch::Sender<()>,
 }
 
 impl TailCache {
@@ -62,6 +64,8 @@ impl TailCache {
             }),
             durable,
             byte_budget,
+            #[cfg(feature = "early-replication-experiment")]
+            written: tokio::sync::watch::channel(()).0,
         }
     }
 
@@ -104,6 +108,14 @@ impl TailCache {
                 inner.bytes -= front.bytes.len();
             }
         }
+        drop(inner);
+        #[cfg(feature = "early-replication-experiment")]
+        self.written.send_replace(());
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    pub(crate) fn subscribe_written(&self) -> tokio::sync::watch::Receiver<()> {
+        self.written.subscribe()
     }
 
     /// Drop everything. Must be called on any backward move of the log
@@ -112,6 +124,9 @@ impl TailCache {
         let mut inner = self.inner.write();
         inner.batches.clear();
         inner.bytes = 0;
+        drop(inner);
+        #[cfg(feature = "early-replication-experiment")]
+        self.written.send_replace(());
     }
 
     /// Serve records `[from, from + max)` from the cache, gated on the durable
@@ -123,18 +138,36 @@ impl TailCache {
     ///   captured frontier. This can be shorter than `max`, or empty when `from`
     ///   is at/past the frontier; a cache hit never returns a partial range.
     pub(crate) fn read_from(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
+        self.read_bounded(from, max, Some(self.durable_frontier().first_non_durable()))
+    }
+
+    /// Tentative replication only: cache miss falls back to durable reads. An
+    /// oversized flush retained by the ordinary cache is excluded from this path.
+    #[cfg(feature = "early-replication-experiment")]
+    pub(crate) fn read_written(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
+        self.read_bounded(from, max, None)
+    }
+
+    fn read_bounded(
+        &self,
+        from: u64,
+        max: usize,
+        durable: Option<u64>,
+    ) -> Option<Vec<OwnedRecord>> {
         if self.byte_budget == 0 || max == 0 {
             return None;
         }
-        // Gate on the durable frontier so we never serve a non-durable offset
-        // even though `push_batch` runs pre-fsync.
-        let durable_excl = self.durable_frontier().first_non_durable();
-        let upper = from.saturating_add(max as u64).min(durable_excl);
+        let upper;
         // Hold the lock only long enough to clone the covering batches' byte
         // handles (cheap Arc refcounts). Decoding runs after the guard drops so a
         // long read never blocks the writer's `push_batch`.
         let bufs: Vec<(u64, u64, Arc<[u8]>)> = {
             let inner = self.inner.read();
+            if durable.is_none() && inner.bytes > self.byte_budget {
+                return None;
+            }
+            let frontier = durable.unwrap_or(inner.batches.back()?.next_offset);
+            upper = from.saturating_add(max as u64).min(frontier);
             let oldest = inner.batches.front()?.base_offset;
             if from < oldest {
                 return None; // below the window: lagging consumer reads the file
@@ -229,6 +262,46 @@ mod tests {
         let (b, n, bytes) = encode_batch(0, 10, 8);
         c.push_batch(b, n, bytes); // no-op when disabled
         assert!(c.read_from(0, 10).is_none());
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    #[tokio::test]
+    async fn tentative_reads_are_bounded_and_wakes_survive_an_unpolled_read() {
+        let (_, _, bytes) = encode_batch(0, 2, 16);
+        let c = cache(bytes.len(), 0);
+        let mut wake = c.subscribe_written();
+        for base in [0, 2] {
+            let (b, n, bytes) = encode_batch(base, 2, 16);
+            c.push_batch(b, n, bytes);
+            // The write happened before changed() was polled.
+            tokio::time::timeout(std::time::Duration::from_secs(1), wake.changed())
+                .await
+                .unwrap()
+                .unwrap();
+            assert!(c.read_from(base, 2).unwrap().is_empty());
+            let records = c.read_written(base, 10).unwrap();
+            assert_eq!(records.len(), 2);
+            assert_eq!(records[0].offset, base);
+        }
+        assert!(c.read_written(0, 4).is_none(), "evicted range must miss");
+        c.clear();
+        assert!(
+            c.read_written(2, 2).is_none(),
+            "reset discards tentative history"
+        );
+        assert!(wake.has_changed().unwrap());
+        let (b, n, bytes) = encode_batch(0, 10, 16);
+        c.push_batch(b, n, bytes);
+        assert!(
+            c.read_written(0, 10).is_none(),
+            "oversized batch uses durable fallback"
+        );
+        c.durable.advance(DurableFrontier::from_exclusive(10));
+        assert_eq!(c.read_from(0, 10).unwrap().len(), 10);
+        let disabled = cache(0, 0);
+        let (b, n, bytes) = encode_batch(0, 1, 16);
+        disabled.push_batch(b, n, bytes);
+        assert!(disabled.read_written(0, 1).is_none());
     }
 
     #[test]
