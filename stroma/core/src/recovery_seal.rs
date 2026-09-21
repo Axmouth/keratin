@@ -136,7 +136,7 @@ fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
 }
 
 impl Stroma {
-    fn recovery_seal_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
+    pub(super) fn recovery_seal_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.snap_dir(topic, part, group).join("recovery.seal")
     }
 

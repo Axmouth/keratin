@@ -44,8 +44,8 @@ pub use stroma::{
     QueuePublishCommit, QueuePublishObserver, RecoveryReadPage, RecoveryReadRequest,
     RecoveryReadSource, RecoveryRecord, RecoverySealRequest, ReplicatedEventBatch,
     ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, RetainedHistoryIdentity,
-    SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma, StromaKeratinConfig,
-    StromaOptions, TaskGroup,
+    PreparedStorageHistory, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma,
+    StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;

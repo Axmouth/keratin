@@ -18,6 +18,19 @@ pub struct StorageHistoryBinding {
     pub writer_session: [u8; 16],
 }
 
+/// Durable preparation of an empty local baseline. It grants no writer access.
+/// Receivers must authenticate the reporting replica before counting this receipt.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct PreparedStorageHistory {
+    pub topic: String,
+    pub partition: u32,
+    pub group: Option<String>,
+    pub stream: bool,
+    pub binding: StorageHistoryBinding,
+    pub storage_instance: [u8; 16],
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct Receipt {
@@ -247,8 +260,58 @@ impl Stroma {
         // log shutdown, even if the caller drops its future.
         tokio::spawn(async move {
             stroma
-                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding)
+                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true)
                 .await
+        })
+        .await
+        .map_err(io_err)?
+    }
+
+    /// Prepare a pristine baseline without opening ordinary writer admission.
+    /// The same storage instance may retry until activation; after restart it
+    /// needs recovery readmission. A previously admitted history cannot supply
+    /// a fresh empty-baseline receipt.
+    pub async fn prepare_empty_storage_history(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        kind: PartitionKind,
+        binding: StorageHistoryBinding,
+    ) -> Result<PreparedStorageHistory> {
+        if !cfg!(unix) {
+            return Err(StromaError::Unsupported(
+                "durable storage history requires directory sync".into(),
+            ));
+        }
+        validate(&binding)?;
+        let group = normalize_group(group).map(str::to_owned);
+        if kind == PartitionKind::Stream && group.is_some() {
+            return Err(StromaError::InvalidArgument(
+                "stream history cannot have a group".into(),
+            ));
+        }
+        let stroma = self.clone();
+        let topic = topic.to_owned();
+        tokio::spawn(async move {
+            stroma
+                .initialize_history_inner(
+                    &topic,
+                    part,
+                    group.as_deref(),
+                    kind,
+                    binding.clone(),
+                    false,
+                )
+                .await?;
+            Ok(PreparedStorageHistory {
+                topic,
+                partition: part,
+                group,
+                stream: kind == PartitionKind::Stream,
+                binding,
+                storage_instance: stroma.storage_session,
+            })
         })
         .await
         .map_err(io_err)?
@@ -261,6 +324,7 @@ impl Stroma {
         group: Option<&str>,
         kind: PartitionKind,
         binding: StorageHistoryBinding,
+        admit: bool,
     ) -> Result<()> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
         let path = self.storage_history_path(topic, part, group);
@@ -272,14 +336,48 @@ impl Stroma {
             binding: binding.clone(),
             storage_session: self.storage_session,
         };
-        if let Some(existing) = self.checked_storage_history(topic, part, group)? {
-            if existing != receipt {
+        let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
+        if !admit && self.admitted_histories.contains_key(&key) {
+            return Err(StromaError::InvalidArgument(
+                "admitted history is not an empty preparation".into(),
+            ));
+        }
+        if self
+            .recovery_seal_path(topic, part, group)
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Err(StromaError::RecoverySealed {
+                topic: topic.into(),
+                partition: part,
+                group: group.map(str::to_owned),
+            });
+        }
+        self.ensure_checkpoint_not_pending(topic, part, group)?;
+        if !admit {
+            for sidecar in [
+                self.snap_file(topic, part, group),
+                self.snap_dir(topic, part, group).join("checkpoint.install"),
+                self.snap_dir(topic, part, group).join("recovery.history"),
+            ] {
+                if sidecar.try_exists().map_err(io_err)? {
+                    return Err(StromaError::InvalidArgument(
+                        "empty preparation contains prior state or recovery metadata".into(),
+                    ));
+                }
+            }
+        }
+        let existing = self.checked_storage_history(topic, part, group)?;
+        if let Some(existing) = &existing {
+            if *existing != receipt {
                 return Err(StromaError::HistoryAdmissionRequired {
                     topic: topic.into(),
                     partition: part,
                     group: group.map(str::to_owned),
                 });
             }
+        }
+        if existing.is_some() && admit {
             let saved = receipt.clone();
             tokio::task::spawn_blocking(move || persist(&path, &saved))
                 .await
@@ -300,7 +398,7 @@ impl Stroma {
                 self.tp_part_dir(topic, part, group),
                 self.snap_dir(topic, part, group),
             ] {
-                if dir.try_exists().map_err(io_err)? {
+                if existing.is_none() && dir.try_exists().map_err(io_err)? {
                     return Err(StromaError::InvalidArgument(
                         "existing storage needs a verified history baseline".into(),
                     ));
@@ -350,8 +448,9 @@ impl Stroma {
         }
         // Admission is published only after successful fsync, directory sync and
         // log shutdown. A visible file after an I/O failure is insufficient.
-        self.admitted_histories
-            .insert((topic.into(), part, group.map(Into::into)), binding);
+        if admit {
+            self.admitted_histories.insert(key, binding);
+        }
         Ok(())
     }
 }
@@ -472,6 +571,99 @@ mod tests {
             .unwrap();
         assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
         reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_is_durable_idempotent_and_never_opens_writer_admission() {
+        let dir = keratin_log::test_dir!("history_prepare");
+        let stroma = open(&dir.root).await;
+        let receipt = stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        assert_eq!(receipt.binding, binding());
+        assert_ne!(receipt.storage_instance, [0; 16]);
+        assert_eq!(
+            receipt,
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .unwrap()
+        );
+        assert!(matches!(
+            stroma.ensure_queue_owner_epoch("q", 0, None, Some(7)).await,
+            Err(StromaError::HistoryAdmissionRequired { .. })
+        ));
+        assert!(stroma.admitted_histories.is_empty());
+        stroma.shutdown().await.unwrap();
+        drop(stroma);
+        let reopened = open(&dir.root).await;
+        assert_eq!(
+            reopened.storage_history_binding("q", 0, None).unwrap(),
+            Some(binding())
+        );
+        assert!(
+            reopened
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_rejects_snapshot_state_even_when_both_logs_are_empty() {
+        let dir = keratin_log::test_dir!("history_prepare_snapshot");
+        let stroma = open(&dir.root).await;
+        stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        fs::write(stroma.snap_file("q", 0, None), b"preexisting snapshot").unwrap();
+        assert!(
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        assert!(stroma.admitted_histories.is_empty());
+        stroma.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_cannot_recertify_admitted_or_sealed_history() {
+        let dir = keratin_log::test_dir!("history_prepare_closed");
+        let stroma = open(&dir.root).await;
+        initialize(&stroma).await.unwrap();
+        assert!(
+            stroma
+                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        stroma
+            .prepare_empty_storage_history("other", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        stroma
+            .seal_replica_for_recovery(
+                "other",
+                0,
+                None,
+                RecoverySealRequest {
+                    transition: [9; 32],
+                    fence_epoch: 1,
+                },
+            )
+            .await
+            .unwrap();
+        assert!(matches!(
+            stroma
+                .prepare_empty_storage_history("other", 0, None, PartitionKind::Queue, binding())
+                .await,
+            Err(StromaError::RecoverySealed { .. })
+        ));
+        stroma.shutdown().await.unwrap();
     }
 
     #[tokio::test]

@@ -52,7 +52,7 @@ use crate::{
 pub use crate::replication::*;
 #[path = "storage_history.rs"]
 mod storage_history;
-pub use storage_history::StorageHistoryBinding;
+pub use storage_history::{PreparedStorageHistory, StorageHistoryBinding};
 #[path = "recovery_history.rs"]
 mod recovery_history;
 #[path = "recovery_seal.rs"]
