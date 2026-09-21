@@ -6,7 +6,7 @@ use crate::{
     RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent,
 };
 use std::collections::BTreeMap;
-use crate::recovery_replay::{QueueReplay, RecoveryQueueReplayEvidence, RecoveryReplayLimits};
+use crate::recovery_replay::{QueueReplay, RecoveryQueueReplayEvidence, RecoveryQueueStateArtifact, RecoveryReplayLimits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySide {
@@ -554,12 +554,49 @@ impl RecoveryPairInspector {
         Ok(())
     }
     pub fn finish(self) -> Result<RecoveryPairInspection, String> {
+        self.finish_inner(None).map(|(report, _)| report)
+    }
+
+    /// Produce deterministic state bytes only after full sealed transfer and
+    /// live-payload verification. These artifacts confer no recovery authority.
+    pub fn finish_with_queue_artifacts(
+        self,
+        max_bytes_per_replica: usize,
+    ) -> Result<(RecoveryPairInspection, [RecoveryQueueStateArtifact; 2]), String> {
+        if self.replay.is_none()
+            || max_bytes_per_replica == 0
+            || max_bytes_per_replica > 16 * 1024 * 1024
+        {
+            return Err("queue artifacts require replay and a bounded output limit".into());
+        }
+        let (report, artifacts) = self.finish_inner(Some(max_bytes_per_replica))?;
+        Ok((
+            report,
+            artifacts.ok_or("queue artifacts were not constructed")?,
+        ))
+    }
+
+    fn finish_inner(
+        self,
+        artifact_limit: Option<usize>,
+    ) -> Result<
+        (
+            RecoveryPairInspection,
+            Option<[RecoveryQueueStateArtifact; 2]>,
+        ),
+        String,
+    > {
         if self.next_read()?.is_some() || self.logs.iter().any(|log| !log.pending.is_empty()) {
             return Err("incomplete recovery inspection".into());
         }
-        let queue_replay = match self.replay {
-            Some([left, right]) => Some([left.finish()?, right.finish()?]),
-            None => None,
+        let (queue_replay, artifacts) = match (self.replay, artifact_limit) {
+            (Some([left, right]), Some(limit)) => {
+                let artifacts = [left.finish_artifact(limit)?, right.finish_artifact(limit)?];
+                let evidence = artifacts.each_ref().map(|a| a.evidence().clone());
+                (Some(evidence), Some(artifacts))
+            }
+            (Some([left, right]), None) => (Some([left.finish()?, right.finish()?]), None),
+            (None, _) => (None, None),
         };
         let mut remaining_proofs = vec![
             RecoveryProofRequirement::CommonOriginAndInstalledLineage,
@@ -580,23 +617,28 @@ impl RecoveryPairInspector {
             remaining_proofs.push(RecoveryProofRequirement::CheckpointCoverage);
         }
         let [messages, events] = self.logs;
-        Ok(RecoveryPairInspection {
-            transition: self.seals[0].request.transition,
-            history_ids: [self.seals[0].history.id, self.seals[1].history.id],
-            messages: messages.result(),
-            events: events.result(),
-            references: self.references,
-            snapshot_digests: [
-                self.seals[0].history.snapshot_digest,
-                self.seals[1].history.snapshot_digest,
-            ],
-            queue_replay,
-            remaining_proofs,
-            pages: self.pages,
-            records: self.records,
-            bytes: self.bytes,
-        })
+        Ok((
+            RecoveryPairInspection {
+                transition: self.seals[0].request.transition,
+                history_ids: [self.seals[0].history.id, self.seals[1].history.id],
+                messages: messages.result(),
+                events: events.result(),
+                references: self.references,
+                snapshot_digests: [
+                    self.seals[0].history.snapshot_digest,
+                    self.seals[1].history.snapshot_digest,
+                ],
+                queue_replay,
+                remaining_proofs,
+                pages: self.pages,
+                records: self.records,
+                bytes: self.bytes,
+            },
+            artifacts,
+        ))
     }
+
+
 }
 
 /// Strict proof decoding. Ordinary replay remains forward-compatible, but an

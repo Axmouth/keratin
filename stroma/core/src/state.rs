@@ -4063,6 +4063,23 @@ impl QueueInternalState {
 
     // TODO: Add enqueued state?
     pub fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Vec<u8> {
+        self.encode_snapshot_with_entries(
+            last_snapshot_event_offset,
+            self.delayed_enqueue_heap.iter().map(|(Reverse(d), off)| (*d, *off)),
+            self.delayed_retry_heap.iter().map(|(Reverse(d), off)| (*d, *off)),
+            self.retries.iter().map(|(off, retries)| (*off, *retries)),
+        )
+    }
+
+    // Ordinary snapshots keep their existing O(n) encoding. Recovery supplies
+    // canonical ordering for the three collections whose iteration is unstable.
+    fn encode_snapshot_with_entries(
+        &self,
+        last_snapshot_event_offset: u64,
+        delayed_enqueues: impl Iterator<Item = (u64, u64)>,
+        delayed_retries: impl Iterator<Item = (u64, u64)>,
+        retries: impl Iterator<Item = (u64, u32)>,
+    ) -> Vec<u8> {
         let start = Instant::now();
 
         let mut out = Vec::new();
@@ -4091,21 +4108,21 @@ impl QueueInternalState {
 
         // pending delayed enqueues
         out.extend_from_slice(&(self.delayed_enqueue_heap.len() as u64).to_be_bytes());
-        for (Reverse(deadline), off) in self.delayed_enqueue_heap.iter() {
+        for (deadline, off) in delayed_enqueues {
             out.extend_from_slice(&deadline.to_be_bytes());
             out.extend_from_slice(&off.to_be_bytes());
         }
 
         // pending delayed retries
         out.extend_from_slice(&(self.delayed_retry_heap.len() as u64).to_be_bytes());
-        for (Reverse(deadline), off) in self.delayed_retry_heap.iter() {
+        for (deadline, off) in delayed_retries {
             out.extend_from_slice(&deadline.to_be_bytes());
             out.extend_from_slice(&off.to_be_bytes());
         }
 
         // retries
         out.extend_from_slice(&(self.retries.len() as u64).to_be_bytes());
-        for (&off, e) in self.retries.iter() {
+        for (off, e) in retries {
             out.extend_from_slice(&off.to_be_bytes());
             out.extend_from_slice(&e.to_be_bytes());
         }

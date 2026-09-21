@@ -44,6 +44,31 @@ pub struct RecoveryQueueReplayEvidence {
     pub live_payload_digest: Option<[u8; 32]>,
 }
 
+/// A verified, deterministic queue-state artifact. It supplies bytes for a
+/// future installation, not source-selection, lineage or activation authority.
+/// Construction requires completed sealed log and live-payload verification.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryQueueStateArtifact {
+    evidence: RecoveryQueueReplayEvidence,
+    message_head: u64,
+    state_snapshot: Vec<u8>,
+    snapshot_digest: [u8; 32],
+}
+impl RecoveryQueueStateArtifact {
+    pub fn evidence(&self) -> &RecoveryQueueReplayEvidence {
+        &self.evidence
+    }
+    pub fn message_head(&self) -> u64 {
+        self.message_head
+    }
+    pub fn state_snapshot(&self) -> &[u8] {
+        &self.state_snapshot
+    }
+    pub fn snapshot_digest(&self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+}
+
 pub(crate) struct QueueReplay {
     state: QueueInternalState,
     history: RetainedHistoryIdentity,
@@ -194,10 +219,12 @@ impl QueueReplay {
         let ev = decode_evidence_event(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
         let refs = ev.referenced_msg_offsets();
-        let work = 1 + refs.len() as u64 + match &ev {
-            StromaEvent::ActivateDelayed { max, .. } => *max as u64,
-            _ => 0,
-        };
+        let work = 1
+            + refs.len() as u64
+            + match &ev {
+                StromaEvent::ActivateDelayed { max, .. } => *max as u64,
+                _ => 0,
+            };
         if work > self.remaining {
             return Err("recovery replay operation budget exhausted".into());
         }
@@ -291,6 +318,45 @@ impl QueueReplay {
     }
 
     pub(crate) fn finish(self) -> Result<RecoveryQueueReplayEvidence, String> {
+        self.finish_parts().map(|(evidence, _)| evidence)
+    }
+
+    pub(crate) fn finish_artifact(
+        self,
+        max_bytes: usize,
+    ) -> Result<RecoveryQueueStateArtifact, String> {
+        if !self.verify_live || max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
+            return Err(
+                "artifact requires live payload verification and a bounded output limit".into(),
+            );
+        }
+        let (topic, partition) = self.state.recovery_resource();
+        let message_head = self.history.message_head;
+        let (evidence, state) = self.finish_parts()?;
+        let state_snapshot = state.into_recovery_snapshot(evidence.event_next);
+        if state_snapshot.len() > max_bytes {
+            return Err("recovery snapshot exceeds artifact output limit".into());
+        }
+        // Confirm the existing snapshot codec preserves the exact projected
+        // state, including optional values that might otherwise be normalized.
+        let mut decoded = QueueInternalState::new(topic, partition);
+        let meta = decoded
+            .load_snapshot(&state_snapshot)
+            .map_err(|e| e.to_string())?;
+        if meta.last_snapshot_event_offset != evidence.event_next.saturating_sub(1)
+            || decoded.recovery_state_digest() != evidence.lease_normalized_state_digest
+        {
+            return Err("recovery snapshot does not preserve the verified projected state".into());
+        }
+        Ok(RecoveryQueueStateArtifact {
+            evidence,
+            message_head,
+            snapshot_digest: *blake3::hash(&state_snapshot).as_bytes(),
+            state_snapshot,
+        })
+    }
+
+    fn finish_parts(self) -> Result<(RecoveryQueueReplayEvidence, QueueInternalState), String> {
         if self.next != self.target {
             return Err("incomplete recovery state replay".into());
         }
@@ -325,7 +391,7 @@ impl QueueReplay {
         } else {
             None
         };
-        Ok(RecoveryQueueReplayEvidence {
+        let evidence = RecoveryQueueReplayEvidence {
             version: 2,
             event_next: self.target,
             required_message_next,
@@ -339,7 +405,8 @@ impl QueueReplay {
             checkpoint_digest: self.checkpoint_event_next.and(self.history.snapshot_digest),
             lease_normalized_state_digest: self.state.recovery_lease_normalized_digest(),
             live_payload_digest,
-        })
+        };
+        Ok((evidence, self.state))
     }
 }
 

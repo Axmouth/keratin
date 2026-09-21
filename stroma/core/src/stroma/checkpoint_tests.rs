@@ -53,6 +53,11 @@ async fn exact_capture_excludes_durable_unapplied_zero_and_restart_replays_nack_
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         {
             let h = ticket.resolve().unwrap();
+            // The application pause is reached after append admission, before
+            // its completion is awaited. Establish the intended durable seam
+            // explicitly instead of racing the writer thread's tail update.
+            h.msg_log().sync().await.unwrap();
+            h.event_log().sync().await.unwrap();
             assert_eq!(h.event_log().next_offset(), 1);
             let snapshot = h.capture_exact_checkpoint(false).await.unwrap();
             assert_eq!(snapshot.event_next, 0);

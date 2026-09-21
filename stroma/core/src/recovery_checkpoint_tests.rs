@@ -74,11 +74,11 @@ fn checkpoint_seal(mut seal: SealedReplicaFrontiers, snapshot: &[u8]) -> SealedR
     seal
 }
 
-fn run_checkpoints(
+fn drive_checkpoints(
     mut inspector: RecoveryPairInspector,
     data: [[&[RecoveryRecord]; 2]; 2],
     snapshots: [&[u8]; 2],
-) -> Result<RecoveryPairInspection, String> {
+) -> Result<RecoveryPairInspector, String> {
     while let Some((side, request)) = inspector.next_read()? {
         let i = side.index();
         let response = if request.source == RecoveryReadSource::Snapshot {
@@ -100,7 +100,61 @@ fn run_checkpoints(
         };
         inspector.accept_page(side, response)?;
     }
-    inspector.finish()
+    Ok(inspector)
+}
+
+fn run_checkpoints(
+    inspector: RecoveryPairInspector,
+    data: [[&[RecoveryRecord]; 2]; 2],
+    snapshots: [&[u8]; 2],
+) -> Result<RecoveryPairInspection, String> {
+    drive_checkpoints(inspector, data, snapshots)?.finish()
+}
+
+#[test]
+fn verified_queue_artifact_preserves_state_and_is_bound_to_complete_payload_evidence() {
+    let mut state = crate::QueueInternalState::new("q".into(), 0);
+    state.enqueue(0, 2, Some(900));
+    state.mark_inflight(0, 300);
+    state.enqueue_delayed(1, 500);
+    let snapshot = checkpoint_envelope(&state, 4);
+    let msg = messages(0, 2);
+    let source = checkpoint_seal(seal(0, &msg, 4, &[]), &snapshot);
+    let build = || inspector(source.clone(), source.clone(), Default::default())
+        .with_queue_checkpoint_replay(4, Default::default(), 4096).unwrap();
+    assert!(build().finish_with_queue_artifacts(4096).is_err()); // incomplete reads
+    let transferred = || drive_checkpoints(build(), [[&msg, &[]], [&msg, &[]]], [&snapshot, &snapshot]).unwrap();
+    assert!(transferred().finish_with_queue_artifacts(0).is_err());
+    assert!(transferred().finish_with_queue_artifacts(1).is_err());
+    let (report, [left, right]) = transferred().finish_with_queue_artifacts(4096).unwrap();
+    assert_eq!(left, right);
+    assert_eq!(left.evidence().history_id, source.history.id);
+    assert_eq!(left.evidence().event_next, 4);
+    assert_eq!(left.evidence().live_payload_digest, report.queue_replay.unwrap()[0].live_payload_digest);
+    assert_eq!(left.snapshot_digest(), *blake3::hash(left.state_snapshot()).as_bytes());
+    let mut restored = crate::QueueInternalState::new("q".into(), 0);
+    restored.load_snapshot(left.state_snapshot()).unwrap();
+    assert!(restored.dump_inflight().is_empty());
+    assert!(restored.is_ready(0));
+    assert!(!restored.is_ready(1));
+    assert_eq!(restored.get_retries(0), 2);
+    assert_eq!(restored.collect_ttl_expired(900, 10), vec![0]);
+    assert_eq!(restored.recovery_state_digest(), state.recovery_lease_normalized_digest());
+    assert_eq!(transferred().finish_with_queue_artifacts(4096).unwrap().1[0], left);
+    assert!(report.remaining_proofs.contains(&RecoveryProofRequirement::CommonOriginAndInstalledLineage));
+}
+
+#[test]
+fn artifacts_require_live_payload_verification_even_when_plain_replay_succeeds() {
+    let build = || inspector(seal(0, &[], 0, &[]), seal(0, &[], 0, &[]), Default::default());
+    let unchecked = build().with_queue_replay(0, Default::default()).unwrap();
+    let unchecked = drive_checkpoints(unchecked, [[&[], &[]], [&[], &[]]], [&[], &[]]).unwrap();
+    assert!(unchecked.finish_with_queue_artifacts(4096).is_err());
+    let checked = build().with_queue_checkpoint_replay(0, Default::default(), 4096).unwrap();
+    let checked = drive_checkpoints(checked, [[&[], &[]], [&[], &[]]], [&[], &[]]).unwrap();
+    let (_, [artifact, _]) = checked.finish_with_queue_artifacts(4096).unwrap();
+    assert_eq!(artifact.evidence().event_next, 0);
+    assert_eq!(artifact.evidence().required_message_next, 0);
 }
 
 #[test]

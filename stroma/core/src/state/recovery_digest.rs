@@ -49,20 +49,55 @@ impl Digest {
 }
 
 impl QueueInternalState {
+    pub(crate) fn recovery_resource(&self) -> (String, u32) {
+        (self.topic.clone(), self.partition)
+    }
+
     /// Projection for a new owner's delivery attempts. Leases are local to an
     /// owner and ordinary delivery does not write MarkInflight to the event log.
     /// Retry counts, delayed work, TTL and DLQ state remain significant.
-    pub(crate) fn recovery_lease_normalized_digest(&self) -> [u8; 32] {
-        let mut state = self.clone();
-        for (&off, _) in &self.inflight {
-            if !state.is_settled(off) && !state.is_pending_dlq(off) {
-                state.ready.insert(off..off + 1);
+    fn release_recovery_leases(&mut self) {
+        for &off in self.inflight.keys() {
+            if !self.is_settled(off) && !self.is_pending_dlq(off) {
+                self.ready.insert(off..off + 1);
             }
         }
-        state.inflight.clear();
-        state.expiry_heap.clear();
-        state.min_deadline_hint = None;
+        self.inflight.clear();
+        self.expiry_heap.clear();
+        self.min_deadline_hint = None;
+    }
+
+    pub(crate) fn recovery_lease_normalized_digest(&self) -> [u8; 32] {
+        let mut state = self.clone();
+        state.release_recovery_leases();
         state.recovery_state_digest()
+    }
+
+    /// Stable bytes for a selected recovery plan. Only local delivery leases and
+    /// capture time are reset; retry, delayed, TTL, terminal and DLQ state remain.
+    pub(crate) fn into_recovery_snapshot(mut self, event_next: u64) -> Vec<u8> {
+        self.release_recovery_leases();
+        self.last_snapshot_timestamp = 0;
+        let mut delayed_enqueues: Vec<_> = self
+            .delayed_enqueue_heap
+            .iter()
+            .map(|(Reverse(d), off)| (*d, *off))
+            .collect();
+        let mut delayed_retries: Vec<_> = self
+            .delayed_retry_heap
+            .iter()
+            .map(|(Reverse(d), off)| (*d, *off))
+            .collect();
+        let mut retries: Vec<_> = self.retries.iter().map(|(off, n)| (*off, *n)).collect();
+        delayed_enqueues.sort_unstable();
+        delayed_retries.sort_unstable();
+        retries.sort_unstable();
+        self.encode_snapshot_with_entries(
+            event_next.saturating_sub(1),
+            delayed_enqueues.into_iter(),
+            delayed_retries.into_iter(),
+            retries.into_iter(),
+        )
     }
 
     pub(crate) fn recovery_live_ranges(&self) -> RangeSet<u64> {
@@ -155,6 +190,43 @@ mod tests {
         });
         state.default_message_ttl_ms = Some(900);
         state
+    }
+
+    #[test]
+    fn recovery_snapshot_bytes_are_canonical_without_changing_semantic_state() {
+        let mut a = QueueInternalState::new("q".into(), 0);
+        let mut b = a.clone();
+        for off in 0..50 {
+            a.enqueue(off, 1 + off as u32, Some(900));
+            a.enqueue_delayed(off + 100, 200 + off % 7);
+            a.delayed_retry_heap.push((Reverse(300 + off % 5), off));
+        }
+        for off in (0..50).rev() {
+            b.enqueue(off, 1 + off as u32, Some(900));
+            b.enqueue_delayed(off + 100, 200 + off % 7);
+            b.delayed_retry_heap.push((Reverse(300 + off % 5), off));
+        }
+        a.mark_inflight(0, 1000);
+        b.mark_inflight(1, 2000);
+        a.last_snapshot_timestamp = 50;
+        b.last_snapshot_timestamp = 99;
+        assert_eq!(
+            a.recovery_lease_normalized_digest(),
+            b.recovery_lease_normalized_digest()
+        );
+        let expected = a.recovery_lease_normalized_digest();
+        let bytes = a.into_recovery_snapshot(80);
+        assert_eq!(bytes, b.into_recovery_snapshot(80));
+        let mut restored = QueueInternalState::new("q".into(), 0);
+        assert_eq!(
+            restored
+                .load_snapshot(&bytes)
+                .unwrap()
+                .last_snapshot_event_offset,
+            79
+        );
+        assert_eq!(restored.recovery_state_digest(), expected);
+        assert_eq!(restored.last_snapshot_timestamp, 0);
     }
 
     #[test]
