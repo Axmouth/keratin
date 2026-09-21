@@ -948,6 +948,18 @@ fn writer_loop_inner(
                     &notify_tx,
                     false,
                 );
+                // No old fsync may publish a frontier or manifest after the
+                // checkpoint cut. Draining also completes outstanding Sync
+                // replies before their files are replaced.
+                wait_for_inflight_fsyncs(
+                    log,
+                    &state,
+                    &notify_tx,
+                    &fsync_done_rx,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                );
                 let res = log.reset_to_checkpoint(next_offset, crate::util::unix_millis());
                 if res.is_ok() {
                     last_fsync = Instant::now();

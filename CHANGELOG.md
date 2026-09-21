@@ -28,6 +28,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Checkpoint reset drains outstanding fsync completions before replacing log
+  files and resetting durability. An older completion can no longer republish
+  its previous frontier after the reset or overwrite the new manifest boundary.
+
 - Fsync jobs retain an exclusive durable boundary. An empty job can no longer
   persist a manifest claiming offset zero exists or mark a later offset-zero
   append durable. Regression coverage includes delayed completion after a new

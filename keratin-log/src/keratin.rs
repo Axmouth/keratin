@@ -894,3 +894,55 @@ mod checkpoint_epoch_tests {
         assert_eq!(log.current_epoch(), 1);
     }
 }
+
+#[cfg(test)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn checkpoint_reset_drains_prior_fsync_completions() {
+    let dir = crate::test_dir!("reset_fsync_drain");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    log.become_follower();
+    for _ in 0..16 {
+        log.append_replicated_batch(
+            0,
+            0,
+            vec![Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![7; 4096],
+            }],
+            Some(KDurability::AfterWrite),
+        )
+        .await
+        .unwrap();
+        let mut syncs = Vec::new();
+        for _ in 0..16 {
+            let (respond_to, rx) = oneshot::channel();
+            log.tx.send(WriterCmd::Sync { respond_to }).unwrap();
+            syncs.push(rx);
+        }
+        let (respond_to, reset) = oneshot::channel();
+        log.tx
+            .send(WriterCmd::ResetToCheckpoint {
+                next_offset: 0,
+                expected_epoch: Some(0),
+                respond_to,
+            })
+            .unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(10), reset)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap();
+        for mut rx in syncs {
+            assert!(
+                matches!(rx.try_recv(), Ok(Ok(()))),
+                "reset returned while an earlier fsync could still publish its old frontier"
+            );
+        }
+        assert_eq!(log.next_offset(), 0);
+        assert_eq!(log.log_state.durable.load().first_non_durable(), 0);
+    }
+    log.shutdown().await.unwrap();
+}
