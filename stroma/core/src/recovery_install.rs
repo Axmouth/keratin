@@ -154,6 +154,169 @@ impl Stroma {
         Ok(Some(self.generation_view(route.root(&self.root))))
     }
 
+    /// Fresh consensus must identify this exact local replica as excluded from
+    /// the current write set. Retain and fence its old history, then publish a
+    /// separate empty learner generation. This grants no broker serving role.
+    pub async fn prepare_queue_learner_storage(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        binding: StorageHistoryBinding,
+        intent: [u8; 32],
+    ) -> Result<PreparedStorageHistory> {
+        if !cfg!(unix) || intent == [0; 32] {
+            return Err(invalid(
+                "learner generation requires durable directories and an exact intent",
+            ));
+        }
+        let st = self.clone();
+        let topic = topic.to_owned();
+        let group = normalize_group(group).map(str::to_owned);
+        tokio::spawn(async move {
+            let current = st.storage_history_binding(&topic, part, group.as_deref())?;
+            let sealed = st
+                .recovery_seal_path(&topic, part, group.as_deref())
+                .try_exists()
+                .map_err(io_err)?;
+            if current.is_none() || (current.as_ref() == Some(&binding) && !sealed) {
+                return st
+                    .resume_unaccepted_storage_history(&topic, part, group.as_deref(), binding)
+                    .await;
+            }
+            if !sealed {
+                let lifecycle = st
+                    .lock_partition_lifecycle(&topic, part, group.as_deref())
+                    .await;
+                let handle = {
+                    let registry = st.queue_handles.load();
+                    slot_lookup_no_alloc(&registry, &topic, part, group.as_deref())
+                        .and_then(|s| s.handle.get().cloned())
+                };
+                if let Some(handle) = handle {
+                    drop(lifecycle);
+                    st.resume_live_checkpoint(&topic, part, group.as_deref(), &handle)
+                        .await?;
+                } else {
+                    let _lifecycle = st
+                        .resume_cold_checkpoint_authorized(
+                            &topic,
+                            part,
+                            group.as_deref(),
+                            lifecycle,
+                            true,
+                        )
+                        .await?;
+                }
+            }
+            // This also drains any surviving local actor and freezes both logs.
+            let sealed = st
+                .seal_replica_inner(
+                    &topic,
+                    part,
+                    group.as_deref(),
+                    PartitionKind::Queue,
+                    RecoverySealRequest {
+                        transition: intent,
+                        fence_epoch: 0,
+                    },
+                    true,
+                )
+                .await?;
+            let route = Route {
+                topic: topic.clone(),
+                partition: part,
+                group: group.clone(),
+                generation: Some(Generation {
+                    plan: intent,
+                    instance: st.storage_session,
+                }),
+            };
+            let view = st.generation_view(route.root(&st.root));
+            // Preparation owns the lifecycle lock itself. The old generation
+            // is durably sealed before this lock is temporarily released.
+            let receipt = view
+                .resume_unaccepted_storage_history(&topic, part, group.as_deref(), binding.clone())
+                .await?;
+            boundary("learner_prepared");
+            let _lifecycle = st
+                .lock_partition_lifecycle(&topic, part, group.as_deref())
+                .await;
+            let route_dir = st.route_dir(&topic, part, group.as_deref());
+            fs::create_dir_all(&route_dir).map_err(io_err)?;
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(route_dir.join(".keratin.lock"))
+                .map_err(io_err)?;
+            let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
+            let disk: Option<Route> = read_meta(&route_dir.join("active"))?;
+            let resource_key = key(&topic, part, group.as_deref());
+            let cached = st.recovery_routes.get(&resource_key).map(|r| r.clone());
+            if disk != cached && disk.as_ref() != Some(&route) {
+                return Err(invalid(
+                    "learner route changed in another storage instance; reopen",
+                ));
+            }
+            st.require_matching_recovery_seal(&topic, part, group.as_deref(), &sealed.request)?;
+            if st.storage_history_binding(&topic, part, group.as_deref())? != current {
+                return Err(invalid("learner source history changed during preparation"));
+            }
+            let old = cached.unwrap_or(Route {
+                topic: topic.clone(),
+                partition: part,
+                group: group.clone(),
+                generation: None,
+            });
+            save_meta(
+                &route_dir.join(format!(
+                    "retained-{}",
+                    blake3::Hash::from_bytes(sealed.request.transition)
+                )),
+                &old,
+            )?;
+            persist_exact(&route_dir.join("started"), b"recovery installation")?;
+            let handle = {
+                let registry = st.queue_handles.load();
+                slot_lookup_no_alloc(&registry, &topic, part, group.as_deref())
+                    .and_then(|s| s.handle.get().cloned())
+            };
+            if let Some(h) = handle {
+                h.begin_recovery_seal();
+                h.quiesce_for_teardown().await;
+                let _apply = h.follower_apply_state().await;
+                h.cancel_background_tasks();
+                h.recovery_gate.retire_snapshots().await?;
+                if let Some(wq) = h.as_work_queue() {
+                    wq.shutdown().await;
+                }
+                h.msg_log().shutdown().await.map_err(io_err)?;
+                h.event_log().shutdown().await.map_err(io_err)?;
+            }
+            st.remove_queue(&topic, part, group.as_deref());
+            st.admitted_histories.remove(&resource_key);
+            boundary("learner_retired");
+            view.verify_admitted_storage_history(&receipt)?;
+            let scratch = route_dir.join("next");
+            if scratch.try_exists().map_err(io_err)? {
+                fs::remove_file(&scratch).map_err(io_err)?;
+            }
+            save_meta(&scratch, &route)?;
+            fs::rename(&scratch, route_dir.join("active")).map_err(io_err)?;
+            recovery_seal::sync_directories(&route_dir)?;
+            boundary("learner_switched");
+            st.recovery_routes.insert(resource_key.clone(), route);
+            st.quarantined.remove(&resource_key);
+            st.admitted_histories.insert(resource_key, binding);
+            st.index_recovered_resource(&topic, part, group.as_deref());
+            st.verify_admitted_storage_history(&receipt)?;
+            Ok(receipt)
+        })
+        .await
+        .map_err(io_err)?
+    }
+
     /// Install a verified stage after fresh external plan authorization. Old
     /// storage must already be sealed under `seal`. This grants no serving role.
     pub async fn install_queue_recovery_stage(
@@ -492,7 +655,11 @@ impl Stroma {
     }
 
     fn index_recovered_partition(&self, spec: &QueueRecoveryStageSpec) {
-        let key = key(&spec.topic, spec.partition, spec.group.as_deref());
+        self.index_recovered_resource(&spec.topic, spec.partition, spec.group.as_deref());
+    }
+
+    fn index_recovered_resource(&self, topic: &str, part: u32, group: Option<&str>) {
+        let key = key(topic, part, group);
         loop {
             let current = self.queue_handles.load();
             if current

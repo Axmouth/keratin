@@ -226,20 +226,28 @@ impl Stroma {
         let group = normalize_group(group).map(str::to_owned);
         tokio::spawn(async move {
             stroma
-                .seal_replica_inner(&topic, part, group.as_deref(), expected_kind, request)
+                .seal_replica_inner(
+                    &topic,
+                    part,
+                    group.as_deref(),
+                    expected_kind,
+                    request,
+                    false,
+                )
                 .await
         })
         .await
         .map_err(io_err)?
     }
 
-    async fn seal_replica_inner(
+    pub(super) async fn seal_replica_inner(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
         expected_kind: PartitionKind,
-        request: RecoverySealRequest,
+        mut request: RecoverySealRequest,
+        excluded_learner: bool,
     ) -> Result<SealedReplicaFrontiers> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
         let actual = self.read_partition_kind(topic, part, group);
@@ -256,7 +264,7 @@ impl Stroma {
             if intent.topic != topic
                 || intent.partition != part
                 || intent.group.as_deref() != group
-                || intent.request != request
+                || (!excluded_learner && intent.request != request)
             {
                 return Err(StromaError::InvalidArgument(
                     "conflicting recovery seal request".into(),
@@ -289,6 +297,19 @@ impl Stroma {
         };
         let result = async {
             let max_epoch = messages.current_epoch().max(events.current_epoch());
+            // Fresh learner authority proves this local copy is outside the
+            // active write set. Preserve any earlier seal and its evidence.
+            if excluded_learner {
+                request = match &previous {
+                    Some(intent) => intent.request.clone(),
+                    None => RecoverySealRequest {
+                        transition: request.transition,
+                        fence_epoch: max_epoch.checked_add(1).ok_or_else(|| {
+                            StromaError::InvalidArgument("learner fence epoch overflow".into())
+                        })?,
+                    },
+                };
+            }
             if max_epoch > request.fence_epoch
                 || (previous.is_none() && max_epoch == request.fence_epoch)
             {

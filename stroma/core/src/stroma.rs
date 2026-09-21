@@ -1524,6 +1524,17 @@ impl Stroma {
                         kind,
                     );
 
+                    if self
+                        .snap_dir(tp, part, group)
+                        .join("storage.learner")
+                        .try_exists()
+                        .map_err(io_err)?
+                    {
+                        inner.become_follower();
+                        inner.msg_log().become_follower();
+                        inner.event_log().become_follower();
+                    }
+
                     if slot.exists_on_disk {
                         self.recover_one_log_with_handle(
                             &self.ticket_for(tp, part, group, &inner),

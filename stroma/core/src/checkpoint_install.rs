@@ -13,6 +13,8 @@ struct Journal {
     partition: u32,
     group: Option<String>,
     phase: Phase,
+    #[serde(default)]
+    history: Option<StorageHistoryBinding>,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -120,6 +122,7 @@ impl Stroma {
             if journal.topic != topic
                 || journal.partition != part
                 || journal.group.as_deref() != normalize_group(group)
+                || journal.history != self.storage_history_binding(topic, part, group)?
             {
                 return Err(StromaError::Corruption(
                     "checkpoint installation identity mismatch".into(),
@@ -189,8 +192,42 @@ impl Stroma {
         let group = normalize_group(group).map(str::to_owned);
         tokio::spawn(async move {
             stroma
-                .install_checkpoint_inner(&topic, part, group.as_deref(), &install)
+                .install_checkpoint_inner(&topic, part, group.as_deref(), &install, None)
                 .await?;
+            Ok(FollowerStateCheckpointInstallOutcome {
+                message_next_offset: install.message_next_offset,
+                event_next_offset: install.event_next_offset,
+                applied_event_offset: install.applied_event_offset,
+                snapshot_meta: meta,
+            })
+        })
+        .await
+        .map_err(io_err)?
+    }
+
+    /// The caller must freshly authorize this exact non-voting learner before
+    /// each installation. Ordinary bound replicas cannot use checkpoint reset.
+    pub async fn install_queue_learner_checkpoint(
+        &self,
+        receipt: PreparedStorageHistory,
+        install: FollowerStateCheckpointInstall,
+    ) -> Result<FollowerStateCheckpointInstallOutcome> {
+        if !cfg!(unix) || receipt.stream {
+            return Err(StromaError::Unsupported(
+                "learner checkpoint requires Unix queue storage".into(),
+            ));
+        }
+        let (_, meta) = validate(&receipt.topic, receipt.partition, &install)?;
+        let st = self.clone();
+        tokio::spawn(async move {
+            st.install_checkpoint_inner(
+                &receipt.topic,
+                receipt.partition,
+                receipt.group.as_deref(),
+                &install,
+                Some(&receipt),
+            )
+            .await?;
             Ok(FollowerStateCheckpointInstallOutcome {
                 message_next_offset: install.message_next_offset,
                 event_next_offset: install.event_next_offset,
@@ -208,12 +245,16 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         install: &FollowerStateCheckpointInstall,
+        learner: Option<&PreparedStorageHistory>,
     ) -> Result<()> {
         loop {
             self.queue_handle(topic, part, group).await?;
             let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
             // Replacing a bound history needs a lineage-aware installation receipt.
-            self.require_unbound_storage_history(topic, part, group)?;
+            match learner {
+                Some(receipt) => self.verify_admitted_storage_history(receipt)?,
+                None => self.require_unbound_storage_history(topic, part, group)?,
+            }
             let h = {
                 let current = self.queue_handles.load();
                 slot_lookup_no_alloc(&current, topic, part, group)
@@ -251,6 +292,7 @@ impl Stroma {
                 partition: part,
                 group: group.map(str::to_owned),
                 phase: Phase::Pending(install.clone()),
+                history: learner.map(|r| r.binding.clone()),
             };
             let path = self.checkpoint_journal_path(topic, part, group);
             let gate = h.recovery_gate.clone();
@@ -466,6 +508,18 @@ impl Stroma {
         group: Option<&str>,
         lifecycle: tokio::sync::OwnedMutexGuard<()>,
     ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
+        self.resume_cold_checkpoint_authorized(topic, part, group, lifecycle, false)
+            .await
+    }
+
+    pub(super) async fn resume_cold_checkpoint_authorized(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        lifecycle: tokio::sync::OwnedMutexGuard<()>,
+        excluded_learner: bool,
+    ) -> Result<tokio::sync::OwnedMutexGuard<()>> {
         let Some(journal) = self.checkpoint_journal(topic, part, group)? else {
             return Ok(lifecycle);
         };
@@ -474,7 +528,22 @@ impl Stroma {
                 "checkpoint recovery requires durable directory sync on this platform".into(),
             ));
         }
-        self.ensure_partition_not_sealed(topic, part, group)?;
+        if excluded_learner {
+            // The caller has checked the exact binding under this lifecycle
+            // lock. Journal identity is bound to that same history above.
+            if journal.history.is_none()
+                || self
+                    .recovery_seal_path(topic, part, group)
+                    .try_exists()
+                    .map_err(io_err)?
+            {
+                return Err(StromaError::InvalidArgument(
+                    "learner checkpoint has no bound authority or is sealed".into(),
+                ));
+            }
+        } else {
+            self.ensure_partition_not_sealed(topic, part, group)?;
+        }
         let stroma = self.clone();
         // Own the lifecycle guard in the task: a cancelled materialization must
         // not release it while detached recovery I/O is still deleting files.
@@ -602,6 +671,101 @@ mod tests {
                 .phase,
             Phase::Complete { .. }
         ));
+    }
+
+    #[tokio::test]
+    async fn learner_checkpoint_restart_retains_authority_and_requires_payload_backfill() {
+        for count in [0, 1] {
+            for boundary in [
+                "intent", "messages", "events", "state", "snapshot", "complete",
+            ] {
+                let dir = test_dir!("learner_checkpoint_restart");
+                let st = open(&dir.root).await;
+                let binding = StorageHistoryBinding {
+                    resource_incarnation: [1; 16],
+                    accepted_history: [2; 16],
+                    writer_session: [3; 16],
+                };
+                let receipt = st
+                    .prepare_queue_learner_storage("q", 0, None, binding.clone(), [4; 32])
+                    .await
+                    .unwrap();
+                follower(&st).await;
+                assert!(
+                    st.install_follower_state_checkpoint("q", 0, None, checkpoint(count))
+                        .await
+                        .is_err()
+                );
+                let mut wrong = receipt.clone();
+                wrong.storage_instance = [9; 16];
+                assert!(
+                    st.install_queue_learner_checkpoint(wrong, checkpoint(count))
+                        .await
+                        .is_err()
+                );
+                *st.checkpoint_fault.lock().unwrap() = Some(boundary);
+                let error = st
+                    .install_queue_learner_checkpoint(receipt.clone(), checkpoint(count))
+                    .await
+                    .unwrap_err();
+                assert!(error.to_string().contains(boundary), "{error}");
+                st.shutdown().await.unwrap();
+                drop(st);
+                let st = open(&dir.root).await;
+                // Ordinary access still requires fresh metadata admission.
+                assert!(st.queue_handle("q", 0, None).await.is_err());
+                let renewed = st
+                    .prepare_queue_learner_storage("q", 0, None, binding, [5; 32])
+                    .await
+                    .unwrap();
+                assert_ne!(renewed.storage_instance, receipt.storage_instance);
+                follower(&st).await;
+                assert_eq!(
+                    st.queue_replication_next_offsets("q", 0, None)
+                        .await
+                        .unwrap(),
+                    (0, count)
+                );
+                if count > 0 {
+                    assert!(
+                        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, count)
+                            .await
+                            .is_err()
+                    );
+                    st.apply_replicated_queue_batch(
+                        "q",
+                        0,
+                        None,
+                        Some(ReplicatedMessageBatch {
+                            epoch: 7,
+                            first_offset: 0,
+                            durability: Some(KDurability::AfterFsync),
+                            records: vec![Message {
+                                flags: 0,
+                                headers: vec![],
+                                payload: b"backfill".to_vec(),
+                            }],
+                        }),
+                        None,
+                    )
+                    .await
+                    .unwrap();
+                }
+                st.verify_queue_learner_caught_up("q", 0, None, 7, count, count)
+                    .await
+                    .unwrap();
+                st.install_queue_learner_checkpoint(renewed, checkpoint(count))
+                    .await
+                    .unwrap();
+                assert_eq!(
+                    st.queue_replication_next_offsets("q", 0, None)
+                        .await
+                        .unwrap(),
+                    (count, count)
+                );
+                st.shutdown().await.unwrap();
+            }
+        }
     }
 
     #[tokio::test]
@@ -820,6 +984,7 @@ mod tests {
         let dir = test_dir!("checkpoint_journal_validation");
         let path = dir.root.join("install");
         let journal = Journal {
+            history: None,
             topic: "q".into(),
             partition: 0,
             group: None,
@@ -843,6 +1008,7 @@ mod tests {
         stroma.shutdown().await.unwrap();
         drop(stroma);
         let journal = Journal {
+            history: None,
             topic: "another-queue".into(),
             partition: 0,
             group: None,

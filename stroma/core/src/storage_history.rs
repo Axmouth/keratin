@@ -494,6 +494,153 @@ impl Stroma {
         .map_err(io_err)?
     }
 
+    /// Fresh consensus must prove this replica is outside the accepted write
+    /// set of exactly this binding. Preserve partial learner data on restart;
+    /// this operation never repairs logs or changes their history/epoch.
+    pub async fn resume_unaccepted_storage_history(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        binding: StorageHistoryBinding,
+    ) -> Result<PreparedStorageHistory> {
+        if !cfg!(unix) {
+            return Err(StromaError::Unsupported(
+                "learner storage requires durable directory sync".into(),
+            ));
+        }
+        if self.storage_history_binding(topic, part, group)?.is_none() {
+            self.resume_empty_storage_history(
+                topic,
+                part,
+                group,
+                PartitionKind::Queue,
+                binding.clone(),
+            )
+            .await?;
+        }
+        let stroma = self.clone();
+        let topic = topic.to_owned();
+        let group = normalize_group(group).map(str::to_owned);
+        tokio::spawn(async move {
+            let mut _lifecycle = stroma
+                .lock_partition_lifecycle(&topic, part, group.as_deref())
+                .await;
+            let path = stroma.storage_history_path(&topic, part, group.as_deref());
+            let old = stroma
+                .checked_storage_history(&topic, part, group.as_deref())?
+                .ok_or_else(|| StromaError::Corruption("learner storage receipt absent".into()))?;
+            if old.binding != binding || old.stream {
+                return Err(StromaError::InvalidArgument(
+                    "learner requires the exact queue history".into(),
+                ));
+            }
+            if stroma
+                .recovery_seal_path(&topic, part, group.as_deref())
+                .try_exists()
+                .map_err(io_err)?
+            {
+                return Err(StromaError::InvalidArgument(
+                    "sealed history requires recovery installation".into(),
+                ));
+            }
+            let mut saved = old.clone();
+            saved.storage_session = stroma.storage_session;
+            if saved != old {
+                _lifecycle = stroma
+                    .resume_cold_checkpoint_authorized(
+                        &topic,
+                        part,
+                        group.as_deref(),
+                        _lifecycle,
+                        true,
+                    )
+                    .await?;
+                let messages = open_preparation_log(
+                    stroma.msg_tp_part_dir(&topic, part, group.as_deref()),
+                    stroma.keratin_cfg_msg,
+                )
+                .await?;
+                let events = match open_preparation_log(
+                    stroma.tp_part_dir(&topic, part, group.as_deref()),
+                    stroma.keratin_cfg_event,
+                )
+                .await
+                {
+                    Ok(events) => events,
+                    Err(e) => {
+                        let _ = messages.shutdown().await;
+                        return Err(e);
+                    }
+                };
+                let result = (|| {
+                    if read(&path)?.as_ref() != Some(&old) {
+                        return Err(StromaError::InvalidArgument(
+                            "learner receipt changed".into(),
+                        ));
+                    }
+                    let next = path.with_file_name("storage.history.next");
+                    if next.try_exists().map_err(io_err)? {
+                        fs::remove_file(&next).map_err(io_err)?;
+                    }
+                    persist(&next, &saved)?;
+                    fs::rename(&next, &path).map_err(io_err)?;
+                    recovery_seal::sync_directories(path.parent().unwrap())
+                })();
+                let (m, e) = tokio::join!(messages.shutdown(), events.shutdown());
+                result?;
+                m.map_err(io_err)?;
+                e.map_err(io_err)?;
+            }
+            // Materialization and eviction must never temporarily grant a
+            // learner an owner role to background timer/expiry maintenance.
+            recovery_stage::persist_exact(
+                &stroma
+                    .snap_dir(&topic, part, group.as_deref())
+                    .join("storage.learner"),
+                b"follower",
+            )?;
+            let handle = {
+                let registry = stroma.queue_handles.load();
+                slot_lookup_no_alloc(&registry, &topic, part, group.as_deref())
+                    .and_then(|s| s.handle.get().cloned())
+            };
+            if let Some(handle) = handle {
+                let _apply = handle.follower_apply_state().await;
+                if handle.role() == QueueRole::Owner {
+                    handle.freeze_owner_and_wait_operations().await?;
+                }
+                handle.become_follower();
+                handle.msg_log().become_follower();
+                handle.event_log().become_follower();
+            }
+            recovery_stage::persist_exact(
+                &stroma
+                    .snap_dir(&topic, part, group.as_deref())
+                    .join("storage.activated"),
+                b"activated",
+            )?;
+            stroma.admitted_histories.insert(
+                (
+                    topic.clone().into_boxed_str(),
+                    part,
+                    group.clone().map(String::into_boxed_str),
+                ),
+                binding.clone(),
+            );
+            Ok(PreparedStorageHistory {
+                topic,
+                partition: part,
+                group,
+                stream: false,
+                binding,
+                storage_instance: stroma.storage_session,
+            })
+        })
+        .await
+        .map_err(io_err)?
+    }
+
     async fn initialize_history_inner(
         &self,
         topic: &str,
@@ -730,6 +877,343 @@ mod tests {
         stroma
             .initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
             .await
+    }
+
+    async fn learner_message(stroma: &Stroma) {
+        stroma
+            .apply_replicated_queue_batch(
+                "q",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: 7,
+                    first_offset: 0,
+                    durability: Some(KDurability::AfterFsync),
+                    records: vec![Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: b"retained".to_vec(),
+                    }],
+                }),
+                Some(ReplicatedEventBatch {
+                    epoch: 7,
+                    first_offset: 0,
+                    durability: Some(KDurability::AfterFsync),
+                    events: vec![StromaEvent::EnqueueMany {
+                        reqs: vec![EnqueueEventMeta {
+                            off: 0,
+                            retries: 0,
+                            expire_at: None,
+                        }],
+                    }],
+                }),
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn learner_generation_crash_child() {
+        let Some(root) = std::env::var_os("STROMA_LEARNER_CRASH_ROOT") else {
+            return;
+        };
+        let st = open(Path::new(&root)).await;
+        initialize(&st).await.unwrap();
+        st.become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        learner_message(&st).await;
+        let mut next = binding();
+        next.accepted_history = [9; 16];
+        st.prepare_queue_learner_storage("q", 0, None, next, [8; 32])
+            .await
+            .unwrap();
+        panic!("child did not stop at learner boundary");
+    }
+
+    #[tokio::test]
+    async fn learner_generation_sigkill_preserves_old_data_and_resumes_new_route() {
+        for boundary in ["learner_prepared", "learner_retired", "learner_switched"] {
+            let dir = keratin_log::test_dir!("learner_generation_sigkill");
+            let ready = dir.root.join("child.ready");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stroma::storage_history::tests::learner_generation_crash_child",
+                    "--nocapture",
+                ])
+                .env("STROMA_LEARNER_CRASH_ROOT", &dir.root)
+                .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
+                .env("STROMA_INSTALL_CRASH_READY", &ready)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            while !ready.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before {boundary}"
+                );
+                if started.elapsed() > std::time::Duration::from_secs(15) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("child timeout at {boundary}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let st = open(&dir.root).await;
+            let mut next = binding();
+            next.accepted_history = [9; 16];
+            st.prepare_queue_learner_storage("q", 0, None, next, [10; 32])
+                .await
+                .unwrap();
+            st.become_queue_follower_with_epoch("q", 0, None, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                st.queue_replication_next_offsets("q", 0, None)
+                    .await
+                    .unwrap(),
+                (0, 0)
+            );
+            let seal = RecoverySealRequest {
+                transition: [8; 32],
+                fence_epoch: 8,
+            };
+            let retained = st
+                .retained_recovery_view("q", 0, None, &seal)
+                .unwrap()
+                .unwrap();
+            let evidence = retained
+                .seal_replica_for_recovery("q", 0, None, seal.clone())
+                .await
+                .unwrap();
+            let page = st
+                .read_sealed_replica(
+                    "q",
+                    0,
+                    None,
+                    PartitionKind::Queue,
+                    RecoveryReadRequest {
+                        seal,
+                        history_id: evidence.history.id,
+                        source: RecoveryReadSource::Messages,
+                        from: 0,
+                        max_records: 8,
+                        max_bytes: 65536,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.records[0].payload, b"retained");
+            st.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn learner_resume_preserves_partial_history_and_requires_complete_applied_cut() {
+        let dir = keratin_log::test_dir!("learner_resume");
+        let stroma = open(&dir.root).await;
+        let original = stroma
+            .prepare_queue_learner_storage("q", 0, None, binding(), [4; 32])
+            .await
+            .unwrap();
+        stroma
+            .become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        let empty = stroma
+            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 0)
+            .await
+            .unwrap();
+        assert_eq!((empty.message_next, empty.event_next), (0, 0));
+        assert!(
+            stroma
+                .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+                .await
+                .is_err()
+        );
+        learner_message(&stroma).await;
+        assert!(
+            stroma
+                .verify_queue_learner_caught_up("q", 0, None, 8, 1, 1)
+                .await
+                .is_err()
+        );
+        stroma
+            .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+            .await
+            .unwrap();
+        stroma.evict("q", 0, None).await.unwrap();
+        let rematerialized = stroma.queue_handle("q", 0, None).await.unwrap();
+        assert_eq!(
+            rematerialized.resolve().unwrap().role(),
+            QueueRole::Follower
+        );
+        drop(rematerialized);
+
+        // A second storage process cannot relabel an open writer's history.
+        let mut competing = stroma.clone();
+        competing.storage_session = *uuid::Uuid::now_v7().as_bytes();
+        assert!(
+            competing
+                .resume_unaccepted_storage_history("q", 0, None, binding())
+                .await
+                .is_err()
+        );
+        drop(competing);
+        stroma.shutdown().await.unwrap();
+        drop(stroma);
+        let resumed = open(&dir.root).await;
+        let receipt = resumed
+            .prepare_queue_learner_storage("q", 0, None, binding(), [5; 32])
+            .await
+            .unwrap();
+        assert_ne!(receipt.storage_instance, original.storage_instance);
+        assert_eq!(receipt.binding, original.binding);
+        resumed
+            .become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        assert_eq!(
+            resumed
+                .queue_replication_next_offsets("q", 0, None)
+                .await
+                .unwrap(),
+            (1, 1)
+        );
+        resumed
+            .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+            .await
+            .unwrap();
+        resumed
+            .become_queue_owner_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        assert!(
+            resumed
+                .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+                .await
+                .is_err()
+        );
+        resumed.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn learner_replaces_old_generation_without_deleting_retained_evidence() {
+        for already_sealed in [false, true] {
+            let dir = keratin_log::test_dir!("learner_retained_generation");
+            let stroma = open(&dir.root).await;
+            initialize(&stroma).await.unwrap();
+            stroma
+                .become_queue_follower_with_epoch("q", 0, None, 7)
+                .await
+                .unwrap();
+            learner_message(&stroma).await;
+            let handle = stroma.queue_handle("q", 0, None).await.unwrap();
+            let old_messages = stroma.msg_tp_part_dir("q", 0, None);
+            let seal = RecoverySealRequest {
+                transition: if already_sealed { [6; 32] } else { [8; 32] },
+                fence_epoch: 8,
+            };
+            let evidence = if already_sealed {
+                Some(
+                    stroma
+                        .seal_replica_for_recovery("q", 0, None, seal.clone())
+                        .await
+                        .unwrap(),
+                )
+            } else {
+                None
+            };
+            let mut next = binding();
+            next.accepted_history = [9; 16];
+            next.writer_session = [10; 16];
+            let prepared = stroma
+                .prepare_queue_learner_storage("q", 0, None, next.clone(), [8; 32])
+                .await
+                .unwrap();
+            assert_eq!(prepared.binding, next);
+            assert_ne!(stroma.msg_tp_part_dir("q", 0, None), old_messages);
+            assert!(old_messages.exists());
+            if let Ok(old) = handle.resolve() {
+                assert!(old.begin_owner_operation().await.is_err());
+            }
+            stroma
+                .become_queue_follower_with_epoch("q", 0, None, 8)
+                .await
+                .unwrap();
+            assert!(
+                stroma
+                    .verify_queue_learner_caught_up("q", 0, None, 8, 1, 1)
+                    .await
+                    .is_err()
+            );
+            let retained = stroma
+                .retained_recovery_view("q", 0, None, &seal)
+                .unwrap()
+                .unwrap();
+            let retained_seal = retained
+                .seal_replica_for_recovery("q", 0, None, seal.clone())
+                .await
+                .unwrap();
+            if let Some(evidence) = evidence {
+                assert_eq!(evidence, retained_seal);
+            }
+            assert_eq!(
+                (retained_seal.message_next, retained_seal.event_next),
+                (1, 1)
+            );
+            let page = stroma
+                .read_sealed_replica(
+                    "q",
+                    0,
+                    None,
+                    PartitionKind::Queue,
+                    RecoveryReadRequest {
+                        seal: seal.clone(),
+                        history_id: retained_seal.history.id,
+                        source: RecoveryReadSource::Messages,
+                        from: 0,
+                        max_records: 8,
+                        max_bytes: 65536,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.records[0].payload, b"retained");
+            stroma.shutdown().await.unwrap();
+            drop(handle);
+            drop(retained);
+            drop(stroma);
+            let reopened = open(&dir.root).await;
+            let receipt = reopened
+                .prepare_queue_learner_storage("q", 0, None, next, [11; 32])
+                .await
+                .unwrap();
+            assert_ne!(receipt.storage_instance, prepared.storage_instance);
+            reopened
+                .become_queue_follower_with_epoch("q", 0, None, 8)
+                .await
+                .unwrap();
+            assert_eq!(
+                reopened
+                    .queue_replication_next_offsets("q", 0, None)
+                    .await
+                    .unwrap(),
+                (0, 0)
+            );
+            assert!(
+                reopened
+                    .retained_recovery_view("q", 0, None, &seal)
+                    .unwrap()
+                    .is_some()
+            );
+            reopened.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

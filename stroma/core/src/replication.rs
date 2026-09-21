@@ -325,6 +325,29 @@ impl Stroma {
         })
     }
 
+    /// Resume cursors for an idle follower, including a checkpoint whose live
+    /// payloads still require backfill. These cursors alone do not prove readiness.
+    pub async fn queue_replication_next_offsets(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<(Offset, Offset)> {
+        let handle = self.queue_handle(topic, part, group).await?;
+        let handle = handle.resolve()?;
+        let apply = handle.follower_apply_state().await;
+        handle.ensure_not_recovery_sealed()?;
+        if *apply || handle.role() != QueueRole::Follower {
+            return Err(StromaError::InvalidArgument(
+                "follower apply is incomplete or role changed".into(),
+            ));
+        }
+        Ok((
+            handle.msg_log().next_offset(),
+            handle.event_log().next_offset(),
+        ))
+    }
+
     /// A stream follower's next offsets for both logs: `(record_next,
     /// cursor_event_next)`. The follower worker pulls from these so it resumes at
     /// the right place after a restart without re-fetching the whole log.
@@ -381,6 +404,58 @@ impl Stroma {
     ) -> Result<QueuePromotionOutcome> {
         self.promote_queue_follower_to_local_tail(topic, part, None, epoch)
             .await
+    }
+
+    /// Verify durable, fully applied follower state without granting an owner
+    /// role. Used before admitting a non-voting learner to the write set.
+    pub async fn verify_queue_learner_caught_up(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        epoch: u64,
+        message_target: u64,
+        event_target: u64,
+    ) -> Result<crate::QueuePublishCommit> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        let apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
+        if *apply || qh.role() != QueueRole::Follower {
+            return Err(StromaError::InvalidArgument(
+                "learner is not a completely applied follower".into(),
+            ));
+        }
+        let message_next = qh.msg_log().next_offset();
+        let event_next = qh.event_log().next_offset();
+        if qh.msg_log().current_epoch() != epoch
+            || qh.event_log().current_epoch() != epoch
+            || message_next < message_target
+            || event_next < event_target
+            || qh.ordered_applied_next()? != Some(event_next)
+        {
+            return Err(StromaError::InvalidArgument(
+                "learner has not reached its exact history and application cut".into(),
+            ));
+        }
+        if let Some(wq) = qh.as_work_queue() {
+            if message_next < wq.required_message_next().await.map_err(io_err)? {
+                return Err(StromaError::InvalidArgument(
+                    "learner payload backfill is incomplete".into(),
+                ));
+            }
+        }
+        let message_log = qh.msg_log();
+        let event_log = qh.event_log();
+        let (messages, events) = tokio::join!(message_log.sync(), event_log.sync());
+        messages.map_err(io_err)?;
+        events.map_err(io_err)?;
+        Ok(crate::QueuePublishCommit {
+            message_next,
+            event_next,
+            message_epoch: epoch,
+            event_epoch: epoch,
+        })
     }
 
     pub async fn promote_queue_follower_if_caught_up(

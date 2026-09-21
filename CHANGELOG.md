@@ -11,6 +11,13 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Externally authorized non-voting queue learner preparation, exact-history
+  checkpoint installation and durable/applied readiness checks. Partial learners
+  resume across restart; older local histories are sealed and retained while a
+  separate learner generation becomes active. Checkpoint journals bind their
+  storage history, and ordinary bound-replica resets remain blocked. Linux tests
+  cover interrupted checkpoint backfill and learner route publication under SIGKILL.
+
 - Initial-history preparation can resume pristine, never-admitted storage after
   fresh external consensus authorization. Durable preparation intent precedes
   log creation; renewed receipts retain history IDs and bind the new storage
