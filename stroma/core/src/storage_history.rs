@@ -225,6 +225,95 @@ impl Stroma {
         Ok(())
     }
 
+    /// Fast live-replication guard. Admission is process-local and cannot be
+    /// reconstructed from a receipt by restarting or replacing a storage root.
+    pub fn verify_admitted_storage_history(&self, prepared: &PreparedStorageHistory) -> Result<()> {
+        let key = (
+            Box::<str>::from(prepared.topic.as_str()),
+            prepared.partition,
+            prepared.group.as_deref().map(Box::<str>::from),
+        );
+        if prepared.storage_instance != self.storage_session
+            || prepared.group.as_deref() != normalize_group(prepared.group.as_deref())
+            || self.admitted_histories.get(&key).as_deref() != Some(&prepared.binding)
+        {
+            return Err(StromaError::HistoryAdmissionRequired {
+                topic: prepared.topic.clone(),
+                partition: prepared.partition,
+                group: prepared.group.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Check a previously issued preparation against this live storage instance.
+    /// This grants no permission and never recreates missing storage identity.
+    pub fn verify_prepared_storage_history(&self, prepared: &PreparedStorageHistory) -> Result<()> {
+        validate(&prepared.binding)?;
+        let expected = Receipt {
+            topic: prepared.topic.clone(),
+            partition: prepared.partition,
+            group: prepared.group.clone(),
+            stream: prepared.stream,
+            binding: prepared.binding.clone(),
+            storage_session: prepared.storage_instance,
+        };
+        if prepared.storage_instance != self.storage_session
+            || prepared.group.as_deref() != normalize_group(prepared.group.as_deref())
+            || prepared.stream && prepared.group.is_some()
+            || self
+                .checked_storage_history(
+                    &prepared.topic,
+                    prepared.partition,
+                    prepared.group.as_deref(),
+                )?
+                .as_ref()
+                != Some(&expected)
+        {
+            return Err(StromaError::HistoryAdmissionRequired {
+                topic: prepared.topic.clone(),
+                partition: prepared.partition,
+                group: prepared.group.clone(),
+            });
+        }
+        Ok(())
+    }
+
+    /// Admit exactly this prepared storage instance after fresh external
+    /// activation authority. A receipt for another process or missing storage
+    /// cannot initialize a replacement. The caller owns consensus authorization.
+    pub async fn admit_prepared_storage_history(
+        &self,
+        prepared: PreparedStorageHistory,
+    ) -> Result<()> {
+        if !cfg!(unix) {
+            return Err(StromaError::Unsupported(
+                "durable storage history requires directory sync".into(),
+            ));
+        }
+        self.verify_prepared_storage_history(&prepared)?;
+        let stroma = self.clone();
+        tokio::spawn(async move {
+            stroma
+                .initialize_history_inner(
+                    &prepared.topic,
+                    prepared.partition,
+                    prepared.group.as_deref(),
+                    if prepared.stream {
+                        PartitionKind::Stream
+                    } else {
+                        PartitionKind::Queue
+                    },
+                    prepared.binding,
+                    true,
+                    Some(prepared.storage_instance),
+                )
+                .await
+        })
+        .await
+        .map_err(io_err)?
+    }
+
     /// Explicitly bind previously nonexistent storage before its first write.
     /// Call only after consensus authorizes this resource/history/writer session.
     /// This is not automatically enabled by the broker. Retries within this
@@ -260,7 +349,7 @@ impl Stroma {
         // log shutdown, even if the caller drops its future.
         tokio::spawn(async move {
             stroma
-                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true)
+                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true, None)
                 .await
         })
         .await
@@ -302,6 +391,7 @@ impl Stroma {
                     kind,
                     binding.clone(),
                     false,
+                    None,
                 )
                 .await?;
             Ok(PreparedStorageHistory {
@@ -325,6 +415,7 @@ impl Stroma {
         kind: PartitionKind,
         binding: StorageHistoryBinding,
         admit: bool,
+        prepared_instance: Option<[u8; 16]>,
     ) -> Result<()> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
         let path = self.storage_history_path(topic, part, group);
@@ -354,7 +445,7 @@ impl Stroma {
             });
         }
         self.ensure_checkpoint_not_pending(topic, part, group)?;
-        if !admit {
+        if !admit || prepared_instance.is_some() && !self.admitted_histories.contains_key(&key) {
             for sidecar in [
                 self.snap_file(topic, part, group),
                 self.snap_dir(topic, part, group).join("checkpoint.install"),
@@ -368,6 +459,16 @@ impl Stroma {
             }
         }
         let existing = self.checked_storage_history(topic, part, group)?;
+        if prepared_instance
+            .is_some_and(|instance| instance != self.storage_session || existing.is_none())
+        {
+            return Err(StromaError::HistoryAdmissionRequired {
+                topic: topic.into(),
+                partition: part,
+                group: group.map(str::to_owned),
+            });
+        }
+
         if let Some(existing) = &existing {
             if *existing != receipt {
                 return Err(StromaError::HistoryAdmissionRequired {
@@ -481,6 +582,99 @@ mod tests {
         stroma
             .initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
             .await
+    }
+
+    #[tokio::test]
+    async fn admission_requires_exact_live_preparation_and_preserves_later_writes() {
+        let dir = keratin_log::test_dir!("history_admit_prepared");
+        let stroma = open(&dir.root).await;
+        let prepared = stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        for mutation in 0..6 {
+            let mut bad = prepared.clone();
+            match mutation {
+                0 => bad.storage_instance = [9; 16],
+                1 => bad.binding.writer_session = [9; 16],
+                2 => bad.topic = "other".into(),
+                3 => bad.stream = true,
+                4 => bad.group = Some("default".into()),
+                _ => bad.partition = 1,
+            }
+            assert!(stroma.admit_prepared_storage_history(bad).await.is_err());
+            assert!(stroma.admitted_histories.is_empty());
+        }
+        stroma
+            .admit_prepared_storage_history(prepared.clone())
+            .await
+            .unwrap();
+        stroma
+            .become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        stroma
+            .apply_replicated_queue_batch(
+                "q",
+                0,
+                None,
+                Some(ReplicatedMessageBatch {
+                    epoch: 7,
+                    first_offset: 0,
+                    durability: Some(KDurability::AfterFsync),
+                    records: vec![Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: b"retained".to_vec(),
+                    }],
+                }),
+                None,
+            )
+            .await
+            .unwrap();
+        stroma
+            .admit_prepared_storage_history(prepared.clone())
+            .await
+            .unwrap();
+        assert_eq!(stroma.current_next_offset("q", 0, None).await.unwrap(), 1);
+        assert!(stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .is_err());
+        stroma.shutdown().await.unwrap();
+        drop(stroma);
+        let reopened = open(&dir.root).await;
+        assert!(reopened.verify_prepared_storage_history(&prepared).is_err());
+        assert!(reopened
+            .admit_prepared_storage_history(prepared)
+            .await
+            .is_err());
+        assert!(reopened.admitted_histories.is_empty());
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn admission_does_not_recreate_a_lost_receipt_or_ignore_snapshot_state() {
+        let dir = keratin_log::test_dir!("history_admit_missing");
+        let stroma = open(&dir.root).await;
+        let prepared = stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        fs::write(stroma.snap_file("q", 0, None), b"unverified snapshot").unwrap();
+        assert!(stroma
+            .admit_prepared_storage_history(prepared.clone())
+            .await
+            .is_err());
+        fs::remove_file(stroma.snap_file("q", 0, None)).unwrap();
+        fs::remove_file(stroma.storage_history_path("q", 0, None)).unwrap();
+        assert!(stroma
+            .admit_prepared_storage_history(prepared)
+            .await
+            .is_err());
+        assert!(stroma.admitted_histories.is_empty());
+        assert!(!stroma.storage_history_path("q", 0, None).exists());
+        stroma.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -602,12 +796,10 @@ mod tests {
             reopened.storage_history_binding("q", 0, None).unwrap(),
             Some(binding())
         );
-        assert!(
-            reopened
-                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-                .await
-                .is_err()
-        );
+        assert!(reopened
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .is_err());
         reopened.shutdown().await.unwrap();
     }
 
@@ -620,12 +812,10 @@ mod tests {
             .await
             .unwrap();
         fs::write(stroma.snap_file("q", 0, None), b"preexisting snapshot").unwrap();
-        assert!(
-            stroma
-                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-                .await
-                .is_err()
-        );
+        assert!(stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .is_err());
         assert!(stroma.admitted_histories.is_empty());
         stroma.shutdown().await.unwrap();
     }
@@ -635,12 +825,10 @@ mod tests {
         let dir = keratin_log::test_dir!("history_prepare_closed");
         let stroma = open(&dir.root).await;
         initialize(&stroma).await.unwrap();
-        assert!(
-            stroma
-                .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
-                .await
-                .is_err()
-        );
+        assert!(stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .is_err());
         stroma
             .prepare_empty_storage_history("other", 0, None, PartitionKind::Queue, binding())
             .await
@@ -939,12 +1127,10 @@ mod tests {
                 .await,
             Err(StromaError::HistoryAdmissionRequired { .. })
         ));
-        assert!(
-            !stroma
-                .snap_dir("q", 0, None)
-                .join("checkpoint.install")
-                .exists()
-        );
+        assert!(!stroma
+            .snap_dir("q", 0, None)
+            .join("checkpoint.install")
+            .exists());
         assert_eq!(
             stroma.storage_history_binding("q", 0, None).unwrap(),
             Some(binding())
