@@ -111,6 +111,11 @@ pub enum WriterCmd {
         expected_epoch: Option<u64>,
         respond_to: oneshot::Sender<io::Result<()>>,
     },
+    RepairSuffix {
+        next_offset: u64,
+        expected_epoch: u64,
+        respond_to: oneshot::Sender<io::Result<()>>,
+    },
     AdvanceEpoch {
         epoch: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
@@ -556,6 +561,19 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    /// Recovery-only suffix repair, preserving the retained prefix. Caller must
+    /// quiesce other operations and readers; the writer drains outstanding I/O.
+    /// The epoch is checked in writer order before mutation. A repair I/O failure
+    /// stops this writer; reopen resumes the durable journal before normal access.
+    pub async fn repair_suffix_at_epoch(&self, next_offset: u64, expected_epoch: u64) -> io::Result<()> {
+        self.ensure_role(KeratinRole::Follower, "repair_suffix_at_epoch")
+            .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
+        let (respond_to, rx) = oneshot::channel();
+        self.tx.send(WriterCmd::RepairSuffix { next_offset, expected_epoch, respond_to })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     async fn reset_checkpoint_inner(

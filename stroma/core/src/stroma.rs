@@ -1279,7 +1279,7 @@ impl Stroma {
         let prev_role = event_log.role();
         event_log.become_follower();
         let reset = event_log
-            .destructive_reset_to_checkpoint(info.truncate_event_offset)
+            .repair_suffix_at_epoch(info.truncate_event_offset, event_log.current_epoch())
             .await
             .map_err(io_err);
         match prev_role {
@@ -3203,17 +3203,15 @@ impl Stroma {
             .await
     }
 
-    /// Drop the event-log suffix from `next_offset` onward - the unresolvable
-    /// tail found during recovery (truncate-to-valid). `destructive_reset_to_
-    /// checkpoint` is follower-gated (a follower resetting its tail to match the
-    /// owner); here we drop our OWN corrupt suffix, so briefly assume the
-    /// follower role around the reset and restore the prior role.
+    /// Drop only the unresolvable suffix. The durable repair journal preserves
+    /// the valid prefix across cancellation, I/O errors and process restart.
+    /// Recovery holds the lifecycle lock and has not exposed this incarnation.
     async fn truncate_event_log_tail(&self, h: &QueueHandleInner, next_offset: u64) -> Result<()> {
         let event_log = h.event_log();
         let prev_role = event_log.role();
         event_log.become_follower();
         let res = event_log
-            .destructive_reset_to_checkpoint(next_offset)
+            .repair_suffix_at_epoch(next_offset, event_log.current_epoch())
             .await
             .map_err(io_err);
         match prev_role {
@@ -3283,13 +3281,10 @@ impl Stroma {
                 .max_referenced_msg_offset()
                 .is_some_and(|max| max >= msg_tail)
             {
-                // A dangling ENQUEUE is the expected parallel-publish artifact: its
-                // payload never became durable, so it is unconfirmed and safe to
-                // drop. A non-enqueue event (ack/nack/mark/dead-letter) referencing a
-                // non-durable offset cannot happen in correct operation, since you
-                // cannot settle a message that was never durably enqueued, so it
-                // signals an accounting inconsistency rather than the artifact. Fold
-                // it the same way (truncate) but surface it loudly, not warn-only.
+                // Only enqueue tails can be explained by the parallel append
+                // crash window. Other missing references may describe lost
+                // confirmed history; quarantine rather than manufacture that
+                // explanation and silently discard them.
                 let is_enqueue = matches!(
                     ev,
                     StromaEvent::Enqueue { .. }
@@ -3298,13 +3293,13 @@ impl Stroma {
                         | StromaEvent::EnqueueDelayedMany { .. }
                 );
                 if !is_enqueue {
-                    tracing::error!(
-                        event_offset = ev_off,
-                        msg_tail,
-                        "recovery: a non-enqueue event references a non-durable offset \
-                         at or past msg_tail, which is not the expected dangling-enqueue \
-                         artifact and indicates an accounting inconsistency"
-                    );
+                    corrupt = Some(RecoveryMismatchFound {
+                        event_offset: *ev_off,
+                        kind: RecoveryMismatchKind::CorruptRecord {
+                            detail: format!("non-enqueue event at {ev_off} depends on message at or beyond durable tail {msg_tail}"),
+                        },
+                    });
+                    break;
                 }
                 // Only walk (and allocate) the per-offset list when this event
                 // actually references the non-durable tail; the common no-crash
@@ -3324,7 +3319,15 @@ impl Stroma {
         // truncation point - the first event of the unresolved tail - and always
         // precedes any corrupt record (which, if present, is at the very end of
         // the scan). Everything at or after `valid_len` is dropped.
-        let mismatch = if valid_len < scanned.len() {
+        let mismatch = if let Some(mut corruption) = corrupt {
+            // A dangling enqueue must not mask genuine corruption later in the
+            // scanned suffix. Preserve evidence and require the configured
+            // corruption policy; explicit repair still cuts at the valid prefix.
+            if valid_len < scanned.len() {
+                corruption.event_offset = scanned[valid_len].0;
+            }
+            Some(corruption)
+        } else if valid_len < scanned.len() {
             let (trunc_off, trunc_ev) = &scanned[valid_len];
             let msg_offset = trunc_ev
                 .referenced_msg_offsets()
@@ -3340,7 +3343,7 @@ impl Stroma {
                 },
             })
         } else {
-            corrupt
+            None
         };
 
         let mut events = Vec::with_capacity(valid_len);
@@ -8810,6 +8813,68 @@ mod tests {
         assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
 
         shutdown_stroma("recovery_auto_truncates_dangling_event_reference", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn recovery_dangling_enqueue_does_not_mask_corrupt_or_missing_settlement_history() {
+        for non_enqueue in [false, true] {
+            let dir = test_dir!("dangling_must_not_mask_corruption");
+            let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+            {
+                let handle = stroma.queue_handle("t", 0, None).await.unwrap();
+                let qh = handle.resolve().unwrap();
+                let bad = if non_enqueue {
+                    event_msg(&StromaEvent::Ack { off: 0 }).unwrap()
+                } else {
+                    Message { flags: 0, headers: vec![], payload: b"invalid event".to_vec() }
+                };
+                qh.event_log().append_batch(vec![
+                    event_msg(&StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }).unwrap(), bad,
+                ], Some(KDurability::AfterFsync)).await.unwrap();
+            }
+            stroma.unmaterialize("t", 0, None).await.unwrap();
+            let snapshot = stroma.snap_file("t", 0, None);
+            if snapshot.exists() { std::fs::remove_file(snapshot).unwrap(); }
+            assert!(stroma.queue_handle("t", 0, None).await.is_err());
+            assert!(stroma.is_quarantined("t", 0, None));
+            // The original evidence is retained, including the unexplained event.
+            let log = stroma.event_log_init("t", 0, None).await.unwrap();
+            assert_eq!(log.head_offset(), 0);
+            assert_eq!(log.next_offset(), 2);
+            log.shutdown().await.unwrap();
+            stroma.shutdown().await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn suffix_repair_preserves_durable_event_prefix_across_restarts() {
+        let dir = test_dir!("suffix_repair_preserves_prefix");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        {
+            let handle = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = handle.resolve().unwrap();
+            qh.msg_log().append_batch(vec![Message { flags: 0, headers: vec![], payload: b"confirmed".to_vec() }], Some(KDurability::AfterFsync)).await.unwrap();
+            qh.event_log().append_batch(vec![
+                event_msg(&StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }).unwrap(),
+                event_msg(&StromaEvent::Enqueue { off: 1, retries: 0, expire_at: None }).unwrap(),
+            ], Some(KDurability::AfterFsync)).await.unwrap();
+        }
+        stroma.unmaterialize("t", 0, None).await.unwrap();
+        // Fixture represents a crash before any snapshot of the durable prefix.
+        let snapshot = stroma.snap_file("t", 0, None);
+        if snapshot.exists() { std::fs::remove_file(&snapshot).unwrap(); }
+        {
+            let handle = stroma.queue_handle("t", 0, None).await.unwrap();
+            let qh = handle.resolve().unwrap();
+            assert!(qh.work_queue().unwrap().is_ready(0).await);
+            assert_eq!(qh.event_log().head_offset(), 0, "repair must retain the valid prefix on disk");
+            assert_eq!(qh.event_log().next_offset(), 1);
+            assert_eq!(qh.event_log().reader().scan_from(0, 10).unwrap().len(), 1);
+        }
+        stroma.unmaterialize("t", 0, None).await.unwrap();
+        if snapshot.exists() { std::fs::remove_file(&snapshot).unwrap(); }
+        assert!(stroma.is_ready("t", 0, None, 0).await.unwrap());
+        stroma.shutdown().await.unwrap();
     }
 
     /// The recovery fold: an Enqueue for a non-durable offset that is later

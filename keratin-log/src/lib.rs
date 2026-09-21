@@ -11,6 +11,7 @@ mod reader;
 mod record;
 mod recovery;
 mod segment;
+mod suffix_repair;
 mod tail_cache;
 pub mod util;
 mod writer;

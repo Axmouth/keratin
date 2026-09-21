@@ -895,6 +895,33 @@ fn writer_loop_inner(
                     tracing::info!("Truncate successful, before {before}");
                 }
             }
+            WriterCmd::RepairSuffix { next_offset, expected_epoch, respond_to } => {
+                if expected_epoch != log.current_epoch()
+                    || next_offset < log.manifest.head_offset || next_offset > log.next_offset()
+                    || !cfg!(unix)
+                {
+                    let _ = respond_to.send(Err(io::Error::new(io::ErrorKind::InvalidInput,
+                        "suffix repair requires the current epoch, a retained cut and Unix durability")));
+                    continue;
+                }
+                shutdown_fail_reqs(batcher.flush(), "writer repairing suffix", &notify_tx);
+                fail_all_pending(&mut pending, "writer repairing suffix", &notify_tx, false);
+                wait_for_inflight_fsyncs(log, &state, &notify_tx, &fsync_done_rx,
+                    &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                );
+                let result = log.repair_suffix(next_offset);
+                let failed = result.is_err();
+                let _ = respond_to.send(result);
+                if failed {
+                    // Never append to or persist old metadata over a partially
+                    // repaired log. The journal owns recovery from this point.
+                    tracing::error!(next_offset, "suffix repair failed; writer stopped until reopen");
+                    return;
+                }
+                last_fsync = Instant::now();
+            }
             WriterCmd::ResetToCheckpoint {
                 next_offset,
                 expected_epoch,

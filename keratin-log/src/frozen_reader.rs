@@ -40,6 +40,9 @@ impl FrozenLogReader {
     /// Does not acquire a lock, recover padding, repair indexes or open writers.
     /// The caller holds either `lock_existing_log` or a quiesced live log owner.
     pub fn open(root: &Path, epoch: u64, head: u64, next: u64) -> io::Result<Self> {
+        if root.join(crate::suffix_repair::JOURNAL).try_exists()? {
+            return Err(invalid("frozen read cannot bypass pending suffix repair"));
+        }
         let mut file = File::open(Manifest::path(root))?;
         if file.metadata()?.len() != 76 {
             return Err(invalid("invalid frozen manifest size"));
@@ -145,7 +148,7 @@ impl FrozenLogReader {
     }
 }
 
-fn read_segment_header(file: &mut File, expected_base: u64) -> io::Result<()> {
+pub(crate) fn read_segment_header(file: &mut File, expected_base: u64) -> io::Result<()> {
     let mut bytes = [0u8; LOG_HEADER_LEN as usize];
     file.read_exact(&mut bytes)?;
     if &bytes[..8] != crate::segment::LOG_MAGIC

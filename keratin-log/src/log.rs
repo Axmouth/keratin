@@ -295,6 +295,9 @@ impl Log {
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
         let root = root.as_ref().to_path_buf();
         let prealloc_chunk = segment_preallocate_bytes as u64;
+        // A journaled cut must finish before discovery can mistake an
+        // interrupted repair for a normal dirty shutdown or an empty log.
+        crate::suffix_repair::resume(&root)?;
         fs::create_dir_all(root.join("segments"))?;
         fs::create_dir_all(root.join("tmp"))?;
 
@@ -1340,6 +1343,40 @@ impl Log {
             new_head,
         );
         Ok(new_head)
+    }
+
+    /// Preserve all retained records below `next_offset`, with restartable
+    /// metadata/file updates. The writer must drain fsync completions first and
+    /// stop on any error after beginning the repair.
+    pub(crate) fn repair_suffix(&mut self, next_offset: u64) -> io::Result<()> {
+        self.flush_buffers()?;
+        self.flush()?;
+        self.fsync()?;
+        self.manifest.next_offset = self.next_offset;
+        self.manifest.store_atomic(&self.root)?;
+        crate::suffix_repair::prepare(&self.root, &self.manifest, next_offset)?;
+        crate::suffix_repair::resume(&self.root)?;
+        self.manifest = Manifest::read_from(&mut File::open(Manifest::path(&self.root))?)?;
+        let base = self.manifest.active_base_offset;
+        let (mut active, index, _) = open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
+        active.enable_prealloc(self.prealloc_chunk);
+        self.active = active;
+        self.index = index;
+        *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?.into_iter().collect();
+        self.write_buf.clear();
+        self.idx_buf.clear();
+        self.tail_cache.clear();
+        self.next_offset = next_offset;
+        self.staged_end_offset = next_offset.saturating_sub(1);
+        self.durable_offset = self.staged_end_offset;
+        self.flushed_through = next_offset;
+        self.last_commit_through = next_offset;
+        self.recent_commit_records = 0;
+        self.last_index_at_log_pos = self.active.bytes_written;
+        self.log_state.tail.store(next_offset, Ordering::Release);
+        self.log_state.durable.reset(self.durable_end_exclusive());
+        self.log_state.diagnostics.lock().record(LogControlKind::SuffixTruncated, self.manifest.epoch, next_offset);
+        Ok(())
     }
 
     pub fn reset_to_checkpoint(&mut self, next_offset: u64, now_ms: u64) -> io::Result<()> {

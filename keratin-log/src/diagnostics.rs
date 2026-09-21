@@ -12,6 +12,7 @@ static NEXT_REPORT_ID: AtomicU64 = AtomicU64::new(1);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum LogControlKind {
+    SuffixTruncated,
     Opened,
     Owner,
     Follower,
