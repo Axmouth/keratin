@@ -50,6 +50,9 @@ use crate::{
 // re-export so existing `stroma_core::` and `crate::stroma::` paths keep resolving
 // (clustering-module separation).
 pub use crate::replication::*;
+#[path = "storage_history.rs"]
+mod storage_history;
+pub use storage_history::StorageHistoryBinding;
 #[path = "recovery_history.rs"]
 mod recovery_history;
 #[path = "recovery_seal.rs"]
@@ -789,6 +792,9 @@ pub struct Stroma {
 
     /// Bounds concurrent full-history scans across this storage instance.
     recovery_read_slots: Arc<Semaphore>,
+    // A new storage instance cannot inherit writer admission from an old process.
+    storage_session: [u8; 16],
+    admitted_histories: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), StorageHistoryBinding>>,
 
     /// Per-partition-key lifecycle lock. Serializes the operations that OPEN or
     /// CLOSE a partition's Keratin logs - building a handle (queue_handle cold
@@ -878,6 +884,8 @@ impl Stroma {
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
+            storage_session: *uuid::Uuid::now_v7().as_bytes(),
+            admitted_histories: Arc::new(DashMap::new()),
             global_dlq: Arc::new(RwLock::new(None)),
             metrics: metrics.clone(),
             deadline_waker: Arc::new(Notify::new()),
@@ -1471,6 +1479,10 @@ impl Stroma {
                 continue;
             }
 
+            // Check before checkpoint recovery or either log can mutate disk.
+            if slot.handle.get().is_none() {
+                self.ensure_storage_history_admitted(tp, part, group)?;
+            }
             let _lifecycle = if slot.handle.get().is_none() {
                 self.resume_cold_checkpoint(tp, part, group, _lifecycle).await?
             } else {

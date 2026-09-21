@@ -163,6 +163,8 @@ impl Stroma {
         Ok(())
     }
 
+    // Ordinary lifecycle mutation also requires admission to a bound history.
+    // Explicit recovery sealing bypasses writer admission so evidence remains accessible.
     pub(super) fn ensure_partition_not_sealed(
         &self,
         topic: &str,
@@ -176,7 +178,7 @@ impl Stroma {
                 group: normalize_group(group).map(str::to_owned),
             });
         }
-        Ok(())
+        self.ensure_storage_history_admitted(topic, part, group)
     }
 
     /// Seal a replica for a committed recovery transition. Retries must provide

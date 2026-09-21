@@ -44,7 +44,8 @@ pub use stroma::{
     QueuePublishCommit, QueuePublishObserver, RecoveryReadPage, RecoveryReadRequest,
     RecoveryReadSource, RecoveryRecord, RecoverySealRequest, ReplicatedEventBatch,
     ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, RetainedHistoryIdentity,
-    SealedReplicaFrontiers, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
+    SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma, StromaKeratinConfig,
+    StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;
@@ -123,6 +124,13 @@ pub enum StromaError {
 
     #[error("partition {topic}/{partition}/{group:?} is sealed for replica recovery")]
     RecoverySealed {
+        topic: String,
+        partition: u32,
+        group: Option<String>,
+    },
+
+    #[error("partition {topic}/{partition}/{group:?} requires recovery history admission")]
+    HistoryAdmissionRequired {
         topic: String,
         partition: u32,
         group: Option<String>,

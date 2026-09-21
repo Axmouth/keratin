@@ -212,6 +212,8 @@ impl Stroma {
         loop {
             self.queue_handle(topic, part, group).await?;
             let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+            // Replacing a bound history needs a lineage-aware installation receipt.
+            self.require_unbound_storage_history(topic, part, group)?;
             let h = {
                 let current = self.queue_handles.load();
                 slot_lookup_no_alloc(&current, topic, part, group)
