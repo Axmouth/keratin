@@ -28,6 +28,8 @@ use crate::metrics::{
 use crate::stream_state::{RetentionConfig, StreamCommand, StreamState, run_stream_control};
 use crate::stroma::{GlobalDLQ, QueueKey, Registry, TaskGroup};
 
+mod recovery_digest;
+
 pub type Offset = u64;
 pub type UnixMillis = u64;
 

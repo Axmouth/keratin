@@ -6,6 +6,7 @@ use crate::{
     RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent,
 };
 use std::collections::BTreeMap;
+use crate::recovery_replay::{QueueReplay, RecoveryQueueReplayEvidence, RecoveryReplayLimits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySide {
@@ -125,6 +126,9 @@ pub struct RecoveryPairInspection {
     pub references: [RecoveryReferenceInspection; 2],
     /// Reported digests only: snapshot state/lineage has NOT been interpreted.
     pub snapshot_digests: [Option<[u8; 32]>; 2],
+    /// Optional reconstruction from event zero at one common exclusive target.
+    /// Existing snapshot bytes are not used as a trusted replay baseline.
+    pub queue_replay: Option<[RecoveryQueueReplayEvidence; 2]>,
     pub remaining_proofs: Vec<RecoveryProofRequirement>,
     pub pages: u64,
     pub records: u64,
@@ -226,9 +230,11 @@ pub struct RecoveryPairInspector {
     records: u64,
     bytes: u64,
     failed: bool,
+    resource: (String, u32),
+    replay: Option<[QueueReplay; 2]>,
 }
 
-fn hash_record(hash: &mut blake3::Hasher, record: &RecoveryRecord) {
+pub(crate) fn hash_record(hash: &mut blake3::Hasher, record: &RecoveryRecord) {
     hash.update(&record.offset.to_be_bytes());
     hash.update(&record.flags.to_be_bytes());
     hash.update(&(record.headers.len() as u64).to_be_bytes());
@@ -318,7 +324,23 @@ impl RecoveryPairInspector {
             records: 0,
             bytes: 0,
             failed: false,
+            resource: (topic.to_string(), partition),
+            replay: None,
         })
+    }
+    /// Request deterministic queue reconstruction in addition to retained-log
+    /// comparison. This must precede all reads. The target is common to both
+    /// sources and may be zero; all sealed records are still verified, including
+    /// records after the target. No authority or activation proof is implied.
+    pub fn with_queue_replay(mut self, event_next: u64, limits: RecoveryReplayLimits) -> Result<Self, String> {
+        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() {
+            return Err("queue replay must be configured once before queue inspection".into());
+        }
+        self.replay = Some([
+            QueueReplay::new(&self.resource.0, self.resource.1, self.seals[0].history.clone(), event_next, limits)?,
+            QueueReplay::new(&self.resource.0, self.resource.1, self.seals[1].history.clone(), event_next, limits)?,
+        ]);
+        Ok(self)
     }
     pub fn next_read(&self) -> Result<Option<(RecoverySide, RecoveryReadRequest)>, String> {
         if self.failed {
@@ -407,6 +429,9 @@ impl RecoveryPairInspector {
             hash_record(&mut cursor.hash, record);
             if log_index == 1 {
                 self.references[i].inspect(record, &self.seals[i].history, self.stream);
+                if let Some(replay) = &mut self.replay {
+                    replay[i].apply(record)?;
+                }
             }
             if record.offset >= log.overlap.0 && record.offset < log.overlap.1 {
                 let id = record_id(record);
@@ -448,6 +473,10 @@ impl RecoveryPairInspector {
         if self.next_read()?.is_some() || self.logs.iter().any(|log| !log.pending.is_empty()) {
             return Err("incomplete recovery inspection".into());
         }
+        let queue_replay = match self.replay {
+            Some([left, right]) => Some([left.finish()?, right.finish()?]),
+            None => None,
+        };
         let mut remaining_proofs = vec![
             RecoveryProofRequirement::CommonOriginAndInstalledLineage,
             RecoveryProofRequirement::StateReplayAndDependencies,
@@ -477,12 +506,35 @@ impl RecoveryPairInspector {
                 self.seals[0].history.snapshot_digest,
                 self.seals[1].history.snapshot_digest,
             ],
+            queue_replay,
             remaining_proofs,
             pages: self.pages,
             records: self.records,
             bytes: self.bytes,
         })
     }
+}
+
+/// Strict proof decoding. Ordinary replay remains forward-compatible, but an
+/// evidence consumer must understand every encoded field and bound allocation.
+pub(crate) fn decode_evidence_event(record: &RecoveryRecord) -> Result<StromaEvent, RecoverySemanticGap> {
+    let payload = &record.payload;
+    if payload.len() >= 16 {
+        let tag = u16::from_be_bytes(payload[10..12].try_into().unwrap());
+        if matches!(tag, 1 | 3 | 4 | 11 | 21 | 22 | 31 | 40 | 41 | 82) {
+            let count = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
+            if count > 65_536 || count > payload.len() / 8 {
+                return Err(RecoverySemanticGap::EventEntryLimit);
+            }
+        }
+    }
+    let event = StromaEvent::decode(payload)
+        .map_err(|_| RecoverySemanticGap::UnknownOrMalformedEncoding)?;
+    if record.flags != 0 || !record.headers.is_empty()
+        || event.encode().ok().as_deref() != Some(payload.as_slice()) {
+        return Err(RecoverySemanticGap::UnknownOrMalformedEncoding);
+    }
+    Ok(event)
 }
 
 impl RecoveryReferenceInspection {
@@ -496,38 +548,13 @@ impl RecoveryReferenceInspection {
         stream: bool,
     ) {
         self.checked_events += 1;
-        // Existing event decoding preallocates batch counts. Guard these before
-        // decoding corrupt/unrecognized evidence and bound diagnostic memory.
-        let payload = &record.payload;
-        if payload.len() >= 16 {
-            let tag = u16::from_be_bytes(payload[10..12].try_into().unwrap());
-            if matches!(tag, 1 | 3 | 4 | 11 | 21 | 22 | 31 | 40 | 41 | 82) {
-                let count = u32::from_be_bytes(payload[12..16].try_into().unwrap()) as usize;
-                if count > 65_536 || count > payload.len() / 8 {
-                    self.gap(record.offset, RecoverySemanticGap::EventEntryLimit);
-                    return;
-                }
+        let event = match decode_evidence_event(record) {
+            Ok(event) => event,
+            Err(gap) => {
+                self.gap(record.offset, gap);
+                return;
             }
-        }
-        let Ok(event) = StromaEvent::decode(payload) else {
-            self.gap(
-                record.offset,
-                RecoverySemanticGap::UnknownOrMalformedEncoding,
-            );
-            return;
         };
-        // Ordinary replay permits future trailing fields. Proof code cannot
-        // silently ignore fields whose dependency semantics it does not know.
-        if record.flags != 0
-            || !record.headers.is_empty()
-            || event.encode().ok().as_deref() != Some(payload.as_slice())
-        {
-            self.gap(
-                record.offset,
-                RecoverySemanticGap::UnknownOrMalformedEncoding,
-            );
-            return;
-        }
         if stream {
             self.gap(record.offset, RecoverySemanticGap::StreamStateRequired);
             return;
@@ -623,6 +650,140 @@ mod tests {
     use super::*;
     use crate::{EnqueueEventMeta, RecoverySealRequest};
 
+
+    #[test]
+    fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {
+        let msg = messages(0, 2);
+        let ev = events(vec![
+            StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None },
+            StromaEvent::MarkInflight { off: 0, deadline: 500 },
+            StromaEvent::Ack { off: 0 },
+            StromaEvent::Enqueue { off: 1, retries: 2, expire_at: Some(800) },
+        ]);
+        for target in 0..=4 {
+            let seal = seal(0, &msg, 0, &ev);
+            let pair = inspector(seal.clone(), seal, RecoveryInspectionLimits {
+                page_records: 1, ..Default::default()
+            }).with_queue_replay(target, Default::default()).unwrap();
+            let report = run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap();
+            let [a, b] = report.queue_replay.unwrap();
+            assert_eq!(a, b);
+            assert_eq!(a.event_next, target);
+            let mut expected = crate::QueueInternalState::new("q".into(), 0);
+            if target >= 1 { expected.enqueue(0, 0, None); }
+            if target >= 2 { expected.mark_inflight(0, 500); }
+            if target >= 3 { expected.ack(0); }
+            if target >= 4 { expected.enqueue(1, 2, Some(800)); }
+            assert_eq!(a.state_digest, expected.recovery_state_digest());
+            assert!(report.remaining_proofs.contains(&RecoveryProofRequirement::CommonOriginAndInstalledLineage));
+            // A common target is evidence only for that cut, not either sealed tail.
+            assert!(report.remaining_proofs.contains(&RecoveryProofRequirement::StateReplayAndDependencies));
+        }
+    }
+
+    #[test]
+    fn replay_equal_state_does_not_hide_different_payload_history() {
+        let a = messages(0, 1);
+        let mut b = a.clone();
+        b[0].payload = b"different confirmed work".to_vec();
+        let ev = events(vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }, StromaEvent::Ack { off: 0 }]);
+        let pair = inspector(seal(0, &a, 0, &ev), seal(0, &b, 0, &ev), Default::default())
+            .with_queue_replay(2, Default::default()).unwrap();
+        let report = run(pair, [[&a, &ev], [&b, &ev]]).unwrap();
+        let [a, b] = report.queue_replay.unwrap();
+        assert_eq!(a.state_digest, b.state_digest);
+        assert_eq!(a.event_prefix_digest, b.event_prefix_digest);
+        assert_ne!(a.message_digest, b.message_digest);
+        assert_ne!(a.history_id, b.history_id);
+        assert!(matches!(report.messages.overlap, RecoveryOverlap::Divergent { .. }));
+    }
+
+    #[test]
+    fn replay_requires_whole_enqueue_batch_coverage_or_completed_cancellation() {
+        let msg = messages(0, 1);
+        let ev = events(vec![
+            StromaEvent::EnqueueMany { reqs: vec![
+                EnqueueEventMeta { off: 0, retries: 0, expire_at: None },
+                EnqueueEventMeta { off: 7, retries: 0, expire_at: None },
+            ] },
+            StromaEvent::CancelEnqueueMany { offs: vec![7] },
+        ]);
+        let check = |target| {
+            let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+                .with_queue_replay(target, Default::default()).unwrap();
+            run(pair, [[&msg, &ev], [&msg, &ev]])
+        };
+        assert!(check(1).unwrap_err().contains("uncancelled missing message 7"));
+        let result = check(2).unwrap().queue_replay.unwrap();
+        assert_eq!(result[0].required_message_next, 1);
+        // A later ACK of a missing payload must not turn it into valid evidence.
+        let ev = events(vec![StromaEvent::Ack { off: 7 }, StromaEvent::CancelEnqueueMany { offs: vec![7] }]);
+        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+            .with_queue_replay(2, Default::default()).unwrap();
+        assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap_err().contains("missing message 7"));
+    }
+
+    #[test]
+    fn replay_delayed_retry_ttl_and_dlq_match_state_operations() {
+        use crate::{DeadLetterMeta, DeadLetterReason, DeclareMeta, DLQDiscardPolicyWire, NackEventMeta};
+        let msg = messages(0, 4);
+        let meta = DeclareMeta { dlq_policy: Some(DLQDiscardPolicyWire::Discard), dlq_max_retries: Some(5), default_message_ttl_ms: Some(80) };
+        let ev = events(vec![
+            StromaEvent::Declare(meta.clone()),
+            StromaEvent::Enqueue { off: 0, retries: 2, expire_at: Some(500) },
+            StromaEvent::MarkInflight { off: 0, deadline: 200 },
+            StromaEvent::NackMany { reqs: vec![NackEventMeta { off: 0, requeue: true, not_before: Some(300) }] },
+            StromaEvent::EnqueueDelayed { off: 1, not_before: 400 },
+            StromaEvent::EnqueueDelayed { off: 2, not_before: 600 },
+            StromaEvent::CancelEnqueueMany { offs: vec![2] },
+            StromaEvent::DeadLetter { reqs: vec![DeadLetterMeta { off: 3, retry_count: 4, reason: DeadLetterReason::RetriesExhausted,
+                target_tp: "dlq".into(), target_part: 0, target_group: None }] },
+        ]);
+        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+            .with_queue_replay(ev.len() as u64, Default::default()).unwrap();
+        let report = run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap();
+        let mut state = crate::QueueInternalState::new("q".into(), 0);
+        state.apply_declare(&meta);
+        state.enqueue(0, 2, Some(500));
+        state.mark_inflight(0, 200);
+        state.nack_at(0, true, Some(300));
+        state.enqueue_delayed(1, 400);
+        state.enqueue_delayed(2, 600);
+        state.cancel_enqueue_many(&[2]);
+        state.mark_pending_dlq_many(&[3]);
+        assert_eq!(report.queue_replay.unwrap()[0].state_digest, state.recovery_state_digest());
+    }
+
+    #[test]
+    fn replay_fails_closed_on_unknown_semantics_overflow_limits_and_compacted_origin() {
+        let msg = messages(0, 1);
+        for event in [
+            StromaEvent::Ack { off: u64::MAX },
+            StromaEvent::ResetQueue { tp: "q".into(), part: 0, group: None },
+            StromaEvent::StreamTruncate { before: 0 },
+        ] {
+            let ev = events(vec![event]);
+            let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+                .with_queue_replay(1, Default::default()).unwrap();
+            assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).is_err());
+        }
+        let ev = events(vec![StromaEvent::Ack { off: 0 }]);
+        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+            .with_queue_replay(1, RecoveryReplayLimits { operations_per_replica: 1 }).unwrap();
+        assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap_err().contains("operation budget"));
+        let mut future = ev.clone();
+        future[0].payload.push(42);
+        let pair = inspector(seal(0, &msg, 0, &future), seal(0, &msg, 0, &future), Default::default())
+            .with_queue_replay(1, Default::default()).unwrap();
+        assert!(run(pair, [[&msg, &future], [&msg, &future]]).unwrap_err().contains("UnknownOrMalformed"));
+        let compacted = seal(1, &[], 1, &[]);
+        assert!(inspector(compacted.clone(), compacted, Default::default()).with_queue_replay(1, Default::default()).is_err());
+        assert!(inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default()).with_queue_replay(2, Default::default()).is_err());
+        // Reconstructing an early target does not permit corruption after it.
+        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
+            .with_queue_replay(0, Default::default()).unwrap();
+        assert!(run(pair, [[&msg, &future], [&msg, &ev]]).unwrap_err().contains("sealed digest"));
+    }
     fn messages(head: u64, next: u64) -> Vec<RecoveryRecord> {
         (head..next)
             .map(|offset| RecoveryRecord {
