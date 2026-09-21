@@ -2,6 +2,7 @@ mod engine;
 mod event;
 mod global;
 mod metrics;
+mod ordered_apply;
 mod replication;
 mod replication_diagnostics;
 pub mod recovery_inspection;

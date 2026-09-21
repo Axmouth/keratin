@@ -60,6 +60,8 @@ mod recovery_read;
 pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord};
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
+#[path = "stroma/checkpoint_capture.rs"]
+mod checkpoint_capture;
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -319,12 +321,31 @@ pub struct ApplyThenComplete {
     qh: QueueHandle,
     _owner_operation: OwnerOperationLease,
     inner: Box<dyn AppendCompletion<IoError> + Send>,
+    ordered_scope: Option<crate::ordered_apply::Scope>,
+    runtime: Option<tokio::runtime::Handle>,
 }
 
 impl AppendCompletion<IoError> for ApplyThenComplete {
     fn complete(self: Box<Self>, res: std::result::Result<AppendResult, IoError>) {
         match res {
             Ok(ar) => {
+                if self.ordered_scope.is_some() {
+                    let runtime = self.runtime.clone().expect("ordered callback runtime");
+                    runtime.spawn(async move {
+                        let ApplyThenComplete { stroma, ev, qh, _owner_operation, inner, ordered_scope, .. } = *self;
+                        let result = async {
+                            let h = qh.resolve()?;
+                            let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
+                            stroma.apply_event_inmem(ev, &h).await?;
+                            h.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+                            crate::ordered_apply::finish(turn, ordered_scope)?;
+                            Ok::<_, StromaError>(ar)
+                        }.await;
+                        inner.complete(result.map_err(|err| IoError::new(err.to_string())));
+                        drop(_owner_operation);
+                    });
+                    return;
+                }
                 let stroma = self.stroma.clone();
                 let ev = self.ev.clone();
                 let inner = self.inner;
@@ -362,12 +383,16 @@ impl ApplyThenComplete {
         owner_operation: OwnerOperationLease,
         inner: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Box<Self> {
+        let ordered_scope = qh.resolve().ok().and_then(|h| h.ordered_apply_scope());
+        let runtime = ordered_scope.as_ref().map(|_| tokio::runtime::Handle::current());
         Box::new(Self {
             stroma,
             ev,
             qh,
             _owner_operation: owner_operation,
             inner,
+            ordered_scope,
+            runtime,
         })
     }
 }
@@ -2030,9 +2055,10 @@ impl Stroma {
                 qh.blocking_command_enqueue(command)?;
                 // Accept NACK even if not inflight:
                 // - race with expiry worker
-                // - duplicate NACKs
                 // - late NACK after consumer retry
-                // NACK is idempotent and safe.
+                // A requeue NACK can increment retries again on a ready offset.
+                // Consumer-tag validation prevents duplicate client settlement;
+                // replay must apply each durable event only once.
             }
             StromaEvent::NackMany { reqs } => {
                 let command = QueueCommand::NackMany {
@@ -2042,9 +2068,10 @@ impl Stroma {
                 qh.blocking_command_enqueue(command)?;
                 // Accept NACK even if not inflight:
                 // - race with expiry worker
-                // - duplicate NACKs
                 // - late NACK after consumer retry
-                // NACK is idempotent and safe.
+                // A requeue NACK can increment retries again on a ready offset.
+                // Consumer-tag validation prevents duplicate client settlement;
+                // replay must apply each durable event only once.
             }
             StromaEvent::DeadLetter { reqs } => {
                 // On replay we just mark pending; recovery scan will re-issue copies.
@@ -2241,9 +2268,10 @@ impl Stroma {
             StromaEvent::Nack { off, requeue } => {
                 // Accept NACK even if not inflight:
                 // - race with expiry worker
-                // - duplicate NACKs
                 // - late NACK after consumer retry
-                // NACK is idempotent and safe.
+                // A requeue NACK can increment retries again on a ready offset.
+                // Consumer-tag validation prevents duplicate client settlement;
+                // replay must apply each durable event only once.
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::Nack {
                     offset: off,
@@ -2258,9 +2286,10 @@ impl Stroma {
             StromaEvent::NackMany { reqs } => {
                 // Accept NACK even if not inflight:
                 // - race with expiry worker
-                // - duplicate NACKs
                 // - late NACK after consumer retry
-                // NACK is idempotent and safe.
+                // A requeue NACK can increment retries again on a ready offset.
+                // Consumer-tag validation prevents duplicate client settlement;
+                // replay must apply each durable event only once.
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.command_enqueue(QueueCommand::NackMany {
                     reqs,
@@ -2398,6 +2427,7 @@ impl Stroma {
         }
         let msgs_count = msgs.len();
         let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
+        let ordered_scope = qh.ordered_apply_scope();
 
         // Durable append first.
         let ar = event_log
@@ -2408,14 +2438,20 @@ impl Stroma {
         self.metrics
             .event_log_appends
             .observe(msgs_count, bytes_count);
-        qh.applied_upto()
-            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        if ordered_scope.is_none() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        }
         qh.set_dirty_snapshot(true);
 
         // Apply in memory after durable accept.
+        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
         for ev in evs.into_iter() {
             self.apply_event_inmem(ev, &qh).await?;
         }
+        if ordered_scope.is_some() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+        }
+        crate::ordered_apply::finish(turn, ordered_scope)?;
 
         // Update applied watermark:
         let new_upto = event_log.head_offset();
@@ -2451,6 +2487,7 @@ impl Stroma {
         msg_barrier: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
         msgs_count: usize,
         bytes_count: usize,
+        ordered_scope: Option<crate::ordered_apply::Scope>,
     ) -> Result<Option<Offset>> {
         let qh = qh.resolve()?;
         let start = Instant::now();
@@ -2473,13 +2510,19 @@ impl Stroma {
         self.metrics
             .event_log_appends
             .observe(msgs_count, bytes_count);
-        qh.applied_upto()
-            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        if ordered_scope.is_none() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        }
         qh.set_dirty_snapshot(true);
 
+        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
         for ev in evs.into_iter() {
             self.apply_event_inmem(ev, &qh).await?;
         }
+        if ordered_scope.is_some() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+        }
+        crate::ordered_apply::finish(turn, ordered_scope)?;
 
         let event_next = ar.base_offset + ar.count as u64;
         self.metrics
@@ -2858,6 +2901,9 @@ impl Stroma {
     /// Recovery loads snapshots, then starts event replay after the snapshot
     /// offset so events already covered by the snapshot are not read again.
     async fn periodic_snapshot_step(stroma: &Stroma, qh: &QueueHandle) -> Result<()> {
+        if qh.resolve()?.has_ordered_apply() {
+            return stroma.write_exact_queue_checkpoint(qh.clone(), true).await;
+        }
         let qh = qh.resolve()?;
         let _apply = qh.follower_apply_state().await;
         if qh.ensure_not_recovery_sealed().is_err() {
@@ -3039,6 +3085,13 @@ impl Stroma {
         last_applied_event_offset: Offset,
         blob: &[u8],
     ) -> Result<()> {
+        self.write_queue_snapshot_envelope(tp, part, group, 1, last_applied_event_offset, blob)
+    }
+
+    pub(super) fn write_queue_snapshot_envelope(
+        &self, tp: &str, part: u32, group: Option<&str>,
+        version: u16, boundary: u64, blob: &[u8],
+    ) -> Result<()> {
         let tmp = self.snap_tmp_file(tp, part, group);
         let final_path = self.snap_file(tp, part, group);
 
@@ -3051,19 +3104,18 @@ impl Stroma {
 
         // file format (big endian):
         // magic 8: b"SSNAP\0\0\0"
-        // ver u16: 1
+        // ver u16: 1 (legacy inclusive), 2 (exact exclusive)
         // reserved u16
-        // last_applied_event_offset u64
+        // event boundary u64
         // blob_len u32
         // blob bytes
         // crc32c u32 over (ver..blob)
         const MAGIC: &[u8; 8] = b"SSNAP\0\0\0";
-        const VER: u16 = 1;
 
         let mut payload = Vec::with_capacity(2 + 2 + 8 + 4 + blob.len());
-        payload.extend_from_slice(&VER.to_be_bytes());
+        payload.extend_from_slice(&version.to_be_bytes());
         payload.extend_from_slice(&0u16.to_be_bytes());
-        payload.extend_from_slice(&last_applied_event_offset.to_be_bytes());
+        payload.extend_from_slice(&boundary.to_be_bytes());
         payload.extend_from_slice(&(blob.len() as u32).to_be_bytes());
         payload.extend_from_slice(blob);
 
@@ -3092,16 +3144,23 @@ impl Stroma {
         }
 
         fs::rename(&tmp, &final_path).map_err(io_err)?;
+        // Publish the directory entry durably before any event-log compaction.
+        #[cfg(unix)]
+        {
+            recovery_seal::sync_directories(final_path.parent().unwrap())?;
+            if tmp.parent() != final_path.parent() {
+                recovery_seal::sync_directories(tmp.parent().unwrap())?;
+            }
+        }
         Ok(())
     }
 
-    fn read_queue_snapshot(&self, path: &Path) -> Result<Option<(Offset, Vec<u8>)>> {
+    fn read_queue_snapshot(&self, path: &Path) -> Result<Option<(checkpoint_capture::SnapshotBoundary, Vec<u8>)>> {
         if !path.exists() {
             return Ok(None);
         }
 
         const MAGIC: &[u8; 8] = b"SSNAP\0\0\0";
-        const VER: u16 = 1;
 
         let bytes = fs::read(path).map_err(io_err)?;
         if bytes.len() < 8 + 2 + 2 + 8 + 4 + 4 {
@@ -3124,7 +3183,7 @@ impl Stroma {
         }
 
         let ver = u16::from_be_bytes(payload[0..2].try_into().expect("exact-length slice"));
-        if ver != VER {
+        if !matches!(ver, 1 | 2) || payload[2..4] != [0, 0] {
             return Err(StromaError::Decode("snapshot version mismatch".into()));
         }
 
@@ -3133,11 +3192,11 @@ impl Stroma {
         let blob_len =
             u32::from_be_bytes(payload[12..16].try_into().expect("exact-length slice")) as usize;
 
-        if 16 + blob_len > payload.len() {
+        if 16 + blob_len != payload.len() {
             return Err(StromaError::Decode("snapshot blob truncated".into()));
         }
         let blob = payload[16..16 + blob_len].to_vec();
-        Ok(Some((last_applied, blob)))
+        Ok(Some((checkpoint_capture::SnapshotBoundary::new(ver, last_applied), blob)))
     }
 
     // ---------------- Recovery ----------------
@@ -3395,8 +3454,14 @@ impl Stroma {
         // Compacted checkpoints have a positive event head and retain their blob.
         if let Some((applied_upto, blob)) = self
             .read_queue_snapshot(&self.snap_file(tp, part, group))?
-            .filter(|(applied, _)| *applied != 0 || event_log.head_offset() != 0)
+            .filter(|(applied, _)| !applied.ambiguous_zero() || event_log.head_offset() != 0)
         {
+            if matches!(applied_upto, checkpoint_capture::SnapshotBoundary::ExactNext(_))
+                && (applied_upto.event_next() < event_log.head_offset()
+                    || applied_upto.event_next() > event_log.next_offset())
+            {
+                return Err(StromaError::Corruption("exact checkpoint does not cover retained event prefix".into()));
+            }
             h.load_snapshot(blob).await.map_err(|err| {
                 StromaError::Io(format!(
                     "snapshot load failed for tp={tp} part={part} group={group:?}: {err}"
@@ -3419,8 +3484,8 @@ impl Stroma {
                     h.event_log().become_follower();
                 }
             }
-            h.applied_upto().store(applied_upto, Ordering::Release);
-            cur = applied_upto.saturating_add(1);
+            h.applied_upto().store(applied_upto.last_applied(), Ordering::Release);
+            cur = applied_upto.event_next();
         }
 
         let tail = event_log.next_offset();
@@ -4123,6 +4188,7 @@ impl Stroma {
         }
         let msgs_count = event_msgs.len();
         let bytes_count: usize = event_msgs.iter().map(|m| m.bytes_len()).sum();
+        let ordered_scope = qh.resolve()?.ordered_apply_scope();
         let event_rx = match encode_err {
             None => event_log
                 .append_batch_enqueue_receiver(event_msgs, Some(durability))
@@ -4170,6 +4236,7 @@ impl Stroma {
                             msg_rx,
                             msgs_count,
                             bytes_count,
+                            ordered_scope,
                         )
                         .await
                 }
@@ -4798,19 +4865,26 @@ impl Stroma {
 
         let event = StromaEvent::ReleaseInflightMany { reqs: reqs.clone() };
         let m = event_msg(&event)?;
+        let ordered_scope = qh.ordered_apply_scope();
         let ar = event_log
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
             .await
             .map_err(io_err)?;
-        qh.applied_upto()
-            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        if ordered_scope.is_none() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        }
         qh.set_dirty_snapshot(true);
 
+        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
         qh.work_queue()?
             .release_inflight_many(reqs)
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?;
 
+        if ordered_scope.is_some() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+        }
+        crate::ordered_apply::finish(turn, ordered_scope)?;
         completion.complete(Ok(ar));
         drop(owner_operation);
         Ok(())
@@ -4849,15 +4923,18 @@ impl Stroma {
         // Phase 1: durable Nack write
         let nack_event = StromaEvent::NackMany { reqs: reqs.clone() };
         let m = event_msg(&nack_event)?;
+        let ordered_scope = h.ordered_apply_scope();
         let ar = event_log
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
             .await
             .map_err(io_err)?;
-        h.applied_upto()
-            .fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        if ordered_scope.is_none() {
+            h.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
+        }
         h.set_dirty_snapshot(true);
 
         // Apply -> get outcomes
+        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
         let outcomes = {
             let (tx, rx) = tokio::sync::oneshot::channel();
             h.command_enqueue(QueueCommand::NackMany {
@@ -4868,6 +4945,10 @@ impl Stroma {
             .map_err(io_err)?;
             rx.await.map_err(|_| StromaError::QueueActorGone)?
         };
+        if ordered_scope.is_some() {
+            h.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+        }
+        crate::ordered_apply::finish(turn, ordered_scope)?;
         let dl_requests: Vec<(Offset, u32, DeadLetterReason)> = outcomes
             .iter()
             .filter_map(|(o, oc)| match oc {
@@ -4895,11 +4976,17 @@ impl Stroma {
             // (DeadLetterCommit on replay = ack, same effect.)
             // Could also use a distinct DiscardPending event; using commit keeps event types minimal.
             let m = event_msg(&ev)?;
-            let _ = event_log
+            let ordered_scope = h.ordered_apply_scope();
+            let discard_ar = event_log
                 .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
                 .await
                 .map_err(io_err)?;
+            let turn = crate::ordered_apply::enter(&ordered_scope, discard_ar.base_offset, discard_ar.count as u64).await?;
             h.work_queue()?.discard_pending_dlq(to_discard).await?;
+            if ordered_scope.is_some() {
+                h.applied_upto().fetch_max(discard_ar.base_offset + discard_ar.count as u64 - 1, Ordering::Release);
+            }
+            crate::ordered_apply::finish(turn, ordered_scope)?;
         }
 
         // DLQ-bound: emit DeadLetter event with resolved targets.
@@ -4908,7 +4995,8 @@ impl Stroma {
                 reqs: to_dlq.clone(),
             };
             let event_msg = event_msg(&ev)?;
-            let _ = event_log
+            let ordered_scope = h.ordered_apply_scope();
+            let dlq_ar = event_log
                 .append_batch(
                     vec![event_msg],
                     Some(self.keratin_cfg_event.default_durability),
@@ -4917,6 +5005,14 @@ impl Stroma {
                 .map_err(io_err)?;
             // (Apply already done at phase-1 nack, which moved them to pending_dlq.
             //  No second apply needed, DeadLetter event is for replay durability only.)
+            let turn = crate::ordered_apply::enter(&ordered_scope, dlq_ar.base_offset, dlq_ar.count as u64).await?;
+            if ordered_scope.is_some() {
+                // Apply the recorded marker as replay does, even though Nack
+                // normally already put the offset in pending-DLQ state.
+                self.apply_event_inmem(ev, &h).await?;
+                h.applied_upto().fetch_max(dlq_ar.base_offset + dlq_ar.count as u64 - 1, Ordering::Release);
+            }
+            crate::ordered_apply::finish(turn, ordered_scope)?;
 
             // Spawn background copy.
             for meta in to_dlq {
@@ -5207,18 +5303,19 @@ impl Stroma {
             ));
         };
 
-        if let Err(e) = qh
+        let ordered_scope = qh.ordered_apply_scope();
+        let ar = qh
             .event_log()
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
             .await
-        {
-            tracing::error!("DeadLetterCommit append failed: {e}");
-            return Err(StromaError::Encode(
-                "Failed to encode DeadLetterCommit event".into(),
-            ));
-        }
+            .map_err(io_err)?;
+        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
         self.apply_event_inmem(StromaEvent::DeadLetterCommit { offs }, qh)
             .await?;
+        if ordered_scope.is_some() {
+            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
+        }
+        crate::ordered_apply::finish(turn, ordered_scope)?;
         Ok(())
     }
 
@@ -5649,6 +5746,9 @@ impl Stroma {
     pub async fn snapshot_partition(&self, tp: &str, part: u32, group: Option<&str>) -> Result<()> {
         let ticket = self.queue_handle(tp, part, group).await?;
         let qh = ticket.resolve()?;
+        if qh.has_ordered_apply() {
+            return self.write_exact_queue_checkpoint(ticket.clone(), false).await;
+        }
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         let upto = qh.applied_upto().load(Ordering::Acquire);
@@ -5958,6 +6058,10 @@ struct PublishApplyPause {
     entered: Notify,
     release: Notify,
 }
+
+#[cfg(test)]
+#[path = "stroma/event_order_tests.rs"]
+mod event_order_tests;
 
 #[cfg(test)]
 mod tests {

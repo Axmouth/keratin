@@ -383,6 +383,7 @@ impl Stroma {
                     .map_err(io_err)?;
                 h.applied_upto()
                     .store(install.applied_event_offset, Ordering::Release);
+                h.reset_ordered_apply_after_recovery(install.event_next_offset);
                 self.checkpoint_boundary("state")?;
                 let gate = h.recovery_gate.clone();
                 let stroma = self.clone();
@@ -428,11 +429,12 @@ impl Stroma {
         let Phase::Pending(install) = &journal.phase else {
             return Ok(());
         };
-        self.write_queue_snapshot(
+        self.write_queue_snapshot_envelope(
             &journal.topic,
             journal.partition,
             journal.group.as_deref(),
-            install.applied_event_offset,
+            2,
+            install.event_next_offset,
             &install.state_snapshot,
         )?;
         recovery_seal::sync_directories(&self.snap_dir(

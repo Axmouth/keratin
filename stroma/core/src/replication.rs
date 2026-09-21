@@ -223,6 +223,7 @@ impl Stroma {
                 )));
             }
         }
+        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
@@ -443,7 +444,11 @@ impl Stroma {
         } else {
             Some(applied_upto)
         };
-        if event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1) {
+        let events_unapplied = match qh.ordered_applied_next()? {
+            Some(next) => next != event_next_offset,
+            None => event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1),
+        };
+        if events_unapplied {
             return Ok(QueuePromotionOutcome::EventsNotApplied {
                 applied_event_offset,
                 event_next_offset,
@@ -459,6 +464,7 @@ impl Stroma {
                 });
             }
         }
+        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
@@ -510,7 +516,11 @@ impl Stroma {
         } else {
             Some(applied_upto)
         };
-        if event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1) {
+        let events_unapplied = match qh.ordered_applied_next()? {
+            Some(next) => next != event_next_offset,
+            None => event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1),
+        };
+        if events_unapplied {
             return Ok(QueuePromotionOutcome::EventsNotApplied {
                 applied_event_offset,
                 event_next_offset,
@@ -532,6 +542,7 @@ impl Stroma {
         qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
         qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
 
+        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
         qh.msg_log().become_owner();
         qh.event_log().become_owner();
@@ -682,7 +693,17 @@ impl Stroma {
             let message_next_offset = qh.msg_log().next_offset();
             let event_next_offset = qh.event_log().next_offset();
             let applied_event_offset = event_next_offset.saturating_sub(1);
-            let state_checkpoint = qh
+            let state_checkpoint = if qh.has_ordered_apply() {
+                let captured = qh.capture_exact_checkpoint(false).await?;
+                if captured.event_next != event_next_offset {
+                    return Err(StromaError::Io("owner checkpoint has unapplied events".into()));
+                }
+                tokio::task::spawn_blocking(move || crate::state::QueueStateCheckpointSnapshot {
+                    message_checkpoint_offset: captured.message_floor,
+                    state_snapshot: captured.encode(),
+                }).await.map_err(io_err)?
+            } else {
+                qh
                 .work_queue()?
                 .export_state_checkpoint_snapshot(applied_event_offset)
                 .await
@@ -690,7 +711,8 @@ impl Stroma {
                     StromaError::Io(format!(
                         "owner checkpoint snapshot export failed for tp={topic} part={part} group={group:?}: {err}"
                     ))
-                })?;
+                })?
+            };
 
             Ok(OwnerStateCheckpoint {
                 message_epoch: qh.msg_log().current_epoch(),
@@ -887,10 +909,28 @@ impl Stroma {
                 rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             if let Some(batch) = events {
-                for (idx, event) in batch.events.into_iter().enumerate() {
-                    self.apply_event_inmem(event, &qh).await?;
-                    qh.applied_upto()
-                        .fetch_max(batch.first_offset + idx as u64, Ordering::Relaxed);
+                // A verified overlap may contain already-applied NACKs, whose
+                // retry increment must not run a second time. The exclusive
+                // frontier also distinguishes an unapplied event zero.
+                let applied_next = qh.ordered_applied_next()?;
+                let skip = match applied_next {
+                    Some(next) if batch.first_offset > next => {
+                        return Err(StromaError::Io("follower event application gap".into()));
+                    }
+                    Some(next) => next.saturating_sub(batch.first_offset)
+                        .min(batch.events.len() as u64) as usize,
+                    None => 0,
+                };
+                let count = batch.events.len() - skip;
+                if count > 0 {
+                    let scope = qh.ordered_apply_scope();
+                    let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
+                    for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
+                        self.apply_event_inmem(event, &qh).await?;
+                        qh.applied_upto()
+                            .fetch_max(batch.first_offset + idx as u64, Ordering::Release);
+                    }
+                    crate::ordered_apply::finish(turn, scope)?;
                 }
             }
             *apply_state = false;

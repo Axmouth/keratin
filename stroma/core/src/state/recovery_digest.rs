@@ -49,6 +49,33 @@ impl Digest {
 }
 
 impl QueueInternalState {
+    /// Projection for a new owner's delivery attempts. Leases are local to an
+    /// owner and ordinary delivery does not write MarkInflight to the event log.
+    /// Retry counts, delayed work, TTL and DLQ state remain significant.
+    pub(crate) fn recovery_lease_normalized_digest(&self) -> [u8; 32] {
+        let mut state = self.clone();
+        for (&off, _) in &self.inflight {
+            if !state.is_settled(off) && !state.is_pending_dlq(off) {
+                state.ready.insert(off..off + 1);
+            }
+        }
+        state.inflight.clear();
+        state.expiry_heap.clear();
+        state.min_deadline_hint = None;
+        state.recovery_state_digest()
+    }
+
+    pub(crate) fn recovery_live_ranges(&self) -> RangeSet<u64> {
+        let mut live = self.ready.clone();
+        for off in self.inflight.keys().chain(self.pending_dlq.keys()).copied()
+            .chain(self.delayed_enqueue_heap.iter().map(|(_, off)| *off))
+            .chain(self.delayed_retry_heap.iter().map(|(_, off)| *off))
+        {
+            if !self.is_settled(off) { live.insert(off..off + 1); }
+        }
+        live
+    }
+
     pub(crate) fn recovery_state_digest(&self) -> [u8; 32] {
         let mut h = Digest(blake3::Hasher::new());
         h.0.update(b"fibril-queue-state-v1\0");

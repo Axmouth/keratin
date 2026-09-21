@@ -309,7 +309,8 @@ pub enum MessageInspectionStatus {
 /// - An offset may exist in at most one of {ready, inflight, acked}.
 /// - The ACK frontier is contiguous and monotonic.
 ///
-/// All operations are idempotent and replay-safe.
+/// Replay applies each event once, in log order. Repeating a NACK can increment
+/// its retry count again.
 ///
 /// Important invariants:
 /// - NACK never creates offsets; it only transforms existing state.
@@ -476,6 +477,11 @@ pub enum QueueCommand {
         last_snapshot_event_offset: u64,
         response: Option<oneshot::Sender<QueueStateCheckpointSnapshot>>,
     },
+    CaptureExactCheckpoint {
+        permit: crate::ordered_apply::CheckpointPermit,
+        mark_clean: bool,
+        response: oneshot::Sender<crate::Result<CapturedQueueCheckpoint>>,
+    },
     LoadSnapshot {
         data: Vec<u8>,
         response: Option<oneshot::Sender<std::io::Result<SnapshotMeta>>>,
@@ -639,6 +645,7 @@ impl QueueCommand {
             // If you need snapshots to run on schedule regardless of load, raise this.
             QueueCommand::EncodeSnapshot { .. } => CommandPrio::SuperLow,
             QueueCommand::ExportStateCheckpoint { .. } => CommandPrio::SuperLow,
+            QueueCommand::CaptureExactCheckpoint { .. } => CommandPrio::High,
             QueueCommand::GetRequiredMessageNext { .. } => CommandPrio::SuperLow,
             // SuperLow: shutdown drains all queued commands before exiting. Each queued
             // command may have a oneshot response sender that callers are awaiting, if
@@ -672,6 +679,7 @@ impl QueueCommand {
             QueueCommand::Reset { .. } => "Reset",
             QueueCommand::EncodeSnapshot { .. } => "EncodeSnapshot",
             QueueCommand::ExportStateCheckpoint { .. } => "ExportStateCheckpoint",
+            QueueCommand::CaptureExactCheckpoint { .. } => "CaptureExactCheckpoint",
             QueueCommand::LoadSnapshot { .. } => "LoadSnapshot",
             QueueCommand::InstallSnapshotState { .. } => "InstallSnapshotState",
             QueueCommand::IsSettled { .. } => "IsSettled",
@@ -1134,6 +1142,8 @@ pub struct QueueHandleInner {
 
     applied_upto: Arc<AtomicU64>,
 
+    ordered_apply: Option<Arc<crate::ordered_apply::OrderedApply>>,
+
     // TODO: Set on startup and on encode snapshot, then pass them as arguments to the internal state, methods for easy access at stroma level
     last_snapshot_timestamp: Arc<AtomicU64>,
     last_snapshot_event_offset: Arc<AtomicU64>,
@@ -1348,6 +1358,8 @@ impl QueueHandleInner {
         let dirty_since_snapshot_loop = dirty_since_snapshot.clone();
 
         let applied_upto = Arc::new(AtomicU64::new(0));
+        let ordered_apply = (cfg!(feature = "ordered-queue-apply") && kind == PartitionKind::Queue)
+            .then(|| crate::ordered_apply::OrderedApply::new(event_log.next_offset()));
         let last_snapshot_timestamp = Arc::new(AtomicU64::new(0));
         let last_snapshot_event_offset = Arc::new(AtomicU64::new(0));
 
@@ -1383,6 +1395,7 @@ impl QueueHandleInner {
             msg_log,
             event_log,
             applied_upto,
+            ordered_apply,
             last_snapshot_timestamp,
             last_snapshot_event_offset,
             creating_snapshot,
@@ -1482,6 +1495,7 @@ impl QueueHandleInner {
     }
 
     pub fn mark_recovery_complete(&self) {
+        if let Some(order) = &self.ordered_apply { order.reset(self.event_log.next_offset()); }
         self.recovery_complete.store(true, Ordering::Release);
         self.recovery_notify.notify_waiters();
     }
@@ -1552,6 +1566,9 @@ impl QueueHandleInner {
     }
 
     pub fn ensure_owner(&self) -> Result<(), QueueHandleError> {
+        if self.ordered_apply.as_ref().is_some_and(|order| order.failed()) {
+            return Err(QueueHandleError::Internal("ordered application interrupted; recovery required".into()));
+        }
         let actual = self.role();
         if actual == QueueRole::Owner {
             return Ok(());
@@ -2060,6 +2077,26 @@ impl QueueHandleInner {
                         });
                     }
                 });
+            }
+            QueueCommand::CaptureExactCheckpoint { permit, mark_clean, response } => {
+                let capture = permit.event_next().map(|event_next| {
+                    let started = Instant::now();
+                    handle.metrics.snapshot.attempts.incr();
+                    state.last_snapshot_event_offset = event_next.saturating_sub(1);
+                    state.last_snapshot_timestamp = unix_millis();
+                    let captured = CapturedQueueCheckpoint {
+                        event_next,
+                        message_floor: state.lowest_not_settled_offset(),
+                        state: state.clone(),
+                        metrics: handle.metrics.clone(),
+                        started,
+                    };
+                    handle.metrics.snapshot.clone_latency.observe(started.elapsed());
+                    if mark_clean { handle.set_dirty_snapshot(false); }
+                    captured
+                });
+                drop(permit);
+                let _ = response.send(capture);
             }
             QueueCommand::LoadSnapshot { data, response } => {
                 let result = state.load_snapshot(&data);
@@ -2884,6 +2921,40 @@ impl QueueHandleInner {
         self.applied_upto.clone()
     }
 
+    pub(crate) fn ordered_apply_scope(&self) -> Option<crate::ordered_apply::Scope> {
+        self.ordered_apply.as_ref().map(|order| order.scope())
+    }
+
+    pub(crate) fn has_ordered_apply(&self) -> bool { self.ordered_apply.is_some() }
+
+    pub(crate) async fn capture_exact_checkpoint(&self, mark_clean: bool) -> crate::Result<CapturedQueueCheckpoint> {
+        let order = self.ordered_apply.as_ref().ok_or_else(||
+            StromaError::InvalidArgument("exact capture requires ordered queue application".into()))?;
+        let permit = order.checkpoint().await?;
+        let (response, rx) = oneshot::channel();
+        self.command_enqueue(QueueCommand::CaptureExactCheckpoint { permit, mark_clean, response }).await
+            .map_err(|err| StromaError::Io(err.to_string()))?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)?
+    }
+
+    /// Only completed recovery or a validated, installed checkpoint can reset
+    /// an interrupted sequence. A role change is not evidence of application.
+    pub(crate) fn reset_ordered_apply_after_recovery(&self, event_next: u64) {
+        if let Some(order) = &self.ordered_apply { order.reset(event_next); }
+    }
+
+    pub(crate) fn ordered_applied_next(&self) -> crate::Result<Option<u64>> {
+        self.ordered_apply.as_ref().map(|order| order.applied_next()).transpose()
+    }
+
+    /// Caller holds follower_apply and has checked there is no interrupted apply.
+    pub(crate) fn align_follower_checkpoint_boundary(&self) -> crate::Result<()> {
+        if self.ordered_applied_next()? != Some(self.event_log.next_offset()) {
+            return Err(StromaError::Io("follower checkpoint has unapplied events".into()));
+        }
+        Ok(())
+    }
+
     /// Per-queue default message TTL (ms), or `None`. Hot-path read for the
     /// publish path. Kept in sync by the actor on Declare and snapshot load.
     pub fn default_message_ttl_ms(&self) -> Option<u64> {
@@ -2896,6 +2967,11 @@ impl QueueHandleInner {
     fn set_default_message_ttl_ms(&self, value: Option<u64>) {
         self.default_message_ttl_ms
             .store(value.unwrap_or(0), Ordering::Relaxed);
+    }
+
+    pub(crate) fn record_checkpoint_persisted(&self, event_next: u64, timestamp: u64) {
+        self.last_snapshot_event_offset.store(event_next.saturating_sub(1), Ordering::Release);
+        self.last_snapshot_timestamp.store(timestamp, Ordering::Release);
     }
 
     pub fn last_snapshot_timestamp(&self) -> u64 {
@@ -4391,6 +4467,26 @@ pub struct QueueInternalDebugInfo {
     pub next_expiry_hint: Option<UnixMillis>,
     pub dlq_policy: String,
     pub dlq_max_retries: u32,
+}
+
+#[derive(Debug)]
+pub struct CapturedQueueCheckpoint {
+    pub(crate) event_next: u64,
+    pub(crate) message_floor: u64,
+    pub(crate) state: QueueInternalState,
+    metrics: Arc<StromaMetrics>,
+    started: Instant,
+}
+impl CapturedQueueCheckpoint {
+    pub(crate) fn encode(self) -> Vec<u8> {
+        let start = Instant::now();
+        let bytes = self.state.encode_snapshot(self.event_next.saturating_sub(1));
+        self.metrics.snapshot.encode_latency.observe(start.elapsed());
+        self.metrics.snapshot.bytes_written.fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.metrics.snapshot.last_snapshot_size_bytes.store(bytes.len() as u64, Ordering::Relaxed);
+        self.metrics.snapshot.total_latency.observe(self.started.elapsed());
+        bytes
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Default)]

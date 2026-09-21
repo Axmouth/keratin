@@ -232,6 +232,16 @@ pub struct RecoveryPairInspector {
     failed: bool,
     resource: (String, u32),
     replay: Option<[QueueReplay; 2]>,
+    checkpoint_replay: Option<CheckpointReplayPlan>,
+}
+
+struct CheckpointReplayPlan {
+    target: u64,
+    limits: RecoveryReplayLimits,
+    max_bytes: u32,
+    buffers: [Vec<u8>; 2],
+    ends: [Option<u64>; 2],
+    done: [bool; 2],
 }
 
 pub(crate) fn hash_record(hash: &mut blake3::Hasher, record: &RecoveryRecord) {
@@ -326,6 +336,7 @@ impl RecoveryPairInspector {
             failed: false,
             resource: (topic.to_string(), partition),
             replay: None,
+            checkpoint_replay: None,
         })
     }
     /// Request deterministic queue reconstruction in addition to retained-log
@@ -333,7 +344,7 @@ impl RecoveryPairInspector {
     /// sources and may be zero; all sealed records are still verified, including
     /// records after the target. No authority or activation proof is implied.
     pub fn with_queue_replay(mut self, event_next: u64, limits: RecoveryReplayLimits) -> Result<Self, String> {
-        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() {
+        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() || self.checkpoint_replay.is_some() {
             return Err("queue replay must be configured once before queue inspection".into());
         }
         self.replay = Some([
@@ -342,11 +353,63 @@ impl RecoveryPairInspector {
         ]);
         Ok(self)
     }
+
+    /// Reconstruct each side from its own exact checkpoint (or event zero when
+    /// no checkpoint exists). Snapshot pages and retained records are verified
+    /// against the resource-bound seals. This produces diagnostic evidence;
+    /// authority, timer transitions and installed lineage still require proof.
+    pub fn with_queue_checkpoint_replay(mut self, event_next: u64, limits: RecoveryReplayLimits, max_checkpoint_bytes: u32) -> Result<Self, String> {
+        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() || self.checkpoint_replay.is_some()
+            || max_checkpoint_bytes == 0 || max_checkpoint_bytes > 16 * 1024 * 1024
+        { return Err("invalid checkpoint replay configuration".into()); }
+        self.checkpoint_replay = Some(CheckpointReplayPlan {
+            target: event_next, limits, max_bytes: max_checkpoint_bytes,
+            buffers: Default::default(), ends: [None; 2],
+            done: self.seals.each_ref().map(|s| s.history.snapshot_digest.is_none()),
+        });
+        self.initialize_checkpoint_replay()?;
+        Ok(self)
+    }
+
+    fn initialize_checkpoint_replay(&mut self) -> Result<(), String> {
+        let Some(plan) = &mut self.checkpoint_replay else { return Ok(()); };
+        if !plan.done.iter().all(|done| *done) { return Ok(()); }
+        let build = |i: usize| -> Result<QueueReplay, String> {
+            let mut replay = if self.seals[i].history.snapshot_digest.is_some() {
+                QueueReplay::from_checkpoint(&self.resource.0, self.resource.1, self.seals[i].history.clone(), plan.target, plan.limits, &plan.buffers[i])?
+            } else {
+                QueueReplay::new(&self.resource.0, self.resource.1, self.seals[i].history.clone(), plan.target, plan.limits)?
+            };
+            replay.verify_live_payloads();
+            Ok(replay)
+        };
+        self.replay = Some([build(0)?, build(1)?]);
+        plan.buffers = Default::default(); // release raw snapshots after decoding
+        Ok(())
+    }
+
     pub fn next_read(&self) -> Result<Option<(RecoverySide, RecoveryReadRequest)>, String> {
         if self.failed {
             return Err("recovery inspection failed; discard partial evidence".into());
         }
-        for (index, log) in self.logs.iter().enumerate() {
+        if let Some(plan) = &self.checkpoint_replay {
+            for (i, side) in [RecoverySide::Left, RecoverySide::Right].into_iter().enumerate() {
+                if !plan.done[i] {
+                    if self.pages >= self.limits.total_pages { return Err("recovery inspection page budget exhausted".into()); }
+                    return Ok(Some((side, RecoveryReadRequest {
+                        seal: self.seals[i].request.clone(), history_id: self.seals[i].history.id,
+                        source: RecoveryReadSource::Snapshot, from: plan.buffers[i].len() as u64,
+                        max_records: self.limits.page_records,
+                        max_bytes: self.limits.page_bytes.min(plan.max_bytes),
+                    })));
+                }
+            }
+        }
+        // Reconstruct state before streaming live payload identities. Ordinary
+        // retained-log inspection preserves its original message-first order.
+        let order = if self.checkpoint_replay.is_some() { [1, 0] } else { [0, 1] };
+        for index in order {
+            let log = &self.logs[index];
             if let Some(side) = log.next_side() {
                 if self.pages >= self.limits.total_pages {
                     return Err("recovery inspection page budget exhausted".into());
@@ -387,6 +450,25 @@ impl RecoveryPairInspector {
             return Err("unexpected page after inspection completed".into());
         };
         let i = side.index();
+        if request.source == RecoveryReadSource::Snapshot {
+            let plan = self.checkpoint_replay.as_mut().ok_or("unexpected snapshot page")?;
+            let bytes = page.snapshot_bytes.len() as u64;
+            if side != expected_side || page.history_id != request.history_id
+                || page.source != request.source || page.from != request.from
+                || !page.records.is_empty() || page.end > plan.max_bytes as u64
+                || page.end < 28 || page.next <= page.from || page.next > page.end
+                || page.next - page.from != bytes || bytes > request.max_bytes as u64
+                || bytes > self.limits.total_bytes - self.bytes
+                || plan.ends[i].is_some_and(|end| end != page.end)
+            { return Err("checkpoint page identity, range or budget mismatch".into()); }
+            plan.ends[i] = Some(page.end);
+            plan.buffers[i].extend(page.snapshot_bytes);
+            plan.done[i] = page.next == page.end;
+            self.pages += 1;
+            self.bytes += bytes;
+            self.initialize_checkpoint_replay()?;
+            return Ok(());
+        }
         let log_index = if request.source == RecoveryReadSource::Messages {
             0
         } else {
@@ -432,6 +514,8 @@ impl RecoveryPairInspector {
                 if let Some(replay) = &mut self.replay {
                     replay[i].apply(record)?;
                 }
+            } else if let Some(replay) = &mut self.replay {
+                replay[i].message(record)?;
             }
             if record.offset >= log.overlap.0 && record.offset < log.overlap.1 {
                 let id = record_id(record);
@@ -650,6 +734,10 @@ mod tests {
     use super::*;
     use crate::{EnqueueEventMeta, RecoverySealRequest};
 
+
+    // Kept with these helpers so sealed page identity and digest validation use
+    // exactly the same path as retained-history comparisons.
+    include!("recovery_checkpoint_tests.rs");
 
     #[test]
     fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {

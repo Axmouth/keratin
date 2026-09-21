@@ -274,7 +274,8 @@ fn read_snapshot(
     let mut header = [0u8; 24];
     file.read_exact(&mut header).map_err(io_err)?;
     if &header[..8] != b"SSNAP\0\0\0"
-        || u16::from_be_bytes(header[8..10].try_into().unwrap()) != 1
+        || !matches!(u16::from_be_bytes(header[8..10].try_into().unwrap()), 1 | 2)
+        || header[10..12] != [0, 0]
         || len != 28 + u32::from_be_bytes(header[20..24].try_into().unwrap()) as u64
     {
         return Err(corrupt("invalid sealed snapshot envelope"));
