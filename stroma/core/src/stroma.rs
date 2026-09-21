@@ -61,6 +61,9 @@ pub use recovery_history::RetainedHistoryIdentity;
 #[path = "recovery_read.rs"]
 mod recovery_read;
 pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord};
+#[path = "recovery_stage.rs"]
+mod recovery_stage;
+pub use recovery_stage::{QueueRecoveryStage, QueueRecoveryStageSpec, QueueRecoveryStageReceipt, RecoveryStageLimits};
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "stroma/checkpoint_capture.rs"]
@@ -792,6 +795,7 @@ pub struct Stroma {
 
     /// Bounds concurrent full-history scans across this storage instance.
     recovery_read_slots: Arc<Semaphore>,
+    recovery_stage_slots: Arc<Semaphore>,
     // A new storage instance cannot inherit writer admission from an old process.
     storage_session: [u8; 16],
     admitted_histories: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), StorageHistoryBinding>>,
@@ -884,6 +888,7 @@ impl Stroma {
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
+            recovery_stage_slots: Arc::new(Semaphore::new(1)),
             storage_session: *uuid::Uuid::now_v7().as_bytes(),
             admitted_histories: Arc::new(DashMap::new()),
             global_dlq: Arc::new(RwLock::new(None)),

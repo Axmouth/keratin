@@ -577,3 +577,28 @@ async fn accepted_history_reopen_preserves_padding_and_rejects_damage_without_mu
         }
     }
 }
+
+#[tokio::test]
+async fn strict_live_scan_requires_frozen_role_and_verifies_disk_beyond_manifest_tail() {
+    let dir = test_dir!("strict_live_reader");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    assert!(log.frozen_reader().is_err());
+    let payload = b"strict-live-reader-payload".to_vec();
+    log.append_batch(vec![message(payload.clone())], Some(KDurability::AfterFsync)).await.unwrap();
+    assert!(log.frozen_reader().is_err());
+    log.freeze();
+    let mut seen = vec![];
+    log.frozen_reader().unwrap().scan(|r| { seen.push((r.offset,r.payload.to_vec())); Ok(()) }).unwrap();
+    assert_eq!(seen, vec![(0,payload.clone())]);
+    // The cold sealed-reader API still requires an exact persisted boundary.
+    assert!(FrozenLogReader::open(&dir.root, log.current_epoch(), 0, 2).is_err());
+    let segment = dir.root.join("segments/00000000000000000000.log");
+    let bytes = std::fs::read(&segment).unwrap();
+    let at = bytes.windows(payload.len()).position(|w| w == payload).unwrap();
+    let mut file = OpenOptions::new().write(true).open(segment).unwrap();
+    file.seek(SeekFrom::Start(at as u64)).unwrap();
+    file.write_all(&[payload[0] ^ 1]).unwrap();
+    file.sync_all().unwrap();
+    assert!(log.frozen_reader().unwrap().scan(|_| Ok(())).is_err());
+    log.shutdown().await.unwrap();
+}

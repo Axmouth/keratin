@@ -418,6 +418,20 @@ impl Keratin {
         self.log_state.tail.load(Ordering::Acquire)
     }
 
+    /// Strict sequential disk verification of a quiescent live log. The caller
+    /// must finish outstanding writes/fsync, keep this instance alive, and retain
+    /// the frozen role for the reader's entire lifetime. Unlike a cold seal, the
+    /// live durable frontier can be ahead of the latest manifest checkpoint.
+    pub fn frozen_reader(&self) -> io::Result<crate::FrozenLogReader> {
+        let next = self.next_offset();
+        if self.role() != KeratinRole::Frozen
+            || self.log_state.durable.load().first_non_durable() < next
+        {
+            return Err(io::Error::other("strict live scan requires a frozen, fully durable log"));
+        }
+        crate::FrozenLogReader::open_live(&self.root, self.current_epoch(), self.head_offset(), next)
+    }
+
     pub fn durable_offset(&self) -> u64 {
         // The watermark is the exclusive durable frontier (count of durable
         // records). Convert back to an inclusive offset for this public accessor.

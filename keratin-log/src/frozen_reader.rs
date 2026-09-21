@@ -40,6 +40,16 @@ impl FrozenLogReader {
     /// Does not acquire a lock, recover padding, repair indexes or open writers.
     /// The caller holds either `lock_existing_log` or a quiesced live log owner.
     pub fn open(root: &Path, epoch: u64, head: u64, next: u64) -> io::Result<Self> {
+        Self::open_inner(root, epoch, head, next, false)
+    }
+
+    // Only Keratin can supply its quiescent, fully durable live frontier. Cold
+    // sealed readers continue to require an exact persisted manifest boundary.
+    pub(crate) fn open_live(root: &Path, epoch: u64, head: u64, next: u64) -> io::Result<Self> {
+        Self::open_inner(root, epoch, head, next, true)
+    }
+
+    fn open_inner(root: &Path, epoch: u64, head: u64, next: u64, live: bool) -> io::Result<Self> {
         if root.join(crate::suffix_repair::JOURNAL).try_exists()? {
             return Err(invalid("frozen read cannot bypass pending suffix repair"));
         }
@@ -50,7 +60,11 @@ impl FrozenLogReader {
         let manifest = Manifest::read_from(&mut file)?;
         if manifest.epoch != epoch
             || manifest.head_offset != head
-            || manifest.next_offset != next
+            || if live {
+                manifest.next_offset > next
+            } else {
+                manifest.next_offset != next
+            }
             || head > next
         {
             return Err(invalid(
