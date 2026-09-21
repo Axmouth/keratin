@@ -365,3 +365,251 @@ async fn stage_resumes_after_sigkill_at_each_durable_boundary() {
         st.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn installation_preserves_source_requires_admission_and_never_resets_retry() {
+    let dir = keratin_log::test_dir!("recovery_install_source");
+    let st = open(&dir.root).await;
+    let old_binding = StorageHistoryBinding {
+        resource_incarnation: [2; 16],
+        accepted_history: [7; 16],
+        writer_session: [8; 16],
+    };
+    st.initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, old_binding)
+        .await
+        .unwrap();
+    st.ensure_queue_owner_epoch("q", 0, None, Some(7))
+        .await
+        .unwrap();
+    let old_ticket = st.queue_handle("q", 0, None).await.unwrap();
+    let old_handle = old_ticket.resolve().unwrap();
+    let seal = RecoverySealRequest {
+        transition: [9; 32],
+        fence_epoch: 8,
+    };
+    let sealed = st
+        .seal_replica_for_recovery("q", 0, None, seal.clone())
+        .await
+        .unwrap();
+    let (spec, snapshot, records) = fixture(1, 3);
+    let stage = st
+        .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
+        .await
+        .unwrap();
+    stage.append(page(&spec, &records)).await.unwrap();
+    stage.finish().await.unwrap();
+    let installed = st
+        .install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
+        .await
+        .unwrap();
+    // Simulate a visible pointer whose directory-sync response was lost before
+    // the in-memory route was published. An identical retry repairs admission.
+    st.recovery_routes.clear();
+    assert_eq!(
+        st.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
+            .await
+            .unwrap(),
+        installed
+    );
+    assert!(st.queue_handle("q", 0, None).await.is_err());
+    old_handle.become_owner();
+    assert_eq!(old_handle.role(), crate::QueueRole::Frozen);
+    assert!(old_handle.begin_owner_operation().await.is_err());
+    let old = st
+        .read_sealed_replica(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            RecoveryReadRequest {
+                seal: seal.clone(),
+                history_id: sealed.history.id,
+                source: RecoveryReadSource::Messages,
+                from: 0,
+                max_records: 10,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(old.end, 0);
+    st.admit_prepared_queue_recovery(installed.clone())
+        .await
+        .unwrap();
+    st.ensure_queue_owner_epoch("q", 0, None, Some(8))
+        .await
+        .unwrap();
+    let ticket = st.queue_handle("q", 0, None).await.unwrap();
+    let h = ticket.resolve().unwrap();
+    assert_eq!(h.msg_log().head_offset(), 1);
+    assert_eq!(h.msg_log().next_offset(), 3);
+    assert_eq!(h.event_log().next_offset(), 3);
+    let mut installed_state = QueueInternalState::new("q".into(), 0);
+    installed_state
+        .load_snapshot(&h.force_encode_snapshot(2).await.unwrap())
+        .unwrap();
+    assert_eq!(installed_state.recovery_state_digest(), spec.state_digest);
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.append_message(
+        "q",
+        0,
+        None,
+        &MessageHeaders {
+            published: 0,
+            publish_received: 0,
+            content_type: None,
+            extra: Default::default(),
+        },
+        b"after activation".to_vec(),
+        completion,
+    )
+    .await
+    .unwrap();
+    rx.await.unwrap().unwrap();
+    assert_eq!(h.msg_log().next_offset(), 4);
+    assert_eq!(
+        st.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
+            .await
+            .unwrap(),
+        installed
+    );
+    st.admit_prepared_queue_recovery(installed.clone())
+        .await
+        .unwrap();
+    assert_eq!(h.msg_log().next_offset(), 4);
+    let expected_event_next = h.event_log().next_offset();
+    drop(stage);
+    st.shutdown().await.unwrap();
+    drop(h);
+    drop(old_handle);
+    drop(st);
+    let st = open(&dir.root).await;
+    assert!(st.admit_prepared_queue_recovery(installed).await.is_err());
+    assert!(st.queue_handle("q", 0, None).await.is_err());
+    let old = st
+        .read_sealed_replica(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            RecoveryReadRequest {
+                seal,
+                history_id: sealed.history.id,
+                source: RecoveryReadSource::Messages,
+                from: 0,
+                max_records: 10,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(old.end, 0);
+    let next_seal = st
+        .seal_replica_for_recovery(
+            "q",
+            0,
+            None,
+            RecoverySealRequest {
+                transition: [10; 32],
+                fence_epoch: 9,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(next_seal.message_next, 4);
+    assert_eq!(next_seal.event_next, expected_event_next);
+    assert_eq!(
+        next_seal.history.storage_history.unwrap().binding,
+        spec.binding
+    );
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn install_crash_child() {
+    let Some(root) = std::env::var_os("STROMA_INSTALL_CRASH_ROOT") else {
+        return;
+    };
+    let st = open(Path::new(&root)).await;
+    let (spec, snapshot, records) = fixture(0, 3);
+    let stage = st
+        .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
+        .await
+        .unwrap();
+    if stage.next_offset().await == 0 {
+        stage.append(page(&spec, &records)).await.unwrap();
+    }
+    stage.finish().await.unwrap();
+    st.install_queue_recovery_stage(
+        spec,
+        RecoverySealRequest {
+            transition: [9; 32],
+            fence_epoch: 8,
+        },
+        &stage,
+    )
+    .await
+    .unwrap();
+}
+
+#[tokio::test]
+async fn installation_sigkill_resumes_each_publication_boundary_without_old_source() {
+    for boundary in ["retired", "messages", "prepared", "switched"] {
+        let dir = keratin_log::test_dir!("install_sigkill");
+        let ready = dir.root.join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stroma::recovery_stage::tests::install_crash_child",
+                "--nocapture",
+            ])
+            .env("STROMA_INSTALL_CRASH_ROOT", &dir.root)
+            .env("STROMA_INSTALL_CRASH_READY", &ready)
+            .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let reached = tokio::time::timeout(Duration::from_secs(20), async {
+            loop {
+                if ready.exists() {
+                    return true;
+                }
+                if child.try_wait().unwrap().is_some() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(matches!(reached, Ok(true)), "boundary {boundary}");
+        let st = open(&dir.root).await;
+        assert!(st.queue_handle("q", 0, None).await.is_err(), "{boundary}");
+        let (spec, _, _) = fixture(0, 3);
+        let stage = st
+            .resume_queue_recovery_stage(spec.clone(), Default::default())
+            .await
+            .unwrap();
+        let installed = st
+            .install_queue_recovery_stage(
+                spec,
+                RecoverySealRequest {
+                    transition: [9; 32],
+                    fence_epoch: 8,
+                },
+                &stage,
+            )
+            .await
+            .unwrap();
+        assert!(st.queue_handle("q", 0, None).await.is_err());
+        st.admit_prepared_queue_recovery(installed).await.unwrap();
+        let ticket = st.queue_handle("q", 0, None).await.unwrap();
+        let h = ticket.resolve().unwrap();
+        assert_eq!(
+            (h.msg_log().next_offset(), h.event_log().next_offset()),
+            (3, 3)
+        );
+        st.shutdown().await.unwrap();
+    }
+}

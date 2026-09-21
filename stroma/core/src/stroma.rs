@@ -63,6 +63,9 @@ mod recovery_read;
 pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord};
 #[path = "recovery_stage.rs"]
 mod recovery_stage;
+#[path = "recovery_install.rs"]
+mod recovery_install;
+pub use recovery_install::PreparedQueueRecovery;
 pub use recovery_stage::{QueueRecoveryStage, QueueRecoveryStageSpec, QueueRecoveryStageReceipt, RecoveryStageLimits};
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
@@ -796,6 +799,7 @@ pub struct Stroma {
     /// Bounds concurrent full-history scans across this storage instance.
     recovery_read_slots: Arc<Semaphore>,
     recovery_stage_slots: Arc<Semaphore>,
+    recovery_routes: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), recovery_install::Route>>,
     // A new storage instance cannot inherit writer admission from an old process.
     storage_session: [u8; 16],
     admitted_histories: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), StorageHistoryBinding>>,
@@ -889,6 +893,7 @@ impl Stroma {
             lifecycle_locks: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
+            recovery_routes: Arc::new(DashMap::new()),
             storage_session: *uuid::Uuid::now_v7().as_bytes(),
             admitted_histories: Arc::new(DashMap::new()),
             global_dlq: Arc::new(RwLock::new(None)),
@@ -912,6 +917,7 @@ impl Stroma {
             publish_apply_pause: Arc::new(std::sync::Mutex::new(None)),
         };
 
+        st.load_recovery_routes()?;
         st.load_global_dlq_setting().await?;
 
         // Discover persisted queues, but do not open logs or replay them yet.
@@ -958,16 +964,8 @@ impl Stroma {
         self.root.clone()
     }
 
-    fn messages_root(&self) -> PathBuf {
-        self.root.join("messages")
-    }
-
     fn events_root(&self) -> PathBuf {
         self.root.join("events")
-    }
-
-    fn snapshots_root(&self) -> PathBuf {
-        self.root.join("snapshots")
     }
 
     pub fn metrics(&self) -> Arc<StromaMetrics> {
@@ -1072,7 +1070,7 @@ impl Stroma {
 
     fn msg_tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
         let group = normalize_group(group);
-        let mut p = self.messages_root();
+        let mut p = self.partition_root(tp, part, group).join("messages");
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
         }
@@ -1082,7 +1080,7 @@ impl Stroma {
 
     fn tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
         let group = normalize_group(group);
-        let mut p = self.events_root();
+        let mut p = self.partition_root(tp, part, group).join("events");
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
         }
@@ -1092,7 +1090,7 @@ impl Stroma {
 
     pub(crate) fn snap_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
         let group = normalize_group(group);
-        let mut p = self.snapshots_root();
+        let mut p = self.partition_root(tp, part, group).join("snapshots");
         if let Some(g) = group {
             p = p.join(Self::enc_component(g))
         }
@@ -3749,11 +3747,10 @@ impl Stroma {
     pub fn discover_partitions(&self) -> Result<Vec<(Option<String>, String, u32)>> {
         let root = self.events_root();
 
+        let mut out: Vec<_> = self.recovery_routes.iter().map(|r| (r.group.clone(), r.topic.clone(), r.partition)).collect();
         if !root.exists() {
-            return Ok(Vec::new());
+            return Ok(out);
         }
-
-        let mut out = Vec::new();
 
         for lvl1 in fs::read_dir(&root).map_err(io_err)? {
             let lvl1 = lvl1.map_err(io_err)?;
@@ -3805,6 +3802,8 @@ impl Stroma {
             }
         }
 
+        out.sort();
+        out.dedup();
         Ok(out)
     }
 

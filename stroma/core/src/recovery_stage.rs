@@ -49,14 +49,14 @@ impl Default for RecoveryStageLimits {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-struct Intent {
-    spec: QueueRecoveryStageSpec,
-    snapshot: Vec<u8>,
+pub(super) struct Intent {
+    pub(super) spec: QueueRecoveryStageSpec,
+    pub(super) snapshot: Vec<u8>,
 }
 
 /// Durable staged data only. It is not an installed-quorum receipt or permission
 /// to serve; replacement admission will require its own lifecycle protocol.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct QueueRecoveryStageReceipt {
     pub plan: [u8; 32],
     pub source_history: [u8; 32],
@@ -65,14 +65,14 @@ pub struct QueueRecoveryStageReceipt {
     pub event_next: u64,
 }
 
-struct StageInner {
-    messages: Arc<Keratin>,
-    root: PathBuf,
-    intent: Intent,
-    limits: RecoveryStageLimits,
+pub(super) struct StageInner {
+    pub(super) messages: Arc<Keratin>,
+    pub(super) root: PathBuf,
+    pub(super) intent: Intent,
+    pub(super) limits: RecoveryStageLimits,
     used: u64,
-    complete: bool,
-    needs_reopen: bool,
+    pub(super) complete: bool,
+    pub(super) needs_reopen: bool,
     // Keep admission/OS locks through all owned work and writer shutdown.
     _lock: fs::File,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -80,7 +80,7 @@ struct StageInner {
 
 #[derive(Clone)]
 pub struct QueueRecoveryStage {
-    inner: Arc<AsyncMutex<StageInner>>,
+    pub(super) inner: Arc<AsyncMutex<StageInner>>,
 }
 
 fn invalid(message: impl Into<String>) -> StromaError {
@@ -90,7 +90,7 @@ fn corrupt(message: impl Into<String>) -> StromaError {
     StromaError::Corruption(message.into())
 }
 
-fn read_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
+pub(super) fn read_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
     let file = match fs::File::open(path) {
         Ok(file) => file,
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
@@ -110,7 +110,7 @@ fn read_bounded(path: &Path, limit: usize) -> Result<Option<Vec<u8>>> {
     Ok(Some(bytes[8..end].to_vec()))
 }
 
-fn persist_exact(path: &Path, content: &[u8]) -> Result<()> {
+pub(super) fn persist_exact(path: &Path, content: &[u8]) -> Result<()> {
     let parent = path.parent().unwrap();
     if let Some(existing) = read_bounded(path, MAX_METADATA)? {
         if existing != content {
@@ -193,17 +193,31 @@ fn record_bytes(record: &RecoveryRecord) -> Result<u64> {
         .ok_or_else(|| invalid("recovery record size overflow"))
 }
 
-fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
-    let s = &inner.intent.spec;
-    let end = inner.messages.next_offset();
-    if inner.messages.head_offset() != s.message_head
+pub(super) fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
+    scan_parts(
+        &inner.messages,
+        &inner.intent,
+        inner.limits,
+        require_complete,
+    )
+}
+
+pub(super) fn scan_parts(
+    messages: &Keratin,
+    intent: &Intent,
+    limits: RecoveryStageLimits,
+    require_complete: bool,
+) -> Result<u64> {
+    let s = &intent.spec;
+    let end = messages.next_offset();
+    if messages.head_offset() != s.message_head
         || end > s.message_next
-        || inner.messages.current_epoch() != s.fence_epoch
+        || messages.current_epoch() != s.fence_epoch
         || require_complete && end != s.message_next
     {
         return Err(corrupt("staged log does not cover the expected boundaries"));
     }
-    let state = validate(&inner.intent, inner.limits)?;
+    let state = validate(&intent, limits)?;
     let live = state.recovery_live_ranges();
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
@@ -222,9 +236,9 @@ fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
             }
         }
     }
-    let _role = RestoreRole(&inner.messages, inner.messages.role());
-    inner.messages.freeze();
-    let reader = inner.messages.frozen_reader().map_err(io_err)?;
+    let _role = RestoreRole(&messages, messages.role());
+    messages.freeze();
+    let reader = messages.frozen_reader().map_err(io_err)?;
     reader
         .scan(|record| {
             let bytes = 18u64
@@ -234,7 +248,7 @@ fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
             used = used
                 .checked_add(bytes)
                 .ok_or_else(|| io::Error::other("staged byte count overflow"))?;
-            if used > inner.limits.max_bytes {
+            if used > limits.max_bytes {
                 return Err(io::Error::other("staged payload budget exceeded"));
             }
             let hash_record = |h: &mut blake3::Hasher| {
@@ -434,6 +448,92 @@ impl Stroma {
 }
 
 impl QueueRecoveryStage {
+    /// Export the immutable snapshot of a completed stage. The receiving target
+    /// must independently authorize its plan and verify the snapshot digest.
+    pub async fn completed_snapshot(&self) -> Result<Vec<u8>> {
+        let guard = self.inner.lock().await;
+        if !guard.complete || guard.needs_reopen {
+            return Err(invalid("stage is not complete"));
+        }
+        Ok(guard.intent.snapshot.clone())
+    }
+
+    /// Bounded, verified messages from a completed stage, even when the original
+    /// sealed source is gone. No actor or ordinary writer can access this log.
+    pub async fn read_completed_messages(
+        &self,
+        from: u64,
+        max_records: u32,
+        max_bytes: u32,
+    ) -> Result<RecoveryReadPage> {
+        if max_records == 0
+            || max_records > 4096
+            || max_bytes == 0
+            || u64::from(max_bytes) > MAX_PAGE
+        {
+            return Err(invalid("invalid stage read budget"));
+        }
+        let guard = self
+            .inner
+            .clone()
+            .try_lock_owned()
+            .map_err(|_| invalid("stage is busy"))?;
+        if !guard.complete
+            || guard.needs_reopen
+            || from < guard.intent.spec.message_head
+            || from > guard.intent.spec.message_next
+        {
+            return Err(invalid("invalid completed stage read"));
+        }
+        tokio::task::spawn_blocking(move || {
+            scan(&guard, true)?;
+            let s = &guard.intent.spec;
+            let mut page = RecoveryReadPage {
+                history_id: s.source_history,
+                source: RecoveryReadSource::Messages,
+                from,
+                next: from,
+                end: s.message_next,
+                records: vec![],
+                snapshot_bytes: vec![],
+            };
+            let mut used = 0usize;
+            let mut full = false;
+            guard
+                .messages
+                .frozen_reader()
+                .map_err(io_err)?
+                .scan(|record| {
+                    if record.offset < from || full {
+                        return Ok(());
+                    }
+                    let size = 18 + record.headers.len() + record.payload.len();
+                    if page.records.len() == max_records as usize
+                        || size > max_bytes as usize - used
+                    {
+                        if page.records.is_empty() {
+                            return Err(io::Error::other("next staged record exceeds page budget"));
+                        }
+                        full = true;
+                    } else {
+                        used += size;
+                        page.next = record.offset + 1;
+                        page.records.push(RecoveryRecord {
+                            offset: record.offset,
+                            flags: record.flags,
+                            headers: record.headers.to_vec(),
+                            payload: record.payload.to_vec(),
+                        });
+                    }
+                    Ok(())
+                })
+                .map_err(io_err)?;
+            Ok(page)
+        })
+        .await
+        .map_err(io_err)?
+    }
+
     pub async fn next_offset(&self) -> u64 {
         self.inner.lock().await.messages.next_offset()
     }

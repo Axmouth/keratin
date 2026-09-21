@@ -33,14 +33,14 @@ pub struct PreparedStorageHistory {
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-struct Receipt {
-    topic: String,
-    partition: u32,
-    group: Option<String>,
-    stream: bool,
-    binding: StorageHistoryBinding,
+pub(super) struct Receipt {
+    pub(super) topic: String,
+    pub(super) partition: u32,
+    pub(super) group: Option<String>,
+    pub(super) stream: bool,
+    pub(super) binding: StorageHistoryBinding,
     // Private to this Stroma instance; callers cannot replay this across restart.
-    storage_session: [u8; 16],
+    pub(super) storage_session: [u8; 16],
 }
 
 fn validate(binding: &StorageHistoryBinding) -> Result<()> {
@@ -88,7 +88,7 @@ fn read(path: &Path) -> Result<Option<Receipt>> {
     Ok(Some(receipt))
 }
 
-fn persist(path: &Path, receipt: &Receipt) -> Result<()> {
+pub(super) fn persist(path: &Path, receipt: &Receipt) -> Result<()> {
     let parent = path.parent().expect("receipt parent");
     fs::create_dir_all(parent).map_err(io_err)?;
     if let Some(existing) = read(path)? {
@@ -128,7 +128,7 @@ fn persist(path: &Path, receipt: &Receipt) -> Result<()> {
 }
 
 impl Stroma {
-    fn storage_history_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
+    pub(super) fn storage_history_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.snap_dir(topic, part, group).join("storage.history")
     }
 
@@ -205,6 +205,9 @@ impl Stroma {
         let group = normalize_group(group);
         let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
         let receipt = self.checked_storage_history(topic, part, group)?;
+        if receipt.is_none() && self.has_recovery_installation(topic, part, group)? {
+            return Err(StromaError::Corruption("installed recovery lost its storage receipt".into()));
+        }
         match receipt {
             Some(receipt)
                 if receipt.storage_session == self.storage_session
@@ -233,6 +236,9 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<()> {
+        if self.has_recovery_installation(topic, part, group)? {
+            return Err(StromaError::HistoryAdmissionRequired { topic:topic.into(),partition:part,group:normalize_group(group).map(str::to_owned) });
+        }
         if self
             .checked_storage_history(topic, part, normalize_group(group))?
             .is_some()

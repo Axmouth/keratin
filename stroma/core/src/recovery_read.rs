@@ -91,6 +91,7 @@ impl Stroma {
             let lifecycle = stroma
                 .lock_partition_lifecycle(&topic, part, group.as_deref())
                 .await;
+            let stroma = stroma.retained_recovery_view(&topic, part, group.as_deref(), &request.seal)?.unwrap_or(stroma);
             let handle = {
                 let registry = stroma.queue_handles.load();
                 slot_lookup_no_alloc(&registry, &topic, part, group.as_deref())
