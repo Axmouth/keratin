@@ -27,6 +27,10 @@ pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::R
         if n == 0 {
             break;
         }
+        // `pos` is the next read position. The window may still begin in an
+        // earlier chunk when a record spans reads; decoded lengths are relative
+        // to that window origin, not to the latest chunk.
+        let window_start = pos - window.len() as u64;
         window.extend_from_slice(&buf[..n]);
 
         let mut consumed = 0usize;
@@ -38,7 +42,7 @@ pub fn scan_last_good(mut file: &File, start_pos: u64, buf_size: usize) -> io::R
             match decode_record_prefix(slice) {
                 Ok((rec, used)) => {
                     consumed += used;
-                    last_good_pos = pos + consumed as u64;
+                    last_good_pos = window_start + consumed as u64;
                     last_offset = Some(rec.offset);
                 }
                 Err(RecordError::Truncated) => {
@@ -147,5 +151,23 @@ mod tests {
         let res = scan_bytes(&vec![0u8; 8192]);
         assert_eq!(res.last_good_pos, 0);
         assert_eq!(res.last_offset, None);
+    }
+
+    #[test]
+    fn scan_tracks_window_origin_across_chunk_boundaries() {
+        for sizes in [vec![480, 100], vec![1600], vec![23, 1600, 900, 40]] {
+            let mut bytes = Vec::new();
+            for (offset, size) in sizes.iter().enumerate() {
+                bytes.extend(rec(offset as u64, *size));
+            }
+            let end = bytes.len() as u64;
+            for padding in [0, 2048] {
+                let mut padded = bytes.clone();
+                padded.resize(padded.len() + padding, 0);
+                let result = scan_bytes(&padded);
+                assert_eq!(result.last_good_pos, end, "sizes={sizes:?}, padding={padding}");
+                assert_eq!(result.last_offset, Some(sizes.len() as u64 - 1));
+            }
+        }
     }
 }

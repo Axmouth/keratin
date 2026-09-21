@@ -31,6 +31,29 @@ fn assert_contiguous_offsets(records: &[OwnedRecord]) {
 }
 
 #[tokio::test]
+async fn forced_recovery_appends_contiguously_after_multichunk_records() {
+    let dir = test_dir!("recovery_multichunk_append");
+    let cfg = force_scan_config();
+    let payloads = [vec![1; 1000], vec![2; 180_000], vec![3; 65_530]];
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    log.append_batch(payloads.iter().cloned().map(message).collect(), Some(KDurability::AfterFsync))
+        .await.unwrap();
+    log.shutdown().await.unwrap();
+    drop(log);
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    log.append_batch(vec![message(b"after-recovery".to_vec())], Some(KDurability::AfterFsync)).await.unwrap();
+    log.shutdown().await.unwrap();
+    drop(log);
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    let records = log.reader().scan_from_disk(0, 10).unwrap();
+    assert_eq!(records.len(), 4);
+    assert_contiguous_offsets(&records);
+    for (record, payload) in records.iter().zip(payloads) { assert_eq!(record.payload, payload); }
+    assert_eq!(records[3].payload, b"after-recovery");
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn clean_shutdown_manifest_lifecycle() {
     let dir = test_dir!("clean_shutdown_manifest_lifecycle");
     let cfg = KeratinConfig::test_default();
