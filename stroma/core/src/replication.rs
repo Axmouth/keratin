@@ -313,6 +313,8 @@ impl Stroma {
     ) -> Result<crate::QueuePublishCommit> {
         let qh = self.queue_handle(topic, part, group).await?;
         let h = qh.resolve()?;
+        let _apply = h.follower_apply_state().await;
+        h.ensure_not_recovery_sealed()?;
         let _pause = h.pause_owner_operations_and_wait().await?;
         Ok(crate::QueuePublishCommit {
             message_next: h.msg_log().next_offset(),
@@ -664,6 +666,8 @@ impl Stroma {
     ) -> Result<OwnerStateCheckpoint> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         let role = qh.role();
         if role != QueueRole::Owner {
             return Err(StromaError::WrongQueueRole {

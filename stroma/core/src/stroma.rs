@@ -7071,6 +7071,45 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn checkpoint_cancel_while_draining_resumes_owner_operations() {
+        let dir = test_dir!("checkpoint_cancel_during_drain");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        let handle = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let h = handle.resolve().unwrap();
+        let active = h.begin_owner_operation().await.unwrap();
+        let mut pause = Box::pin(h.pause_owner_operations_and_wait());
+        assert!(futures::poll!(&mut pause).is_pending());
+        // Cancellation happens after admission was paused, before existing work
+        // drains. Dropping the future must release the pause that it acquired.
+        drop(pause);
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), h.begin_owner_operation()).await
+            .expect("cancelled checkpoint left owner operations permanently paused").unwrap();
+        drop(next);
+        drop(active);
+        let pause = h.pause_owner_operations_and_wait().await.unwrap();
+        drop(pause);
+        stroma.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn checkpoint_pause_rechecks_owner_after_drain() {
+        let dir = test_dir!("checkpoint_pause_role_change");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        let handle = stroma.queue_handle("topic", 0, None).await.unwrap();
+        let h = handle.resolve().unwrap();
+        let active = h.begin_owner_operation().await.unwrap();
+        let mut pause = Box::pin(h.pause_owner_operations_and_wait());
+        assert!(futures::poll!(&mut pause).is_pending());
+        h.become_follower();
+        drop(active);
+        assert!(pause.await.is_err(), "a demoted owner must not finish an owner capture");
+        h.become_owner();
+        let next = tokio::time::timeout(std::time::Duration::from_millis(200), h.begin_owner_operation()).await.unwrap().unwrap();
+        drop(next);
+        stroma.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
     async fn checkpoint_pause_waits_without_changing_owner_role() {
         let dir = test_dir!("checkpoint_pause_waits_without_role_change");
         let stroma = Stroma::open(

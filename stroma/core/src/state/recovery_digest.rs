@@ -104,6 +104,101 @@ impl QueueInternalState {
 mod tests {
     use super::*;
 
+    fn checkpoint_fixture() -> QueueInternalState {
+        let mut state = QueueInternalState::new("q".into(), 0);
+        state.enqueue(0, 2, Some(100));
+        state.enqueue(1, 0, None);
+        state.mark_inflight(1, 50);
+        state.ack(3);
+        state.enqueue_delayed(4, 200);
+        state.enqueue(5, 1, Some(500));
+        state.nack_at(5, true, Some(300));
+        state.pending_dlq.insert(
+            6,
+            Some(ResolvedDlqTarget {
+                tp: "dead".into(),
+                part: 2,
+                group: Some("workers".into()),
+            }),
+        );
+        state.dlq_policy = DLQDiscardPolicy::CustomDQL(CustomDLQ {
+            tp: "dead".into(),
+            part: 2,
+            group: Some("workers".into()),
+        });
+        state.default_message_ttl_ms = Some(900);
+        state
+    }
+
+    #[test]
+    fn checkpoint_truncation_never_panics_or_partially_replaces_state() {
+        let fixture = checkpoint_fixture();
+        let bytes = fixture.encode_snapshot(19);
+        let mut existing = QueueInternalState::new("q".into(), 0);
+        existing.enqueue(90, 7, Some(123));
+        existing.last_snapshot_event_offset = 44;
+        let original = existing.recovery_state_digest();
+        for cut in 0..bytes.len() {
+            let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                existing.load_snapshot(&bytes[..cut])
+            }));
+            assert!(result.is_ok(), "snapshot prefix {cut} panicked");
+            assert!(result.unwrap().is_err(), "snapshot prefix {cut} accepted");
+            assert_eq!(
+                existing.recovery_state_digest(),
+                original,
+                "snapshot prefix {cut} changed live state"
+            );
+            assert_eq!(existing.last_snapshot_event_offset, 44);
+        }
+        let meta = existing.load_snapshot(&bytes).unwrap();
+        assert_eq!(meta.last_snapshot_event_offset, 19);
+        assert_eq!(
+            existing.recovery_state_digest(),
+            fixture.recovery_state_digest()
+        );
+    }
+
+    #[test]
+    fn checkpoint_malformed_ranges_counts_and_offsets_are_errors() {
+        let fixture = checkpoint_fixture();
+        let bytes = fixture.encode_snapshot(19);
+        // Exercise all field boundaries, including range ends, count fields,
+        // DLQ string lengths/tags, terminal offsets and presence tags.
+        for at in 0..bytes.len() {
+            for byte in [0, 255] {
+                let mut malformed = bytes.clone();
+                malformed[at] = byte;
+                let mut target = QueueInternalState::new("q".into(), 0);
+                target.enqueue(90, 3, None);
+                let original = target.recovery_state_digest();
+                let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+                    target.load_snapshot(&malformed)
+                }));
+                assert!(result.is_ok(), "snapshot mutation {at}={byte} panicked");
+                if result.unwrap().is_err() {
+                    assert_eq!(target.recovery_state_digest(), original);
+                }
+            }
+        }
+        let mut overflow = bytes.clone();
+        overflow[24..32].copy_from_slice(&u64::MAX.to_be_bytes());
+        assert!(
+            QueueInternalState::new("q".into(), 0)
+                .load_snapshot(&overflow)
+                .is_err()
+        );
+        // First settled range is [3,4). Empty/inverted ranges must not silently
+        // remove terminal history or reach RangeSet's assertions.
+        overflow = bytes;
+        overflow[40..48].copy_from_slice(&3u64.to_be_bytes());
+        assert!(
+            QueueInternalState::new("q".into(), 0)
+                .load_snapshot(&overflow)
+                .is_err()
+        );
+    }
+
     #[test]
     fn recovery_digest_canonicalizes_order_and_excludes_only_local_metadata() {
         let mut a = QueueInternalState::new("q".into(), 3);

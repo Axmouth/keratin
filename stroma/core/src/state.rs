@@ -1626,11 +1626,13 @@ impl QueueHandleInner {
             }
         }
 
-        if let Err(err) = self.ensure_owner() {
-            self.owner_operations_paused.store(false, Ordering::Release);
-            self.owner_operations_resumed.notify_waiters();
-            return Err(err);
-        }
+        // Own the pause before the first await after acquiring it. Cancellation
+        // while existing operations drain must resume admission too.
+        let pause = OwnerOperationPauseGuard {
+            paused: self.owner_operations_paused.clone(),
+            resumed: self.owner_operations_resumed.clone(),
+        };
+        self.ensure_owner()?;
 
         loop {
             let drained = self.owner_operations_drained.notified();
@@ -1640,10 +1642,10 @@ impl QueueHandleInner {
             drained.await;
         }
 
-        Ok(OwnerOperationPauseGuard {
-            paused: self.owner_operations_paused.clone(),
-            resumed: self.owner_operations_resumed.clone(),
-        })
+        // A role transition can complete while older work drains. Do not hand
+        // a successful owner capture barrier back after the owner was fenced.
+        self.ensure_owner()?;
+        Ok(pause)
     }
 
     pub async fn freeze_owner_and_wait_operations(&self) -> Result<(), QueueHandleError> {
@@ -4060,7 +4062,16 @@ impl QueueInternalState {
     }
 
     // TODO: Add enqueued state?
-    pub fn load_snapshot(&mut self, mut bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
+    pub fn load_snapshot(&mut self, bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
+        // Decode into isolated state. A rejected checkpoint must not erase or
+        // partially mutate the actor that is already serving valid state.
+        let mut decoded = Self::new_with_waker(self.topic.clone(), self.partition, self.deadline_waker.clone());
+        let meta = decoded.load_snapshot_inner(bytes)?;
+        *self = decoded;
+        Ok(meta)
+    }
+
+    fn load_snapshot_inner(&mut self, mut bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
         use std::io::{Error, ErrorKind};
 
         fn take<const N: usize>(b: &mut &[u8]) -> std::io::Result<[u8; N]> {
@@ -4070,6 +4081,31 @@ impl QueueInternalState {
             let (a, rest) = b.split_at(N);
             *b = rest;
             Ok(a.try_into().expect("exact-length slice"))
+        }
+
+        fn count(b: &mut &[u8], minimum_entry_bytes: usize) -> std::io::Result<usize> {
+            let value = u64::from_be_bytes(take::<8>(b)?);
+            let value = usize::try_from(value).map_err(|_| Error::new(ErrorKind::InvalidData, "snapshot count overflow"))?;
+            if value > b.len() / minimum_entry_bytes {
+                return Err(Error::new(ErrorKind::UnexpectedEof, "snapshot count exceeds remaining bytes"));
+            }
+            Ok(value)
+        }
+        fn offset(b: &mut &[u8]) -> std::io::Result<u64> {
+            let value = u64::from_be_bytes(take::<8>(b)?);
+            if value == u64::MAX {
+                return Err(Error::new(ErrorKind::InvalidData, "snapshot offset has no exclusive successor"));
+            }
+            Ok(value)
+        }
+        fn range(b: &mut &[u8], previous_end: &mut u64) -> std::io::Result<std::ops::Range<u64>> {
+            let start = u64::from_be_bytes(take::<8>(b)?);
+            let end = u64::from_be_bytes(take::<8>(b)?);
+            if start >= end || start < *previous_end {
+                return Err(Error::new(ErrorKind::InvalidData, "invalid or overlapping snapshot ranges"));
+            }
+            *previous_end = end;
+            Ok(start..end)
         }
 
         // Version
@@ -4085,71 +4121,71 @@ impl QueueInternalState {
         self.reset();
 
         self.last_snapshot_timestamp = u64::from_be_bytes(take::<8>(&mut bytes)?);
-        self.last_snapshot_event_offset = u64::from_be_bytes(take::<8>(&mut bytes)?);
+        self.last_snapshot_event_offset = offset(&mut bytes)?;
 
         // settled ranges (from 0; the contiguous run covering 0 is the frontier)
-        let settled_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let settled_len = count(&mut bytes, 16)?;
+        let mut previous_end = 0;
         for _ in 0..settled_len {
-            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            if end > start {
-                self.settled.insert(start..end);
-            }
+            self.settled.insert(range(&mut bytes, &mut previous_end)?);
         }
 
         // inflight
-        let inflight_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let inflight_len = count(&mut bytes, 16)?;
         for _ in 0..inflight_len {
-            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = offset(&mut bytes)?;
             let dl = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            self.inflight.insert(off, dl);
+            if self.inflight.insert(off, dl).is_some() {
+                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot inflight offset"));
+            }
         }
 
         // pending delayed enqueues
-        let delayed_enq_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let delayed_enq_len = count(&mut bytes, 16)?;
         for _ in 0..delayed_enq_len {
             let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = offset(&mut bytes)?;
             self.delayed_enqueue_heap.push((Reverse(deadline), off));
         }
 
         // pending delayed retries
-        let delayed_retry_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let delayed_retry_len = count(&mut bytes, 16)?;
         for _ in 0..delayed_retry_len {
             let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = offset(&mut bytes)?;
             self.delayed_retry_heap.push((Reverse(deadline), off));
         }
 
         // retries
-        let retries_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let retries_len = count(&mut bytes, 12)?;
         for _ in 0..retries_len {
-            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = offset(&mut bytes)?;
             let retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
-            self.retries.insert(off, retries);
+            if self.retries.insert(off, retries).is_some() {
+                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot retry offset"));
+            }
         }
 
         // ready ranges
-        let ranges_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let ranges_len = count(&mut bytes, 16)?;
+        let mut previous_end = 0;
         for _ in 0..ranges_len {
-            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            self.ready.insert(start..end);
+            self.ready.insert(range(&mut bytes, &mut previous_end)?);
         }
 
         // ttl deadlines (message TTL)
-        let ttl_len = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let ttl_len = count(&mut bytes, 24)?;
+        let mut previous_end = 0;
         for _ in 0..ttl_len {
-            let start = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            let end = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let range = range(&mut bytes, &mut previous_end)?;
             let deadline = u64::from_be_bytes(take::<8>(&mut bytes)?);
-            self.ttl_deadlines.insert(start..end, deadline);
+            self.ttl_deadlines.insert(range, deadline);
         }
 
         // pending dlq
-        let n = u64::from_be_bytes(take::<8>(&mut bytes)?) as usize;
+        let n = count(&mut bytes, 9)?;
         for _ in 0..n {
-            let off = u64::from_be_bytes(take::<8>(&mut bytes)?);
+            let off = offset(&mut bytes)?;
             let target = {
                 let tag = take::<1>(&mut bytes)?[0];
                 match tag {
@@ -4179,7 +4215,9 @@ impl QueueInternalState {
                     _ => return Err(Error::new(ErrorKind::InvalidData, "pending tag")),
                 }
             };
-            self.pending_dlq.insert(off, target);
+            if self.pending_dlq.insert(off, target).is_some() {
+                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot DLQ offset"));
+            }
         }
 
         let tag = take::<1>(&mut bytes)?[0];
@@ -4199,6 +4237,9 @@ impl QueueInternalState {
                 let part = u32::from_be_bytes(take::<4>(&mut bytes)?);
 
                 let len = u32::from_be_bytes(take::<4>(&mut bytes)?) as usize;
+                if bytes.len() < len {
+                    return Err(Error::new(ErrorKind::UnexpectedEof, "dlq group"));
+                }
                 let group_tmp = String::from_utf8(bytes[..len].to_vec())
                     .map_err(|_| Error::new(ErrorKind::InvalidData, "utf8"))?;
                 let group = if group_tmp.is_empty() {
@@ -4218,7 +4259,8 @@ impl QueueInternalState {
         // per-queue default message TTL (presence byte + value)
         self.default_message_ttl_ms = match take::<1>(&mut bytes)?[0] {
             0 => None,
-            _ => Some(u64::from_be_bytes(take::<8>(&mut bytes)?)),
+            1 => Some(u64::from_be_bytes(take::<8>(&mut bytes)?)),
+            _ => return Err(Error::new(ErrorKind::InvalidData, "snapshot TTL presence tag")),
         };
 
         if !bytes.is_empty() {
