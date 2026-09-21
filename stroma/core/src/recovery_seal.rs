@@ -43,11 +43,19 @@ pub struct SealedReplicaFrontiers {
 }
 
 fn read_intent(path: &Path) -> Result<Option<SealIntent>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(io_err(err)),
     };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(65_537).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() > 65_536 {
+        return Err(StromaError::Corruption(
+            "recovery metadata exceeds size limit".into(),
+        ));
+    }
     if bytes.len() < 12 || &bytes[..8] != MAGIC {
         return Err(StromaError::Corruption(
             "invalid recovery seal header".into(),
@@ -130,6 +138,29 @@ fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
 impl Stroma {
     fn recovery_seal_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.snap_dir(topic, part, group).join("recovery.seal")
+    }
+
+    pub(super) fn require_matching_recovery_seal(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        request: &RecoverySealRequest,
+    ) -> Result<()> {
+        let intent =
+            read_intent(&self.recovery_seal_path(topic, part, group))?.ok_or_else(|| {
+                StromaError::InvalidArgument("replica has no durable recovery seal".into())
+            })?;
+        if intent.topic != topic
+            || intent.partition != part
+            || intent.group.as_deref() != group
+            || &intent.request != request
+        {
+            return Err(StromaError::InvalidArgument(
+                "recovery read does not match durable seal".into(),
+            ));
+        }
+        Ok(())
     }
 
     pub(super) fn ensure_partition_not_sealed(

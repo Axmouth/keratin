@@ -67,11 +67,19 @@ fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
 }
 
 fn read_receipt(path: &Path) -> Result<Option<Receipt>> {
-    let bytes = match fs::read(path) {
-        Ok(bytes) => bytes,
+    let file = match fs::File::open(path) {
+        Ok(file) => file,
         Err(err) if err.kind() == io::ErrorKind::NotFound => return Ok(None),
         Err(err) => return Err(io_err(err)),
     };
+    use std::io::Read;
+    let mut bytes = Vec::new();
+    file.take(65_537).read_to_end(&mut bytes).map_err(io_err)?;
+    if bytes.len() > 65_536 {
+        return Err(StromaError::Corruption(
+            "recovery metadata exceeds size limit".into(),
+        ));
+    }
     if bytes.len() < 12 || &bytes[..8] != MAGIC {
         return Err(StromaError::Corruption(
             "invalid retained-history header".into(),
@@ -89,6 +97,52 @@ fn read_receipt(path: &Path) -> Result<Option<Receipt>> {
 }
 
 impl Stroma {
+    pub(super) fn require_retained_history(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        stream: bool,
+        request: &RecoverySealRequest,
+        expected_id: [u8; 32],
+    ) -> Result<RetainedHistoryIdentity> {
+        let receipt = read_receipt(&self.snap_dir(topic, part, group).join("recovery.history"))?
+            .ok_or_else(|| {
+                StromaError::InvalidArgument(
+                    "seal has no completed history receipt; retry sealing first".into(),
+                )
+            })?;
+        if receipt.topic != topic
+            || receipt.partition != part
+            || receipt.group.as_deref() != group
+            || receipt.stream != stream
+            || &receipt.request != request
+            || receipt.history.id != expected_id
+            || receipt.history.version != 1
+            || receipt.history.message_head > receipt.history.message_next
+            || receipt.history.event_head > receipt.history.event_next
+        {
+            return Err(StromaError::InvalidArgument(
+                "recovery read does not match history receipt".into(),
+            ));
+        }
+        let mut history = receipt.history;
+        history.id = [0; 32];
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"fibril-retained-history-v1\0");
+        hash.update(
+            &rmp_serde::to_vec_named(&(topic, part, group, stream, &history))
+                .map_err(encode_err)?,
+        );
+        if hash.finalize().as_bytes() != &expected_id {
+            return Err(StromaError::Corruption(
+                "retained-history identity mismatch".into(),
+            ));
+        }
+        history.id = expected_id;
+        Ok(history)
+    }
+
     pub(super) fn persist_retained_history(
         &self,
         topic: &str,

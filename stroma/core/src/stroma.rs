@@ -55,6 +55,9 @@ mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
 pub use recovery_history::RetainedHistoryIdentity;
+#[path = "recovery_read.rs"]
+mod recovery_read;
+pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord};
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
@@ -759,6 +762,9 @@ pub struct Stroma {
     // Materialized queue state
     queue_handles: Arc<ArcSwap<Registry>>,
 
+    /// Bounds concurrent full-history scans across this storage instance.
+    recovery_read_slots: Arc<Semaphore>,
+
     /// Per-partition-key lifecycle lock. Serializes the operations that OPEN or
     /// CLOSE a partition's Keratin logs - building a handle (queue_handle cold
     /// path), destroy_partition, and evict - so two never race on the same dir.
@@ -846,6 +852,7 @@ impl Stroma {
             task_group: Arc::new(TaskGroup::new()),
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
+            recovery_read_slots: Arc::new(Semaphore::new(1)),
             global_dlq: Arc::new(RwLock::new(None)),
             metrics: metrics.clone(),
             deadline_waker: Arc::new(Notify::new()),

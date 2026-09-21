@@ -38,7 +38,8 @@ pub use stroma::{
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
-    QueuePublishCommit, QueuePublishObserver, RecoverySealRequest, ReplicatedEventBatch,
+    QueuePublishCommit, QueuePublishObserver, RecoveryReadPage, RecoveryReadRequest,
+    RecoveryReadSource, RecoveryRecord, RecoverySealRequest, ReplicatedEventBatch,
     ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, RetainedHistoryIdentity,
     SealedReplicaFrontiers, SnapshotConfig, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
