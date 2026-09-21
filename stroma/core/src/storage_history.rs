@@ -205,6 +205,9 @@ impl Stroma {
         let group = normalize_group(group);
         let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
         let receipt = self.checked_storage_history(topic, part, group)?;
+        if receipt.is_none() && self.snap_dir(topic, part, group).join("storage.preparing").try_exists().map_err(io_err)? {
+            return Err(StromaError::HistoryAdmissionRequired { topic: topic.into(), partition: part, group: group.map(str::to_owned) });
+        }
         if receipt.is_none() && self.has_recovery_installation(topic, part, group)? {
             return Err(StromaError::Corruption("installed recovery lost its storage receipt".into()));
         }
@@ -236,7 +239,10 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<()> {
-        if self.has_recovery_installation(topic, part, group)? {
+        if self.has_recovery_installation(topic, part, group)?
+            || self.snap_dir(topic, part, group).join("storage.preparing").try_exists().map_err(io_err)?
+            || self.snap_dir(topic, part, group).join("storage.activated").try_exists().map_err(io_err)?
+        {
             return Err(StromaError::HistoryAdmissionRequired { topic:topic.into(),partition:part,group:normalize_group(group).map(str::to_owned) });
         }
         if self
@@ -334,6 +340,7 @@ impl Stroma {
                     prepared.binding,
                     true,
                     Some(prepared.storage_instance),
+                    false,
                 )
                 .await
         })
@@ -376,7 +383,7 @@ impl Stroma {
         // log shutdown, even if the caller drops its future.
         tokio::spawn(async move {
             stroma
-                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true, None)
+                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true, None, false)
                 .await
         })
         .await
@@ -419,6 +426,59 @@ impl Stroma {
                     binding.clone(),
                     false,
                     None,
+                    false,
+                )
+                .await?;
+            Ok(PreparedStorageHistory {
+                topic,
+                partition: part,
+                group,
+                stream: kind == PartitionKind::Stream,
+                binding,
+                storage_instance: stroma.storage_session,
+            })
+        })
+        .await
+        .map_err(io_err)?
+    }
+
+    /// Resume only a never-activated, pristine preparation after fresh external
+    /// consensus authorization. Keeps the original history IDs, renews the local
+    /// storage instance, and grants no writer admission. Activated histories must
+    /// use recovery even when empty.
+    pub async fn resume_empty_storage_history(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        kind: PartitionKind,
+        binding: StorageHistoryBinding,
+    ) -> Result<PreparedStorageHistory> {
+        if !cfg!(unix) {
+            return Err(StromaError::Unsupported(
+                "durable storage history requires directory sync".into(),
+            ));
+        }
+        validate(&binding)?;
+        let group = normalize_group(group).map(str::to_owned);
+        if kind == PartitionKind::Stream && group.is_some() {
+            return Err(StromaError::InvalidArgument(
+                "stream history cannot have a group".into(),
+            ));
+        }
+        let stroma = self.clone();
+        let topic = topic.to_owned();
+        tokio::spawn(async move {
+            stroma
+                .initialize_history_inner(
+                    &topic,
+                    part,
+                    group.as_deref(),
+                    kind,
+                    binding.clone(),
+                    false,
+                    None,
+                    true,
                 )
                 .await?;
             Ok(PreparedStorageHistory {
@@ -443,9 +503,15 @@ impl Stroma {
         binding: StorageHistoryBinding,
         admit: bool,
         prepared_instance: Option<[u8; 16]>,
+        resume: bool,
     ) -> Result<()> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
         let path = self.storage_history_path(topic, part, group);
+        let intent_path = self.snap_dir(topic, part, group).join("storage.preparing");
+        let activated_path = self.snap_dir(topic, part, group).join("storage.activated");
+        if !admit && (activated_path.try_exists().map_err(io_err)? || self.has_recovery_installation(topic, part, group)?) {
+            return Err(StromaError::InvalidArgument("activated storage requires history recovery".into()));
+        }
         let receipt = Receipt {
             topic: topic.into(),
             partition: part,
@@ -496,8 +562,17 @@ impl Stroma {
             });
         }
 
+        let intent = read(&intent_path)?;
+        let same_history = |r: &Receipt| {
+            let mut r = r.clone();
+            r.storage_session = self.storage_session;
+            r == receipt
+        };
+        if intent.as_ref().is_some_and(|r| !same_history(r)) {
+            return Err(StromaError::InvalidArgument("preparation intent differs from history".into()));
+        }
         if let Some(existing) = &existing {
-            if *existing != receipt {
+            if *existing != receipt && !(resume && intent.is_some() && same_history(existing)) {
                 return Err(StromaError::HistoryAdmissionRequired {
                     topic: topic.into(),
                     partition: part,
@@ -526,16 +601,22 @@ impl Stroma {
                 self.tp_part_dir(topic, part, group),
                 self.snap_dir(topic, part, group),
             ] {
-                if existing.is_none() && dir.try_exists().map_err(io_err)? {
+                if existing.is_none() && intent.is_none() && dir.try_exists().map_err(io_err)? {
                     return Err(StromaError::InvalidArgument(
                         "existing storage needs a verified history baseline".into(),
                     ));
                 }
             }
+            // Persist intent before creating log files. A crash here must leave
+            // a resumable closed preparation, never an unbound legacy queue.
+            if !admit {
+                persist(&intent_path, intent.as_ref().unwrap_or(&receipt))?;
+                preparation_boundary("intent");
+            }
             // Take both Keratin locks before persisting. Another storage instance
             // cannot write these logs concurrently with initial binding.
-            let messages = self.msg_log_init(topic, part, group).await?;
-            let events = match self.event_log_init(topic, part, group).await {
+            let messages = open_preparation_log(self.msg_tp_part_dir(topic, part, group), self.keratin_cfg_msg).await?;
+            let events = match open_preparation_log(self.tp_part_dir(topic, part, group), self.keratin_cfg_event).await {
                 Ok(events) => events,
                 Err(error) => {
                     let _ = messages.shutdown().await;
@@ -543,6 +624,10 @@ impl Stroma {
                 }
             };
             let result = async {
+                if read(&path)? != existing {
+                    return Err(StromaError::InvalidArgument("storage receipt changed during preparation".into()));
+                }
+                preparation_boundary("logs");
                 if messages.next_offset() != 0
                     || messages.head_offset() != 0
                     || events.next_offset() != 0
@@ -563,7 +648,18 @@ impl Stroma {
                         saved.group.as_deref(),
                         kind,
                     )?;
-                    persist(&path, &saved)
+                    if resume && existing.as_ref().is_some_and(|old| old != &saved) {
+                        // Both log locks are held. Only the local session changes;
+                        // the history binding and pristine logs remain intact.
+                        let next = path.with_file_name("storage.history.next");
+                        if next.try_exists().map_err(io_err)? { fs::remove_file(&next).map_err(io_err)?; }
+                        persist(&next, &saved)?;
+                        fs::rename(&next, &path).map_err(io_err)?;
+                        recovery_seal::sync_directories(path.parent().unwrap())?;
+                        Ok(())
+                    } else {
+                        persist(&path, &saved)
+                    }
                 })
                 .await
                 .map_err(io_err)?
@@ -573,13 +669,38 @@ impl Stroma {
             result?;
             message_close.map_err(io_err)?;
             event_close.map_err(io_err)?;
+            preparation_boundary("receipt");
         }
         // Admission is published only after successful fsync, directory sync and
         // log shutdown. A visible file after an I/O failure is insufficient.
         if admit {
+            // A permanent marker also rules out empty re-preparation after a
+            // process restart. Publish it before making any writer accessible.
+            recovery_stage::persist_exact(&activated_path, b"activated")?;
             self.admitted_histories.insert(key, binding);
         }
         Ok(())
+    }
+}
+
+async fn open_preparation_log(path: PathBuf, config: KeratinConfig) -> Result<Keratin> {
+    // Only a new directory (or its lock) may create a new log. Existing files
+    // must pass strict recovery; preparation never repairs away an offset.
+    let empty = if path.try_exists().map_err(io_err)? {
+        fs::read_dir(&path).map_err(io_err)?.try_fold(true, |empty, entry| {
+            Ok::<_, StromaError>(empty && entry.map_err(io_err)?.file_name() == ".keratin.lock")
+        })?
+    } else { true };
+    if empty { Keratin::open(path, config).await.map_err(io_err) }
+    else { Keratin::open_preserving_history(path, config).await.map_err(io_err) }
+}
+
+fn preparation_boundary(_name: &str) {
+    #[cfg(test)]
+    if std::env::var("STROMA_PREPARATION_CRASH_BOUNDARY").ok().as_deref() == Some(_name) {
+        let marker = std::env::var("STROMA_PREPARATION_CRASH_MARKER").unwrap();
+        fs::write(marker, b"ready").unwrap();
+        loop { std::thread::park(); }
     }
 }
 
@@ -976,6 +1097,161 @@ mod tests {
             Err(StromaError::RecoverySealed { .. })
         ));
         stroma.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_restart_renews_only_pristine_unactivated_history() {
+        let dir = keratin_log::test_dir!("preparation_resume");
+        let stroma = open(&dir.root).await;
+        let original = stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        stroma.shutdown().await.unwrap();
+        drop(stroma);
+        let reopened = open(&dir.root).await;
+        let mut different = binding();
+        different.writer_session = [9; 16];
+        assert!(
+            reopened
+                .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, different)
+                .await
+                .is_err()
+        );
+        let renewed = reopened
+            .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        assert_eq!(renewed.binding, original.binding);
+        assert_ne!(renewed.storage_instance, original.storage_instance);
+        assert!(reopened.verify_prepared_storage_history(&original).is_err());
+        assert!(
+            reopened
+                .ensure_queue_owner_epoch("q", 0, None, Some(1))
+                .await
+                .is_err()
+        );
+        reopened
+            .admit_prepared_storage_history(renewed.clone())
+            .await
+            .unwrap();
+        // No log writes: even an activated empty history cannot be renewed.
+        reopened.shutdown().await.unwrap();
+        drop(reopened);
+        let again = open(&dir.root).await;
+        assert!(
+            again
+                .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        again.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_resume_rejects_nonempty_logs_and_snapshot() {
+        let dir = keratin_log::test_dir!("preparation_resume_nonempty");
+        let stroma = open(&dir.root).await;
+        stroma
+            .prepare_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        let log = stroma.event_log_init("q", 0, None).await.unwrap();
+        log.advance_epoch(1).await.unwrap();
+        log.shutdown().await.unwrap();
+        drop(log);
+        stroma.shutdown().await.unwrap();
+        drop(stroma);
+        let reopened = open(&dir.root).await;
+        let before = fs::read(reopened.storage_history_path("q", 0, None)).unwrap();
+        assert!(
+            reopened
+                .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        assert_eq!(
+            fs::read(reopened.storage_history_path("q", 0, None)).unwrap(),
+            before
+        );
+        reopened
+            .prepare_empty_storage_history("snapshot", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+        fs::write(reopened.snap_file("snapshot", 0, None), b"unexpected state").unwrap();
+        assert!(
+            reopened
+                .resume_empty_storage_history("snapshot", 0, None, PartitionKind::Queue, binding())
+                .await
+                .is_err()
+        );
+        reopened.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_crash_child() {
+        let Some(root) = std::env::var_os("STROMA_PREPARATION_CRASH_ROOT") else {
+            return;
+        };
+        let stroma = open(Path::new(&root)).await;
+        stroma
+            .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn preparation_sigkill_resumes_intent_logs_and_receipt() {
+        for boundary in ["intent", "logs", "receipt"] {
+            let dir = keratin_log::test_dir!("preparation_sigkill");
+            let marker = dir.root.join("crash.ready");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stroma::storage_history::tests::preparation_crash_child",
+                    "--nocapture",
+                ])
+                .env("STROMA_PREPARATION_CRASH_ROOT", &dir.root)
+                .env("STROMA_PREPARATION_CRASH_BOUNDARY", boundary)
+                .env("STROMA_PREPARATION_CRASH_MARKER", &marker)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let reached = tokio::time::timeout(Duration::from_secs(20), async {
+                while !marker.exists() {
+                    if child.try_wait().unwrap().is_some() {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                }
+                true
+            })
+            .await;
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert!(
+                matches!(reached, Ok(true)),
+                "child did not reach {boundary}"
+            );
+            let reopened = open(&dir.root).await;
+            assert!(
+                reopened
+                    .ensure_queue_owner_epoch("q", 0, None, Some(1))
+                    .await
+                    .is_err()
+            );
+            let prepared = reopened
+                .resume_empty_storage_history("q", 0, None, PartitionKind::Queue, binding())
+                .await
+                .unwrap();
+            assert_eq!(prepared.binding, binding());
+            assert!(reopened.admitted_histories.is_empty());
+            reopened
+                .admit_prepared_storage_history(prepared)
+                .await
+                .unwrap();
+            reopened.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

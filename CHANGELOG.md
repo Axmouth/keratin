@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Initial-history preparation can resume pristine, never-admitted storage after
+  fresh external consensus authorization. Durable preparation intent precedes
+  log creation; renewed receipts retain history IDs and bind the new storage
+  instance. Admission persists a marker that prevents later empty preparation.
+
 - Startup `KeratinConfig.writer_buffer_factor` controls the eagerly allocated
   writer input and notification channels: 64 slots per factor unit, range
   1–128, default 128 (8,192 slots each). Smaller factors apply backpressure
