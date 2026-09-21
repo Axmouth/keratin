@@ -9,6 +9,59 @@ fn checkpoint_envelope(state: &crate::QueueInternalState, next: u64) -> Vec<u8> 
     out
 }
 
+#[test]
+fn delayed_timer_history_replays_from_different_checkpoints_without_local_clock() {
+    let msg = messages(0, 1);
+    let ev = events(vec![
+        StromaEvent::EnqueueDelayed {
+            off: 0,
+            not_before: 100,
+        },
+        StromaEvent::ActivateDelayed { now: 100, max: 10 },
+        StromaEvent::NackMany {
+            reqs: vec![crate::NackEventMeta {
+                off: 0,
+                requeue: true,
+                not_before: Some(500),
+            }],
+        },
+        StromaEvent::ActivateDelayed { now: 500, max: 10 },
+    ]);
+    let mut a = crate::QueueInternalState::new("q".into(), 0);
+    a.enqueue_delayed(0, 100);
+    let mut b = a.clone();
+    b.activate_delayed(100, 10);
+    b.mark_inflight(0, 300); // owner-local delivery
+    b.nack_at(0, true, Some(500));
+    let snapshots = [checkpoint_envelope(&a, 1), checkpoint_envelope(&b, 3)];
+    for target in [3, 4] {
+        let seals = [
+            checkpoint_seal(seal(0, &msg, 1, &ev[1..]), &snapshots[0]),
+            checkpoint_seal(seal(0, &msg, 3, &ev[3..]), &snapshots[1]),
+        ];
+        let pair = inspector(seals[0].clone(), seals[1].clone(), Default::default())
+            .with_queue_checkpoint_replay(target, Default::default(), 4096)
+            .unwrap();
+        let report = run_checkpoints(
+            pair,
+            [[&msg, &ev[1..]], [&msg, &ev[3..]]],
+            [&snapshots[0], &snapshots[1]],
+        )
+        .unwrap();
+        let [left, right] = report.queue_replay.unwrap();
+        assert_eq!(left.state_digest, right.state_digest);
+        assert_eq!(left.live_payload_digest, right.live_payload_digest);
+        let mut expected = b.clone();
+        if target == 4 {
+            expected.activate_delayed(500, 10);
+        }
+        assert_eq!(left.state_digest, expected.recovery_state_digest());
+        assert_eq!(expected.get_retries(0), 1);
+        assert_eq!(expected.is_ready(0), target == 4);
+    }
+}
+
+
 fn checkpoint_seal(mut seal: SealedReplicaFrontiers, snapshot: &[u8]) -> SealedReplicaFrontiers {
     seal.history.snapshot_digest = Some(*blake3::hash(snapshot).as_bytes());
     seal.history.id = [0; 32];

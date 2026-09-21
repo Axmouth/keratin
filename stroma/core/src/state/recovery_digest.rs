@@ -158,6 +158,53 @@ mod tests {
     }
 
     #[test]
+    fn delayed_retry_projection_preserves_deadline_without_a_local_lease() {
+        let mut owner = QueueInternalState::new("q".into(), 0);
+        owner.enqueue(0, 0, Some(900));
+        let mut follower = owner.clone();
+        owner.mark_inflight(0, 300);
+        for state in [&mut owner, &mut follower] {
+            state.nack_at(0, true, Some(500));
+            assert!(!state.is_ready(0));
+            assert_eq!(state.get_retries(0), 1);
+        }
+        assert_eq!(
+            owner.recovery_state_digest(),
+            follower.recovery_state_digest()
+        );
+        assert_eq!(owner.activate_delayed(499, 10), 0);
+        assert_eq!(follower.activate_delayed(499, 10), 0);
+        owner.activate_delayed(500, 10);
+        follower.activate_delayed(500, 10);
+        assert_eq!(
+            owner.recovery_state_digest(),
+            follower.recovery_state_digest()
+        );
+        assert!(owner.is_ready(0));
+        assert_eq!(owner.get_retries(0), 1);
+        assert_eq!(owner.collect_ttl_expired(900, 10), vec![0]);
+    }
+
+    #[test]
+    fn delayed_activation_is_bounded_and_cannot_resurrect_terminal_state() {
+        let mut state = QueueInternalState::new("q".into(), 0);
+        for off in 0..4 {
+            state.enqueue_delayed(off, 100);
+        }
+        state.ack(3);
+        state.pending_dlq.insert(2, None);
+        assert_eq!(state.activate_delayed(100, 2), 2);
+        assert_eq!(state.ready.iter().count(), 0);
+        assert!(state.has_due_delayed(100));
+        assert_eq!(state.activate_delayed(100, 2), 2);
+        assert!(state.is_ready(0));
+        assert!(state.is_ready(1));
+        assert!(!state.is_ready(2));
+        assert!(!state.is_ready(3));
+        assert!(!state.has_due_delayed(100));
+    }
+
+    #[test]
     fn checkpoint_truncation_never_panics_or_partially_replaces_state() {
         let fixture = checkpoint_fixture();
         let bytes = fixture.encode_snapshot(19);

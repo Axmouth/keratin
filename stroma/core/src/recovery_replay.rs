@@ -194,7 +194,10 @@ impl QueueReplay {
         let ev = decode_evidence_event(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
         let refs = ev.referenced_msg_offsets();
-        let work = 1 + refs.len() as u64;
+        let work = 1 + refs.len() as u64 + match &ev {
+            StromaEvent::ActivateDelayed { max, .. } => *max as u64,
+            _ => 0,
+        };
         if work > self.remaining {
             return Err("recovery replay operation budget exhausted".into());
         }
@@ -230,6 +233,9 @@ impl QueueReplay {
         // Same state operations used by the actor, without delivery, clocks,
         // external DLQ copies, priority scheduling or snapshot mutations.
         match ev {
+            StromaEvent::ActivateDelayed { now, max } => {
+                self.state.activate_delayed(now, max as usize);
+            }
             StromaEvent::Enqueue {
                 off,
                 retries,

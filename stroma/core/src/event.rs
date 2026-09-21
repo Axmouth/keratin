@@ -8,6 +8,9 @@ pub type UnixMillis = u64;
 pub const STROMA_MAGIC: &[u8; 8] = b"STROMA\0\0";
 pub const STROMA_VER: u16 = 3;
 
+/// Maximum heap entries consumed by one durable delayed-activation event.
+pub const MAX_DELAYED_ACTIVATION: u32 = 4096;
+
 #[repr(u16)]
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EventType {
@@ -16,6 +19,7 @@ pub enum EventType {
     EnqueueDelayed = 2,
     EnqueueDelayedMany = 3,
     CancelEnqueueMany = 4,
+    ActivateDelayed = 5,
     MarkInflight = 10,
     MarkInflightMany = 11,
     Ack = 20,
@@ -229,6 +233,9 @@ pub enum StromaEvent {
     EnqueueDelayedMany {
         reqs: Vec<EnqueueDelayedEventMeta>,
     },
+    /// Advance delayed publishes/retries at an explicit clock boundary. The
+    /// bounded transition is applied in event order on every replica.
+    ActivateDelayed { now: UnixMillis, max: u32 },
     /// Annihilates a previously-emitted enqueue for offsets whose message
     /// payload never became durable (the parallel msg/event append path where the
     /// msg fsync failed after the event log already recorded the enqueue). Folded
@@ -429,7 +436,8 @@ impl StromaEvent {
             StromaEvent::NackMany { reqs } => reqs.iter().map(|r| r.off).max(),
             StromaEvent::DeadLetter { reqs } => reqs.iter().map(|r| r.off).max(),
             StromaEvent::DeadLetterCommit { offs } => offs.iter().copied().max(),
-            StromaEvent::Declare(_)
+            StromaEvent::ActivateDelayed { .. }
+            | StromaEvent::Declare(_)
             | StromaEvent::ResetQueue { .. }
             | StromaEvent::Snapshot { .. }
             // A cursor is a soft pointer (it may legitimately sit at the tail or
@@ -471,7 +479,8 @@ impl StromaEvent {
             StromaEvent::DeadLetterCommit { offs } | StromaEvent::CancelEnqueueMany { offs } => {
                 offs.clone()
             }
-            StromaEvent::Declare(_)
+            StromaEvent::ActivateDelayed { .. }
+            | StromaEvent::Declare(_)
             | StromaEvent::ResetQueue { .. }
             | StromaEvent::Snapshot { .. }
             | StromaEvent::CursorCommit { .. }
@@ -488,6 +497,14 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
+            StromaEvent::ActivateDelayed { now, max } => {
+                if *max == 0 || *max > MAX_DELAYED_ACTIVATION {
+                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid delayed activation limit"));
+                }
+                put_u16(&mut out, EventType::ActivateDelayed as u16);
+                put_u64(&mut out, *now);
+                put_u32(&mut out, *max);
+            }
             StromaEvent::Enqueue {
                 off,
                 retries,
@@ -740,6 +757,14 @@ impl StromaEvent {
                     });
                 }
                 Ok(StromaEvent::EnqueueMany { reqs })
+            }
+            x if x == EventType::ActivateDelayed as u16 => {
+                let now = rd_u64(bytes, &mut i)?;
+                let max = rd_u32(bytes, &mut i)?;
+                if max == 0 || max > MAX_DELAYED_ACTIVATION {
+                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid delayed activation limit"));
+                }
+                Ok(StromaEvent::ActivateDelayed { now, max })
             }
             x if x == EventType::EnqueueDelayed as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
@@ -1346,6 +1371,29 @@ mod tests {
         let bytes = vec![0u8; 5];
         let decoded = StromaEvent::decode(&bytes);
         assert!(decoded.is_err());
+    }
+
+    #[test]
+    fn delayed_activation_codec_is_bounded_and_rejects_truncation() {
+        let event = StromaEvent::ActivateDelayed {
+            now: 123,
+            max: MAX_DELAYED_ACTIVATION,
+        };
+        let bytes = event.encode().unwrap();
+        assert_eq!(StromaEvent::decode(&bytes).unwrap(), event);
+        for len in 0..bytes.len() {
+            assert!(StromaEvent::decode(&bytes[..len]).is_err());
+        }
+        for max in [0, MAX_DELAYED_ACTIVATION + 1, u32::MAX] {
+            assert!(
+                StromaEvent::ActivateDelayed { now: 123, max }
+                    .encode()
+                    .is_err()
+            );
+            let mut invalid = bytes.clone();
+            invalid[20..24].copy_from_slice(&max.to_be_bytes());
+            assert!(StromaEvent::decode(&invalid).is_err());
+        }
     }
 
     #[test]

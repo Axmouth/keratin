@@ -550,10 +550,15 @@ pub enum QueueCommand {
     GetStatusReport {
         response: Option<oneshot::Sender<QueueStatusReport>>,
     },
+    ActivateDelayed {
+        now: UnixMillis,
+        max: u32,
+        response: Option<oneshot::Sender<()>>,
+    },
     CollectExpired {
         now: UnixMillis,
         max: usize,
-        response: Option<oneshot::Sender<Vec<Offset>>>,
+        response: Option<oneshot::Sender<(Vec<Offset>, bool)>>,
     }, // now, max
 
     CollectTtlExpired {
@@ -637,6 +642,7 @@ impl QueueCommand {
             QueueCommand::EnqueueDelayedMany { .. } => CommandPrio::Medium,
 
             // === Background maintenance — wait for quiet periods ===
+            QueueCommand::ActivateDelayed { .. } => CommandPrio::Medium,
             QueueCommand::CollectExpired { .. } => CommandPrio::Low,
             QueueCommand::CollectTtlExpired { .. } => CommandPrio::Low,
 
@@ -698,6 +704,7 @@ impl QueueCommand {
             QueueCommand::GetCanonicalQueueState { .. } => "GetCanonicalQueueState",
             QueueCommand::GetStatusReport { .. } => "GetStatusReport",
             QueueCommand::InspectOffsets { .. } => "InspectOffsets",
+            QueueCommand::ActivateDelayed { .. } => "ActivateDelayed",
             QueueCommand::CollectExpired { .. } => "CollectExpired",
             QueueCommand::CollectTtlExpired { .. } => "CollectTtlExpired",
             QueueCommand::DumpInflight { .. } => "DumpInflight",
@@ -1956,11 +1963,15 @@ impl QueueHandleInner {
                     let _ = r.send(result);
                 }
             }
+            QueueCommand::ActivateDelayed { now, max, response } => {
+                dirty = state.activate_delayed(now, max as usize) > 0;
+                if let Some(r) = response { let _ = r.send(()); }
+            }
             QueueCommand::CollectExpired { now, max, response } => {
-                let result = state.collect_expired(now, max);
+                let result = state.collect_expired_leases(now, max);
                 dirty = !result.is_empty();
                 if let Some(r) = response {
-                    let _ = r.send(result);
+                    let _ = r.send((result, max > 0 && state.has_due_delayed(now)));
                 }
             }
             QueueCommand::CollectTtlExpired { now, max, response } => {
@@ -2842,14 +2853,61 @@ impl WorkQueueHandle<'_> {
     ) -> Result<Vec<Offset>, QueueHandleError> {
         let _owner_operation = self.begin_owner_operation().await?;
         let (tx, rx) = oneshot::channel();
-        let _ = self
-            .command_enqueue(QueueCommand::CollectExpired {
+        self.command_enqueue(QueueCommand::CollectExpired {
+            now,
+            max,
+            response: Some(tx),
+        })
+        .await
+        .map_err(|_| QueueHandleError::ActorGone)?;
+        let (expired, due) = rx.await.map_err(|_| QueueHandleError::ActorGone)?;
+        if due {
+            self.activate_delayed_durably(
                 now,
-                max,
-                response: Some(tx),
-            })
-            .await;
-        rx.await.map_err(|_| QueueHandleError::ActorGone)
+                max.min(crate::event::MAX_DELAYED_ACTIVATION as usize) as u32,
+            )
+            .await
+            .map_err(|e| QueueHandleError::Internal(e.to_string()))?;
+        }
+        Ok(expired)
+    }
+
+    /// Caller holds the owner-operation guard across the durable event and its
+    /// actor application. Abandoning an ordered scope blocks future admission.
+    async fn activate_delayed_durably(&self, now: u64, max: u32) -> crate::Result<()> {
+        let scope = self.ordered_apply_scope();
+        let payload = crate::StromaEvent::ActivateDelayed { now, max }
+            .encode()
+            .map_err(|e| StromaError::Io(e.to_string()))?;
+        let appended = self
+            .event_log()
+            .append_batch(
+                vec![keratin_log::Message {
+                    flags: 0,
+                    headers: vec![],
+                    payload,
+                }],
+                None,
+            )
+            .await
+            .map_err(|e| StromaError::Io(e.to_string()))?;
+        let turn = crate::ordered_apply::enter(&scope, appended.base_offset, appended.count as u64)
+            .await?;
+        let (tx, rx) = oneshot::channel();
+        self.command_enqueue(QueueCommand::ActivateDelayed {
+            now,
+            max,
+            response: Some(tx),
+        })
+        .await
+        .map_err(|e| StromaError::Io(e.to_string()))?;
+        rx.await.map_err(|_| StromaError::QueueActorGone)?;
+        self.applied_upto().fetch_max(
+            appended.base_offset + appended.count as u64 - 1,
+            Ordering::Release,
+        );
+        self.set_dirty_snapshot(true);
+        crate::ordered_apply::finish(turn, scope)
     }
 
     pub async fn collect_ttl_expired(
@@ -3430,6 +3488,7 @@ impl QueueInternalState {
 
         *retries += 1;
         if let Some(not_before) = not_before {
+            self.ready.remove(offset..offset + 1);
             self.delayed_retry_heap.push((Reverse(not_before), offset));
             self.recompute_hint_if_needed();
             return NackOutcome::RequeuedLater { not_before };
@@ -3853,46 +3912,53 @@ impl QueueInternalState {
             .min()
     }
 
+    fn has_due_delayed(&self, now: UnixMillis) -> bool {
+        [&self.delayed_enqueue_heap, &self.delayed_retry_heap]
+            .iter()
+            .any(|heap| heap.peek().is_some_and(|(Reverse(d), _)| *d <= now))
+    }
+
+    /// Deterministic bounded transition used by live, follower and offline replay.
+    /// The event's clock is authoritative; the replay host's clock is irrelevant.
+    pub(crate) fn activate_delayed(&mut self, now: UnixMillis, max: usize) -> usize {
+        let mut consumed = 0;
+        while consumed < max {
+            let enqueue = self.delayed_enqueue_heap.peek().map(|(Reverse(d), _)| *d);
+            let retry = self.delayed_retry_heap.peek().map(|(Reverse(d), _)| *d);
+            let retry = match (enqueue, retry) {
+                (None, None) => break,
+                (None, Some(_)) => true,
+                (Some(_), None) => false,
+                (Some(a), Some(b)) => b < a,
+            };
+            let heap = if retry {
+                &mut self.delayed_retry_heap
+            } else {
+                &mut self.delayed_enqueue_heap
+            };
+            let &(Reverse(deadline), off) = heap.peek().expect("chosen nonempty heap");
+            if deadline > now {
+                break;
+            }
+            heap.pop();
+            consumed += 1;
+            if !self.is_settled(off) && !self.is_pending_dlq(off) {
+                let retries = if retry { self.get_retries(off) } else { 0 };
+                self.enqueue(off, retries, None);
+            }
+        }
+        consumed
+    }
+
+    /// In-memory helper. Live actors perform delayed activation through a durable
+    /// ordered event before invoking the lease-only operation below.
     pub fn collect_expired(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
+        self.activate_delayed(now, max);
+        self.collect_expired_leases(now, max)
+    }
+
+    fn collect_expired_leases(&mut self, now: UnixMillis, max: usize) -> Vec<Offset> {
         let mut out = Vec::new();
-
-        // TODO: Since we now use this to handle delayed things in one convenient place we might need to find a way to make the expiry worker go earlier
-        // TODO: in the case where a message is enqueued/retries with delay and will be available before the next schedule expiry worker run.
-        // TODO: At the very least, it should be documented that the guarantee is not published before timestamp, but guaranteed after,
-        // TODO: with maximum delayed equal to expiry worker period
-        let mut to_enqueue = Vec::new();
-        // Handle delayed publishes and retries
-        while let Some(&(Reverse(deadline), off)) = self.delayed_enqueue_heap.peek() {
-            if deadline > now {
-                break;
-            }
-
-            self.delayed_enqueue_heap.pop();
-
-            let meta = EnqueueEventMeta {
-                off,
-                retries: 0,
-                expire_at: None,
-            };
-            to_enqueue.push(meta);
-        }
-
-        while let Some(&(Reverse(deadline), off)) = self.delayed_retry_heap.peek() {
-            if deadline > now {
-                break;
-            }
-
-            self.delayed_retry_heap.pop();
-
-            let meta = EnqueueEventMeta {
-                off,
-                retries: self.retries.get(&off).copied().unwrap_or(0),
-                expire_at: None,
-            };
-            to_enqueue.push(meta);
-        }
-
-        self.enqueue_many(&to_enqueue);
 
         while let Some(&(Reverse(deadline), off)) = self.expiry_heap.peek() {
             if deadline > now || out.len() >= max {

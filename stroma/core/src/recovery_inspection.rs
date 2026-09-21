@@ -705,7 +705,8 @@ impl RecoveryReferenceInspection {
                     reference(off);
                 }
             }
-            StromaEvent::CancelEnqueueMany { .. } | StromaEvent::ResetQueue { .. } => {
+            StromaEvent::CancelEnqueueMany { .. } | StromaEvent::ResetQueue { .. }
+            | StromaEvent::ActivateDelayed { .. } => {
                 self.gap(record.offset, RecoverySemanticGap::StateReplayRequired)
             }
             StromaEvent::Snapshot { .. } => {

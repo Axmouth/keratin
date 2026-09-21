@@ -2005,6 +2005,9 @@ impl Stroma {
                 };
                 qh.blocking_command_enqueue(command)?;
             }
+            StromaEvent::ActivateDelayed { now, max } => {
+                qh.blocking_command_enqueue(QueueCommand::ActivateDelayed { now, max, response: None })?;
+            }
             StromaEvent::EnqueueDelayed { off, not_before } => {
                 let command = QueueCommand::EnqueueDelayed {
                     offset: off,
@@ -2200,6 +2203,12 @@ impl Stroma {
                 })
                 .await
                 .map_err(io_err)?;
+                rx.await.map_err(|_| StromaError::QueueActorGone)?;
+            }
+            StromaEvent::ActivateDelayed { now, max } => {
+                let (tx, rx) = tokio::sync::oneshot::channel();
+                qh.command_enqueue(QueueCommand::ActivateDelayed { now, max, response: Some(tx) })
+                    .await.map_err(io_err)?;
                 rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             StromaEvent::EnqueueDelayed { off, not_before } => {

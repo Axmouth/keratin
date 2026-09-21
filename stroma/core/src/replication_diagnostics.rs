@@ -19,6 +19,7 @@ struct EventCoordinate {
 fn coordinate(offset: u64, event: &StromaEvent) -> EventCoordinate {
     use StromaEvent::*;
     let kind = match event {
+        ActivateDelayed { .. } => "ActivateDelayed",
         Enqueue { .. } => "Enqueue",
         EnqueueMany { .. } => "EnqueueMany",
         EnqueueDelayed { .. } => "EnqueueDelayed",
