@@ -110,9 +110,24 @@ impl LogState {
     }
 }
 
+// Separate from channel capacity: buffers grow through the existing reserve path.
+fn initial_staging_capacity(default: usize, small: usize) -> usize {
+    #[cfg(feature = "early-replication-experiment")]
+    {
+        static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *SMALL
+            .get_or_init(|| std::env::var("FIBRIL_EXPERIMENT_SMALL_STAGING").as_deref() == Ok("1"))
+        {
+            return small;
+        }
+    }
+    let _ = small;
+    default
+}
+
 pub struct Log {
     // buffers
-    write_buf: Vec<u8>, // 16-64MB ideally
+    write_buf: Vec<u8>, // encoded staging; retains capacity grown for larger batches
     idx_buf: Vec<u8>,   // sparse index buffer
 
     // Staging uses an inclusive offset; durability uses an exclusive boundary.
@@ -387,8 +402,8 @@ impl Log {
                     recent_commit_records: 0,
                     prealloc_chunk,
                     manifest,
-                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                    idx_buf: Vec::with_capacity(256 * 1024),
+                    write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
+                    idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
                     stats: IoStats::new(),
                     log_state,
                     last_stats_dump: Instant::now(),
@@ -440,8 +455,8 @@ impl Log {
                     recent_commit_records: 0,
                     prealloc_chunk,
                     last_index_at_log_pos,
-                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                    idx_buf: Vec::with_capacity(256 * 1024),
+                    write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
+                    idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
                     log_state,
                     stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
@@ -526,8 +541,8 @@ impl Log {
                 recent_commit_records: 0,
                 prealloc_chunk,
                 last_index_at_log_pos,
-                write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                idx_buf: Vec::with_capacity(256 * 1024),
+                write_buf: Vec::with_capacity(initial_staging_capacity(16 * 1024 * 1024, 64 * 1024)),
+                idx_buf: Vec::with_capacity(initial_staging_capacity(256 * 1024, 4 * 1024)),
                 log_state,
                 stats: IoStats::new(),
                 last_stats_dump: Instant::now(),
