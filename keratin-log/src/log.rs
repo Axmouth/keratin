@@ -116,7 +116,30 @@ fn staging_buffer(
     default: usize,
     minimum: usize,
     policy: Option<crate::AdaptiveStagingConfig>,
+    #[cfg(feature = "staging-buffer-experiment")] label: String,
 ) -> ReusableBuffer<u8> {
+    #[cfg(feature = "staging-buffer-experiment")]
+    {
+        use crate::reusable_buffer::EmptyBufferResize;
+        static MODE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        let mode = MODE.get_or_init(|| std::env::var("KERATIN_BUFFER_EXPERIMENT_MODE").unwrap_or_else(|_| "normal".into()));
+        let mut buffer = match mode.as_str() {
+            "small-retained" => ReusableBuffer::retained(minimum.max(1)),
+            "adaptive-eager-reallocate" | "adaptive-lazy-reallocate" | "adaptive-lazy-replace" => {
+                let p = policy.expect("buffer experiment requires adaptive staging config");
+                let strategy = if mode == "adaptive-lazy-replace" { EmptyBufferResize::Replace } else { EmptyBufferResize::Reallocate };
+                ReusableBuffer::adaptive(minimum, p.decay_interval, p.idle_release_after).with_empty_resize(strategy)
+            }
+            "normal" => match policy {
+                Some(p) => ReusableBuffer::adaptive(minimum, p.decay_interval, p.idle_release_after).with_empty_resize(p.empty_resize),
+                None => ReusableBuffer::retained(default),
+            },
+            _ => panic!("unknown KERATIN_BUFFER_EXPERIMENT_MODE: {mode}"),
+        };
+        if mode == "adaptive-eager-reallocate" { buffer.reserve(minimum, Instant::now()); }
+        return buffer.observe_capacity(label);
+    }
+    #[cfg(not(feature = "staging-buffer-experiment"))]
     match policy {
         Some(policy) => {
             ReusableBuffer::adaptive(minimum, policy.decay_interval, policy.idle_release_after)
@@ -333,6 +356,8 @@ impl Log {
             policy.validate()?;
         }
         let root = root.as_ref().to_path_buf();
+        #[cfg(feature = "staging-buffer-experiment")]
+        let staging_root = root.display().to_string();
         let prealloc_chunk = segment_preallocate_bytes as u64;
         // A journaled cut must finish before discovery can mistake an
         // interrupted repair for a normal dirty shutdown or an empty log.
@@ -432,11 +457,15 @@ impl Log {
                         16 * 1024 * 1024,
                         adaptive_staging.map_or(0, |p| p.write_min_bytes),
                         adaptive_staging,
+                        #[cfg(feature = "staging-buffer-experiment")]
+                        format!("{staging_root}|write"),
                     ),
                     idx_buf: staging_buffer(
                         256 * 1024,
                         adaptive_staging.map_or(0, |p| p.index_min_bytes),
                         adaptive_staging,
+                        #[cfg(feature = "staging-buffer-experiment")]
+                        format!("{staging_root}|index"),
                     ),
                     stats: IoStats::new(),
                     log_state,
@@ -496,11 +525,15 @@ impl Log {
                         16 * 1024 * 1024,
                         adaptive_staging.map_or(0, |p| p.write_min_bytes),
                         adaptive_staging,
+                        #[cfg(feature = "staging-buffer-experiment")]
+                        format!("{staging_root}|write"),
                     ),
                     idx_buf: staging_buffer(
                         256 * 1024,
                         adaptive_staging.map_or(0, |p| p.index_min_bytes),
                         adaptive_staging,
+                        #[cfg(feature = "staging-buffer-experiment")]
+                        format!("{staging_root}|index"),
                     ),
                     log_state,
                     stats: IoStats::new(),
@@ -590,11 +623,15 @@ impl Log {
                     16 * 1024 * 1024,
                     adaptive_staging.map_or(0, |p| p.write_min_bytes),
                     adaptive_staging,
+                    #[cfg(feature = "staging-buffer-experiment")]
+                    format!("{staging_root}|write"),
                 ),
                 idx_buf: staging_buffer(
                     256 * 1024,
                     adaptive_staging.map_or(0, |p| p.index_min_bytes),
                     adaptive_staging,
+                    #[cfg(feature = "staging-buffer-experiment")]
+                    format!("{staging_root}|index"),
                 ),
                 log_state,
                 stats: IoStats::new(),

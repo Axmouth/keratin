@@ -37,6 +37,19 @@ struct Retention {
 pub struct ReusableBuffer<T> {
     data: Vec<T>,
     retention: Option<Retention>,
+    #[cfg(feature = "staging-buffer-experiment")]
+    observer: Option<CapacityObserver>,
+}
+
+#[cfg(feature = "staging-buffer-experiment")]
+#[derive(Debug)]
+struct CapacityObserver {
+    label: String,
+    current: usize,
+    peak: usize,
+    grows: u64,
+    shrinks: u64,
+    releases: u64,
 }
 
 impl<T> ReusableBuffer<T> {
@@ -45,6 +58,8 @@ impl<T> ReusableBuffer<T> {
         Self {
             data: Vec::with_capacity(capacity),
             retention: None,
+            #[cfg(feature = "staging-buffer-experiment")]
+            observer: None,
         }
     }
 
@@ -72,6 +87,8 @@ impl<T> ReusableBuffer<T> {
                 peak: 0,
                 empty_resize: EmptyBufferResize::Reallocate,
             }),
+            #[cfg(feature = "staging-buffer-experiment")]
+            observer: None,
         }
     }
 
@@ -83,6 +100,46 @@ impl<T> ReusableBuffer<T> {
             r.empty_resize = strategy;
         }
         self
+    }
+
+    /// Experiment-only observation; no observer or hot-path work in normal builds.
+    #[cfg(feature = "staging-buffer-experiment")]
+    pub(crate) fn observe_capacity(mut self, label: String) -> Self {
+        self.observer = Some(CapacityObserver {
+            label,
+            current: self.capacity(),
+            peak: self.capacity(),
+            grows: 0,
+            shrinks: 0,
+            releases: 0,
+        });
+        self.record_capacity("initial", true);
+        self
+    }
+
+    #[cfg(feature = "staging-buffer-experiment")]
+    fn record_capacity(&mut self, cause: &'static str, force: bool) {
+        let current = self.data.capacity();
+        let Some(o) = &mut self.observer else { return };
+        let previous = o.current;
+        if current == previous && !force {
+            return;
+        }
+        if current > previous {
+            o.grows += 1;
+        }
+        if current < previous {
+            if current == 0 {
+                o.releases += 1;
+            } else {
+                o.shrinks += 1;
+            }
+        }
+        o.current = current;
+        o.peak = o.peak.max(current);
+        let width = std::mem::size_of::<T>();
+        tracing::info!(target: "keratin_buffer", "BUFFER_CAP label={} cause={} current={} peak={} grows={} shrinks={} releases={}",
+            o.label, cause, current.saturating_mul(width), o.peak.saturating_mul(width), o.grows, o.shrinks, o.releases);
     }
 
     /// Reserve additional elements immediately, including the adaptive floor.
@@ -114,6 +171,8 @@ impl<T> ReusableBuffer<T> {
             r.last_use = Some(now);
             r.deadline = now.checked_add(r.interval);
         }
+        #[cfg(feature = "staging-buffer-experiment")]
+        self.record_capacity("reserve", false);
     }
 
     /// Borrow the vector for one batch. Retention is recorded on guard drop,
@@ -180,7 +239,10 @@ impl<T> ReusableBuffer<T> {
         } else {
             now.checked_add(r.interval)
         };
-        self.data.capacity() < before
+        let reduced = self.data.capacity() < before;
+        #[cfg(feature = "staging-buffer-experiment")]
+        self.record_capacity("maintain", false);
+        reduced
     }
 }
 
@@ -213,6 +275,8 @@ impl<T> DerefMut for BufferEdit<'_, T> {
 
 impl<T> Drop for BufferEdit<'_, T> {
     fn drop(&mut self) {
+        #[cfg(feature = "staging-buffer-experiment")]
+        self.buffer.record_capacity("edit", false);
         if let Some(r) = &mut self.buffer.retention {
             let used = self.starting_len.max(self.buffer.data.len());
             r.peak = r.peak.max(used);
@@ -235,6 +299,29 @@ mod tests {
     }
     fn fill(b: &mut ReusableBuffer<u8>, now: Instant, bytes: usize) {
         b.edit(now).resize(bytes, 42);
+    }
+
+    #[cfg(feature = "staging-buffer-experiment")]
+    #[test]
+    fn observer_tracks_reserve_edit_decay_and_release() {
+        let now = Instant::now();
+        let mut b = buffer().observe_capacity("test|write".into());
+        b.reserve(256, now);
+        fill(&mut b, now, 1024);
+        let peak = b.capacity();
+        b.clear();
+        b.maintain(now + INTERVAL);
+        b.maintain(now + INTERVAL * 2);
+        let observer = b.observer.as_ref().unwrap();
+        assert_eq!(observer.current, b.capacity());
+        assert_eq!(observer.peak, peak);
+        assert_eq!(observer.grows, 2);
+        assert_eq!(observer.shrinks, 1);
+        b.maintain(now + Duration::from_secs(60));
+        let observer = b.observer.as_ref().unwrap();
+        assert_eq!(observer.current, 0);
+        assert_eq!(observer.releases, 1);
+        assert_eq!(observer.peak, peak);
     }
 
     #[test]

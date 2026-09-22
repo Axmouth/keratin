@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+staging-buffer-experiment = ["keratin-log/staging-buffer-experiment"]
 # Keep the opt-out for controlled comparisons; ordinary queue writes apply in
 # log order so checkpoints can carry an exact event boundary.
 default = ["ordered-queue-apply"]
