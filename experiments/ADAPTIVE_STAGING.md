@@ -1,51 +1,56 @@
-# Adaptive staging buffer prototype
+# Adaptive staging buffers
 
 `keratin_log::reusable_buffer::ReusableBuffer<T>` owns a reusable vector and an
 optional retention policy. Callers fill it through a scoped edit, consume and
 clear the batch, then service its maintenance deadline from their existing loop.
 Time is supplied by the caller, making the policy independently testable.
 
-The Keratin prototype requires `early-replication-experiment` at build time and
-`FIBRIL_EXPERIMENT_ADAPTIVE_STAGING=1` at process startup. It is independent of the
-runtime early-replication switch and takes precedence over
-`FIBRIL_EXPERIMENT_SMALL_STAGING`. Ordinary builds retain the existing capacities.
+## Configuration
 
-Startup environment controls:
+Ordinary builds support `KeratinConfig::adaptive_staging`. `None` (the default)
+preserves eager 16 MiB write and 256 KiB sparse-index reservations per log.
+`Some(AdaptiveStagingConfig::default())` enables lazy staging with 64 KiB write
+and 4 KiB index reservation floors, a 10-second decay interval and 60-second idle
+release. Both message and event logs can use this policy. Standalone callers can
+configure the floors, durations and empty-buffer resize strategy independently.
+No replication experiment feature or process-global environment variable is needed.
 
-- `FIBRIL_EXPERIMENT_STAGING_DECAY_SECS`: shrink check interval, default 10.
-- `FIBRIL_EXPERIMENT_STAGING_IDLE_RELEASE_SECS`: full idle release delay, default
-  six times the decay interval (60 seconds with defaults).
+Capacities must be positive and representable; decay must be positive and idle
+release must be at least as long as decay and representable on the monotonic clock.
+Invalid settings fail before opening or creating a log. The policy is local
+startup configuration and does not change the persisted format.
 
-Values must be positive whole seconds, with idle release at least the decay
-interval. Invalid values fail log opening when adaptive staging is enabled.
-For bursts roughly a minute apart, an example experiment is decay 120 seconds
-and idle release 1800 seconds. Disabling adaptive staging and enabling the small
-initial-buffer switch retains grown allocations indefinitely. These controls are
-process-start settings; production/runtime configuration remains an adoption task.
+## Retention
 
-The prototype starts without staging allocations. Reservations have a 64 KiB
-payload floor and a 4 KiB index floor, and grow immediately to fit larger batches.
-There is no 16 MiB hard cap. With the defaults, every ten seconds, an empty buffer may shrink by up to
-half, preserving at least twice the largest batch observed since the previous
-check. Sixty seconds without use permits full release. A delayed maintenance call
-performs one decay step. Nonempty buffers are never reclaimed.
+Buffers start without staging allocations and grow immediately to fit larger
+batches. Neither the adaptive floors nor the retained 16 MiB reservation is a
+hard cap. At each decay check an empty buffer may shrink by up to half, preserving
+at least twice the largest batch observed since the previous check. The idle
+release delay permits full release. Delayed maintenance performs one decay step;
+nonempty buffers are never reclaimed, and maintenance never increases capacity.
 
-The writer includes the next maintenance deadline in its existing receive wait.
-There are no additional threads or tasks. Once an idle allocation is released,
-its maintenance wakeups stop. Tail-cache allocations, pending fsync jobs, channel
-capacities and durability frontiers are independent of this policy. Allocator
-page retention means released capacity need not produce an immediate RSS drop.
+The writer includes the maintenance deadline in its existing receive wait. There
+are no additional threads or tasks; wakeups stop once idle allocations are released.
+Tail caches, pending fsync jobs, channel capacities and durability frontiers are
+independent. Released vector capacity need not produce an immediate RSS drop:
+allocator retention, allocation layout and OS page accounting also matter.
 
-Empty-buffer resizing is selectable. The generic abstraction defaults to Vec
-reallocation. This broker-focused prototype selects allocation replacement,
-which avoids copying unused capacity with Fibril's mimalloc allocator. A separate
-system-allocator control showed higher cold refill cost with replacement, so this
-choice requires allocator-specific testing when reusing the abstraction.
+The generic abstraction and standalone Keratin default to Vec reallocation.
+Fibril selects replacement for empty allocations to avoid copying unused capacity
+with its mimalloc allocator. A system-allocator control showed higher cold refill
+cost with replacement, so the strategy remains selectable in Keratin.
+
+## Validation and tradeoffs
 
 Tests cover demand retention, decay, idle release, burst boundaries, error returns,
-large records, both resize strategies and growth with live elements. A log-level
-test releases staging between file write and fsync, verifies early-cache and
-ordinary durable reads, and appends another record. Adoption still requires broker
-burst/steady-load comparisons, first-message tail latency after idle, and aggregate
-RSS/CPU measurements with many queues. Standalone resize timings establish no
-broker latency guarantee.
+large records, both resize strategies and growth with live elements. A log test
+opens with the policy, releases staging between file write and fsync, verifies
+cache and disk reads remain gated by durability, and appends another record.
+Writer tests exercise durable completion and reopening with the retained policy.
+
+A Linux broker screen covered steady rates, saturation, replicated RPC and
+many-queue bursts. Latency generally remained comparable and several steady-load
+cases used less anonymous memory; the replicated follow-up used more CPU, and the
+large-payload burst case used more RSS despite releasing vector capacity. The
+policy remains opt-in. Capacity measurements alongside allocator/OS accounting
+are needed to explain the burst result; allocator retention alone is unproven.

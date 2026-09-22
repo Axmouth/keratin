@@ -192,6 +192,9 @@ impl Keratin {
     ) -> std::io::Result<Self> {
         // Reject invalid capacities before creating directories or opening logs.
         let writer_channel_capacity = cfg.writer_channel_capacity()?;
+        if let Some(policy) = cfg.adaptive_staging {
+            policy.validate()?;
+        }
         let root = root.as_ref().to_path_buf();
 
         std::fs::create_dir_all(&root)?;
@@ -232,6 +235,7 @@ impl Keratin {
             cfg.force_recovery_scan,
             preserve_history,
             log_state.clone(),
+            cfg.adaptive_staging,
         )?;
 
         log_state.tail.store(log.next_offset(), Ordering::SeqCst); // add getter or read field
@@ -749,6 +753,47 @@ mod writer_buffer_tests {
     use super::*;
 
     #[tokio::test]
+    async fn invalid_adaptive_staging_is_rejected_before_open() {
+        let dir = crate::test_dir!("invalid_adaptive_staging");
+        let unopened = dir.root.join("unopened");
+        let defaults = crate::AdaptiveStagingConfig::default();
+        for policy in [
+            crate::AdaptiveStagingConfig {
+                write_min_bytes: 0,
+                ..defaults
+            },
+            crate::AdaptiveStagingConfig {
+                index_min_bytes: 0,
+                ..defaults
+            },
+            crate::AdaptiveStagingConfig {
+                write_min_bytes: usize::MAX,
+                ..defaults
+            },
+            crate::AdaptiveStagingConfig {
+                decay_interval: std::time::Duration::ZERO,
+                ..defaults
+            },
+            crate::AdaptiveStagingConfig {
+                idle_release_after: std::time::Duration::from_secs(1),
+                ..defaults
+            },
+            crate::AdaptiveStagingConfig {
+                idle_release_after: std::time::Duration::MAX,
+                ..defaults
+            },
+        ] {
+            let cfg = KeratinConfig {
+                adaptive_staging: Some(policy),
+                ..Default::default()
+            };
+            let error = Keratin::open(&unopened, cfg).await.unwrap_err();
+            assert_eq!(error.kind(), io::ErrorKind::InvalidInput);
+            assert!(!unopened.exists());
+        }
+    }
+
+    #[tokio::test]
     async fn writer_buffer_factor_rejects_invalid_values_before_open() {
         let dir = crate::test_dir!("invalid_writer_buffer_factor");
         let unopened = dir.root.join("unopened");
@@ -768,6 +813,7 @@ mod writer_buffer_tests {
         let dir = crate::test_dir!("small_writer_buffers");
         let cfg = KeratinConfig {
             writer_buffer_factor: 1,
+            adaptive_staging: Some(crate::AdaptiveStagingConfig::default()),
             ..KeratinConfig::default()
         };
         let log = Keratin::open(&dir.root, cfg).await.unwrap();

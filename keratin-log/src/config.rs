@@ -1,4 +1,50 @@
 use crate::KDurability;
+use crate::reusable_buffer::EmptyBufferResize;
+use std::time::{Duration, Instant};
+
+/// Optional retention policy for encoded records and their sparse index.
+/// Capacities are reservation floors, not limits on accepted batch sizes.
+#[derive(Debug, Clone, Copy)]
+pub struct AdaptiveStagingConfig {
+    pub write_min_bytes: usize,
+    pub index_min_bytes: usize,
+    pub decay_interval: Duration,
+    pub idle_release_after: Duration,
+    pub empty_resize: EmptyBufferResize,
+}
+
+impl Default for AdaptiveStagingConfig {
+    fn default() -> Self {
+        Self {
+            write_min_bytes: 64 * 1024,
+            index_min_bytes: 4 * 1024,
+            decay_interval: Duration::from_secs(10),
+            idle_release_after: Duration::from_secs(60),
+            empty_resize: EmptyBufferResize::Reallocate,
+        }
+    }
+}
+
+impl AdaptiveStagingConfig {
+    pub(crate) fn validate(self) -> std::io::Result<()> {
+        if self.write_min_bytes == 0
+            || self.index_min_bytes == 0
+            || self.write_min_bytes > isize::MAX as usize
+            || self.index_min_bytes > isize::MAX as usize
+            || self.decay_interval.is_zero()
+            || self.idle_release_after < self.decay_interval
+            || Instant::now()
+                .checked_add(self.idle_release_after)
+                .is_none()
+        {
+            return Err(std::io::Error::new(
+                std::io::ErrorKind::InvalidInput,
+                "adaptive staging requires valid positive capacities and decay, and a representable idle delay at least as long as decay",
+            ));
+        }
+        Ok(())
+    }
+}
 
 #[derive(Debug, Clone, Copy)]
 pub struct KeratinConfig {
@@ -45,6 +91,9 @@ pub struct KeratinConfig {
     /// Each channel has `64 * factor` eagerly allocated slots per log. Accepted
     /// range: 1..=128; 128 preserves the original 8,192-slot capacities.
     pub writer_buffer_factor: usize,
+    /// None preserves eager 16 MiB write / 256 KiB index staging per log.
+    /// Some enables lazy growth, empty-buffer decay and full idle release.
+    pub adaptive_staging: Option<AdaptiveStagingConfig>,
     pub force_recovery_scan: bool,
 }
 
@@ -65,6 +114,7 @@ impl Default for KeratinConfig {
             max_inflight_fsyncs: 8,
             pipeline_commit_records: 2048,
             writer_buffer_factor: 128,
+            adaptive_staging: None,
             force_recovery_scan: false,
         }
     }

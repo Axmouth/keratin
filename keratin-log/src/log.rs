@@ -111,68 +111,19 @@ impl LogState {
     }
 }
 
-// Separate from channel capacity; experiments preserve ordinary build defaults.
-fn staging_buffer(default: usize, small: usize) -> io::Result<ReusableBuffer<u8>> {
-    #[cfg(feature = "early-replication-experiment")]
-    {
-        static ADAPTIVE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *ADAPTIVE.get_or_init(|| {
-            std::env::var("FIBRIL_EXPERIMENT_ADAPTIVE_STAGING").as_deref() == Ok("1")
-        }) {
-            static TIMING: std::sync::OnceLock<Result<(Duration, Duration), String>> =
-                std::sync::OnceLock::new();
-            let &(decay, release) = TIMING
-                .get_or_init(|| {
-                    adaptive_staging_timing(
-                        std::env::var("FIBRIL_EXPERIMENT_STAGING_DECAY_SECS")
-                            .ok()
-                            .as_deref(),
-                        std::env::var("FIBRIL_EXPERIMENT_STAGING_IDLE_RELEASE_SECS")
-                            .ok()
-                            .as_deref(),
-                    )
-                    .map_err(|error| error.to_string())
-                })
-                .as_ref()
-                .map_err(|error| io::Error::new(io::ErrorKind::InvalidInput, error.clone()))?;
-            return Ok(ReusableBuffer::adaptive(small, decay, release)
-                .with_empty_resize(crate::reusable_buffer::EmptyBufferResize::Replace));
+// Independent of channel capacity and tail-cache retention.
+fn staging_buffer(
+    default: usize,
+    minimum: usize,
+    policy: Option<crate::AdaptiveStagingConfig>,
+) -> ReusableBuffer<u8> {
+    match policy {
+        Some(policy) => {
+            ReusableBuffer::adaptive(minimum, policy.decay_interval, policy.idle_release_after)
+                .with_empty_resize(policy.empty_resize)
         }
-        static SMALL: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
-        if *SMALL
-            .get_or_init(|| std::env::var("FIBRIL_EXPERIMENT_SMALL_STAGING").as_deref() == Ok("1"))
-        {
-            return Ok(ReusableBuffer::retained(small));
-        }
+        None => ReusableBuffer::retained(default),
     }
-    let _ = small;
-    Ok(ReusableBuffer::retained(default))
-}
-
-#[cfg(any(test, feature = "early-replication-experiment"))]
-fn adaptive_staging_timing(
-    decay: Option<&str>,
-    release: Option<&str>,
-) -> io::Result<(Duration, Duration)> {
-    let invalid = |message| io::Error::new(io::ErrorKind::InvalidInput, message);
-    let decay: u64 = decay
-        .unwrap_or("10")
-        .parse()
-        .map_err(|_| invalid("FIBRIL_EXPERIMENT_STAGING_DECAY_SECS must be a positive integer"))?;
-    let release = match release {
-        Some(value) => value.parse::<u64>().map_err(|_| {
-            invalid("FIBRIL_EXPERIMENT_STAGING_IDLE_RELEASE_SECS must be a positive integer")
-        })?,
-        None => decay
-            .checked_mul(6)
-            .ok_or_else(|| invalid("staging retention duration overflow"))?,
-    };
-    if decay == 0 || release < decay {
-        return Err(invalid(
-            "staging decay must be positive and idle release must be at least the decay interval",
-        ));
-    }
-    Ok((Duration::from_secs(decay), Duration::from_secs(release)))
 }
 
 pub struct Log {
@@ -350,7 +301,8 @@ impl Log {
             Err(err) => return Err(err),
         }
         fs::create_dir_all(&segments)?;
-        let (segment, index, _) = create_segment_pair(root, next_offset, crate::util::unix_millis())?;
+        let (segment, index, _) =
+            create_segment_pair(root, next_offset, crate::util::unix_millis())?;
         segment.fsync()?;
         index.fsync()?;
         fsync_dir(&segments)?;
@@ -375,7 +327,11 @@ impl Log {
         force_recovery_scan: bool,
         preserve_history: bool,
         log_state: Arc<LogState>,
+        adaptive_staging: Option<crate::AdaptiveStagingConfig>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
+        if let Some(policy) = adaptive_staging {
+            policy.validate()?;
+        }
         let root = root.as_ref().to_path_buf();
         let prealloc_chunk = segment_preallocate_bytes as u64;
         // A journaled cut must finish before discovery can mistake an
@@ -463,14 +419,25 @@ impl Log {
                     active: seg,
                     index: idx,
                     next_offset,
-                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    tail_cache: Arc::new(TailCache::new(
+                        log_state.durable.clone(),
+                        tail_cache_bytes,
+                    )),
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
                     manifest,
-                    write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
-                    idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
+                    write_buf: staging_buffer(
+                        16 * 1024 * 1024,
+                        adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                        adaptive_staging,
+                    ),
+                    idx_buf: staging_buffer(
+                        256 * 1024,
+                        adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                        adaptive_staging,
+                    ),
                     stats: IoStats::new(),
                     log_state,
                     last_stats_dump: Instant::now(),
@@ -516,14 +483,25 @@ impl Log {
                     active,
                     index,
                     next_offset,
-                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    tail_cache: Arc::new(TailCache::new(
+                        log_state.durable.clone(),
+                        tail_cache_bytes,
+                    )),
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
                     last_index_at_log_pos,
-                    write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
-                    idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
+                    write_buf: staging_buffer(
+                        16 * 1024 * 1024,
+                        adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                        adaptive_staging,
+                    ),
+                    idx_buf: staging_buffer(
+                        256 * 1024,
+                        adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                        adaptive_staging,
+                    ),
                     log_state,
                     stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
@@ -608,8 +586,16 @@ impl Log {
                 recent_commit_records: 0,
                 prealloc_chunk,
                 last_index_at_log_pos,
-                write_buf: staging_buffer(16 * 1024 * 1024, 64 * 1024)?,
-                idx_buf: staging_buffer(256 * 1024, 4 * 1024)?,
+                write_buf: staging_buffer(
+                    16 * 1024 * 1024,
+                    adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                    adaptive_staging,
+                ),
+                idx_buf: staging_buffer(
+                    256 * 1024,
+                    adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                    adaptive_staging,
+                ),
                 log_state,
                 stats: IoStats::new(),
                 last_stats_dump: Instant::now(),
@@ -1206,10 +1192,7 @@ impl Log {
     ) -> io::Result<()> {
         self.stats.fsync += elapsed;
         self.durable_end = self.durable_end.max(durable_end);
-        self.manifest.next_offset = self
-            .manifest
-            .next_offset
-            .max(durable_end);
+        self.manifest.next_offset = self.manifest.next_offset.max(durable_end);
         self.manifest.active_base_offset = self.active.base_offset;
 
         // manifest is a hint; persist it on interval
@@ -1510,11 +1493,14 @@ impl Log {
         crate::suffix_repair::resume(&self.root)?;
         self.manifest = Manifest::read_from(&mut File::open(Manifest::path(&self.root))?)?;
         let base = self.manifest.active_base_offset;
-        let (mut active, index, _) = open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
+        let (mut active, index, _) =
+            open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
         active.enable_prealloc(self.prealloc_chunk);
         self.active = active;
         self.index = index;
-        *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?.into_iter().collect();
+        *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?
+            .into_iter()
+            .collect();
         self.write_buf.clear();
         self.idx_buf.clear();
         self.tail_cache.clear();
@@ -1527,7 +1513,11 @@ impl Log {
         self.last_index_at_log_pos = self.active.bytes_written;
         self.log_state.tail.store(next_offset, Ordering::Release);
         self.log_state.durable.reset(self.durable_end_exclusive());
-        self.log_state.diagnostics.lock().record(LogControlKind::SuffixTruncated, self.manifest.epoch, next_offset);
+        self.log_state.diagnostics.lock().record(
+            LogControlKind::SuffixTruncated,
+            self.manifest.epoch,
+            next_offset,
+        );
         Ok(())
     }
 
@@ -1706,35 +1696,17 @@ impl Log {
 // ---- helpers
 
 #[test]
-fn adaptive_staging_timing_validates_configuration() {
-    assert_eq!(
-        adaptive_staging_timing(None, None).unwrap(),
-        (Duration::from_secs(10), Duration::from_secs(60))
-    );
-    assert_eq!(
-        adaptive_staging_timing(Some("120"), None).unwrap(),
-        (Duration::from_secs(120), Duration::from_secs(720))
-    );
-    assert_eq!(
-        adaptive_staging_timing(Some("120"), Some("1800")).unwrap(),
-        (Duration::from_secs(120), Duration::from_secs(1800))
-    );
-    for (decay, release) in [
-        ("0", "60"),
-        ("10", "0"),
-        ("60", "10"),
-        ("bad", "60"),
-        ("10", "-1"),
-    ] {
-        assert!(adaptive_staging_timing(Some(decay), Some(release)).is_err());
-    }
-    assert!(adaptive_staging_timing(Some("18446744073709551615"), None).is_err());
-}
-
-#[test]
 fn adaptive_staging_release_preserves_written_cache_fsync_and_next_append() {
     let dir = crate::test_dir!("adaptive_staging_durability");
-    let cfg = crate::KeratinConfig::test_default();
+    let cfg = crate::KeratinConfig {
+        adaptive_staging: Some(crate::AdaptiveStagingConfig {
+            write_min_bytes: 64,
+            index_min_bytes: 16,
+            empty_resize: crate::reusable_buffer::EmptyBufferResize::Replace,
+            ..Default::default()
+        }),
+        ..crate::KeratinConfig::test_default()
+    };
     let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
     let (mut log, mapping) = Log::open(
         &dir.root,
@@ -1747,11 +1719,12 @@ fn adaptive_staging_release_preserves_written_cache_fsync_and_next_append() {
         false,
         false,
         state,
+        cfg.adaptive_staging,
     )
     .unwrap();
     let reader = LogReader::new(&dir.root, mapping, log.tail_cache.clone());
-    log.write_buf = ReusableBuffer::adaptive(64, Duration::from_secs(10), Duration::from_secs(60));
-    log.idx_buf = ReusableBuffer::adaptive(16, Duration::from_secs(10), Duration::from_secs(60));
+    assert_eq!(log.write_buf.capacity(), 0);
+    assert_eq!(log.idx_buf.capacity(), 0);
     let message = Message {
         headers: vec![9; 17],
         payload: vec![42; 128 * 1024],
@@ -1774,12 +1747,6 @@ fn adaptive_staging_release_preserves_written_cache_fsync_and_next_append() {
     assert_eq!(log.staging_maintenance_deadline(), None);
     assert_eq!(log.durable_end_exclusive().first_non_durable(), 0);
     assert!(reader.scan_from(0, 2).unwrap().is_empty());
-    #[cfg(feature = "early-replication-experiment")]
-    {
-        let written = reader.scan_for_replication(0, 2).unwrap();
-        assert_eq!(written.len(), 1);
-        assert_eq!(written[0].payload, message.payload);
-    }
     let elapsed = job.sync().unwrap();
     log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
     log.log_state.durable.advance(log.durable_end_exclusive());
@@ -1821,6 +1788,7 @@ fn empty_fsync_does_not_invent_a_record_or_cover_a_later_append() {
         false,
         false,
         state,
+        cfg.adaptive_staging,
     )
     .unwrap();
     log.manifest_flush_interval = Duration::ZERO;
@@ -1873,6 +1841,7 @@ fn failed_epoch_persistence_must_not_make_retry_a_successful_noop() {
         false,
         false,
         state.clone(),
+        cfg.adaptive_staging,
     )
     .unwrap();
     // Isolate the explicit epoch-store failure from periodic manifest updates.
