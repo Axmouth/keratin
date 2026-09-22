@@ -1,3 +1,5 @@
+#[cfg(feature = "mimalloc-collection-experiment")]
+pub use keratin_log::allocator_probe;
 mod engine;
 mod event;
 mod global;

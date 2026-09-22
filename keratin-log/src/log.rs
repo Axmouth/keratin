@@ -290,6 +290,8 @@ fn encode_append_payloads_into(
 impl Log {
     /// Reclaim empty staging allocations without touching durability or caches.
     pub(crate) fn maintain_staging(&mut self, now: Instant) {
+        #[cfg(feature = "mimalloc-collection-experiment")]
+        crate::allocator_probe::collect_requested(&self.root);
         self.write_buf.maintain(now);
         self.idx_buf.maintain(now);
     }

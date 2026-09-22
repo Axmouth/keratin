@@ -631,6 +631,10 @@ fn writer_loop_inner(
         let now = Instant::now();
         log.maintain_staging(now);
         let mut wait = Duration::MAX;
+        #[cfg(feature = "mimalloc-collection-experiment")]
+        if crate::allocator_probe::enabled() {
+            wait = wait.min(Duration::from_secs(1));
+        }
         if let Some(deadline) = log.staging_maintenance_deadline() {
             wait = wait.min(deadline.saturating_duration_since(now));
         }

@@ -1,3 +1,5 @@
+#[cfg(feature = "mimalloc-collection-experiment")]
+pub mod allocator_probe;
 mod batcher;
 mod config;
 mod durability;
