@@ -10,6 +10,7 @@ mod manifest;
 mod reader;
 mod record;
 mod recovery;
+pub mod reusable_buffer;
 mod segment;
 mod suffix_repair;
 mod tail_cache;

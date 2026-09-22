@@ -24,6 +24,7 @@ pub use event::{
 };
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
+    AdaptiveStagingConfig, reusable_buffer::EmptyBufferResize,
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
     KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
 };

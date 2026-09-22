@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Opt-in `KeratinConfig::adaptive_staging` and reusable, caller-maintained buffers
+  with lazy growth, configurable empty-buffer decay and full idle release.
+  Retained staging remains the default; durable completion and the on-disk format
+  are unchanged. See `experiments/ADAPTIVE_STAGING.md` for policy and tradeoffs.
+
 - Externally authorized non-voting queue learner preparation, exact-history
   checkpoint installation and durable/applied readiness checks. Partial learners
   resume across restart; older local histories are sealed and retained while a

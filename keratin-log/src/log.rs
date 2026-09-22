@@ -22,6 +22,7 @@ use crate::{
     reader::LogReader,
     record::{Message, Record, encode_record},
     recovery::scan_last_good,
+    reusable_buffer::ReusableBuffer,
     segment::Segment,
     tail_cache::TailCache,
     util::fsync_dir,
@@ -110,10 +111,25 @@ impl LogState {
     }
 }
 
+// Independent of channel capacity and tail-cache retention.
+fn staging_buffer(
+    default: usize,
+    minimum: usize,
+    policy: Option<crate::AdaptiveStagingConfig>,
+) -> ReusableBuffer<u8> {
+    match policy {
+        Some(policy) => {
+            ReusableBuffer::adaptive(minimum, policy.decay_interval, policy.idle_release_after)
+                .with_empty_resize(policy.empty_resize)
+        }
+        None => ReusableBuffer::retained(default),
+    }
+}
+
 pub struct Log {
     // buffers
-    write_buf: Vec<u8>, // 16-64MB ideally
-    idx_buf: Vec<u8>,   // sparse index buffer
+    write_buf: ReusableBuffer<u8>, // encoded staging
+    idx_buf: ReusableBuffer<u8>,   // sparse index buffer
 
     // Staging uses an inclusive offset; durability uses an exclusive boundary.
     staged_end_offset: u64, // last offset staged into buffers
@@ -203,10 +219,13 @@ fn encode_append_payloads_into(
     state: &mut AppendPlanState,
     payloads: &[Message],
     now_ms: u64,
-    write_buf: &mut Vec<u8>,
-    idx_buf: &mut Vec<u8>,
+    now: Instant,
+    write_buf: &mut ReusableBuffer<u8>,
+    idx_buf: &mut ReusableBuffer<u8>,
 ) -> io::Result<AppendPlanOutcome> {
     debug_assert!(!payloads.is_empty());
+    let mut write_buf = write_buf.edit(now);
+    let mut idx_buf = idx_buf.edit(now);
 
     let base_offset = state.next_offset;
 
@@ -222,7 +241,7 @@ fn encode_append_payloads_into(
 
         let record_start_pos = state.active_bytes_written + write_buf.len() as u64;
 
-        encode_record(write_buf, &record)
+        encode_record(&mut write_buf, &record)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e.to_string()))?;
 
         if (record_start_pos - state.last_index_at_log_pos) >= state.index_stride_bytes as u64 {
@@ -246,6 +265,20 @@ fn encode_append_payloads_into(
 }
 
 impl Log {
+    /// Reclaim empty staging allocations without touching durability or caches.
+    pub(crate) fn maintain_staging(&mut self, now: Instant) {
+        self.write_buf.maintain(now);
+        self.idx_buf.maintain(now);
+    }
+
+    pub(crate) fn staging_maintenance_deadline(&self) -> Option<Instant> {
+        self.write_buf
+            .maintenance_deadline()
+            .into_iter()
+            .chain(self.idx_buf.maintenance_deadline())
+            .min()
+    }
+
     /// Complete a reset authorized by an external durable installation journal,
     /// before normal log open can encounter partially removed segment files.
     /// The caller must hold the root's exclusive Keratin lock throughout.
@@ -268,7 +301,8 @@ impl Log {
             Err(err) => return Err(err),
         }
         fs::create_dir_all(&segments)?;
-        let (segment, index, _) = create_segment_pair(root, next_offset, crate::util::unix_millis())?;
+        let (segment, index, _) =
+            create_segment_pair(root, next_offset, crate::util::unix_millis())?;
         segment.fsync()?;
         index.fsync()?;
         fsync_dir(&segments)?;
@@ -293,7 +327,11 @@ impl Log {
         force_recovery_scan: bool,
         preserve_history: bool,
         log_state: Arc<LogState>,
+        adaptive_staging: Option<crate::AdaptiveStagingConfig>,
     ) -> io::Result<(Self, Arc<RwLock<BTreeMap<u64, PathBuf>>>)> {
+        if let Some(policy) = adaptive_staging {
+            policy.validate()?;
+        }
         let root = root.as_ref().to_path_buf();
         let prealloc_chunk = segment_preallocate_bytes as u64;
         // A journaled cut must finish before discovery can mistake an
@@ -381,14 +419,25 @@ impl Log {
                     active: seg,
                     index: idx,
                     next_offset,
-                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    tail_cache: Arc::new(TailCache::new(
+                        log_state.durable.clone(),
+                        tail_cache_bytes,
+                    )),
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
                     manifest,
-                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                    idx_buf: Vec::with_capacity(256 * 1024),
+                    write_buf: staging_buffer(
+                        16 * 1024 * 1024,
+                        adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                        adaptive_staging,
+                    ),
+                    idx_buf: staging_buffer(
+                        256 * 1024,
+                        adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                        adaptive_staging,
+                    ),
                     stats: IoStats::new(),
                     log_state,
                     last_stats_dump: Instant::now(),
@@ -434,14 +483,25 @@ impl Log {
                     active,
                     index,
                     next_offset,
-                    tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                    tail_cache: Arc::new(TailCache::new(
+                        log_state.durable.clone(),
+                        tail_cache_bytes,
+                    )),
                     flushed_through: next_offset,
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
                     last_index_at_log_pos,
-                    write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                    idx_buf: Vec::with_capacity(256 * 1024),
+                    write_buf: staging_buffer(
+                        16 * 1024 * 1024,
+                        adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                        adaptive_staging,
+                    ),
+                    idx_buf: staging_buffer(
+                        256 * 1024,
+                        adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                        adaptive_staging,
+                    ),
                     log_state,
                     stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
@@ -526,8 +586,16 @@ impl Log {
                 recent_commit_records: 0,
                 prealloc_chunk,
                 last_index_at_log_pos,
-                write_buf: Vec::with_capacity(16 * 1024 * 1024),
-                idx_buf: Vec::with_capacity(256 * 1024),
+                write_buf: staging_buffer(
+                    16 * 1024 * 1024,
+                    adaptive_staging.map_or(0, |p| p.write_min_bytes),
+                    adaptive_staging,
+                ),
+                idx_buf: staging_buffer(
+                    256 * 1024,
+                    adaptive_staging.map_or(0, |p| p.index_min_bytes),
+                    adaptive_staging,
+                ),
                 log_state,
                 stats: IoStats::new(),
                 last_stats_dump: Instant::now(),
@@ -617,10 +685,13 @@ impl Log {
         let base_offset = self.next_offset;
 
         // Reserve to avoid realloc
-        self.write_buf.reserve(estimated);
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
         // Index entries are sparse; reserve modestly
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -630,6 +701,7 @@ impl Log {
             &mut plan_state,
             payloads,
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -640,6 +712,7 @@ impl Log {
                     &mut plan_state,
                     payloads,
                     now_ms,
+                    t_encode,
                     &mut self.write_buf,
                     &mut self.idx_buf,
                 )
@@ -649,6 +722,7 @@ impl Log {
                 &mut plan_state,
                 payloads,
                 now_ms,
+                t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
             )?
@@ -811,9 +885,12 @@ impl Log {
             self.roll(now_ms)?;
         }
 
-        self.write_buf.reserve(estimated);
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -822,6 +899,7 @@ impl Log {
             &mut plan_state,
             payloads,
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -888,10 +966,13 @@ impl Log {
         let base_offset = self.next_offset;
 
         // Reserve to avoid realloc
-        self.write_buf.reserve(estimated);
+        let t_reserve = Instant::now();
+        self.write_buf.reserve(estimated, t_reserve);
         // Index entries are sparse; reserve modestly
-        self.idx_buf
-            .reserve((estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64));
+        self.idx_buf.reserve(
+            (estimated / (self.manifest.index_stride_bytes as usize).max(1)).max(64),
+            t_reserve,
+        );
 
         let t_encode = Instant::now();
 
@@ -901,6 +982,7 @@ impl Log {
             &mut plan_state,
             std::slice::from_ref(payload),
             now_ms,
+            t_encode,
             &mut self.write_buf,
             &mut self.idx_buf,
         )?;
@@ -911,6 +993,7 @@ impl Log {
                     &mut plan_state,
                     std::slice::from_ref(payload),
                     now_ms,
+                    t_encode,
                     &mut self.write_buf,
                     &mut self.idx_buf,
                 )
@@ -920,6 +1003,7 @@ impl Log {
                 &mut plan_state,
                 std::slice::from_ref(payload),
                 now_ms,
+                t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
             )?
@@ -1108,10 +1192,7 @@ impl Log {
     ) -> io::Result<()> {
         self.stats.fsync += elapsed;
         self.durable_end = self.durable_end.max(durable_end);
-        self.manifest.next_offset = self
-            .manifest
-            .next_offset
-            .max(durable_end);
+        self.manifest.next_offset = self.manifest.next_offset.max(durable_end);
         self.manifest.active_base_offset = self.active.base_offset;
 
         // manifest is a hint; persist it on interval
@@ -1412,11 +1493,14 @@ impl Log {
         crate::suffix_repair::resume(&self.root)?;
         self.manifest = Manifest::read_from(&mut File::open(Manifest::path(&self.root))?)?;
         let base = self.manifest.active_base_offset;
-        let (mut active, index, _) = open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
+        let (mut active, index, _) =
+            open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
         active.enable_prealloc(self.prealloc_chunk);
         self.active = active;
         self.index = index;
-        *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?.into_iter().collect();
+        *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?
+            .into_iter()
+            .collect();
         self.write_buf.clear();
         self.idx_buf.clear();
         self.tail_cache.clear();
@@ -1429,7 +1513,11 @@ impl Log {
         self.last_index_at_log_pos = self.active.bytes_written;
         self.log_state.tail.store(next_offset, Ordering::Release);
         self.log_state.durable.reset(self.durable_end_exclusive());
-        self.log_state.diagnostics.lock().record(LogControlKind::SuffixTruncated, self.manifest.epoch, next_offset);
+        self.log_state.diagnostics.lock().record(
+            LogControlKind::SuffixTruncated,
+            self.manifest.epoch,
+            next_offset,
+        );
         Ok(())
     }
 
@@ -1607,6 +1695,79 @@ impl Log {
 
 // ---- helpers
 
+#[test]
+fn adaptive_staging_release_preserves_written_cache_fsync_and_next_append() {
+    let dir = crate::test_dir!("adaptive_staging_durability");
+    let cfg = crate::KeratinConfig {
+        adaptive_staging: Some(crate::AdaptiveStagingConfig {
+            write_min_bytes: 64,
+            index_min_bytes: 16,
+            empty_resize: crate::reusable_buffer::EmptyBufferResize::Replace,
+            ..Default::default()
+        }),
+        ..crate::KeratinConfig::test_default()
+    };
+    let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+    let (mut log, mapping) = Log::open(
+        &dir.root,
+        0,
+        cfg.segment_max_bytes,
+        1,
+        cfg.flush_target_bytes,
+        cfg.tail_cache_bytes,
+        0,
+        false,
+        false,
+        state,
+        cfg.adaptive_staging,
+    )
+    .unwrap();
+    let reader = LogReader::new(&dir.root, mapping, log.tail_cache.clone());
+    assert_eq!(log.write_buf.capacity(), 0);
+    assert_eq!(log.idx_buf.capacity(), 0);
+    let message = Message {
+        headers: vec![9; 17],
+        payload: vec![42; 128 * 1024],
+        flags: 0,
+    };
+    log.stage_append(&message, 1).unwrap();
+    let staged_len = log.write_buf.len();
+    let later = Instant::now() + Duration::from_secs(120);
+    log.maintain_staging(later);
+    assert_eq!(
+        log.write_buf.len(),
+        staged_len,
+        "maintenance must preserve unflushed bytes"
+    );
+    // Preparing the job writes and clears staging, but does not acknowledge fsync.
+    let job = log.prepare_fsync_job().unwrap();
+    log.maintain_staging(later + Duration::from_secs(10));
+    assert_eq!(log.write_buf.capacity(), 0);
+    assert_eq!(log.idx_buf.capacity(), 0);
+    assert_eq!(log.staging_maintenance_deadline(), None);
+    assert_eq!(log.durable_end_exclusive().first_non_durable(), 0);
+    assert!(reader.scan_from(0, 2).unwrap().is_empty());
+    let elapsed = job.sync().unwrap();
+    log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
+    log.log_state.durable.advance(log.durable_end_exclusive());
+    // Both cache and physical file outlive the released encoding allocation.
+    for record in [
+        reader.scan_from(0, 2).unwrap(),
+        reader.scan_from_disk(0, 2).unwrap(),
+    ] {
+        assert_eq!(record.len(), 1);
+        assert_eq!(record[0].payload, message.payload);
+        assert_eq!(record[0].headers, message.headers);
+    }
+    assert_eq!(log.stage_append(&message, 2).unwrap().0.base_offset, 1);
+    let job = log.prepare_fsync_job().unwrap();
+    let elapsed = job.sync().unwrap();
+    log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
+    log.log_state.durable.advance(log.durable_end_exclusive());
+    assert_eq!(reader.scan_from_disk(0, 3).unwrap().len(), 2);
+    log.shutdown().unwrap();
+}
+
 fn seg_log_path(root: &Path, base: u64) -> PathBuf {
     root.join("segments").join(format!("{:020}.log", base))
 }
@@ -1627,6 +1788,7 @@ fn empty_fsync_does_not_invent_a_record_or_cover_a_later_append() {
         false,
         false,
         state,
+        cfg.adaptive_staging,
     )
     .unwrap();
     log.manifest_flush_interval = Duration::ZERO;
@@ -1679,6 +1841,7 @@ fn failed_epoch_persistence_must_not_make_retry_a_successful_noop() {
         false,
         false,
         state.clone(),
+        cfg.adaptive_staging,
     )
     .unwrap();
     // Isolate the explicit epoch-store failure from periodic manifest updates.

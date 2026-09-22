@@ -629,7 +629,11 @@ fn writer_loop_inner(
 
         // (C) Compute how long we may wait for the next cmd.
         let now = Instant::now();
+        log.maintain_staging(now);
         let mut wait = Duration::MAX;
+        if let Some(deadline) = log.staging_maintenance_deadline() {
+            wait = wait.min(deadline.saturating_duration_since(now));
+        }
 
         // Cap by the commit deadline when durability acks are pending. With no
         // fsync in flight the wait only runs to the idle-commit floor, so the
