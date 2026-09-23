@@ -4,6 +4,7 @@ fn main() {
     let temp_dir = test_dir!("keratin-test");
 
     let cfg = KeratinConfig {
+        adaptive_staging: None,
         segment_max_bytes: 8 * 1024 * 1024,
         index_stride_bytes: 64 * 1024,
         max_batch_bytes: 512 * 1024,

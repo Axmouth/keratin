@@ -37,6 +37,7 @@ fn decode_record(v: &[u8]) -> (u32, u64) {
 async fn main() {
     let root = test_dir!("keratin-stream");
     let cfg = KeratinConfig {
+        adaptive_staging: None,
         segment_max_bytes: 256 * 1024 * 1024,
         index_stride_bytes: 64 * 1024,
         max_batch_bytes: 32 * 1024 * 1024,
