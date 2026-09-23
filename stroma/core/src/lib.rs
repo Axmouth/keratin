@@ -44,7 +44,7 @@ pub use stroma::{
     OwnerStateCheckpoint, PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome,
     QueuePublishCommit, QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageSpec,
     QueueRecoveryStageReceipt, RecoveryStageLimits, RecoveryReadPage, RecoveryReadRequest,
-    RecoveryReadSource, RecoveryRecord, RecoverySealRequest, ReplicatedEventBatch,
+    RecoveryReadSource, RecoveryRecord, RecoverySequentialRead, RecoverySealRequest, ReplicatedEventBatch,
     ReplicatedMessageBatch, ReplicatedQueueApplyOutcome, RetainedHistoryIdentity,
     PreparedQueueRecovery, PreparedStorageHistory, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma,
     StromaKeratinConfig, StromaOptions, TaskGroup,

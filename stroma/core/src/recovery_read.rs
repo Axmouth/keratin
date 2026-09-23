@@ -44,6 +44,127 @@ pub struct RecoveryReadPage {
     pub snapshot_bytes: Vec<u8>,
 }
 
+/// Tentative sequential inspection state. Pages are not recovery evidence until
+/// the receiver verifies every retained log and snapshot against the seal.
+/// Ownership moves into blocking I/O; a cancelled caller cannot reuse the cursor.
+pub struct RecoverySequentialRead {
+    topic: String,
+    part: u32,
+    group: Option<String>,
+    kind: PartitionKind,
+    seal: RecoverySealRequest,
+    history: RetainedHistoryIdentity,
+    source: Option<RecoveryReadSource>,
+    cursor: Option<keratin_log::FrozenLogCursor>,
+    pending: Option<RecoveryRecord>,
+    hash: blake3::Hasher,
+    next: u64,
+    end: u64,
+    _permit: tokio::sync::OwnedSemaphorePermit,
+}
+
+impl RecoverySequentialRead {
+    fn read_log(
+        &mut self,
+        root: &Path,
+        request: &RecoveryReadRequest,
+        page: &mut RecoveryReadPage,
+    ) -> Result<()> {
+        let (head, end, digest) = match request.source {
+            RecoveryReadSource::Messages => (
+                self.history.message_head,
+                self.history.message_next,
+                self.history.message_digest,
+            ),
+            RecoveryReadSource::Events => (
+                self.history.event_head,
+                self.history.event_next,
+                self.history.event_digest,
+            ),
+            RecoveryReadSource::Snapshot => {
+                return Err(invalid("snapshot is not a sequential log"));
+            }
+        };
+        if self.source != Some(request.source) {
+            if self.source.is_some() && self.next != self.end {
+                return Err(invalid("previous sequential log is incomplete"));
+            }
+            if request.from != head {
+                return Err(invalid("sequential inspection must start at retained head"));
+            }
+            self.cursor = Some(
+                FrozenLogReader::open(root, request.seal.fence_epoch, head, end)
+                    .map_err(io_err)?
+                    .into_cursor()
+                    .map_err(io_err)?,
+            );
+            self.source = Some(request.source);
+            self.pending = None;
+            self.hash = blake3::Hasher::new();
+            self.hash.update(b"fibril-retained-log-v1\0");
+            self.hash.update(&head.to_be_bytes());
+            self.hash.update(&end.to_be_bytes());
+            self.next = head;
+            self.end = end;
+        }
+        if request.from != self.next {
+            return Err(invalid("sequential inspection skipped or repeated a page"));
+        }
+        page.end = end;
+        let mut used = 0usize;
+        while self.next < end && page.records.len() < request.max_records as usize {
+            let record = match self.pending.take() {
+                Some(record) => record,
+                None => {
+                    let record = self
+                        .cursor
+                        .as_mut()
+                        .unwrap()
+                        .next_record(request.max_bytes as usize + 18)
+                        .map_err(io_err)?
+                        .ok_or_else(|| corrupt("sequential history ended early"))?;
+                    RecoveryRecord {
+                        offset: record.offset,
+                        flags: record.flags,
+                        headers: record.headers.to_vec(),
+                        payload: record.payload.to_vec(),
+                    }
+                }
+            };
+            let size = 18 + record.headers.len() + record.payload.len();
+            if size > request.max_bytes as usize - used {
+                if page.records.is_empty() {
+                    return Err(invalid("next recovery record exceeds page byte budget"));
+                }
+                self.pending = Some(record);
+                break;
+            }
+            if record.offset != self.next {
+                return Err(corrupt("noncontiguous sequential history"));
+            }
+            self.hash.update(&record.offset.to_be_bytes());
+            self.hash.update(&record.flags.to_be_bytes());
+            self.hash
+                .update(&(record.headers.len() as u64).to_be_bytes());
+            self.hash.update(&record.headers);
+            self.hash
+                .update(&(record.payload.len() as u64).to_be_bytes());
+            self.hash.update(&record.payload);
+            used += size;
+            self.next += 1;
+            page.next = self.next;
+            page.records.push(record);
+        }
+        if self.next == end {
+            if self.hash.finalize().as_bytes() != &digest {
+                return Err(corrupt("sequential history does not match sealed digest"));
+            }
+            self.cursor = None;
+        }
+        Ok(())
+    }
+}
+
 fn invalid(message: &str) -> StromaError {
     StromaError::InvalidArgument(message.into())
 }
@@ -63,6 +184,37 @@ impl Stroma {
         expected_kind: PartitionKind,
         request: RecoveryReadRequest,
     ) -> Result<RecoveryReadPage> {
+        self.read_sealed_replica_inner(topic, part, group, expected_kind, request, false, None)
+            .await
+            .map(|(page, _)| page)
+    }
+
+    /// Read tentative pages in order, validating the selected complete log at
+    /// its final page. Use only with a receiver that verifies all sealed digests
+    /// before emitting evidence. Strict diagnostics use `read_sealed_replica`.
+    pub async fn read_sealed_replica_sequential(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        expected_kind: PartitionKind,
+        request: RecoveryReadRequest,
+        cursor: Option<RecoverySequentialRead>,
+    ) -> Result<(RecoveryReadPage, Option<RecoverySequentialRead>)> {
+        self.read_sealed_replica_inner(topic, part, group, expected_kind, request, true, cursor)
+            .await
+    }
+
+    async fn read_sealed_replica_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        expected_kind: PartitionKind,
+        request: RecoveryReadRequest,
+        sequential: bool,
+        mut cursor: Option<RecoverySequentialRead>,
+    ) -> Result<(RecoveryReadPage, Option<RecoverySequentialRead>)> {
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
                 "sealed recovery reads require Unix log locking".into(),
@@ -77,6 +229,16 @@ impl Stroma {
                 "recovery page budget must be 1..16 MiB and 1..4096 records",
             ));
         }
+        let session_permit = if sequential && cursor.is_none() {
+            Some(
+                self.recovery_stream_slots
+                    .clone()
+                    .try_acquire_owned()
+                    .map_err(|_| invalid("sequential inspection session limit reached"))?,
+            )
+        } else {
+            None
+        };
         let permit = self
             .recovery_read_slots
             .clone()
@@ -91,7 +253,9 @@ impl Stroma {
             let lifecycle = stroma
                 .lock_partition_lifecycle(&topic, part, group.as_deref())
                 .await;
-            let stroma = stroma.retained_recovery_view(&topic, part, group.as_deref(), &request.seal)?.unwrap_or(stroma);
+            let stroma = stroma
+                .retained_recovery_view(&topic, part, group.as_deref(), &request.seal)?
+                .unwrap_or(stroma);
             let handle = {
                 let registry = stroma.queue_handles.load();
                 slot_lookup_no_alloc(&registry, &topic, part, group.as_deref())
@@ -140,6 +304,41 @@ impl Stroma {
                     }
                     None
                 };
+                if sequential {
+                    if let Some(state) = &cursor {
+                        if state.source.is_some()
+                            && state.source != Some(request.source)
+                            && state.next != state.end
+                        {
+                            return Err(invalid("previous sequential log is incomplete"));
+                        }
+                        if state.topic != topic
+                            || state.part != part
+                            || state.group != group
+                            || state.kind != expected_kind
+                            || state.seal != request.seal
+                            || state.history != history
+                        {
+                            return Err(invalid("sequential inspection identity changed"));
+                        }
+                    } else {
+                        cursor = Some(RecoverySequentialRead {
+                            topic: topic.clone(),
+                            part,
+                            group: group.clone(),
+                            kind: expected_kind,
+                            seal: request.seal.clone(),
+                            history: history.clone(),
+                            source: None,
+                            cursor: None,
+                            pending: None,
+                            hash: blake3::Hasher::new(),
+                            next: 0,
+                            end: 0,
+                            _permit: session_permit.unwrap(),
+                        });
+                    }
+                }
                 let mut page = RecoveryReadPage {
                     history_id: request.history_id,
                     source: request.source,
@@ -149,80 +348,103 @@ impl Stroma {
                     records: vec![],
                     snapshot_bytes: vec![],
                 };
-                for (index, (head, end, digest)) in [
-                    (
-                        history.message_head,
-                        history.message_next,
-                        history.message_digest,
-                    ),
-                    (history.event_head, history.event_next, history.event_digest),
-                ]
-                .into_iter()
-                .enumerate()
-                {
-                    let selected = (index == 0 && request.source == RecoveryReadSource::Messages)
-                        || (index == 1 && request.source == RecoveryReadSource::Events);
-                    if selected {
-                        if request.from < head || request.from > end {
-                            return Err(invalid("recovery offset outside sealed retained range"));
-                        }
-                        page.end = end;
+                if sequential {
+                    if request.source != RecoveryReadSource::Snapshot {
+                        let index = if request.source == RecoveryReadSource::Messages {
+                            0
+                        } else {
+                            1
+                        };
+                        cursor
+                            .as_mut()
+                            .unwrap()
+                            .read_log(&roots[index], &request, &mut page)?;
                     }
-                    let reader =
-                        FrozenLogReader::open(&roots[index], request.seal.fence_epoch, head, end)
-                            .map_err(io_err)?;
-                    let mut hash = blake3::Hasher::new();
-                    hash.update(b"fibril-retained-log-v1\0");
-                    hash.update(&head.to_be_bytes());
-                    hash.update(&end.to_be_bytes());
-                    let mut used = 0usize;
-                    let mut full = false;
-                    reader
-                        .scan(|record| {
-                            hash.update(&record.offset.to_be_bytes());
-                            hash.update(&record.flags.to_be_bytes());
-                            hash.update(&(record.headers.len() as u64).to_be_bytes());
-                            hash.update(record.headers);
-                            hash.update(&(record.payload.len() as u64).to_be_bytes());
-                            hash.update(record.payload);
-                            if selected && record.offset >= request.from && !full {
-                                let size = 18 + record.headers.len() + record.payload.len();
-                                if page.records.len() == request.max_records as usize
-                                    || size > request.max_bytes as usize - used
-                                {
-                                    if page.records.is_empty() {
-                                        return Err(io::Error::new(
-                                            io::ErrorKind::InvalidInput,
-                                            "next recovery record exceeds page byte budget",
-                                        ));
-                                    }
-                                    full = true;
-                                } else {
-                                    used += size;
-                                    page.next = record.offset + 1;
-                                    page.records.push(RecoveryRecord {
-                                        offset: record.offset,
-                                        flags: record.flags,
-                                        headers: record.headers.to_vec(),
-                                        payload: record.payload.to_vec(),
-                                    });
-                                }
+                } else {
+                    for (index, (head, end, digest)) in [
+                        (
+                            history.message_head,
+                            history.message_next,
+                            history.message_digest,
+                        ),
+                        (history.event_head, history.event_next, history.event_digest),
+                    ]
+                    .into_iter()
+                    .enumerate()
+                    {
+                        let selected = (index == 0
+                            && request.source == RecoveryReadSource::Messages)
+                            || (index == 1 && request.source == RecoveryReadSource::Events);
+                        if selected {
+                            if request.from < head || request.from > end {
+                                return Err(invalid(
+                                    "recovery offset outside sealed retained range",
+                                ));
                             }
-                            Ok(())
-                        })
+                            page.end = end;
+                        }
+                        let reader = FrozenLogReader::open(
+                            &roots[index],
+                            request.seal.fence_epoch,
+                            head,
+                            end,
+                        )
                         .map_err(io_err)?;
-                    if hash.finalize().as_bytes() != &digest {
-                        return Err(corrupt(
-                            "sealed log content changed; recovery page withheld",
-                        ));
+                        let mut hash = blake3::Hasher::new();
+                        hash.update(b"fibril-retained-log-v1\0");
+                        hash.update(&head.to_be_bytes());
+                        hash.update(&end.to_be_bytes());
+                        let mut used = 0usize;
+                        let mut full = false;
+                        reader
+                            .scan(|record| {
+                                hash.update(&record.offset.to_be_bytes());
+                                hash.update(&record.flags.to_be_bytes());
+                                hash.update(&(record.headers.len() as u64).to_be_bytes());
+                                hash.update(record.headers);
+                                hash.update(&(record.payload.len() as u64).to_be_bytes());
+                                hash.update(record.payload);
+                                if selected && record.offset >= request.from && !full {
+                                    let size = 18 + record.headers.len() + record.payload.len();
+                                    if page.records.len() == request.max_records as usize
+                                        || size > request.max_bytes as usize - used
+                                    {
+                                        if page.records.is_empty() {
+                                            return Err(io::Error::new(
+                                                io::ErrorKind::InvalidInput,
+                                                "next recovery record exceeds page byte budget",
+                                            ));
+                                        }
+                                        full = true;
+                                    } else {
+                                        used += size;
+                                        page.next = record.offset + 1;
+                                        page.records.push(RecoveryRecord {
+                                            offset: record.offset,
+                                            flags: record.flags,
+                                            headers: record.headers.to_vec(),
+                                            payload: record.payload.to_vec(),
+                                        });
+                                    }
+                                }
+                                Ok(())
+                            })
+                            .map_err(io_err)?;
+                        if hash.finalize().as_bytes() != &digest {
+                            return Err(corrupt(
+                                "sealed log content changed; recovery page withheld",
+                            ));
+                        }
                     }
                 }
-                read_snapshot(
-                    &stroma.snap_file(&topic, part, group.as_deref()),
-                    &history,
-                    &request,
-                    &mut page,
-                )?;
+                if !sequential || request.source == RecoveryReadSource::Snapshot {
+                    read_snapshot(
+                        &stroma.snap_file(&topic, part, group.as_deref()),
+                        &history,
+                        &request,
+                        &mut page,
+                    )?;
+                }
                 // Require the same durable metadata after the scan as well.
                 stroma.require_matching_recovery_seal(
                     &topic,
@@ -241,7 +463,12 @@ impl Stroma {
                 {
                     return Err(corrupt("recovery receipt changed during read"));
                 }
-                Ok(page)
+                // Release completed log/snapshot sessions before replying. The
+                // receiver binds successive sources into one complete proof.
+                if sequential && page.next == page.end {
+                    cursor = None;
+                }
+                Ok((page, cursor))
             })
             .await
             .map_err(io_err)?
@@ -419,6 +646,186 @@ mod tests {
         result
     }
     use std::collections::BTreeMap;
+
+    async fn sequential(
+        s: &Stroma,
+        request: RecoveryReadRequest,
+        cursor: Option<RecoverySequentialRead>,
+    ) -> Result<(RecoveryReadPage, Option<RecoverySequentialRead>)> {
+        s.read_sealed_replica_sequential("q", 0, None, PartitionKind::Queue, request, cursor)
+            .await
+    }
+
+    #[tokio::test]
+    async fn sequential_pages_match_strict_reads_across_segments_and_byte_limits() {
+        let dir = test_dir!("sequential_pages");
+        let s = populate(&dir.root).await;
+        let mut request = seal(&s).await;
+        request.max_bytes = 150; // one message fits; the next becomes bounded pending scratch
+        let mut cursor = None;
+        let before = files(&dir.root);
+        for source in [RecoveryReadSource::Messages, RecoveryReadSource::Events] {
+            request.source = source;
+            request.from = 0;
+            loop {
+                let strict = read(&s, request.clone()).await.unwrap();
+                let (page, next) = sequential(&s, request.clone(), cursor.take())
+                    .await
+                    .unwrap();
+                assert_eq!(page, strict);
+                cursor = next;
+                if page.next == page.end {
+                    break;
+                }
+                request.from = page.next;
+            }
+        }
+        assert_eq!(files(&dir.root), before);
+        drop(cursor);
+        assert_eq!(s.recovery_stream_slots.available_permits(), 2);
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequential_sessions_bound_admission_and_reject_changed_identity_or_progress() {
+        let dir = test_dir!("sequential_admission");
+        let s = populate(&dir.root).await;
+        let request = seal(&s).await;
+        let (_, a) = sequential(&s, request.clone(), None).await.unwrap();
+        let (_, b) = sequential(&s, request.clone(), None).await.unwrap();
+        assert!(sequential(&s, request.clone(), None).await.is_err());
+        // Idle cursors do not retain the active strict read admission slot.
+        assert!(read(&s, request.clone()).await.is_ok());
+        drop(a);
+        drop(b);
+        for change in 0..6 {
+            let (page, cursor) = sequential(&s, request.clone(), None).await.unwrap();
+            let mut bad = request.clone();
+            bad.from = page.next;
+            match change {
+                0 => bad.from = request.from,
+                1 => bad.from += 1,
+                2 => {
+                    bad.source = RecoveryReadSource::Events;
+                    bad.from = 0;
+                }
+                3 => bad.history_id[0] ^= 1,
+                4 => bad.seal.transition[0] ^= 1,
+                _ => { bad.source = RecoveryReadSource::Snapshot; bad.from = 0; },
+            }
+            assert!(sequential(&s, bad, cursor).await.is_err(), "case {change}");
+            assert_eq!(s.recovery_stream_slots.available_permits(), 2);
+        }
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequential_late_valid_crc_mutation_cannot_complete_verified_history() {
+        let dir = test_dir!("sequential_late_corruption");
+        let s = populate(&dir.root).await;
+        let mut request = seal(&s).await;
+        let (page, mut cursor) = sequential(&s, request.clone(), None).await.unwrap();
+        request.from = page.next;
+        let mut paths: Vec<_> = fs::read_dir(s.msg_tp_part_dir("q", 0, None).join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "log"))
+            .collect();
+        paths.sort();
+        let path = paths.pop().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let start = 68;
+        let h = u32::from_be_bytes(bytes[start + 8..start + 12].try_into().unwrap()) as usize;
+        let p = u32::from_be_bytes(bytes[start + 12..start + 16].try_into().unwrap()) as usize;
+        bytes[start + 32 + h] ^= 1;
+        let end = start + 32 + h + p;
+        let crc = crc32c::crc32c(&bytes[start + 2..end]);
+        bytes[end..end + 4].copy_from_slice(&crc.to_be_bytes());
+        fs::write(path, bytes).unwrap();
+        loop {
+            match sequential(&s, request.clone(), cursor.take()).await {
+                Err(StromaError::Corruption(message)) => {
+                    assert!(message.contains("sealed digest"));
+                    break;
+                }
+                Err(error) => panic!("unexpected failure: {error}"),
+                Ok((page, next)) => {
+                    assert!(page.next < page.end, "damaged history must never complete");
+                    request.from = page.next;
+                    cursor = next;
+                }
+            }
+        }
+        assert_eq!(s.recovery_stream_slots.available_permits(), 2);
+        assert!(read(&s, request).await.is_err());
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn sequential_nonzero_head_and_restart_require_a_fresh_cursor() {
+        let dir = test_dir!("sequential_head_restart");
+        let s = populate(&dir.root).await;
+        let ticket = s.queue_handle("q", 0, None).await.unwrap();
+        let handle = ticket.resolve().unwrap();
+        let head = handle.msg_log().truncate_before(4).await.unwrap();
+        drop(handle);
+        drop(ticket);
+        let mut request = seal(&s).await;
+        request.from = head;
+        request.max_records = 1;
+        let (first, cursor) = sequential(&s, request.clone(), None).await.unwrap();
+        drop(cursor);
+        s.shutdown().await.unwrap();
+        drop(s);
+        let s = Stroma::open(
+            &dir.root,
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        let mut skipped = request.clone();
+        skipped.from = first.next;
+        assert!(sequential(&s, skipped, None).await.is_err());
+        let (page, cursor) = sequential(&s, request, None).await.unwrap();
+        assert_eq!(page, first);
+        drop(cursor);
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_sequential_read_keeps_guards_until_owned_io_finishes() {
+        let dir = test_dir!("sequential_cancel");
+        let s = populate(&dir.root).await;
+        let request = seal(&s).await;
+        let (page, cursor) = sequential(&s, request.clone(), None).await.unwrap();
+        let guard = s.lock_partition_lifecycle("q", 0, None).await;
+        let copy = s.clone();
+        let mut req = request.clone();
+        req.from = page.next;
+        let call = tokio::spawn(async move { sequential(&copy, req, cursor).await });
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while s.recovery_read_slots.available_permits() != 0 {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        call.abort();
+        assert!(matches!(call.await, Err(error) if error.is_cancelled()));
+        assert_eq!(s.recovery_stream_slots.available_permits(), 1);
+        drop(guard);
+        tokio::time::timeout(Duration::from_secs(2), async {
+            while s.recovery_read_slots.available_permits() == 0
+                || s.recovery_stream_slots.available_permits() != 2
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        s.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn frozen_pages_span_segments_and_are_identical_after_cold_restart_without_writes() {
@@ -713,7 +1120,7 @@ mod tests {
         .await
         .unwrap();
         call.abort();
-        assert!(call.await.unwrap_err().is_cancelled());
+        assert!(matches!(call.await, Err(error) if error.is_cancelled()));
         assert!(read(&s, request.clone()).await.is_err());
         drop(guard);
         tokio::time::timeout(Duration::from_secs(2), async {

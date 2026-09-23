@@ -581,20 +581,36 @@ async fn accepted_history_reopen_preserves_padding_and_rejects_damage_without_mu
 #[tokio::test]
 async fn strict_live_scan_requires_frozen_role_and_verifies_disk_beyond_manifest_tail() {
     let dir = test_dir!("strict_live_reader");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
     assert!(log.frozen_reader().is_err());
     let payload = b"strict-live-reader-payload".to_vec();
-    log.append_batch(vec![message(payload.clone())], Some(KDurability::AfterFsync)).await.unwrap();
+    log.append_batch(
+        vec![message(payload.clone())],
+        Some(KDurability::AfterFsync),
+    )
+    .await
+    .unwrap();
     assert!(log.frozen_reader().is_err());
     log.freeze();
     let mut seen = vec![];
-    log.frozen_reader().unwrap().scan(|r| { seen.push((r.offset,r.payload.to_vec())); Ok(()) }).unwrap();
-    assert_eq!(seen, vec![(0,payload.clone())]);
+    log.frozen_reader()
+        .unwrap()
+        .scan(|r| {
+            seen.push((r.offset, r.payload.to_vec()));
+            Ok(())
+        })
+        .unwrap();
+    assert_eq!(seen, vec![(0, payload.clone())]);
     // The cold sealed-reader API still requires an exact persisted boundary.
     assert!(FrozenLogReader::open(&dir.root, log.current_epoch(), 0, 2).is_err());
     let segment = dir.root.join("segments/00000000000000000000.log");
     let bytes = std::fs::read(&segment).unwrap();
-    let at = bytes.windows(payload.len()).position(|w| w == payload).unwrap();
+    let at = bytes
+        .windows(payload.len())
+        .position(|w| w == payload)
+        .unwrap();
     let mut file = OpenOptions::new().write(true).open(segment).unwrap();
     file.seek(SeekFrom::Start(at as u64)).unwrap();
     file.write_all(&[payload[0] ^ 1]).unwrap();
@@ -623,24 +639,62 @@ async fn strict_frozen_scan_handles_varying_records_across_read_buffer_boundarie
         .unwrap();
     log.freeze();
     let mut count = 0;
-    log.frozen_reader().unwrap().scan(|record| {
-        assert_eq!(record.offset, count as u64);
-        assert_eq!(record.headers, messages[count].headers);
-        assert_eq!(record.payload, messages[count].payload);
-        count += 1;
-        Ok(())
-    }).unwrap();
+    log.frozen_reader()
+        .unwrap()
+        .scan(|record| {
+            assert_eq!(record.offset, count as u64);
+            assert_eq!(record.headers, messages[count].headers);
+            assert_eq!(record.payload, messages[count].payload);
+            count += 1;
+            Ok(())
+        })
+        .unwrap();
     assert_eq!(count, messages.len());
     // Corrupt a later record after a successful scan. A new buffered scan must
     // still read the changed bytes and reject their checksum.
     let segment = dir.root.join("segments/00000000000000000000.log");
     let bytes = std::fs::read(&segment).unwrap();
     let payload = &messages[3].payload;
-    let at = bytes.windows(payload.len()).position(|w| w == payload).unwrap();
+    let at = bytes
+        .windows(payload.len())
+        .position(|w| w == payload)
+        .unwrap();
     let mut file = OpenOptions::new().write(true).open(segment).unwrap();
     file.seek(SeekFrom::Start(at as u64)).unwrap();
     file.write_all(&[payload[0] ^ 1]).unwrap();
     file.sync_all().unwrap();
     assert!(log.frozen_reader().unwrap().scan(|_| Ok(())).is_err());
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn sequential_frozen_cursor_cannot_resume_after_a_read_error() {
+    let dir = test_dir!("frozen_cursor_poison");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    log.append_batch(
+        vec![Message {
+            flags: 0,
+            headers: vec![],
+            payload: vec![7; 100],
+        }],
+        Some(KDurability::AfterFsync),
+    )
+    .await
+    .unwrap();
+    log.freeze();
+    let mut cursor = log.frozen_reader().unwrap().into_cursor().unwrap();
+    assert!(cursor.next_record(10).is_err());
+    assert!(
+        cursor.next_record(1024).is_err(),
+        "a failed cursor must not skip a partially read record"
+    );
+    let mut fresh = log.frozen_reader().unwrap().into_cursor().unwrap();
+    assert_eq!(
+        fresh.next_record(1024).unwrap().unwrap().payload,
+        vec![7; 100]
+    );
+    assert!(fresh.next_record(1024).unwrap().is_none());
     log.shutdown().await.unwrap();
 }

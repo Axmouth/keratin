@@ -11,6 +11,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Bounded sequential frozen-log cursors and tentative sealed-history inspection
+  sessions. CRC, offset and final canonical-digest verification remain mandatory;
+  errors poison cursors, cancellation retains owned I/O guards, and admission is
+  separate from strict read admission. Existing strict recovery reads and the
+  storage format are unchanged.
+
 - Opt-in `KeratinConfig::adaptive_staging` and reusable, caller-maintained buffers
   with lazy growth, configurable empty-buffer decay and full idle release.
   Retained staging remains the default; durable completion and the on-disk format

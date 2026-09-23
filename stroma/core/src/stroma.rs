@@ -60,7 +60,7 @@ mod recovery_seal;
 pub use recovery_history::RetainedHistoryIdentity;
 #[path = "recovery_read.rs"]
 mod recovery_read;
-pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord};
+pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord, RecoverySequentialRead};
 #[path = "recovery_stage.rs"]
 mod recovery_stage;
 #[path = "recovery_install.rs"]
@@ -799,6 +799,7 @@ pub struct Stroma {
 
     /// Bounds concurrent full-history scans across this storage instance.
     recovery_read_slots: Arc<Semaphore>,
+    recovery_stream_slots: Arc<Semaphore>,
     recovery_stage_slots: Arc<Semaphore>,
     recovery_routes: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), recovery_install::Route>>,
     // A new storage instance cannot inherit writer admission from an old process.
@@ -920,6 +921,7 @@ impl Stroma {
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
+            recovery_stream_slots: Arc::new(Semaphore::new(2)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
             recovery_routes: Arc::new(DashMap::new()),
             storage_session: *uuid::Uuid::now_v7().as_bytes(),

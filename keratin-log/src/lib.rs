@@ -24,7 +24,7 @@ pub use config::*;
 pub use runtime_config::{LogRuntimeConfig, LogRuntimeSettings, LogRuntimeSnapshot, LogRuntimeStatus};
 pub use diagnostics::{LogControlEvent, LogControlKind, ReplicationOverlapDiagnostic, CONTROL_HISTORY_LIMIT};
 pub use durability::{DurableFrontier, DurableWatermark, KDurability};
-pub use frozen_reader::{FrozenLogReader, MAX_FROZEN_RECORD_BYTES, lock_existing_log};
+pub use frozen_reader::{FrozenLogCursor, FrozenLogReader, MAX_FROZEN_RECORD_BYTES, lock_existing_log};
 pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};

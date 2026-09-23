@@ -24,6 +24,100 @@ pub struct FrozenLogReader {
     active: u64,
 }
 
+/// Sequential, read-only cursor over an externally sealed log. The caller must
+/// keep the log frozen and verify a full content digest before accepting a scan.
+/// Retains one file buffer and bounded record scratch, never the full history.
+pub struct FrozenLogCursor {
+    entries: Vec<(u64, PathBuf)>,
+    segment: usize,
+    file: Option<BufReader<File>>,
+    segment_end: u64,
+    expected: u64,
+    head: u64,
+    next: u64,
+    bytes: Vec<u8>,
+    failed: bool,
+}
+
+impl FrozenLogCursor {
+    /// A returned record borrows scratch storage until the next read. CRC and
+    /// exact offsets are checked for every record, including a retained prefix
+    /// before `head` in its first segment. No disk repair is performed.
+    pub fn next_record(
+        &mut self,
+        max_record_bytes: usize,
+    ) -> io::Result<Option<DecodedRecord<'_>>> {
+        if self.failed {
+            return Err(invalid("failed frozen cursor must be discarded"));
+        }
+        self.failed = true;
+        if !self.advance(max_record_bytes)? {
+            self.failed = false;
+            return Ok(None);
+        }
+        let record = decode_record_prefix(&self.bytes)
+            .map_err(|_| invalid("corrupt frozen record"))?
+            .0;
+        self.failed = false;
+        Ok(Some(record))
+    }
+
+    fn advance(&mut self, max_record_bytes: usize) -> io::Result<bool> {
+        loop {
+            if self.expected == self.next {
+                return Ok(false);
+            }
+            if self.file.is_none() || self.expected == self.segment_end {
+                let (base, path) = self
+                    .entries
+                    .get(self.segment)
+                    .ok_or_else(|| invalid("missing frozen suffix"))?;
+                if *base != self.expected {
+                    return Err(invalid("gap between frozen segments"));
+                }
+                let mut file = File::open(path)?;
+                read_segment_header(&mut file, *base)?;
+                self.segment += 1;
+                self.segment_end = self
+                    .entries
+                    .get(self.segment)
+                    .map(|(base, _)| *base)
+                    .unwrap_or(self.next);
+                self.file = Some(BufReader::with_capacity(64 * 1024, file));
+            }
+            let file = self.file.as_mut().unwrap();
+            let mut fixed = [0u8; RECORD_HEADER_LEN];
+            file.read_exact(&mut fixed)?;
+            let headers = u32::from_be_bytes(fixed[8..12].try_into().unwrap()) as usize;
+            let payload = u32::from_be_bytes(fixed[12..16].try_into().unwrap()) as usize;
+            let total = RECORD_HEADER_LEN
+                .checked_add(headers)
+                .and_then(|n| n.checked_add(payload))
+                .and_then(|n| n.checked_add(4))
+                .ok_or_else(|| invalid("frozen record length overflow"))?;
+            if total > MAX_FROZEN_RECORD_BYTES || total > max_record_bytes {
+                return Err(invalid("frozen record exceeds recovery allocation limit"));
+            }
+            if total > self.bytes.capacity() {
+                self.bytes.reserve_exact(total - self.bytes.len());
+            }
+            self.bytes.resize(total, 0);
+            self.bytes[..RECORD_HEADER_LEN].copy_from_slice(&fixed);
+            file.read_exact(&mut self.bytes[RECORD_HEADER_LEN..])?;
+            let offset = u64::from_be_bytes(fixed[24..32].try_into().unwrap());
+            if offset != self.expected {
+                return Err(invalid("noncontiguous frozen record"));
+            }
+            self.expected += 1;
+            if offset >= self.head {
+                break;
+            }
+            decode_record_prefix(&self.bytes).map_err(|_| invalid("corrupt frozen record"))?;
+        }
+        Ok(true)
+    }
+}
+
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
 }
@@ -95,6 +189,50 @@ impl FrozenLogReader {
             head,
             next,
             active: manifest.active_base_offset,
+        })
+    }
+
+    /// Start one sequential traversal of the exact frozen retained range.
+    pub fn into_cursor(self) -> io::Result<FrozenLogCursor> {
+        if self.head == self.next {
+            let path = self
+                .segments
+                .get(&self.active)
+                .ok_or_else(|| invalid("missing empty frozen segment"))?;
+            read_segment_header(&mut File::open(path)?, self.active)?;
+            return Ok(FrozenLogCursor {
+                entries: vec![],
+                segment: 0,
+                file: None,
+                segment_end: self.next,
+                expected: self.next,
+                head: self.head,
+                next: self.next,
+                bytes: vec![],
+                failed: false,
+            });
+        }
+        let first = *self
+            .segments
+            .range(..=self.head)
+            .next_back()
+            .ok_or_else(|| invalid("missing frozen head segment"))?
+            .0;
+        let entries = self
+            .segments
+            .into_iter()
+            .filter(|(base, _)| *base >= first && *base < self.next)
+            .collect();
+        Ok(FrozenLogCursor {
+            entries,
+            segment: 0,
+            file: None,
+            segment_end: first,
+            expected: first,
+            head: self.head,
+            next: self.next,
+            bytes: vec![],
+            failed: false,
         })
     }
 
