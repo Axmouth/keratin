@@ -10,7 +10,7 @@ use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, Read},
+    io::{self, BufReader, Read},
     path::{Path, PathBuf},
 };
 
@@ -118,6 +118,9 @@ impl FrozenLogReader {
             .0;
         let mut expected = first;
         let entries: Vec<_> = self.segments.range(first..self.next).collect();
+        // Reuse bounded scratch storage across records and segments. Scanning
+        // still decodes and validates every record in the sealed range.
+        let mut bytes = Vec::new();
         for (index, (base, path)) in entries.iter().enumerate() {
             if **base != expected {
                 return Err(invalid("gap between frozen segments"));
@@ -128,6 +131,8 @@ impl FrozenLogReader {
                 .unwrap_or(self.next);
             let mut file = File::open(path)?;
             read_segment_header(&mut file, **base)?;
+            // Avoid two filesystem reads for every record during full scans.
+            let mut file = BufReader::with_capacity(64 * 1024, file);
             while expected < end {
                 let mut fixed = [0u8; RECORD_HEADER_LEN];
                 file.read_exact(&mut fixed)?;
@@ -141,7 +146,11 @@ impl FrozenLogReader {
                 if total > MAX_FROZEN_RECORD_BYTES {
                     return Err(invalid("frozen record exceeds recovery allocation limit"));
                 }
-                let mut bytes = vec![0u8; total];
+                if total > bytes.capacity() {
+                    // Avoid geometric growth beyond the validated record limit.
+                    bytes.reserve_exact(total - bytes.len());
+                }
+                bytes.resize(total, 0);
                 bytes[..RECORD_HEADER_LEN].copy_from_slice(&fixed);
                 file.read_exact(&mut bytes[RECORD_HEADER_LEN..])?;
                 let (record, _) =

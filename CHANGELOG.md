@@ -38,6 +38,13 @@ tagged releases yet. Earlier history predates this changelog.
   failures without retaining message bodies. Diagnostics do not alter repair
   policy or add ordinary append-path history recording.
 
+### Changed
+
+- Frozen recovery scans use buffered sequential reads and reuse bounded record
+  scratch space while retaining CRC, offset and full-history verification.
+  Varied-size records, buffer boundaries and post-scan corruption are covered
+  by regression tests.
+
 ### Fixed
 
 - Checkpoint reset drains outstanding fsync completions before replacing log
