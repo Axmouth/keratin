@@ -19,6 +19,8 @@ pub struct Segment {
     /// the active segment. Turned off automatically if the filesystem rejects
     /// `fallocate`.
     prealloc_chunk: u64,
+    allocation_error: Option<String>,
+    runtime_status: Option<std::sync::Arc<parking_lot::RwLock<crate::LogRuntimeStatus>>>,
 }
 
 impl Segment {
@@ -47,6 +49,8 @@ impl Segment {
             bytes_written: header_len as u64,
             alloc_end: header_len as u64,
             prealloc_chunk: 0,
+            allocation_error: None,
+            runtime_status: None,
         })
     }
 
@@ -82,7 +86,24 @@ impl Segment {
             bytes_written: len,
             alloc_end: len,
             prealloc_chunk: 0,
+            allocation_error: None,
+            runtime_status: None,
         })
+    }
+
+    pub(crate) fn attach_runtime_status(
+        &mut self,
+        status: std::sync::Arc<parking_lot::RwLock<crate::LogRuntimeStatus>>,
+        snapshot: crate::LogRuntimeSnapshot,
+    ) {
+        {
+            let mut value = status.write();
+            value.applied = snapshot;
+            value.active_segment_base = self.base_offset;
+            value.effective_preallocate_bytes = self.prealloc_chunk;
+            value.allocation_error = self.allocation_error.clone();
+        }
+        self.runtime_status = Some(status);
     }
 
     pub fn append_bytes(&mut self, data: &[u8]) -> io::Result<u64> {
@@ -105,7 +126,7 @@ impl Segment {
     }
 
     /// Enable preallocation on this (active) segment: keep `chunk` bytes allocated
-    /// ahead of the write cursor. A filesystem that rejects `fallocate` silently
+    /// ahead of the write cursor. A filesystem that rejects `fallocate` reports a warning and
     /// disables it (writes just extend the file, correctness unchanged).
     pub fn enable_prealloc(&mut self, chunk: u64) {
         if chunk == 0 {
@@ -127,7 +148,16 @@ impl Segment {
         let target = need.div_ceil(chunk).saturating_mul(chunk).max(need);
         match self.file.allocate(target) {
             Ok(()) => self.alloc_end = target,
-            Err(_) => self.prealloc_chunk = 0,
+            Err(error) => {
+                self.prealloc_chunk = 0;
+                self.allocation_error = Some(error.to_string());
+                tracing::warn!(%error, segment_base = self.base_offset, "preallocation unavailable; falling back to extending writes");
+                if let Some(status) = &self.runtime_status {
+                    let mut status = status.write();
+                    status.effective_preallocate_bytes = 0;
+                    status.allocation_error = self.allocation_error.clone();
+                }
+            }
         }
     }
 
@@ -200,4 +230,48 @@ pub fn read_segment_created_ts_ms(path: &std::path::Path) -> io::Result<u64> {
     Ok(u64::from_be_bytes(
         hdr[24..32].try_into().expect("exact-length slice"),
     ))
+}
+
+#[cfg(test)]
+mod runtime_tests {
+    use super::*;
+    use crate::{LogRuntimeConfig, LogRuntimeSettings, LogRuntimeStatus};
+    #[test]
+    fn allocation_failure_is_visible_before_and_after_status_attachment() {
+        let dir = crate::test_dir!("allocation_status");
+        let path = dir.root.join("segment");
+        let writable = File::options()
+            .read(true)
+            .write(true)
+            .create_new(true)
+            .open(&path)
+            .unwrap();
+        drop(Segment::create(writable, 0, 0).unwrap());
+        let runtime = LogRuntimeSettings::new(LogRuntimeConfig {
+            segment_preallocate_bytes: 4096,
+        })
+        .unwrap();
+        for attach_first in [false, true] {
+            // Read-only descriptor makes allocation fail without depending on disk space.
+            let mut segment = Segment::open(File::open(&path).unwrap(), 0).unwrap();
+            let snapshot = runtime.current();
+            let status = runtime.register(LogRuntimeStatus {
+                root: dir.root.clone(),
+                applied: snapshot,
+                active_segment_base: 0,
+                effective_preallocate_bytes: 0,
+                allocation_error: None,
+            });
+            if attach_first {
+                segment.attach_runtime_status(status.clone(), snapshot);
+            }
+            segment.enable_prealloc(4096);
+            if !attach_first {
+                segment.attach_runtime_status(status.clone(), snapshot);
+            }
+            assert_eq!(status.read().effective_preallocate_bytes, 0);
+            assert!(status.read().allocation_error.is_some());
+            assert_eq!(status.read().applied.config.segment_preallocate_bytes, 4096);
+        }
+    }
 }

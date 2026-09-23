@@ -531,3 +531,5 @@ pub mod unix_millis {
         }
     }
 }
+
+pub use keratin_log::{LogRuntimeConfig, LogRuntimeSettings, LogRuntimeSnapshot, LogRuntimeStatus};

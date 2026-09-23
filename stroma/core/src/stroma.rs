@@ -780,6 +780,7 @@ pub struct Stroma {
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg_msg: KeratinConfig,
     pub(crate) keratin_cfg_event: KeratinConfig,
+    pub(crate) log_runtime: Option<Arc<keratin_log::LogRuntimeSettings>>,
     // FIXME: snapshot cadence. snap_cfg.every_events is not wired yet - the gate
     // in periodic_snapshot_step is commented out, so snapshots currently fire on
     // every periodic tick when the partition is dirty. The plan is to make
@@ -870,6 +871,32 @@ impl Stroma {
         snap_cfg: SnapshotConfig,
         options: StromaOptions,
     ) -> Result<Self> {
+        Self::open_internal(root, keratin_cfg, snap_cfg, options, None).await
+    }
+
+    pub async fn open_with_runtime(
+        root: impl AsRef<Path>,
+        keratin_cfg: StromaKeratinConfig,
+        snap_cfg: SnapshotConfig,
+        runtime: Arc<keratin_log::LogRuntimeSettings>,
+    ) -> Result<Self> {
+        Self::open_internal(
+            root,
+            keratin_cfg,
+            snap_cfg,
+            StromaOptions::default(),
+            Some(runtime),
+        )
+        .await
+    }
+
+    async fn open_internal(
+        root: impl AsRef<Path>,
+        keratin_cfg: StromaKeratinConfig,
+        snap_cfg: SnapshotConfig,
+        options: StromaOptions,
+        log_runtime: Option<Arc<keratin_log::LogRuntimeSettings>>,
+    ) -> Result<Self> {
         let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
         fs::create_dir_all(root.join("events")).map_err(io_err)?;
@@ -886,6 +913,7 @@ impl Stroma {
             root,
             keratin_cfg_msg,
             keratin_cfg_event,
+            log_runtime,
             snap_cfg,
             global_store: Arc::new(OnceCell::new()),
             task_group: Arc::new(TaskGroup::new()),
@@ -977,7 +1005,12 @@ impl Stroma {
             .get_or_try_init(|| async {
                 let dir = self.root.join("global");
                 fs::create_dir_all(&dir).map_err(io_err)?;
-                let store = GlobalStore::open(dir, self.keratin_cfg_event).await?;
+                let store = GlobalStore::open_with_runtime(
+                    dir,
+                    self.keratin_cfg_event,
+                    self.log_runtime.clone(),
+                )
+                .await?;
                 Ok::<_, StromaError>(Arc::new(store))
             })
             .await
@@ -1241,12 +1274,14 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
-        let k = if self.storage_history_binding(tp, part, group)?.is_some() {
-            Keratin::open_preserving_history(dir, self.keratin_cfg_event).await
-        } else {
-            Keratin::open(dir, self.keratin_cfg_event).await
-        }
-        .map_err(io_err)?;
+        let k = self
+            .open_keratin(
+                dir,
+                self.keratin_cfg_event,
+                self.storage_history_binding(tp, part, group)?.is_some(),
+            )
+            .await
+            .map_err(io_err)?;
         tracing::info!("Initialized event log: (`{tp}` `{part}` `{group:?}`)");
 
         Ok(Arc::new(k))
@@ -1257,15 +1292,32 @@ impl Stroma {
         fs::create_dir_all(&dir).map_err(io_err)?;
 
         tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
-        let k = if self.storage_history_binding(tp, part, group)?.is_some() {
-            Keratin::open_preserving_history(dir, self.keratin_cfg_msg).await
-        } else {
-            Keratin::open(dir, self.keratin_cfg_msg).await
-        }
-        .map_err(io_err)?;
+        let k = self
+            .open_keratin(
+                dir,
+                self.keratin_cfg_msg,
+                self.storage_history_binding(tp, part, group)?.is_some(),
+            )
+            .await
+            .map_err(io_err)?;
         tracing::info!("Initialized message log: (`{tp}` `{part}` `{group:?}`)");
 
         Ok(Arc::new(k))
+    }
+
+    pub(crate) async fn open_keratin(
+        &self,
+        root: impl AsRef<Path>,
+        cfg: KeratinConfig,
+        preserve_history: bool,
+    ) -> std::io::Result<Keratin> {
+        match &self.log_runtime {
+            Some(runtime) => {
+                Keratin::open_with_runtime(root, cfg, preserve_history, runtime.clone()).await
+            }
+            None if preserve_history => Keratin::open_preserving_history(root, cfg).await,
+            None => Keratin::open(root, cfg).await,
+        }
     }
 
     pub fn deadline_waker(&self) -> Arc<Notify> {
@@ -6215,6 +6267,51 @@ mod tests {
 
     fn test_keratin_config() -> StromaKeratinConfig {
         StromaKeratinConfig::from_message_log(KeratinConfig::default())
+    }
+
+    #[tokio::test]
+    async fn runtime_policy_reaches_metadata_message_event_and_future_logs() {
+        let dir = test_dir!("stroma_runtime_policy");
+        let runtime = Arc::new(
+            keratin_log::LogRuntimeSettings::new(keratin_log::LogRuntimeConfig {
+                segment_preallocate_bytes: 0,
+            })
+            .unwrap(),
+        );
+        let st = Stroma::open_with_runtime(
+            &dir.root,
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+            SnapshotConfig::default(),
+            runtime.clone(),
+        )
+        .await
+        .unwrap();
+        st.global_store().await.unwrap();
+        let messages = st.msg_log_init("runtime-a", 0, None).await.unwrap();
+        let events = st.event_log_init("runtime-a", 0, None).await.unwrap();
+        assert_eq!(runtime.logs().len(), 3);
+        runtime
+            .replace(
+                0,
+                keratin_log::LogRuntimeConfig {
+                    segment_preallocate_bytes: 4096,
+                },
+            )
+            .unwrap();
+        assert!(runtime.logs().iter().all(|log| log.applied.revision == 0));
+        let future = st.msg_log_init("runtime-b", 0, None).await.unwrap();
+        assert_eq!(
+            runtime
+                .logs()
+                .iter()
+                .filter(|log| log.applied.revision == 1)
+                .count(),
+            1
+        );
+        messages.shutdown().await.unwrap();
+        events.shutdown().await.unwrap();
+        future.shutdown().await.unwrap();
+        st.shutdown().await.unwrap();
     }
 
     #[tokio::test]

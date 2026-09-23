@@ -161,6 +161,10 @@ pub struct Log {
     /// Bytes to preallocate ahead of the active segment's write cursor (`0` =
     /// off). Applied to the active segment and to each new segment on roll.
     prealloc_chunk: u64,
+    runtime: Option<(
+        Arc<crate::LogRuntimeSettings>,
+        Arc<RwLock<crate::LogRuntimeStatus>>,
+    )>,
 
     // stats
     pub stats: IoStats,
@@ -427,6 +431,7 @@ impl Log {
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
+                    runtime: None,
                     manifest,
                     write_buf: staging_buffer(
                         16 * 1024 * 1024,
@@ -491,6 +496,7 @@ impl Log {
                     last_commit_through: next_offset,
                     recent_commit_records: 0,
                     prealloc_chunk,
+                    runtime: None,
                     last_index_at_log_pos,
                     write_buf: staging_buffer(
                         16 * 1024 * 1024,
@@ -585,6 +591,7 @@ impl Log {
                 last_commit_through: next_offset,
                 recent_commit_records: 0,
                 prealloc_chunk,
+                runtime: None,
                 last_index_at_log_pos,
                 write_buf: staging_buffer(
                     16 * 1024 * 1024,
@@ -1337,6 +1344,39 @@ impl Log {
         self.write_buf.len() >= self.flush_target_bytes
     }
 
+    pub(crate) fn attach_runtime(
+        &mut self,
+        settings: Arc<crate::LogRuntimeSettings>,
+        snapshot: crate::LogRuntimeSnapshot,
+    ) {
+        let status = settings.register(crate::LogRuntimeStatus {
+            root: self.root.clone(),
+            applied: snapshot,
+            active_segment_base: self.active.base_offset,
+            effective_preallocate_bytes: 0,
+            allocation_error: None,
+        });
+        self.active.attach_runtime_status(status.clone(), snapshot);
+        self.runtime = Some((settings, status));
+    }
+
+    fn prepare_segment_policy(&self, segment: &mut Segment) -> Option<crate::LogRuntimeSnapshot> {
+        let snapshot = self
+            .runtime
+            .as_ref()
+            .map(|(settings, _)| settings.current());
+        segment.enable_prealloc(snapshot.map_or(self.prealloc_chunk, |s| {
+            s.config.segment_preallocate_bytes as u64
+        }));
+        snapshot
+    }
+
+    fn publish_segment_policy(&mut self, snapshot: Option<crate::LogRuntimeSnapshot>) {
+        if let (Some(snapshot), Some((_, status))) = (snapshot, &self.runtime) {
+            self.active.attach_runtime_status(status.clone(), snapshot);
+        }
+    }
+
     fn roll(&mut self, now_ms: u64) -> io::Result<()> {
         // 1) flush current buffers to current segment files
         self.flush_buffers()?;
@@ -1350,7 +1390,7 @@ impl Log {
 
         let new_base = self.next_offset;
         let (mut seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
-        seg.enable_prealloc(self.prealloc_chunk);
+        let policy = self.prepare_segment_policy(&mut seg);
         self.active = seg;
         self.index = idx;
 
@@ -1363,6 +1403,7 @@ impl Log {
         self.manifest.store_atomic(&self.root)?;
         self.stats.manifest += t.elapsed();
         self.last_manifest_flush = Instant::now();
+        self.publish_segment_policy(policy);
 
         Ok(())
     }
@@ -1495,9 +1536,10 @@ impl Log {
         let base = self.manifest.active_base_offset;
         let (mut active, index, _) =
             open_or_create_segment_pair(&self.root, base, crate::util::unix_millis())?;
-        active.enable_prealloc(self.prealloc_chunk);
+        let policy = self.prepare_segment_policy(&mut active);
         self.active = active;
         self.index = index;
+        self.publish_segment_policy(policy);
         *self.segment_mapping.write() = list_segment_bases(&self.root.join("segments"))?
             .into_iter()
             .collect();
@@ -1543,7 +1585,7 @@ impl Log {
         self.segment_mapping.write().clear();
 
         let (mut seg, idx, seg_path) = create_segment_pair(&self.root, next_offset, now_ms)?;
-        seg.enable_prealloc(self.prealloc_chunk);
+        let policy = self.prepare_segment_policy(&mut seg);
         self.active = seg;
         self.index = idx;
         self.segment_mapping.write().insert(next_offset, seg_path);
@@ -1567,6 +1609,7 @@ impl Log {
         fsync_dir(&seg_dir)?;
         self.manifest.store_atomic(&self.root)?;
 
+        self.publish_segment_policy(policy);
         self.log_state.head.store(next_offset, Ordering::Release);
         self.log_state.tail.store(next_offset, Ordering::Release);
         // Truncation/checkpoint reset: the durable set can legitimately shrink.

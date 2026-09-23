@@ -324,6 +324,7 @@ impl Stroma {
             .join("recovery-staging")
             .join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str());
         let cfg = self.keratin_cfg_msg;
+        let runtime = self.log_runtime.clone();
         tokio::spawn(async move {
             let read_root = root.clone();
             let (intent, encoded) = tokio::task::spawn_blocking(move || {
@@ -387,10 +388,15 @@ impl Stroma {
             // Unfinished staging is not accepted history and can repair an
             // interrupted append. Completed data must never silently lose a tail.
             let messages = Arc::new(
-                if complete {
-                    Keratin::open_preserving_history(root.join("messages"), cfg).await
-                } else {
-                    Keratin::open(root.join("messages"), cfg).await
+                match runtime {
+                    Some(runtime) => {
+                        Keratin::open_with_runtime(root.join("messages"), cfg, complete, runtime)
+                            .await
+                    }
+                    None if complete => {
+                        Keratin::open_preserving_history(root.join("messages"), cfg).await
+                    }
+                    None => Keratin::open(root.join("messages"), cfg).await,
                 }
                 .map_err(io_err)?,
             );

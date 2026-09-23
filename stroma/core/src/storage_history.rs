@@ -557,11 +557,13 @@ impl Stroma {
                     )
                     .await?;
                 let messages = open_preparation_log(
+                    &stroma,
                     stroma.msg_tp_part_dir(&topic, part, group.as_deref()),
                     stroma.keratin_cfg_msg,
                 )
                 .await?;
                 let events = match open_preparation_log(
+                    &stroma,
                     stroma.tp_part_dir(&topic, part, group.as_deref()),
                     stroma.keratin_cfg_event,
                 )
@@ -762,8 +764,19 @@ impl Stroma {
             }
             // Take both Keratin locks before persisting. Another storage instance
             // cannot write these logs concurrently with initial binding.
-            let messages = open_preparation_log(self.msg_tp_part_dir(topic, part, group), self.keratin_cfg_msg).await?;
-            let events = match open_preparation_log(self.tp_part_dir(topic, part, group), self.keratin_cfg_event).await {
+            let messages = open_preparation_log(
+                self,
+                self.msg_tp_part_dir(topic, part, group),
+                self.keratin_cfg_msg,
+            )
+            .await?;
+            let events = match open_preparation_log(
+                self,
+                self.tp_part_dir(topic, part, group),
+                self.keratin_cfg_event,
+            )
+            .await
+            {
                 Ok(events) => events,
                 Err(error) => {
                     let _ = messages.shutdown().await;
@@ -830,16 +843,26 @@ impl Stroma {
     }
 }
 
-async fn open_preparation_log(path: PathBuf, config: KeratinConfig) -> Result<Keratin> {
+async fn open_preparation_log(
+    stroma: &Stroma,
+    path: PathBuf,
+    config: KeratinConfig,
+) -> Result<Keratin> {
     // Only a new directory (or its lock) may create a new log. Existing files
     // must pass strict recovery; preparation never repairs away an offset.
     let empty = if path.try_exists().map_err(io_err)? {
-        fs::read_dir(&path).map_err(io_err)?.try_fold(true, |empty, entry| {
-            Ok::<_, StromaError>(empty && entry.map_err(io_err)?.file_name() == ".keratin.lock")
-        })?
-    } else { true };
-    if empty { Keratin::open(path, config).await.map_err(io_err) }
-    else { Keratin::open_preserving_history(path, config).await.map_err(io_err) }
+        fs::read_dir(&path)
+            .map_err(io_err)?
+            .try_fold(true, |empty, entry| {
+                Ok::<_, StromaError>(empty && entry.map_err(io_err)?.file_name() == ".keratin.lock")
+            })?
+    } else {
+        true
+    };
+    stroma
+        .open_keratin(path, config, !empty)
+        .await
+        .map_err(io_err)
 }
 
 fn preparation_boundary(_name: &str) {

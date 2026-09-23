@@ -86,7 +86,21 @@ pub struct GlobalStore {
 
 impl GlobalStore {
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> Result<Self> {
-        let log = Arc::new(Keratin::open(root, cfg).await.map_err(io_err)?);
+        Self::open_with_runtime(root, cfg, None).await
+    }
+
+    pub(crate) async fn open_with_runtime(
+        root: impl AsRef<Path>,
+        cfg: KeratinConfig,
+        runtime: Option<Arc<keratin_log::LogRuntimeSettings>>,
+    ) -> Result<Self> {
+        let log = Arc::new(
+            match runtime {
+                Some(runtime) => Keratin::open_with_runtime(root, cfg, false, runtime).await,
+                None => Keratin::open(root, cfg).await,
+            }
+            .map_err(io_err)?,
+        );
         let mut values = HashMap::new();
         let mut events_replayed = 0_u64;
 

@@ -521,12 +521,14 @@ impl Stroma {
             })
             .await
             .map_err(io_err)??;
-            let messages = Keratin::open_preserving_history(
-                view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-                st.keratin_cfg_msg,
-            )
-            .await
-            .map_err(io_err)?;
+            let messages = view
+                .open_keratin(
+                    view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                    st.keratin_cfg_msg,
+                    true,
+                )
+                .await
+                .map_err(io_err)?;
             messages.freeze();
             let (messages, guard) = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan_parts(&messages, &guard.intent, guard.limits, true)?;
@@ -536,12 +538,14 @@ impl Stroma {
             .map_err(io_err)??;
             messages.shutdown().await.map_err(io_err)?;
             drop(messages);
-            let events = Keratin::open(
-                view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-                st.keratin_cfg_event,
-            )
-            .await
-            .map_err(io_err)?;
+            let events = view
+                .open_keratin(
+                    view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                    st.keratin_cfg_event,
+                    false,
+                )
+                .await
+                .map_err(io_err)?;
             events.become_follower();
             events
                 .advance_epoch(spec.fence_epoch)
@@ -602,19 +606,23 @@ impl Stroma {
         }
         // Reopen and verify the whole baseline, including a completed
         // generation whose receipt survived an interrupted route switch.
-        let messages = Keratin::open_preserving_history(
-            view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-            st.keratin_cfg_msg,
-        )
-        .await
-        .map_err(io_err)?;
+        let messages = view
+            .open_keratin(
+                view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                st.keratin_cfg_msg,
+                true,
+            )
+            .await
+            .map_err(io_err)?;
         messages.freeze();
-        let events = Keratin::open_preserving_history(
-            view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-            st.keratin_cfg_event,
-        )
-        .await
-        .map_err(io_err)?;
+        let events = view
+            .open_keratin(
+                view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                st.keratin_cfg_event,
+                true,
+            )
+            .await
+            .map_err(io_err)?;
         if events.head_offset() != spec.event_next
             || events.next_offset() != spec.event_next
             || events.current_epoch() != spec.fence_epoch

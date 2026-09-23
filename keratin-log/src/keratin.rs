@@ -172,7 +172,7 @@ impl Keratin {
     }
 
     pub async fn open(root: impl AsRef<Path>, cfg: KeratinConfig) -> std::io::Result<Self> {
-        Self::open_with_history_guard(root, cfg, false).await
+        Self::open_with_history_guard(root, cfg, false, None).await
     }
 
     /// Reopen accepted history without silently repairing/reusing a damaged tail.
@@ -182,14 +182,30 @@ impl Keratin {
         root: impl AsRef<Path>,
         cfg: KeratinConfig,
     ) -> std::io::Result<Self> {
-        Self::open_with_history_guard(root, cfg, true).await
+        Self::open_with_history_guard(root, cfg, true, None).await
+    }
+
+    /// Open with shared live tuning. Existing segments keep their policy until
+    /// rollover; reopening a log adopts the current snapshot during open.
+    pub async fn open_with_runtime(
+        root: impl AsRef<Path>,
+        cfg: KeratinConfig,
+        preserve_history: bool,
+        runtime: Arc<crate::LogRuntimeSettings>,
+    ) -> io::Result<Self> {
+        Self::open_with_history_guard(root, cfg, preserve_history, Some(runtime)).await
     }
 
     async fn open_with_history_guard(
         root: impl AsRef<Path>,
-        cfg: KeratinConfig,
+        mut cfg: KeratinConfig,
         preserve_history: bool,
+        runtime: Option<Arc<crate::LogRuntimeSettings>>,
     ) -> std::io::Result<Self> {
+        let runtime_snapshot = runtime.as_ref().map(|settings| settings.current());
+        if let Some(snapshot) = runtime_snapshot {
+            cfg.segment_preallocate_bytes = snapshot.config.segment_preallocate_bytes;
+        }
         // Reject invalid capacities before creating directories or opening logs.
         let writer_channel_capacity = cfg.writer_channel_capacity()?;
         if let Some(policy) = cfg.adaptive_staging {
@@ -224,7 +240,7 @@ impl Keratin {
 
         let log_state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
 
-        let (log, segment_mapping) = Log::open(
+        let (mut log, segment_mapping) = Log::open(
             &root,
             now,
             cfg.segment_max_bytes,
@@ -237,6 +253,10 @@ impl Keratin {
             log_state.clone(),
             cfg.adaptive_staging,
         )?;
+
+        if let (Some(runtime), Some(snapshot)) = (runtime, runtime_snapshot) {
+            log.attach_runtime(runtime, snapshot);
+        }
 
         log_state.tail.store(log.next_offset(), Ordering::SeqCst); // add getter or read field
         // Recovery baseline: authoritatively establish the frontier at startup.

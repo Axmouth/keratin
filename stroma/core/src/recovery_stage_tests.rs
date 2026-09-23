@@ -191,6 +191,62 @@ async fn stage_supports_empty_zero_and_compacted_boundaries() {
 }
 
 #[tokio::test]
+async fn stage_adopts_runtime_policy_on_open_and_resume() {
+    let dir = keratin_log::test_dir!("recovery_stage_runtime");
+    let runtime = Arc::new(
+        keratin_log::LogRuntimeSettings::new(keratin_log::LogRuntimeConfig {
+            segment_preallocate_bytes: 0,
+        })
+        .unwrap(),
+    );
+    let st = Stroma::open_with_runtime(
+        &dir.root,
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+        SnapshotConfig::default(),
+        runtime.clone(),
+    )
+    .await
+    .unwrap();
+    let (spec, snapshot, records) = fixture(5, 8);
+    runtime
+        .replace(
+            0,
+            keratin_log::LogRuntimeConfig {
+                segment_preallocate_bytes: 4096,
+            },
+        )
+        .unwrap();
+    let stage = st
+        .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
+        .await
+        .unwrap();
+    assert!(runtime.logs().iter().any(
+        |log| log.root.to_string_lossy().contains("recovery-staging") && log.applied.revision == 1
+    ));
+    stage.append(page(&spec, &records)).await.unwrap();
+    let receipt = stage.finish().await.unwrap();
+    drop(stage);
+    runtime
+        .replace(
+            1,
+            keratin_log::LogRuntimeConfig {
+                segment_preallocate_bytes: 0,
+            },
+        )
+        .unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec, Default::default())
+        .await
+        .unwrap();
+    assert_eq!(stage.finish().await.unwrap(), receipt);
+    assert!(runtime.logs().iter().any(
+        |log| log.root.to_string_lossy().contains("recovery-staging") && log.applied.revision == 2
+    ));
+    drop(stage);
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn stage_rejects_wrong_pages_and_enforces_budget_across_resume() {
     let dir = keratin_log::test_dir!("recovery_stage_validation");
     let st = open(&dir.root).await;
