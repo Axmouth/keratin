@@ -1327,9 +1327,11 @@ fn stage_reqs(
     let now_ms = crate::util::unix_millis();
 
     let mut total_bytes: usize = 0;
+    let mut successful_bytes = 0u64;
 
     for r in reqs {
-        total_bytes = total_bytes.saturating_add(r.records.bytes_len());
+        let request_bytes = r.records.bytes_len();
+        total_bytes = total_bytes.saturating_add(request_bytes);
 
         let dur = r.durability.unwrap_or(cfg.default_durability);
         let completion = r.completion;
@@ -1353,6 +1355,7 @@ fn stage_reqs(
 
         match result {
             Ok((ar, end_offset)) => {
+                successful_bytes = successful_bytes.saturating_add(request_bytes as u64);
                 // Report the assigned offset as early as possible (staged, pre-ack).
                 // A oneshot send is a non-blocking store plus a waker, safe on the
                 // writer thread. The durability ack still flows through `completion`.
@@ -1388,6 +1391,7 @@ fn stage_reqs(
         }
     }
 
+    state.local_append_bytes.fetch_add(successful_bytes, Ordering::Relaxed);
     total_bytes
 }
 

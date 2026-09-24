@@ -73,7 +73,7 @@ mod checkpoint_install;
 mod checkpoint_capture;
 #[path = "agreed_checkpoint.rs"]
 mod agreed_checkpoint;
-pub use agreed_checkpoint::{QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits};
+pub use agreed_checkpoint::{QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits};
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {

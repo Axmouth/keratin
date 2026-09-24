@@ -450,6 +450,12 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
+    /// Approximate local append content bytes since this log was opened. Excludes
+    /// replicated appends and framing. Resets on reopen; grants no durability proof.
+    pub fn local_append_bytes(&self) -> u64 {
+        self.log_state.local_append_bytes.load(Ordering::Relaxed)
+    }
+
     pub fn next_offset(&self) -> u64 {
         self.log_state.tail.load(Ordering::Acquire)
     }

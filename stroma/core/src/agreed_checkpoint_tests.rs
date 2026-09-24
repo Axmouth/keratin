@@ -755,3 +755,26 @@ async fn missing_agreed_capsule_falls_back_but_corruption_cannot_authorize_recov
         st.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test]
+async fn activity_hint_does_not_materialize_and_observes_local_append_work() {
+    let dir = keratin_log::test_dir!("checkpoint_activity_hint");
+    let st = open(&dir.root).await;
+    assert!(st.queue_checkpoint_activity("q", 0, None).is_none());
+    admitted(&st).await;
+    publish(&st, 2).await;
+    let activity = tokio::time::timeout(std::time::Duration::from_secs(1), async {
+        loop {
+            let activity = st.queue_checkpoint_activity("q", 0, None).unwrap();
+            if activity.local_append_bytes >= 1024 { break activity; }
+            tokio::task::yield_now().await;
+        }
+    }).await.unwrap();
+    assert_eq!(activity.message_next, 2);
+    assert!(activity.event_next > 0);
+    assert!(activity.local_append_bytes >= 1024);
+    st.shutdown().await.unwrap();
+    let reopened = open(&dir.root).await;
+    assert!(reopened.queue_checkpoint_activity("q", 0, None).is_none());
+    reopened.shutdown().await.unwrap();
+}

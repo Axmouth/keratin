@@ -73,6 +73,8 @@ pub struct LogState {
     pub(crate) diagnostics: Arc<Mutex<LogDiagnostics>>,
     pub head: Arc<AtomicU64>, // inclusive; first available offset (0 initially)
     pub tail: Arc<AtomicU64>, // next offset to assign (exclusive)
+    /// Successful local append content bytes in this open instance; scheduling hint only.
+    pub(crate) local_append_bytes: Arc<AtomicU64>,
     // Exclusive durable frontier, published through a typed wrapper so the
     // empty-vs-"offset 0 durable" encoding lives in one place. See
     // `DurableWatermark` and `Log::durable_end_exclusive`.
@@ -105,6 +107,7 @@ impl LogState {
             diagnostics: Arc::new(Mutex::new(LogDiagnostics::default())),
             head: Arc::new(AtomicU64::new(head)),
             tail: Arc::new(AtomicU64::new(tail)),
+            local_append_bytes: Arc::new(AtomicU64::new(0)),
             durable: DurableWatermark::new(durable),
             epoch: Arc::new(AtomicU64::new(0)),
         }

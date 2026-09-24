@@ -18,6 +18,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Added non-materializing checkpoint activity hints (log ranges and per-open local
+  append content bytes). Hints are approximate scheduling/diagnostic values and
+  grant no durability or history authority.
+
 - Durable queue checkpoint pins and canonical same-cut capsules with bounded
   replay/physical verification, compaction retention and atomic replacement.
   Externally authorized acceptance persists a covering restart snapshot before

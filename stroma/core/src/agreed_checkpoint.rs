@@ -8,6 +8,32 @@ use std::{
     io::{Read, Write},
 };
 
+/// Cheap, non-atomic scheduling hints from an already materialized queue.
+/// No snapshot, disk reads or actor pause; never use these values as evidence.
+#[derive(Debug, Clone, Copy, Serialize)]
+pub struct QueueCheckpointActivity {
+    pub event_head: u64,
+    pub event_next: u64,
+    pub message_head: u64,
+    pub message_next: u64,
+    pub local_append_bytes: u64,
+    pub event_epoch: u64,
+}
+impl Stroma {
+    pub fn queue_checkpoint_activity(&self, topic: &str, part: u32, group: Option<&str>) -> Option<QueueCheckpointActivity> {
+        let current = self.queue_handles.load();
+        let h = slot_lookup_no_alloc(current.as_ref(), topic, part, group)?.handle.get()?;
+        Some(QueueCheckpointActivity {
+            event_head: h.event_log().head_offset(),
+            event_next: h.event_log().next_offset(),
+            message_head: h.msg_log().head_offset(),
+            message_next: h.msg_log().next_offset(),
+            local_append_bytes: h.msg_log().local_append_bytes().saturating_add(h.event_log().local_append_bytes()),
+            event_epoch: h.event_log().current_epoch(),
+        })
+    }
+}
+
 const MAGIC: &[u8; 8] = b"QCPIN\0\0\x01";
 const MAX_INDEX: usize = 65_536;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
