@@ -10,7 +10,7 @@ use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File},
-    io::{self, BufReader, Read},
+    io::{self, BufReader, Read, Seek, SeekFrom},
     path::{Path, PathBuf},
 };
 
@@ -24,8 +24,9 @@ pub struct FrozenLogReader {
     active: u64,
 }
 
-/// Sequential, read-only cursor over an externally sealed log. The caller must
-/// keep the log frozen and verify a full content digest before accepting a scan.
+/// Sequential, read-only cursor over an externally stable log range. Its
+/// constructor requires either a frozen log or an externally retained durable
+/// prefix. Keep that guarantee through the scan and verify its content digest.
 /// Retains one file buffer and bounded record scratch, never the full history.
 pub struct FrozenLogCursor {
     entries: Vec<(u64, PathBuf)>,
@@ -37,9 +38,84 @@ pub struct FrozenLogCursor {
     next: u64,
     bytes: Vec<u8>,
     failed: bool,
+    scanned_bytes: u64,
+    scan_budget: u64,
 }
 
 impl FrozenLogCursor {
+    pub fn scanned_bytes(&self) -> u64 {
+        self.scanned_bytes
+    }
+
+    /// Internal constructor for an externally retained durable prefix. Sparse
+    /// index entries are seek hints; headers, CRCs and exact record offsets are
+    /// still verified. The byte budget includes skipped records before `head`.
+    pub(crate) fn durable_prefix(
+        segments: BTreeMap<u64, PathBuf>,
+        head: u64,
+        next: u64,
+        scan_budget: u64,
+    ) -> io::Result<Self> {
+        if head > next || scan_budget == 0 {
+            return Err(invalid("invalid durable scan range or budget"));
+        }
+        if head == next {
+            return Ok(Self {
+                entries: vec![],
+                segment: 0,
+                file: None,
+                segment_end: next,
+                expected: next,
+                head,
+                next,
+                bytes: vec![],
+                failed: false,
+                scanned_bytes: 0,
+                scan_budget,
+            });
+        }
+        let first = *segments
+            .range(..=head)
+            .next_back()
+            .ok_or_else(|| invalid("missing durable prefix segment"))?
+            .0;
+        let entries: Vec<_> = segments
+            .into_iter()
+            .filter(|(base, _)| *base >= first && *base < next)
+            .collect();
+        let path = &entries[0].1;
+        let mut file = File::open(path)?;
+        read_segment_header(&mut file, first)?;
+        let (expected, position) = match index_hint(&path.with_extension("idx"), first, head) {
+            Ok(hint) => hint,
+            Err(error) => {
+                // Indexes are optional acceleration, not evidence. An absent or
+                // damaged hint falls back to the original strict physical scan;
+                // its extra work is still charged to the caller's byte budget.
+                tracing::warn!(path=%path.display(), %error, "retained scan ignoring unavailable index hint");
+                (first, LOG_HEADER_LEN as u64)
+            }
+        };
+        if position < LOG_HEADER_LEN as u64 || position >= file.metadata()?.len() {
+            return Err(invalid("durable prefix index points outside its segment"));
+        }
+        file.seek(SeekFrom::Start(position))?;
+        let segment_end = entries.get(1).map(|(base, _)| *base).unwrap_or(next);
+        Ok(Self {
+            entries,
+            segment: 1,
+            file: Some(BufReader::with_capacity(64 * 1024, file)),
+            segment_end,
+            expected,
+            head,
+            next,
+            bytes: vec![],
+            failed: false,
+            scanned_bytes: 0,
+            scan_budget,
+        })
+    }
+
     /// A returned record borrows scratch storage until the next read. CRC and
     /// exact offsets are checked for every record, including a retained prefix
     /// before `head` in its first segment. No disk repair is performed.
@@ -97,6 +173,13 @@ impl FrozenLogCursor {
                 .ok_or_else(|| invalid("frozen record length overflow"))?;
             if total > MAX_FROZEN_RECORD_BYTES || total > max_record_bytes {
                 return Err(invalid("frozen record exceeds recovery allocation limit"));
+            }
+            self.scanned_bytes = self
+                .scanned_bytes
+                .checked_add(total as u64)
+                .ok_or_else(|| invalid("durable cursor byte count overflow"))?;
+            if self.scanned_bytes > self.scan_budget {
+                return Err(invalid("durable cursor scan budget exhausted"));
             }
             if total > self.bytes.capacity() {
                 self.bytes.reserve_exact(total - self.bytes.len());
@@ -192,6 +275,27 @@ impl FrozenLogReader {
         })
     }
 
+    /// Verify the logical retained range, seeking past a discarded prefix using
+    /// index hints. Every retained record still passes CRC and continuity checks.
+    /// The caller supplies an externally stable manifest and verifies its digest.
+    pub fn into_retained_cursor(self) -> io::Result<FrozenLogCursor> {
+        if self.head == self.next {
+            return self.into_cursor();
+        }
+        FrozenLogCursor::durable_prefix(self.segments, self.head, self.next, u64::MAX)
+    }
+
+    pub fn scan_retained(
+        self,
+        mut visit: impl FnMut(DecodedRecord<'_>) -> io::Result<()>,
+    ) -> io::Result<()> {
+        let mut cursor = self.into_retained_cursor()?;
+        while let Some(record) = cursor.next_record(MAX_FROZEN_RECORD_BYTES)? {
+            visit(record)?;
+        }
+        Ok(())
+    }
+
     /// Start one sequential traversal of the exact frozen retained range.
     pub fn into_cursor(self) -> io::Result<FrozenLogCursor> {
         if self.head == self.next {
@@ -210,6 +314,8 @@ impl FrozenLogReader {
                 next: self.next,
                 bytes: vec![],
                 failed: false,
+                scanned_bytes: 0,
+                scan_budget: u64::MAX,
             });
         }
         let first = *self
@@ -233,6 +339,8 @@ impl FrozenLogReader {
             next: self.next,
             bytes: vec![],
             failed: false,
+            scanned_bytes: 0,
+            scan_budget: u64::MAX,
         })
     }
 
@@ -322,4 +430,44 @@ pub(crate) fn read_segment_header(file: &mut File, expected_base: u64) -> io::Re
         return Err(invalid("corrupt frozen segment header"));
     }
     Ok(())
+}
+
+fn index_hint(path: &Path, base: u64, target: u64) -> io::Result<(u64, u64)> {
+    use crate::index::{IDX_ENTRY_LEN, IDX_HEADER_LEN, IDX_MAGIC, IDX_VERSION};
+    let mut file = File::open(path)?;
+    let mut header = [0u8; IDX_HEADER_LEN as usize];
+    file.read_exact(&mut header)?;
+    let end = header.len() - 4;
+    if &header[..8] != IDX_MAGIC
+        || u16::from_be_bytes(header[8..10].try_into().unwrap()) != IDX_VERSION
+        || u32::from_be_bytes(header[12..16].try_into().unwrap()) != IDX_HEADER_LEN
+        || u64::from_be_bytes(header[16..24].try_into().unwrap()) != base
+        || u16::from_be_bytes(header[32..34].try_into().unwrap()) != IDX_ENTRY_LEN as u16
+        || crc32c::crc32c(&header[..end]) != u32::from_be_bytes(header[end..].try_into().unwrap())
+    {
+        return Err(invalid("corrupt durable prefix index header"));
+    }
+    // A concurrently appended, incomplete entry is outside this snapshot.
+    let mut high =
+        file.metadata()?.len().saturating_sub(IDX_HEADER_LEN as u64) / IDX_ENTRY_LEN as u64;
+    let mut low = 0;
+    let mut best = (base, LOG_HEADER_LEN as u64);
+    while low < high {
+        let mid = low + (high - low) / 2;
+        file.seek(SeekFrom::Start(
+            IDX_HEADER_LEN as u64 + mid * IDX_ENTRY_LEN as u64,
+        ))?;
+        let mut entry = [0u8; IDX_ENTRY_LEN];
+        file.read_exact(&mut entry)?;
+        let off = base
+            .checked_add(u32::from_be_bytes(entry[..4].try_into().unwrap()) as u64)
+            .ok_or_else(|| invalid("durable prefix index offset overflow"))?;
+        if off <= target {
+            best = (off, u64::from_be_bytes(entry[8..16].try_into().unwrap()));
+            low = mid + 1;
+        } else {
+            high = mid;
+        }
+    }
+    Ok(best)
 }

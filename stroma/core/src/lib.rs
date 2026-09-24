@@ -37,6 +37,7 @@ pub use state::{
 };
 pub use stream_state::RetentionConfig;
 pub use stroma::{
+    QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits,
     DestroyOutcome, DiskUsedBreakdownEntry, EnqueuedStreamAppend, EvictOutcome,
     FollowerStateCheckpointInstall, FollowerStateCheckpointInstallOutcome, GlobalDLQ,
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,

@@ -71,6 +71,9 @@ pub use recovery_stage::{QueueRecoveryStage, QueueRecoveryStageSpec, QueueRecove
 mod checkpoint_install;
 #[path = "stroma/checkpoint_capture.rs"]
 mod checkpoint_capture;
+#[path = "agreed_checkpoint.rs"]
+mod agreed_checkpoint;
+pub use agreed_checkpoint::{QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits};
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {
@@ -3040,6 +3043,7 @@ impl Stroma {
         stroma
             .write_snapshots_for_partition(tp, part, group, applied_upto)
             .await?;
+        let (safe_msg_truncate, applied_upto) = stroma.checkpoint_retention_limits(&qh, safe_msg_truncate, applied_upto).await?;
         let event_log = qh.event_log();
         let event_head = event_log
             .truncate_before(applied_upto)
@@ -3198,29 +3202,7 @@ impl Stroma {
             fs::create_dir_all(parent).map_err(io_err)?;
         }
 
-        // file format (big endian):
-        // magic 8: b"SSNAP\0\0\0"
-        // ver u16: 1 (legacy inclusive), 2 (exact exclusive)
-        // reserved u16
-        // event boundary u64
-        // blob_len u32
-        // blob bytes
-        // crc32c u32 over (ver..blob)
-        const MAGIC: &[u8; 8] = b"SSNAP\0\0\0";
-
-        let mut payload = Vec::with_capacity(2 + 2 + 8 + 4 + blob.len());
-        payload.extend_from_slice(&version.to_be_bytes());
-        payload.extend_from_slice(&0u16.to_be_bytes());
-        payload.extend_from_slice(&boundary.to_be_bytes());
-        payload.extend_from_slice(&(blob.len() as u32).to_be_bytes());
-        payload.extend_from_slice(blob);
-
-        let crc = crc32c::crc32c(&payload);
-
-        let mut out = Vec::with_capacity(8 + payload.len() + 4);
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&payload);
-        out.extend_from_slice(&crc.to_be_bytes());
+        let out = Self::queue_snapshot_envelope(version, boundary, blob)?;
 
         // write temp + fsync + rename
         {
@@ -3249,6 +3231,35 @@ impl Stroma {
             }
         }
         Ok(())
+    }
+
+    pub(super) fn queue_snapshot_envelope(version: u16, boundary: u64, blob: &[u8]) -> Result<Vec<u8>> {
+        // file format (big endian):
+        // magic 8: b"SSNAP\0\0\0"
+        // ver u16: 1 (legacy inclusive), 2 (exact exclusive)
+        // reserved u16
+        // event boundary u64
+        // blob_len u32
+        // blob bytes
+        // crc32c u32 over (ver..blob)
+        const MAGIC: &[u8; 8] = b"SSNAP\0\0\0";
+
+        let blob_len = u32::try_from(blob.len()).map_err(|_| StromaError::InvalidArgument("snapshot is too large".into()))?;
+        let mut payload = Vec::with_capacity(2 + 2 + 8 + 4 + blob.len());
+        payload.extend_from_slice(&version.to_be_bytes());
+        payload.extend_from_slice(&0u16.to_be_bytes());
+        payload.extend_from_slice(&boundary.to_be_bytes());
+        payload.extend_from_slice(&blob_len.to_be_bytes());
+        payload.extend_from_slice(blob);
+
+        let crc = crc32c::crc32c(&payload);
+
+        let mut out = Vec::with_capacity(8 + payload.len() + 4);
+        out.extend_from_slice(MAGIC);
+        out.extend_from_slice(&payload);
+        out.extend_from_slice(&crc.to_be_bytes());
+
+        Ok(out)
     }
 
     fn read_queue_snapshot(&self, path: &Path) -> Result<Option<(checkpoint_capture::SnapshotBoundary, Vec<u8>)>> {
@@ -5626,6 +5637,7 @@ impl Stroma {
         let qh = ticket.resolve()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
+        let (before, _) = self.checkpoint_retention_limits(&qh, before, u64::MAX).await?;
         qh.msg_log().truncate_before(before).await.map_err(io_err)
     }
 
@@ -5866,6 +5878,7 @@ impl Stroma {
         let tp = qh.topic();
         let part = qh.partition();
         let group = qh.group();
+        let (tp_msg_floor, before_event) = self.checkpoint_retention_limits(&qh, u64::MAX, before_event).await?;
         let event_log = qh.event_log();
         let event_head = event_log
             .truncate_before(before_event)
@@ -5888,7 +5901,7 @@ impl Stroma {
             None => 0,
         };
         let msg_head = msg_log
-            .truncate_before(safe_msg_truncate)
+            .truncate_before(safe_msg_truncate.min(tp_msg_floor))
             .await
             .map_err(io_err)?;
         tracing::info!(

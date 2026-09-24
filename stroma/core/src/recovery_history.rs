@@ -32,6 +32,8 @@ struct Receipt {
     stream: bool,
     request: RecoverySealRequest,
     history: RetainedHistoryIdentity,
+    #[serde(default)]
+    checkpoint_snapshot: bool,
 }
 
 impl RetainedHistoryIdentity {
@@ -50,32 +52,17 @@ fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
     let end = log.next_offset();
     hash.update(&next.to_be_bytes());
     hash.update(&end.to_be_bytes());
-    let reader = log.reader();
-    while next < end {
-        // Read disk rather than a cache that could hide damage since sealing.
-        let records = reader.scan_from_disk(next, 64).map_err(io_err)?;
-        if records.is_empty() {
-            return Err(StromaError::Corruption(format!(
-                "sealed log missing offset {next}"
-            )));
-        }
-        for record in records {
-            if record.offset != next || next >= end {
-                return Err(StromaError::Corruption(format!(
-                    "sealed log discontinuity at {next}"
-                )));
-            }
-            hash.update(&record.offset.to_be_bytes());
-            hash.update(&record.flags.to_be_bytes());
-            // Storage append timestamps differ between replicas. Identity covers
-            // the replicated record, including its application headers.
-            hash.update(&(record.headers.len() as u64).to_be_bytes());
-            hash.update(&record.headers);
-            hash.update(&(record.payload.len() as u64).to_be_bytes());
-            hash.update(&record.payload);
-            next += 1;
-        }
+    let mut cursor = log.retained_durable_cursor(log.current_epoch(), next, end, u64::MAX).map_err(io_err)?;
+    while let Some(record) = cursor.next_record(keratin_log::MAX_FROZEN_RECORD_BYTES).map_err(io_err)? {
+        hash.update(&record.offset.to_be_bytes());
+        hash.update(&record.flags.to_be_bytes());
+        hash.update(&(record.headers.len() as u64).to_be_bytes());
+        hash.update(record.headers);
+        hash.update(&(record.payload.len() as u64).to_be_bytes());
+        hash.update(record.payload);
+        next += 1;
     }
+    if next != end { return Err(StromaError::Corruption("sealed log ended before durable boundary".into())); }
     Ok(*hash.finalize().as_bytes())
 }
 
@@ -110,6 +97,13 @@ fn read_receipt(path: &Path) -> Result<Option<Receipt>> {
 }
 
 impl Stroma {
+    pub(super) fn recovery_snapshot_path(&self, topic: &str, part: u32, group: Option<&str>) -> Result<PathBuf> {
+        let root = self.snap_dir(topic, part, group);
+        let receipt = read_receipt(&root.join("recovery.history"))?
+            .ok_or_else(|| StromaError::Corruption("sealed snapshot has no receipt".into()))?;
+        Ok(if receipt.checkpoint_snapshot { root.join("recovery.snapshot") } else { self.snap_file(topic, part, group) })
+    }
+
     pub(super) fn require_retained_history(
         &self,
         topic: &str,
@@ -169,13 +163,28 @@ impl Stroma {
     ) -> Result<RetainedHistoryIdentity> {
         let path = self.snap_dir(topic, part, group).join("recovery.history");
         let stream = self.read_partition_kind(topic, part, group) == PartitionKind::Stream;
-        let snapshot = self.snap_file(topic, part, group);
-        // Validate the snapshot envelope as well as identifying its exact bytes.
+        let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
+        let agreed = if stream { None } else {
+            self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages, events)?
+        };
+        let checkpoint_snapshot = agreed.is_some();
+        let snapshot = if let Some(bytes) = agreed {
+            let root = self.snap_dir(topic, part, group);
+            let target = root.join("recovery.snapshot");
+            let temporary = root.join("recovery.snapshot.pending");
+            let mut file = fs::OpenOptions::new().create(true).truncate(true).write(true).open(&temporary).map_err(io_err)?;
+            file.write_all(&bytes).map_err(io_err)?;
+            file.sync_all().map_err(io_err)?;
+            drop(file);
+            fs::rename(&temporary, &target).map_err(io_err)?;
+            recovery_seal::sync_directories(&root)?;
+            target
+        } else { self.snap_file(topic, part, group) };
+        // Validate the selected envelope and bind its exact bytes to the seal.
         let snapshot_digest = match self.read_queue_snapshot(&snapshot)? {
             Some(_) => Some(*blake3::hash(&fs::read(snapshot).map_err(io_err)?).as_bytes()),
             None => None,
         };
-        let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
         let mut history = RetainedHistoryIdentity {
             version: if storage_history.is_some() { 2 } else { 1 },
             storage_history,
@@ -202,6 +211,7 @@ impl Stroma {
             stream,
             request,
             history: history.clone(),
+            checkpoint_snapshot,
         };
         if let Some(old) = read_receipt(&path)? {
             if old != receipt {

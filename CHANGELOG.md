@@ -18,6 +18,16 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Durable queue checkpoint pins and canonical same-cut capsules with bounded
+  replay/physical verification, compaction retention and atomic replacement.
+  Externally authorized acceptance persists a covering restart snapshot before
+  exact logical log floors; sealed recovery can use the accepted capsule plus
+  retained suffix. Missing capsules use ordinary verified snapshots, while corrupt
+  evidence is refused. Publication boundaries have fault and SIGKILL tests.
+- Strict indexed cursors for externally retained durable prefixes and frozen
+  logical ranges. Every retained record still requires CRC and contiguous offsets;
+  sparse indexes are seek hints and bounded scan costs include skipped records.
+
 - Frozen-log forks with private active tails and metadata, immutable closed-segment
   sharing on Unix, and copy fallback when linking is unavailable. Repair and
   unclean-open truncation privatize shared files before mutation. Stroma recovery

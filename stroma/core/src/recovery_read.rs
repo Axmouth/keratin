@@ -95,7 +95,7 @@ impl RecoverySequentialRead {
             self.cursor = Some(
                 FrozenLogReader::open(root, request.seal.fence_epoch, head, end)
                     .map_err(io_err)?
-                    .into_cursor()
+                    .into_retained_cursor()
                     .map_err(io_err)?,
             );
             self.source = Some(request.source);
@@ -397,7 +397,7 @@ impl Stroma {
                         let mut used = 0usize;
                         let mut full = false;
                         reader
-                            .scan(|record| {
+                            .scan_retained(|record| {
                                 hash.update(&record.offset.to_be_bytes());
                                 hash.update(&record.flags.to_be_bytes());
                                 hash.update(&(record.headers.len() as u64).to_be_bytes());
@@ -439,7 +439,7 @@ impl Stroma {
                 }
                 if !sequential || request.source == RecoveryReadSource::Snapshot {
                     read_snapshot(
-                        &stroma.snap_file(&topic, part, group.as_deref()),
+                        &stroma.recovery_snapshot_path(&topic, part, group.as_deref())?,
                         &history,
                         &request,
                         &mut page,

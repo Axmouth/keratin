@@ -106,6 +106,11 @@ pub enum WriterCmd {
         before: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
     },
+    AdvanceRetainedHead {
+        before: u64,
+        epoch: u64,
+        respond_to: oneshot::Sender<io::Result<u64>>,
+    },
     ResetToCheckpoint {
         next_offset: u64,
         expected_epoch: Option<u64>,
@@ -463,6 +468,21 @@ impl Keratin {
         crate::FrozenLogReader::open_live(&self.root, self.current_epoch(), self.head_offset(), next)
     }
 
+    /// Strict disk scan of an externally pinned, fully durable prefix while
+    /// appends continue. The caller must keep this instance alive and prevent
+    /// truncation/reset/repair of the range through the entire scan. This API
+    /// grants no retention or history authority. Sparse indexes only locate the
+    /// first record; CRCs, exact offsets and a total byte budget remain enforced.
+    pub fn retained_durable_cursor(
+        &self, epoch: u64, head: u64, next: u64, max_scan_bytes: u64,
+    ) -> io::Result<crate::FrozenLogCursor> {
+        if self.current_epoch() != epoch || head < self.head_offset() || head > next
+            || next > self.log_state.durable.load().first_non_durable()
+        { return Err(io::Error::other("retained scan exceeds durable history or has stale epoch")); }
+        let segments = self.segment_mapping.read().clone();
+        crate::FrozenLogCursor::durable_prefix(segments, head, next, max_scan_bytes)
+    }
+
     pub fn durable_offset(&self) -> u64 {
         // The watermark is the exclusive durable frontier (count of durable
         // records). Convert back to an inclusive offset for this public accessor.
@@ -573,6 +593,16 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    /// Discard a prefix only after a covering external checkpoint is durable.
+    /// Unlike segment-granular retention this can advance inside an active file.
+    /// Cancellation does not retract an already queued command.
+    pub async fn advance_retained_head(&self, before: u64, epoch: u64) -> io::Result<u64> {
+        let (respond_to, rx) = oneshot::channel();
+        self.tx.send(WriterCmd::AdvanceRetainedHead { before, epoch, respond_to })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     pub async fn truncate_before(&self, before: u64) -> std::io::Result<u64> {

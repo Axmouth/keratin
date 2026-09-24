@@ -698,3 +698,91 @@ async fn sequential_frozen_cursor_cannot_resume_after_a_read_error() {
     assert!(fresh.next_record(1024).unwrap().is_none());
     log.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn retained_durable_cursor_seeks_suffix_and_stays_bounded_while_appending() {
+    let dir = test_dir!("retained_prefix_cursor");
+    let mut cfg = KeratinConfig::test_default();
+    cfg.index_stride_bytes = 128;
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    log.append_batch((0..1000).map(|n: u64| message(n.to_be_bytes().to_vec())).collect(), Some(KDurability::AfterFsync)).await.unwrap();
+    let epoch = log.current_epoch();
+    assert!(log.retained_durable_cursor(epoch + 1, 990, 1000, 4096).is_err());
+    assert!(log.retained_durable_cursor(epoch, 990, 1001, 4096).is_err());
+    let mut cursor = log.retained_durable_cursor(epoch, 990, 1000, 4096).unwrap();
+    log.append_batch(vec![message(b"later".to_vec())], Some(KDurability::AfterFsync)).await.unwrap();
+    let mut offsets = vec![];
+    while let Some(r) = cursor.next_record(1024).unwrap() {
+        offsets.push(r.offset);
+        assert_eq!(r.payload, &r.offset.to_be_bytes());
+    }
+    assert_eq!(offsets, (990..1000).collect::<Vec<_>>());
+    assert!(cursor.scanned_bytes() < 4096);
+    let mut limited = log.retained_durable_cursor(epoch, 990, 1000, 1).unwrap();
+    assert!(limited.next_record(1024).is_err());
+    assert!(limited.next_record(1024).is_err());
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_durable_cursor_checks_crc_despite_warm_cache_and_bad_index() {
+    let dir = test_dir!("retained_prefix_corrupt");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    let payload = b"checkpoint-physical-payload".to_vec();
+    log.append_batch(vec![message(payload.clone())], Some(KDurability::AfterFsync)).await.unwrap();
+    let segment = dir.root.join("segments/00000000000000000000.log");
+    let bytes = std::fs::read(&segment).unwrap();
+    let at = bytes.windows(payload.len()).position(|w| w == payload).unwrap();
+    let mut file = OpenOptions::new().write(true).open(&segment).unwrap();
+    file.seek(SeekFrom::Start(at as u64)).unwrap(); file.write_all(&[payload[0] ^ 1]).unwrap(); file.sync_all().unwrap();
+    let mut cursor = log.retained_durable_cursor(log.current_epoch(), 0, 1, 4096).unwrap();
+    assert!(cursor.next_record(1024).is_err());
+    let index = dir.root.join("segments/00000000000000000000.idx");
+    let mut file = OpenOptions::new().write(true).open(index).unwrap();
+    file.write_all(b"damaged!").unwrap(); file.sync_all().unwrap();
+    let mut cursor = log.retained_durable_cursor(log.current_epoch(), 0, 1, 4096).unwrap();
+    assert!(cursor.next_record(1024).is_err());
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn checkpoint_logical_floor_survives_reopen_and_segment_retention() {
+    let dir = test_dir!("checkpoint_logical_floor");
+    let mut cfg = KeratinConfig::test_default();
+    cfg.segment_max_bytes = 4096;
+    let log = Keratin::open(&dir.root, cfg.clone()).await.unwrap();
+    log.append_batch((0..100).map(|n: u64| message(n.to_be_bytes().to_vec())).collect(), Some(KDurability::AfterFsync)).await.unwrap();
+    let epoch = log.current_epoch();
+    assert!(log.advance_retained_head(101, epoch).await.is_err());
+    assert!(log.advance_retained_head(80, epoch + 1).await.is_err());
+    assert_eq!(log.advance_retained_head(80, epoch).await.unwrap(), 80);
+    assert_eq!(log.head_offset(), 80);
+    assert!(log.advance_retained_head(79, epoch).await.is_err());
+    log.truncate_before(81).await.unwrap();
+    assert!(log.head_offset() >= 80);
+    log.shutdown().await.unwrap();
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    assert_eq!(log.head_offset(), 80);
+    assert_eq!(log.next_offset(), 100);
+    log.append_batch(vec![message(b"after restart".to_vec())], Some(KDurability::AfterFsync)).await.unwrap();
+    let mut cursor = log.retained_durable_cursor(log.current_epoch(), 80, 101, 8192).unwrap();
+    let mut offsets = vec![];
+    while let Some(r) = cursor.next_record(1024).unwrap() { offsets.push(r.offset); }
+    assert_eq!(offsets, (80..101).collect::<Vec<_>>());
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn retained_durable_cursor_missing_index_falls_back_with_same_integrity_budget() {
+    let dir = test_dir!("retained_prefix_missing_index");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default()).await.unwrap();
+    log.append_batch((0..10).map(|n: u64| message(n.to_be_bytes().to_vec())).collect(), Some(KDurability::AfterFsync)).await.unwrap();
+    std::fs::remove_file(dir.root.join("segments/00000000000000000000.idx")).unwrap();
+    let mut cursor = log.retained_durable_cursor(log.current_epoch(), 9, 10, 4096).unwrap();
+    assert_eq!(cursor.next_record(1024).unwrap().unwrap().offset, 9);
+    assert!(cursor.scanned_bytes() > 10 * 8);
+    assert!(cursor.next_record(1024).unwrap().is_none());
+    let mut limited = log.retained_durable_cursor(log.current_epoch(), 9, 10, 100).unwrap();
+    assert!(limited.next_record(1024).is_err());
+    log.shutdown().await.unwrap();
+}

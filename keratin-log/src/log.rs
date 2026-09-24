@@ -1451,7 +1451,7 @@ impl Log {
         self.store_manifest()?;
         crate::shared_segment::boundary("source-sealed");
         let mut cursor =
-            crate::FrozenLogReader::open(&self.root, epoch, head, next)?.into_cursor()?;
+            crate::FrozenLogReader::open(&self.root, epoch, head, next)?.into_retained_cursor()?;
         while cursor
             .next_record(crate::MAX_FROZEN_RECORD_BYTES)?
             .is_some()
@@ -1501,10 +1501,31 @@ impl Log {
 
     /// Delete whole sealed segments whose max offset < `before`.
     /// NOTE: v0 is *segment-granular* retention. It will not trim inside the active segment.
+    /// Advance an exact logical floor covered by an external durable checkpoint.
+    /// The caller must serialize checkpoint publication and retain its snapshot.
+    pub(crate) fn advance_retained_head(&mut self, before: u64, epoch: u64) -> io::Result<u64> {
+        if epoch != self.current_epoch() || before > self.next_offset || before < self.manifest.head_offset {
+            return Err(io::Error::new(io::ErrorKind::InvalidInput, "checkpoint floor differs from current epoch or retained bounds"));
+        }
+        self.flush_buffers()?;
+        self.fsync()?;
+        self.manifest.next_offset = self.next_offset;
+        // Publish the durable logical floor before any physical removal. Reopen
+        // must never resurrect a discarded prefix after interrupted reclamation.
+        self.manifest.head_offset = before;
+        self.manifest.store_atomic(&self.root)?;
+        self.log_state.head.store(before, Ordering::Release);
+        self.truncate_before_inner(before, true)
+    }
+
     pub fn truncate_before(&mut self, before: u64) -> io::Result<u64> {
+        self.truncate_before_inner(before, false)
+    }
+
+    fn truncate_before_inner(&mut self, before: u64, reclaim: bool) -> io::Result<u64> {
         // Nothing to do
         let cur_head = self.manifest.head_offset; // add this to manifest
-        if before <= cur_head {
+        if before <= cur_head && !reclaim {
             return Ok(cur_head);
         }
 
@@ -1597,7 +1618,8 @@ impl Log {
             .first()
             .map(|(v, _)| v)
             .copied()
-            .unwrap_or(self.next_offset);
+            .unwrap_or(self.next_offset)
+            .max(cur_head);
 
         // Persist + publish head
         self.manifest.head_offset = new_head;

@@ -150,7 +150,7 @@ impl Stroma {
         Ok(())
     }
 
-    fn checkpoint_boundary(&self, _boundary: &'static str) -> Result<()> {
+    pub(super) fn checkpoint_boundary(&self, _boundary: &'static str) -> Result<()> {
         #[cfg(test)]
         {
             if std::env::var("STROMA_CHECKPOINT_CRASH_BOUNDARY").as_deref() == Ok(_boundary) {
