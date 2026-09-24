@@ -192,9 +192,9 @@ fn resume_with_hook(root: &Path, mut after: impl FnMut(u8) -> io::Result<()>) ->
     }
     after(0)?;
     let segments = root.join("segments");
-    let boundary = OpenOptions::new()
-        .write(true)
-        .open(segments.join(format!("{:020}.log", repair.base)))?;
+    let boundary_path = segments.join(format!("{:020}.log", repair.base));
+    crate::shared_segment::make_private(&boundary_path)?;
+    let boundary = OpenOptions::new().write(true).open(boundary_path)?;
     boundary.set_len(repair.pos)?;
     boundary.sync_all()?;
     after(1)?;

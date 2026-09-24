@@ -13,6 +13,8 @@ mod record;
 mod recovery;
 pub mod reusable_buffer;
 mod segment;
+mod shared_segment;
+pub use shared_segment::FrozenForkStats;
 mod suffix_repair;
 mod tail_cache;
 pub mod util;

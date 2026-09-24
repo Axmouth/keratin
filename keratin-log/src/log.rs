@@ -537,7 +537,11 @@ impl Log {
                 None => scan_last_good(seg.file_ref(), header_len, 64 * 1024)?,
             };
             if scan.last_good_pos < seg.bytes_written {
-                // truncate partial tail
+                // No writable descriptor to a shared inode may survive this barrier.
+                drop(seg);
+                crate::shared_segment::make_private(&log_path)?;
+                let f = OpenOptions::new().read(true).write(true).open(&log_path)?;
+                seg = Segment::open(f, *base)?;
                 seg.set_len(scan.last_good_pos)?;
             }
             if let Some(last) = scan.last_offset {
@@ -1408,6 +1412,93 @@ impl Log {
         Ok(())
     }
 
+    /// Ordered writer barrier: retire the writable tail before linking closed files.
+    /// The caller owns an unreferenced destination and must keep this log sealed.
+    pub(crate) fn fork_frozen(
+        &mut self,
+        destination: &Path,
+        epoch: u64,
+        head: u64,
+        next: u64,
+    ) -> io::Result<crate::FrozenForkStats> {
+        if self.manifest.epoch != epoch
+            || self.manifest.head_offset != head
+            || self.next_offset != next
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "frozen fork boundary changed",
+            ));
+        }
+        if destination.exists() {
+            return Err(io::Error::new(
+                io::ErrorKind::AlreadyExists,
+                "frozen fork destination exists",
+            ));
+        }
+        self.flush_buffers()?;
+        self.fsync()?;
+        if self.active.base_offset != next {
+            self.roll(crate::util::unix_millis())?;
+        }
+        self.manifest.next_offset = next;
+        // Persist the downgrade fence before the first shared inode is exposed.
+        #[cfg(unix)]
+        {
+            self.manifest.shared_segments |=
+                self.segment_mapping.read().keys().any(|base| *base < next);
+        }
+        self.store_manifest()?;
+        crate::shared_segment::boundary("source-sealed");
+        let mut cursor =
+            crate::FrozenLogReader::open(&self.root, epoch, head, next)?.into_cursor()?;
+        while cursor
+            .next_record(crate::MAX_FROZEN_RECORD_BYTES)?
+            .is_some()
+        {}
+
+        std::fs::create_dir(destination)?;
+        std::fs::create_dir(destination.join("segments"))?;
+        std::fs::create_dir(destination.join("tmp"))?;
+        let mut stats = crate::FrozenForkStats::default();
+        for (&base, source) in self.segment_mapping.read().iter() {
+            if base == next {
+                continue;
+            }
+            let target = seg_log_path(destination, base);
+            let file = File::open(source)?;
+            file.sync_all()?;
+            let length = file.metadata()?.len();
+            #[cfg(unix)]
+            let shared = std::fs::hard_link(source, &target).is_ok();
+            #[cfg(not(unix))]
+            let shared = false;
+            if shared {
+                stats.shared_segments += 1;
+                stats.shared_bytes += length;
+                crate::shared_segment::boundary("linked");
+            } else {
+                std::fs::copy(source, &target)?;
+                File::open(&target)?.sync_all()?;
+                stats.copied_bytes += length;
+            }
+            let target_index = seg_idx_path(destination, base);
+            stats.copied_bytes += std::fs::copy(seg_idx_path(&self.root, base), &target_index)?;
+            File::open(target_index)?.sync_all()?;
+        }
+        create_segment_pair(destination, next, crate::util::unix_millis())?;
+        crate::shared_segment::boundary("target-tail");
+        crate::util::fsync_dir(&destination.join("segments"))?;
+        let mut manifest = self.manifest.clone();
+        manifest.clean_shutdown = true;
+        manifest.store_atomic(destination)?;
+        crate::shared_segment::boundary("target-manifest");
+        if let Some(parent) = destination.parent() {
+            crate::util::fsync_dir(parent)?;
+        }
+        Ok(stats)
+    }
+
     /// Delete whole sealed segments whose max offset < `before`.
     /// NOTE: v0 is *segment-granular* retention. It will not trim inside the active segment.
     pub fn truncate_before(&mut self, before: u64) -> io::Result<u64> {
@@ -1933,6 +2024,7 @@ fn create_segment_pair(
 ) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
+    crate::shared_segment::make_private(&log_path)?;
 
     let logf = OpenOptions::new()
         .create(true)
@@ -1959,6 +2051,7 @@ fn open_or_create_segment_pair(
 ) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
+    crate::shared_segment::make_private(&log_path)?;
 
     // TODO: reeval truncate
     let logf = OpenOptions::new()

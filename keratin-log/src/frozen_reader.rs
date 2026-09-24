@@ -148,7 +148,7 @@ impl FrozenLogReader {
             return Err(invalid("frozen read cannot bypass pending suffix repair"));
         }
         let mut file = File::open(Manifest::path(root))?;
-        if file.metadata()?.len() != 76 {
+        if !matches!(file.metadata()?.len(), 76 | 84) {
             return Err(invalid("invalid frozen manifest size"));
         }
         let manifest = Manifest::read_from(&mut file)?;

@@ -513,14 +513,19 @@ impl Stroma {
                 fs::remove_dir_all(&root).map_err(io_err)?;
             }
             let target = view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref());
-            let guard = tokio::task::spawn_blocking(move || {
+            let (guard, target) = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan(&guard, true)?;
-                copy_log(&guard.root.join("messages"), &target)?;
-                boundary("messages");
-                Ok::<_, StromaError>(guard)
+                if let Some(parent) = target.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                Ok::<_, StromaError>((guard, target))
             })
             .await
             .map_err(io_err)??;
+            let stats = guard.messages.fork_frozen(target, spec.fence_epoch, spec.message_head, spec.message_next)
+                .await.map_err(io_err)?;
+            tracing::info!(topic = spec.topic, partition = spec.partition,
+                shared_bytes = stats.shared_bytes, copied_bytes = stats.copied_bytes,
+                shared_segments = stats.shared_segments, "recovery installation reused staged payloads");
+            boundary("messages");
             let messages = view
                 .open_keratin(
                     view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
@@ -770,35 +775,6 @@ impl Stroma {
         .await
         .map_err(io_err)?
     }
-}
-fn copy_log(source: &Path, target: &Path) -> Result<()> {
-    copy_log_depth(source, target, 0)
-}
-fn copy_log_depth(source: &Path, target: &Path, depth: usize) -> Result<()> {
-    if depth > 8 {
-        return Err(invalid("staged log directory nesting exceeds limit"));
-    }
-    fs::create_dir_all(target).map_err(io_err)?;
-    for entry in fs::read_dir(source).map_err(io_err)? {
-        let entry = entry.map_err(io_err)?;
-        if entry.file_name() == ".keratin.lock" {
-            continue;
-        }
-        let dest = target.join(entry.file_name());
-        let kind = entry.file_type().map_err(io_err)?;
-        if kind.is_dir() {
-            copy_log_depth(&entry.path(), &dest, depth + 1)?;
-            continue;
-        }
-        if !kind.is_file() {
-            return Err(invalid("nonregular staged log entry"));
-        }
-        fs::copy(entry.path(), &dest).map_err(io_err)?;
-        fs::File::open(dest)
-            .and_then(|f| f.sync_all())
-            .map_err(io_err)?;
-    }
-    recovery_seal::sync_directories(target)
 }
 fn boundary(_name: &str) {
     #[cfg(test)]

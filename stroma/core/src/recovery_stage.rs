@@ -287,7 +287,23 @@ impl Stroma {
         snapshot: Vec<u8>,
         limits: RecoveryStageLimits,
     ) -> Result<QueueRecoveryStage> {
-        self.open_queue_recovery_stage_inner(spec, Some(snapshot), limits)
+        self.open_queue_recovery_stage_inner(spec, Some(snapshot), limits, None)
+            .await
+    }
+
+    /// Prefer exact, freshly sealed local payloads. Snapshot/authority checks and
+    /// installation receipts are unchanged; incompatible data uses transfer.
+    pub async fn open_queue_recovery_stage_reusing(
+        &self,
+        spec: QueueRecoveryStageSpec,
+        snapshot: Vec<u8>,
+        limits: RecoveryStageLimits,
+        seal: RecoverySealRequest,
+    ) -> Result<QueueRecoveryStage> {
+        if seal.fence_epoch != spec.fence_epoch {
+            return Err(invalid("reuse fence differs from stage"));
+        }
+        self.open_queue_recovery_stage_inner(spec, Some(snapshot), limits, Some(seal))
             .await
     }
 
@@ -298,8 +314,104 @@ impl Stroma {
         spec: QueueRecoveryStageSpec,
         limits: RecoveryStageLimits,
     ) -> Result<QueueRecoveryStage> {
-        self.open_queue_recovery_stage_inner(spec, None, limits)
+        self.open_queue_recovery_stage_inner(spec, None, limits, None)
             .await
+    }
+
+    async fn try_reuse_stage_messages(
+        &self,
+        intent: &Intent,
+        limits: RecoveryStageLimits,
+        seal: &RecoverySealRequest,
+        destination: PathBuf,
+    ) -> Result<bool> {
+        let s = &intent.spec;
+        let _lifecycle = self
+            .lock_partition_lifecycle(&s.topic, s.partition, s.group.as_deref())
+            .await;
+        if !self
+            .recovery_seal_path(&s.topic, s.partition, s.group.as_deref())
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Ok(false);
+        }
+        self.require_matching_recovery_seal(&s.topic, s.partition, s.group.as_deref(), seal)?;
+        self.ensure_checkpoint_not_pending(&s.topic, s.partition, s.group.as_deref())?;
+        let Some(receipt) =
+            self.durable_storage_history_receipt(&s.topic, s.partition, s.group.as_deref())?
+        else {
+            return Ok(false);
+        };
+        if receipt.stream || receipt.binding.resource_incarnation != s.binding.resource_incarnation
+        {
+            return Ok(false);
+        }
+        let handle = {
+            let current = self.queue_handles.load();
+            slot_lookup_no_alloc(&current, &s.topic, s.partition, s.group.as_deref())
+                .and_then(|slot| slot.handle.get().cloned())
+        };
+        let _apply = match &handle {
+            Some(handle) => Some(handle.follower_apply_state().await),
+            None => None,
+        };
+        let messages = match &handle {
+            Some(handle) => handle.msg_log(),
+            None => Arc::new(
+                self.open_keratin(
+                    self.msg_tp_part_dir(&s.topic, s.partition, s.group.as_deref()),
+                    self.keratin_cfg_msg,
+                    true,
+                )
+                .await
+                .map_err(io_err)?,
+            ),
+        };
+        let result = async {
+            if handle.is_none() {
+                messages.freeze();
+            }
+            if messages.role() != KeratinRole::Frozen {
+                return Err(invalid("sealed reuse source still has a writer role"));
+            }
+            if messages.current_epoch() != s.fence_epoch
+                || messages.head_offset() != s.message_head
+                || messages.next_offset() != s.message_next
+            {
+                return Ok(false);
+            }
+            let checked = messages.clone();
+            let expected = intent.clone();
+            let compatible =
+                tokio::task::spawn_blocking(move || scan_parts(&checked, &expected, limits, true))
+                    .await
+                    .map_err(io_err)?;
+            if let Err(error) = compatible {
+                tracing::info!(topic = s.topic, partition = s.partition, %error,
+                    "local retained payloads cannot be reused; using verified transfer");
+                return Ok(false);
+            }
+            let stats = messages
+                .fork_frozen(destination, s.fence_epoch, s.message_head, s.message_next)
+                .await
+                .map_err(io_err)?;
+            tracing::info!(
+                topic = s.topic,
+                partition = s.partition,
+                shared_bytes = stats.shared_bytes,
+                copied_bytes = stats.copied_bytes,
+                shared_segments = stats.shared_segments,
+                "recovery stage reused compatible retained payloads"
+            );
+            stage_boundary("reused-messages");
+            Ok(true)
+        }
+        .await;
+        if handle.is_none() {
+            messages.shutdown().await.map_err(io_err)?;
+        }
+        result
     }
 
     async fn open_queue_recovery_stage_inner(
@@ -307,6 +419,7 @@ impl Stroma {
         spec: QueueRecoveryStageSpec,
         snapshot: Option<Vec<u8>>,
         limits: RecoveryStageLimits,
+        reuse_seal: Option<RecoverySealRequest>,
     ) -> Result<QueueRecoveryStage> {
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
@@ -325,6 +438,7 @@ impl Stroma {
             .join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str());
         let cfg = self.keratin_cfg_msg;
         let runtime = self.log_runtime.clone();
+        let st = self.clone();
         tokio::spawn(async move {
             let read_root = root.clone();
             let (intent, encoded) = tokio::task::spawn_blocking(move || {
@@ -352,7 +466,7 @@ impl Stroma {
             .map_err(io_err)??;
             let setup_root = root.clone();
             let plan = intent.spec.plan;
-            let (lock, initialized, complete) = tokio::task::spawn_blocking(move || {
+            let (lock, mut initialized, complete) = tokio::task::spawn_blocking(move || {
                 if !resume_only {
                     fs::create_dir_all(&setup_root).map_err(io_err)?;
                     fs::OpenOptions::new()
@@ -384,6 +498,27 @@ impl Stroma {
             .map_err(io_err)??;
             if complete && !initialized {
                 return Err(corrupt("completed stage lost initialization marker"));
+            }
+            if !initialized {
+                // Only an unpublished attempt owned by this stage lock is disposable.
+                let unfinished = root.join("messages");
+                tokio::task::spawn_blocking(move || {
+                    if unfinished.try_exists().map_err(io_err)? {
+                        fs::remove_dir_all(unfinished).map_err(io_err)?;
+                    }
+                    Ok::<_, StromaError>(())
+                }).await.map_err(io_err)??;
+                if let Some(seal) = reuse_seal {
+                    if st.try_reuse_stage_messages(&intent, limits, &seal, root.join("messages")).await? {
+                        let initialized_root = root.clone();
+                        tokio::task::spawn_blocking(move || {
+                            persist_exact(&initialized_root.join("initialized"), &plan)?;
+                            stage_boundary("initialized");
+                            Ok::<_, StromaError>(())
+                        }).await.map_err(io_err)??;
+                        initialized = true;
+                    }
+                }
             }
             // Unfinished staging is not accepted history and can repair an
             // interrupted append. Completed data must never silently lose a tail.

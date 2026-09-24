@@ -116,6 +116,13 @@ pub enum WriterCmd {
         expected_epoch: u64,
         respond_to: oneshot::Sender<io::Result<()>>,
     },
+    ForkFrozen {
+        destination: PathBuf,
+        epoch: u64,
+        head: u64,
+        next: u64,
+        respond_to: oneshot::Sender<io::Result<crate::FrozenForkStats>>,
+    },
     AdvanceEpoch {
         epoch: u64,
         respond_to: oneshot::Sender<io::Result<u64>>,
@@ -511,6 +518,41 @@ impl Keratin {
 
     pub fn current_epoch(&self) -> u64 {
         self.log_state.epoch.load(Ordering::Acquire)
+    }
+
+    /// Fork an externally sealed log into a new, unreferenced directory.
+    ///
+    /// Closed segments may share storage; metadata, indexes and the writable tail
+    /// are private. The caller must serialize role changes, repair and retention
+    /// for this operation, and owns cleanup of an incomplete destination on error.
+    /// Once dispatched, cancellation does not cancel the writer-owned operation.
+    /// Keep the handle alive until completion; after abandoning the future, an
+    /// ordered `sync()` provides a barrier before cleanup or releasing ownership.
+    pub async fn fork_frozen(
+        &self,
+        destination: PathBuf,
+        epoch: u64,
+        head: u64,
+        next: u64,
+    ) -> io::Result<crate::FrozenForkStats> {
+        if self.role() != KeratinRole::Frozen {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "fork requires frozen log",
+            ));
+        }
+        let (respond_to, rx) = oneshot::channel();
+        self.tx
+            .send(WriterCmd::ForkFrozen {
+                destination,
+                epoch,
+                head,
+                next,
+                respond_to,
+            })
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     pub async fn advance_epoch(&self, epoch: u64) -> std::io::Result<u64> {

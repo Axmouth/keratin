@@ -9,7 +9,20 @@ tagged releases yet. Earlier history predates this changelog.
 
 ## [Unreleased]
 
+### Breaking changes
+
+- Recovery forks that share closed payload segments persist manifest version 3
+  before linking. Older binaries reject participating logs; this implementation
+  continues to read version 2. Unshared logs retain version 2. See
+  [recovery segment reuse](experiments/RECOVERY_SEGMENT_REUSE.md).
+
 ### Added
+
+- Frozen-log forks with private active tails and metadata, immutable closed-segment
+  sharing on Unix, and copy fallback when linking is unavailable. Repair and
+  unclean-open truncation privatize shared files before mutation. Stroma recovery
+  reuses exact, independently verified local payloads and completed stages while
+  retaining the existing seal, selected snapshot and quorum-admission boundaries.
 
 - Bounded sequential frozen-log cursors and tentative sealed-history inspection
   sessions. CRC, offset and final canonical-digest verification remain mandatory;

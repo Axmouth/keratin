@@ -972,6 +972,60 @@ fn writer_loop_inner(
                     tracing::info!("Error sending reset-to-checkpoint response");
                 }
             }
+            WriterCmd::ForkFrozen { destination, epoch, head, next, respond_to } => {
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    stage_reqs_then_post!(
+                        tracer,
+                        log,
+                        &cfg,
+                        &state,
+                        &mut pending,
+                        unstaged,
+                        &notify_tx,
+                        &mut last_fsync,
+                        fsync_interval,
+                        &fsync_tx,
+                        &fsync_done_rx,
+                        &mut inflight_fsyncs,
+                        &mut linger,
+                        linger_min,
+                        linger_max,
+                    );
+                }
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                let res = commit(
+                    log,
+                    &state,
+                    &mut pending,
+                    &mut last_fsync,
+                    &notify_tx,
+                    &fsync_tx,
+                    &fsync_done_rx,
+                    &mut inflight_fsyncs,
+                    cfg.max_inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                    #[cfg(feature = "writer-stage-trace")]
+                    work_id,
+                )
+                .and_then(|_| {
+                    wait_for_inflight_fsyncs(
+                        log,
+                        &state,
+                        &notify_tx,
+                        &fsync_done_rx,
+                        &mut inflight_fsyncs,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                    );
+                    log.fork_frozen(&destination, epoch, head, next)
+                });
+                if respond_to.send(res).is_err() {
+                    tracing::info!("Error sending frozen-fork response");
+                }
+            }
             WriterCmd::AdvanceEpoch { epoch, respond_to } => {
                 let unstaged = batcher.flush();
                 if !unstaged.is_empty() {

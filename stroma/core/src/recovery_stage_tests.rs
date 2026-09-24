@@ -669,3 +669,192 @@ async fn installation_sigkill_resumes_each_publication_boundary_without_old_sour
         st.shutdown().await.unwrap();
     }
 }
+
+async fn local_reuse_source(st: &Stroma, divergent: bool) -> RecoverySealRequest {
+    st.initialize_empty_storage_history(
+        "q",
+        0,
+        None,
+        PartitionKind::Queue,
+        StorageHistoryBinding {
+            resource_incarnation: [2; 16],
+            accepted_history: [7; 16],
+            writer_session: [8; 16],
+        },
+    )
+    .await
+    .unwrap();
+    st.ensure_queue_owner_epoch("q", 0, None, Some(7))
+        .await
+        .unwrap();
+    let ticket = st.queue_handle("q", 0, None).await.unwrap();
+    let handle = ticket.resolve().unwrap();
+    handle
+        .msg_log()
+        .append_batch(
+            (0..3)
+                .map(|off| keratin_log::Message {
+                    payload: vec![if divergent { 99 } else { off }],
+                    flags: 0,
+                    headers: vec![],
+                })
+                .collect(),
+            Some(KDurability::AfterFsync),
+        )
+        .await
+        .unwrap();
+    let seal = RecoverySealRequest {
+        transition: [9; 32],
+        fence_epoch: 8,
+    };
+    st.seal_replica_for_recovery("q", 0, None, seal.clone())
+        .await
+        .unwrap();
+    seal
+}
+
+#[tokio::test]
+async fn reuse_checks_actual_payloads_and_installs_private_writable_tail() {
+    use std::os::unix::fs::MetadataExt;
+    for cold in [false, true] {
+        for divergent in [false, true] {
+            let dir = keratin_log::test_dir!("stage_local_reuse");
+            let mut st = open(&dir.root).await;
+            let seal = local_reuse_source(&st, divergent).await;
+            let source = st.msg_tp_part_dir("q", 0, None);
+            if cold {
+                st.shutdown().await.unwrap();
+                drop(st);
+                st = open(&dir.root).await;
+            }
+            let (spec, snapshot, records) = fixture(0, 3);
+            let stage = st
+                .open_queue_recovery_stage_reusing(
+                    spec.clone(),
+                    snapshot,
+                    Default::default(),
+                    seal.clone(),
+                )
+                .await
+                .unwrap();
+            let prefix = "segments/00000000000000000000.log";
+            if divergent {
+                assert_eq!(stage.next_offset().await, 0);
+                stage.append(page(&spec, &records)).await.unwrap();
+            } else {
+                assert_eq!(stage.next_offset().await, 3);
+                assert_eq!(
+                    fs::metadata(source.join(prefix)).unwrap().ino(),
+                    fs::metadata(stage.inner.lock().await.root.join("messages").join(prefix))
+                        .unwrap()
+                        .ino()
+                );
+            }
+            stage.finish().await.unwrap();
+            let original = fs::read(source.join(prefix)).unwrap();
+            let installed = st
+                .install_queue_recovery_stage(spec.clone(), seal, &stage)
+                .await
+                .unwrap();
+            let destination = st.msg_tp_part_dir("q", 0, None);
+            assert_eq!(
+                fs::metadata(destination.join(prefix)).unwrap().ino(),
+                fs::metadata(stage.inner.lock().await.root.join("messages").join(prefix))
+                    .unwrap()
+                    .ino()
+            );
+            st.admit_prepared_queue_recovery(installed).await.unwrap();
+            st.ensure_queue_owner_epoch("q", 0, None, Some(8))
+                .await
+                .unwrap();
+            let ticket = st.queue_handle("q", 0, None).await.unwrap();
+            let handle = ticket.resolve().unwrap();
+            handle
+                .msg_log()
+                .append_batch(
+                    vec![keratin_log::Message {
+                        payload: vec![42],
+                        flags: 0,
+                        headers: vec![],
+                    }],
+                    Some(KDurability::AfterFsync),
+                )
+                .await
+                .unwrap();
+            assert_eq!(fs::read(source.join(prefix)).unwrap(), original);
+            assert_eq!(stage.next_offset().await, 3);
+            assert_eq!(
+                stage
+                    .read_completed_messages(0, 10, 1024)
+                    .await
+                    .unwrap()
+                    .records,
+                records
+            );
+            st.shutdown().await.unwrap();
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reuse_crash_child() {
+    let Some(root) = std::env::var_os("STROMA_REUSE_CRASH_ROOT") else {
+        return;
+    };
+    let st = open(Path::new(&root)).await;
+    let seal = local_reuse_source(&st, false).await;
+    let (spec, snapshot, _) = fixture(0, 3);
+    st.open_queue_recovery_stage_reusing(spec, snapshot, Default::default(), seal)
+        .await
+        .unwrap();
+    panic!("expected reuse interruption");
+}
+
+#[tokio::test]
+async fn reuse_resumes_after_kill_before_and_after_initialized_marker() {
+    for boundary in ["reused-messages", "initialized"] {
+        let dir = keratin_log::test_dir!("reuse_sigkill");
+        let ready = dir.root.join("ready");
+        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stroma::recovery_stage::tests::reuse_crash_child",
+                "--nocapture",
+            ])
+            .env("STROMA_REUSE_CRASH_ROOT", &dir.root)
+            .env("STROMA_STAGE_CRASH_BOUNDARY", boundary)
+            .env("STROMA_STAGE_CRASH_READY", &ready)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap();
+        let reached = tokio::time::timeout(Duration::from_secs(15), async {
+            loop {
+                if ready.exists() {
+                    return true;
+                }
+                if child.try_wait().unwrap().is_some() {
+                    return false;
+                }
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        })
+        .await;
+        let _ = child.kill();
+        child.wait().unwrap();
+        assert!(matches!(reached, Ok(true)), "{boundary}");
+        let st = open(&dir.root).await;
+        let (spec, snapshot, _) = fixture(0, 3);
+        let seal = RecoverySealRequest {
+            transition: [9; 32],
+            fence_epoch: 8,
+        };
+        let stage = st
+            .open_queue_recovery_stage_reusing(spec.clone(), snapshot, Default::default(), seal)
+            .await
+            .unwrap();
+        assert_eq!(stage.next_offset().await, 3);
+        stage.finish().await.unwrap();
+        assert!(st.queue_handle("q", 0, None).await.is_err());
+        st.shutdown().await.unwrap();
+    }
+}
