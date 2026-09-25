@@ -18,6 +18,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Recovery limit errors carry bounded numeric diagnostics for inspection, replay,
+  snapshot output and staging budgets. Reports identify accepted work and refused
+  work without payloads. The limits and recovery authority remain unchanged.
+
 - Read-only, bounded node storage accounting distinguishes active files,
   agreed-checkpoint artifacts, inactive generations, recovery staging and other
   files. Unix counts allocated blocks and deduplicates hard links. Traversal runs

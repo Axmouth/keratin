@@ -1,4 +1,5 @@
 //! Bounded pages from sealed storage, verified without opening ordinary writers.
+use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use super::*;
 use keratin_log::{FrozenLogReader, lock_existing_log};
 use std::io::Read;
@@ -134,7 +135,7 @@ impl RecoverySequentialRead {
             let size = 18 + record.headers.len() + record.payload.len();
             if size > request.max_bytes as usize - used {
                 if page.records.is_empty() {
-                    return Err(invalid("next recovery record exceeds page byte budget"));
+                    return Err(invalid(&Limit::message(Budget::RecordBytes, request.max_bytes as u64, 0, size as u64)));
                 }
                 self.pending = Some(record);
                 break;
@@ -412,7 +413,7 @@ impl Stroma {
                                         if page.records.is_empty() {
                                             return Err(io::Error::new(
                                                 io::ErrorKind::InvalidInput,
-                                                "next recovery record exceeds page byte budget",
+                                                Limit::message(Budget::RecordBytes, request.max_bytes as u64, 0, size as u64),
                                             ));
                                         }
                                         full = true;

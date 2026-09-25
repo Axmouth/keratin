@@ -2,6 +2,7 @@
 //! Only the sealed inspector can finish this evidence: it first verifies every
 //! transferred record against the resource-bound receipt. No actor is queried.
 
+use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_event, hash_record};
 use crate::{QueueInternalState, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
 use std::collections::BTreeSet;
@@ -152,7 +153,7 @@ impl QueueReplay {
         // entries; ranges stay compressed and are never expanded into offsets.
         let cost = len as u64;
         if cost > limits.operations_per_replica {
-            return Err("checkpoint exceeds recovery replay operation budget".into());
+            return Err(Limit::message(Budget::ReplayOperations, limits.operations_per_replica, 0, cost));
         }
         let mut state = QueueInternalState::new(topic.into(), partition);
         let meta = state
@@ -226,7 +227,7 @@ impl QueueReplay {
                 _ => 0,
             };
         if work > self.remaining {
-            return Err("recovery replay operation budget exhausted".into());
+            return Err(Limit::message(Budget::ReplayOperations, self.operations + self.remaining, self.operations, work));
         }
         self.remaining -= work;
         self.operations += work;
@@ -335,7 +336,7 @@ impl QueueReplay {
         let (evidence, state) = self.finish_parts()?;
         let state_snapshot = state.into_recovery_snapshot(evidence.event_next);
         if state_snapshot.len() > max_bytes {
-            return Err("recovery snapshot exceeds artifact output limit".into());
+            return Err(Limit::message(Budget::ArtifactBytes, max_bytes as u64, 0, state_snapshot.len() as u64));
         }
         // Confirm the existing snapshot codec preserves the exact projected
         // state, including optional values that might otherwise be normalized.

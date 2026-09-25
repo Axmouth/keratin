@@ -1,6 +1,7 @@
 //! Non-serving recovery staging. Transferred payloads use a separate native log;
 //! no active partition path, receipt, role or seal is changed by these methods.
 use super::*;
+use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::QueueInternalState;
 use keratin_log::{KeratinReplicaExt, ReplicatedAppendOutcome, lock_existing_log};
 use std::io::{Read, Write};
@@ -158,15 +159,21 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
         ]
         .contains(&[0; 16])
         || s.message_head > s.message_next
-        || s.message_next - s.message_head > limits.max_records
         || limits.max_bytes == 0
         || intent.snapshot.is_empty()
-        || intent.snapshot.len() > MAX_SNAPSHOT
-        || *blake3::hash(&intent.snapshot).as_bytes() != s.snapshot_digest
     {
         return Err(invalid(
             "invalid recovery staging identity, snapshot or budget",
         ));
+    }
+    if s.message_next - s.message_head > limits.max_records {
+        return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.message_next - s.message_head)));
+    }
+    if intent.snapshot.len() > MAX_SNAPSHOT {
+        return Err(invalid(Limit::message(Budget::SnapshotBytes, MAX_SNAPSHOT as u64, 0, intent.snapshot.len() as u64)));
+    }
+    if *blake3::hash(&intent.snapshot).as_bytes() != s.snapshot_digest {
+        return Err(invalid("recovery staging snapshot digest mismatch"));
     }
     let mut state = QueueInternalState::new(s.topic.clone(), s.partition);
     let meta = state.load_snapshot(&intent.snapshot).map_err(decode_err)?;
@@ -249,7 +256,7 @@ pub(super) fn scan_parts(
                 .checked_add(bytes)
                 .ok_or_else(|| io::Error::other("staged byte count overflow"))?;
             if used > limits.max_bytes {
-                return Err(io::Error::other("staged payload budget exceeded"));
+                return Err(io::Error::other(Limit::message(Budget::StageBytes, limits.max_bytes, used - bytes, bytes)));
             }
             let hash_record = |h: &mut blake3::Hasher| {
                 h.update(&record.offset.to_be_bytes());
@@ -717,15 +724,13 @@ impl QueueRecoveryStage {
             || bytes > MAX_PAGE
             || page.from > next
             || !duplicate && page.from != next
-            || !duplicate
-                && guard
-                    .used
-                    .checked_add(bytes)
-                    .is_none_or(|n| n > guard.limits.max_bytes)
         {
             return Err(invalid(
                 "recovery page differs from staging identity, boundary or budget",
             ));
+        }
+        if !duplicate && guard.used.checked_add(bytes).is_none_or(|n| n > guard.limits.max_bytes) {
+            return Err(invalid(Limit::message(Budget::StageBytes, guard.limits.max_bytes, guard.used, bytes)));
         }
         tokio::spawn(async move {
             let records = page

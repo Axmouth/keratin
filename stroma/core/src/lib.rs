@@ -6,6 +6,7 @@ mod ordered_apply;
 mod replication;
 mod replication_diagnostics;
 pub mod recovery_inspection;
+pub mod recovery_budget;
 pub mod recovery_replay;
 mod state;
 // Some stream-engine helpers (cursor introspection, retention axes) are wired in

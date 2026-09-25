@@ -1,6 +1,7 @@
 //! Explicit diagnostics over sealed retained histories. No source selection or
 //! activation authority is produced, including when every shared record matches.
 
+use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::{
     RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
     RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent,
@@ -395,7 +396,7 @@ impl RecoveryPairInspector {
         if let Some(plan) = &self.checkpoint_replay {
             for (i, side) in [RecoverySide::Left, RecoverySide::Right].into_iter().enumerate() {
                 if !plan.done[i] {
-                    if self.pages >= self.limits.total_pages { return Err("recovery inspection page budget exhausted".into()); }
+                    if self.pages >= self.limits.total_pages { return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1)); }
                     return Ok(Some((side, RecoveryReadRequest {
                         seal: self.seals[i].request.clone(), history_id: self.seals[i].history.id,
                         source: RecoveryReadSource::Snapshot, from: plan.buffers[i].len() as u64,
@@ -412,7 +413,7 @@ impl RecoveryPairInspector {
             let log = &self.logs[index];
             if let Some(side) = log.next_side() {
                 if self.pages >= self.limits.total_pages {
-                    return Err("recovery inspection page budget exhausted".into());
+                    return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1));
                 }
                 let seal = &self.seals[side.index()];
                 return Ok(Some((
@@ -455,12 +456,17 @@ impl RecoveryPairInspector {
             let bytes = page.snapshot_bytes.len() as u64;
             if side != expected_side || page.history_id != request.history_id
                 || page.source != request.source || page.from != request.from
-                || !page.records.is_empty() || page.end > plan.max_bytes as u64
+                || !page.records.is_empty()
                 || page.end < 28 || page.next <= page.from || page.next > page.end
                 || page.next - page.from != bytes || bytes > request.max_bytes as u64
-                || bytes > self.limits.total_bytes - self.bytes
                 || plan.ends[i].is_some_and(|end| end != page.end)
             { return Err("checkpoint page identity, range or budget mismatch".into()); }
+            if page.end > plan.max_bytes as u64 {
+                return Err(Limit::message(Budget::SnapshotBytes, plan.max_bytes as u64, 0, page.end));
+            }
+            if bytes > self.limits.total_bytes - self.bytes {
+                return Err(Limit::message(Budget::InspectionBytes, self.limits.total_bytes, self.bytes, bytes));
+            }
             plan.ends[i] = Some(page.end);
             plan.buffers[i].extend(page.snapshot_bytes);
             plan.done[i] = page.next == page.end;
@@ -501,11 +507,14 @@ impl RecoveryPairInspector {
                 .and_then(|n| n.checked_add(record.payload.len() as u64))
                 .ok_or("recovery inspection byte overflow")?;
         }
-        if bytes > request.max_bytes as u64
-            || bytes > self.limits.total_bytes - self.bytes
-            || page.records.len() as u64 > self.limits.total_records - self.records
-        {
-            return Err("recovery inspection record/byte budget exhausted".into());
+        if bytes > request.max_bytes as u64 {
+            return Err("recovery inspection page exceeds requested byte bound".into());
+        }
+        if bytes > self.limits.total_bytes - self.bytes {
+            return Err(Limit::message(Budget::InspectionBytes, self.limits.total_bytes, self.bytes, bytes));
+        }
+        if page.records.len() as u64 > self.limits.total_records - self.records {
+            return Err(Limit::message(Budget::InspectionRecords, self.limits.total_records, self.records, page.records.len() as u64));
         }
         for record in &page.records {
             hash_record(&mut cursor.hash, record);
@@ -1312,13 +1321,15 @@ mod tests {
                 1 => limits.total_records = 1,
                 _ => limits.total_bytes = 1,
             }
-            assert!(
-                run(
-                    inspector(left.clone(), left.clone(), limits),
-                    [[&msg, &[]], [&msg, &[]]]
-                )
-                .is_err()
-            );
+            let error = run(
+                inspector(left.clone(), left.clone(), limits),
+                [[&msg, &[]], [&msg, &[]]]
+            ).unwrap_err();
+            let budget = Limit::from_message(&error).unwrap();
+            assert_eq!(budget.budget, [Budget::InspectionPages, Budget::InspectionRecords, Budget::InspectionBytes][case]);
+            assert_eq!(budget.limit, 1);
+            assert!(budget.requested > budget.limit - budget.completed);
+            assert!(!budget.unchanged_retry_can_help);
         }
     }
 
