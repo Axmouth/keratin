@@ -458,6 +458,11 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         .install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
         .await
         .unwrap();
+    // Accounting observes the routed generation without admitting the queue.
+    let usage = st.recovery_disk_usage().await.unwrap();
+    assert!(usage.active_bytes > 0);
+    assert!(usage.retained_bytes > 0);
+    assert!(usage.staging_bytes > 0);
     // Simulate a visible pointer whose directory-sync response was lost before
     // the in-memory route was published. An identical retry repairs admission.
     st.recovery_routes.clear();

@@ -18,6 +18,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Read-only, bounded node storage accounting distinguishes active files,
+  agreed-checkpoint artifacts, inactive generations, recovery staging and other
+  files. Unix counts allocated blocks and deduplicates hard links. Traversal runs
+  on a blocking worker with one process-wide permit and never admits a queue.
+
 - Added non-materializing checkpoint activity hints (log ranges and per-open local
   append content bytes). Hints are approximate scheduling/diagnostic values and
   grant no durability or history authority.

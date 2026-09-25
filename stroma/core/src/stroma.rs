@@ -50,6 +50,9 @@ use crate::{
 // re-export so existing `stroma_core::` and `crate::stroma::` paths keep resolving
 // (clustering-module separation).
 pub use crate::replication::*;
+#[path = "recovery_disk.rs"]
+mod recovery_disk;
+pub use recovery_disk::RecoveryDiskUsage;
 #[path = "storage_history.rs"]
 mod storage_history;
 pub use storage_history::{PreparedStorageHistory, StorageHistoryBinding};
