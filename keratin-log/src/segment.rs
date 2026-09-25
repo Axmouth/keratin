@@ -120,6 +120,9 @@ impl Segment {
         // file end is past the data (zero padding).
         let start = self.bytes_written;
         self.file.seek(SeekFrom::Start(start))?;
+        #[cfg(feature = "io-fault-injection")]
+        crate::io_fault_injection::write_all(&mut self.file, data)?;
+        #[cfg(not(feature = "io-fault-injection"))]
         self.file.write_all(data)?;
         self.bytes_written += data.len() as u64;
         Ok(start)

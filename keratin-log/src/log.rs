@@ -95,6 +95,9 @@ impl FsyncJob {
 
     pub(crate) fn sync(&self) -> io::Result<Duration> {
         let started = Instant::now();
+        #[cfg(feature = "io-fault-injection")]
+        crate::io_fault_injection::sync_data(&self.active)?;
+        #[cfg(not(feature = "io-fault-injection"))]
         self.active.sync_data()?;
         self.index.sync_data()?;
         Ok(started.elapsed())

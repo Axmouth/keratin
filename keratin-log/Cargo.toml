@@ -4,6 +4,8 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+# Test-only file-operation faults. Never enable in deployed binaries.
+io-fault-injection = []
 early-replication-experiment = []
 default = []
 writer-stage-trace = []

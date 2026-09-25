@@ -1,3 +1,5 @@
+#[cfg(feature = "io-fault-injection")]
+pub mod io_fault_injection;
 mod batcher;
 mod config;
 mod runtime_config;
