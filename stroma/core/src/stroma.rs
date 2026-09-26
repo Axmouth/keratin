@@ -63,21 +63,32 @@ mod recovery_seal;
 pub use recovery_history::RetainedHistoryIdentity;
 #[path = "recovery_read.rs"]
 mod recovery_read;
-pub use recovery_read::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord, RecoverySequentialRead};
-#[path = "recovery_stage.rs"]
-mod recovery_stage;
+pub use recovery_read::{
+    RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
+    RecoverySequentialRead,
+};
 #[path = "recovery_install.rs"]
 mod recovery_install;
+#[path = "recovery_stage.rs"]
+mod recovery_stage;
 pub use recovery_install::PreparedQueueRecovery;
-pub use recovery_stage::{QueueRecoveryStage, QueueRecoveryStageSpec, QueueRecoveryStageReceipt, RecoveryStageLimits};
-#[path = "checkpoint_install.rs"]
-mod checkpoint_install;
-#[path = "stroma/checkpoint_capture.rs"]
-mod checkpoint_capture;
+pub use recovery_stage::{
+    QueueRecoveryStage, QueueRecoveryStageReceipt, QueueRecoveryStageSpec, RecoveryStageLimits,
+};
 #[path = "agreed_checkpoint.rs"]
 mod agreed_checkpoint;
-pub use agreed_checkpoint::{QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits};
+#[path = "stroma/checkpoint_capture.rs"]
+mod checkpoint_capture;
+#[path = "checkpoint_install.rs"]
+mod checkpoint_install;
+#[path = "replication_retention.rs"]
+mod replication_retention;
+pub use agreed_checkpoint::{
+    QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointBuildLimits,
+    QueueCheckpointCapsule, QueueCheckpointContents, QueueCheckpointPin, QueueCheckpointTarget,
+};
 pub use recovery_seal::{RecoverySealRequest, SealedReplicaFrontiers};
+pub use replication_retention::QueueReplicationRetention;
 
 pub(crate) fn io_err(e: impl std::fmt::Display) -> StromaError {
     StromaError::Io(e.to_string())
@@ -810,7 +821,10 @@ pub struct Stroma {
     recovery_routes: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), recovery_install::Route>>,
     // A new storage instance cannot inherit writer admission from an old process.
     storage_session: [u8; 16],
+    reseed_views: Arc<DashMap<[u8; 32], Stroma>>,
+    retired_view: Arc<AtomicBool>,
     admitted_histories: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), StorageHistoryBinding>>,
+    replication_retention: Arc<std::sync::RwLock<Option<Arc<dyn QueueReplicationRetention>>>>,
 
     /// Per-partition-key lifecycle lock. Serializes the operations that OPEN or
     /// CLOSE a partition's Keratin logs - building a handle (queue_handle cold
@@ -931,7 +945,10 @@ impl Stroma {
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
             recovery_routes: Arc::new(DashMap::new()),
             storage_session: *uuid::Uuid::now_v7().as_bytes(),
+            reseed_views: Arc::new(DashMap::new()),
+            retired_view: Arc::new(AtomicBool::new(false)),
             admitted_histories: Arc::new(DashMap::new()),
+            replication_retention: Arc::new(std::sync::RwLock::new(None)),
             global_dlq: Arc::new(RwLock::new(None)),
             metrics: metrics.clone(),
             deadline_waker: Arc::new(Notify::new()),
@@ -3914,12 +3931,16 @@ impl Stroma {
         use futures::stream::{FuturesUnordered, StreamExt};
 
         // Step 1: atomically take ownership of all queues
-        let old = self.queue_handles.swap(Arc::new(hashbrown::HashMap::new()));
+        let mut registries = vec![self.queue_handles.swap(Arc::new(hashbrown::HashMap::new()))];
+        for view in self.reseed_views.iter() {
+            registries.push(view.queue_handles.swap(Arc::new(hashbrown::HashMap::new())));
+        }
+        self.reseed_views.clear();
 
         // Step 2: stop per-queue background work before draining queue actors.
         // Snapshot tasks can otherwise enqueue work while shutdown is trying to
         // drain the same queue, which is especially visible in slow CI runs.
-        for (_key, slot) in old.iter() {
+        for (_key, slot) in registries.iter().flat_map(|registry| registry.iter()) {
             if let Some(q) = slot.handle.get() {
                 q.cancel_background_tasks();
             }
@@ -3927,7 +3948,7 @@ impl Stroma {
 
         // Step 3: shutdown everything from the old snapshot
         let mut futs = FuturesUnordered::new();
-        for (_key, slot) in old.iter() {
+        for (_key, slot) in registries.iter().flat_map(|registry| registry.iter()) {
             if let Some(q) = slot.handle.get() {
                 let q = q.clone();
                 futs.push(async move {

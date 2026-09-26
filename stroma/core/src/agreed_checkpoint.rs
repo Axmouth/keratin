@@ -534,7 +534,16 @@ impl Stroma {
             h.partition(),
             h.group().map(str::to_owned),
         );
+        let storage = self.clone();
+        let protects_followers = h.role() == QueueRole::Owner;
         tokio::task::spawn_blocking(move || {
+            let (replica_message, replica_event) = if protects_followers {
+                storage.replication_retention_limits(&topic, part, group.as_deref())?
+            } else {
+                (u64::MAX, u64::MAX)
+            };
+            let message = message.min(replica_message);
+            let event = event.min(replica_event);
             let index = load_index(&root, &topic, part, group.as_deref())?;
             Ok(index.pins.values().fold((message, event), |(m, e), pin| {
                 let accepted = index.accepted.as_ref().filter(|a| a.attempt == pin.attempt);

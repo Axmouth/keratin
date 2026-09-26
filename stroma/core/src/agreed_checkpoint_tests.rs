@@ -1,15 +1,32 @@
 use super::*;
 
+#[derive(Debug)]
+struct NoLaggingReplicas;
+impl QueueReplicationRetention for NoLaggingReplicas {
+    fn retained_from(
+        &self,
+        _: &str,
+        _: u32,
+        _: Option<&str>,
+        _: Option<&StorageHistoryBinding>,
+    ) -> Result<(u64, u64)> {
+        Ok((u64::MAX, u64::MAX))
+    }
+}
+
 async fn open(root: &Path) -> Stroma {
     let mut config = KeratinConfig::test_default();
     config.segment_max_bytes = 1024;
-    Stroma::open(
+    let st = Stroma::open(
         root,
         StromaKeratinConfig::from_message_log(config),
         SnapshotConfig::default(),
     )
     .await
-    .unwrap()
+    .unwrap();
+    // These tests isolate durable checkpoint pins with no lagging live replicas.
+    st.set_queue_replication_retention(Arc::new(NoLaggingReplicas));
+    st
 }
 async fn admitted(st: &Stroma) -> PreparedStorageHistory {
     let storage = st
