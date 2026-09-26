@@ -1,6 +1,9 @@
-//! Experimental ordering of durable applications; disk appends remain concurrent.
+//! Ordered durable application. Disk appends remain concurrent.
 //! Abandoning an admitted operation poisons the sequence until recovery.
-use std::sync::{Arc, Mutex};
+use std::{
+    collections::BTreeMap,
+    sync::{Arc, Mutex},
+};
 use tokio::sync::Notify;
 
 #[derive(Debug)]
@@ -14,6 +17,7 @@ struct State {
     next: u64,
     active: bool,
     failed: bool,
+    waiters: BTreeMap<u64, Vec<Arc<Notify>>>,
 }
 
 impl OrderedApply {
@@ -24,6 +28,7 @@ impl OrderedApply {
                 next,
                 active: false,
                 failed: false,
+                waiters: BTreeMap::new(),
             }),
             changed: Notify::new(),
         })
@@ -34,7 +39,12 @@ impl OrderedApply {
         s.next = next;
         s.active = false;
         s.failed = false;
+        let waiters = std::mem::take(&mut s.waiters)
+            .into_values()
+            .flatten()
+            .collect();
         drop(s);
+        wake(waiters);
         self.changed.notify_waiters();
     }
     pub(crate) fn scope(self: &Arc<Self>) -> Scope {
@@ -106,11 +116,51 @@ impl CheckpointPermit {
 impl Drop for CheckpointPermit {
     fn drop(&mut self) {
         let mut s = self.order.state.lock().unwrap();
-        if s.generation == self.generation {
+        let waiters = if s.generation == self.generation {
             s.active = false;
-        }
+            ready_waiters(&mut s)
+        } else {
+            Vec::new()
+        };
         drop(s);
+        wake(waiters);
         self.order.changed.notify_waiters();
+    }
+}
+
+// Wake the next range and stale duplicate ranges, not every future operation.
+// Checkpoint waiters use the separate boundary notification above.
+fn ready_waiters(s: &mut State) -> Vec<Arc<Notify>> {
+    let mut ready = Vec::new();
+    while s
+        .waiters
+        .first_key_value()
+        .is_some_and(|(first, _)| *first <= s.next)
+    {
+        ready.extend(s.waiters.pop_first().unwrap().1);
+    }
+    ready
+}
+fn wake(waiters: Vec<Arc<Notify>>) {
+    for waiter in waiters {
+        waiter.notify_one();
+    }
+}
+struct WaitRegistration {
+    order: Arc<OrderedApply>,
+    first: u64,
+    changed: Arc<Notify>,
+}
+impl Drop for WaitRegistration {
+    fn drop(&mut self) {
+        let mut s = self.order.state.lock().unwrap();
+        if let Some(waiters) = s.waiters.get_mut(&self.first) {
+            // Identity matters across reset and re-registration at the same offset.
+            waiters.retain(|n| !Arc::ptr_eq(n, &self.changed));
+            if waiters.is_empty() {
+                s.waiters.remove(&self.first);
+            }
+        }
     }
 }
 
@@ -126,10 +176,7 @@ impl Scope {
             .filter(|_| count > 0)
             .ok_or_else(|| crate::StromaError::Io("invalid ordered application range".into()))?;
         loop {
-            let changed = self.order.changed.notified();
-            tokio::pin!(changed);
-            changed.as_mut().enable();
-            {
+            let registration = {
                 let mut s = self.order.state.lock().unwrap();
                 if s.generation != self.generation || s.failed || first < s.next {
                     return Err(crate::StromaError::Io(
@@ -145,8 +192,17 @@ impl Scope {
                         complete: false,
                     });
                 }
-            }
-            changed.await;
+                let changed = Arc::new(Notify::new());
+                s.waiters.entry(first).or_default().push(changed.clone());
+                WaitRegistration {
+                    order: self.order.clone(),
+                    first,
+                    changed,
+                }
+            };
+            // Each registration has one waiter. notify_one stores a permit if
+            // completion races the first poll, avoiding a lost wake-up.
+            registration.changed.notified().await;
         }
     }
     pub(crate) fn complete(mut self) {
@@ -155,10 +211,16 @@ impl Scope {
 }
 fn poison(order: &OrderedApply, generation: u64) {
     let mut s = order.state.lock().unwrap();
-    if s.generation == generation {
-        s.failed = true;
+    if s.generation != generation {
+        return;
     }
+    s.failed = true;
+    let waiters = std::mem::take(&mut s.waiters)
+        .into_values()
+        .flatten()
+        .collect();
     drop(s);
+    wake(waiters);
     order.changed.notify_waiters();
 }
 impl Drop for Scope {
@@ -185,7 +247,9 @@ impl Turn {
         s.next = self.next;
         s.active = false;
         self.complete = true;
+        let waiters = ready_waiters(&mut s);
         drop(s);
+        wake(waiters);
         self.order.changed.notify_waiters();
         Ok(())
     }
@@ -221,6 +285,112 @@ pub(crate) fn finish(turn: Option<Turn>, scope: Option<Scope>) -> crate::Result<
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::{
+        future::Future,
+        sync::atomic::{AtomicUsize, Ordering},
+        task::Context,
+    };
+
+    #[derive(Default)]
+    struct WakeCount(AtomicUsize);
+    impl futures::task::ArcWake for WakeCount {
+        fn wake_by_ref(arc: &Arc<Self>) {
+            arc.0.fetch_add(1, Ordering::Relaxed);
+        }
+    }
+
+    #[tokio::test]
+    async fn progress_wakes_only_the_next_range() {
+        let order = OrderedApply::new(0);
+        let scopes: Vec<_> = (0..1024).map(|_| order.scope()).collect();
+        let mut pending: Vec<_> = scopes
+            .iter()
+            .enumerate()
+            .map(|(i, s)| Box::pin(s.enter(i as u64 + 1, 1)))
+            .collect();
+        let counts: Vec<_> = (0..1024).map(|_| Arc::new(WakeCount::default())).collect();
+        for (future, count) in pending.iter_mut().zip(&counts) {
+            let waker = futures::task::waker_ref(count);
+            assert!(
+                future
+                    .as_mut()
+                    .poll(&mut Context::from_waker(&waker))
+                    .is_pending()
+            );
+        }
+        let first = order.scope();
+        finish(Some(first.enter(0, 1).await.unwrap()), Some(first)).unwrap();
+        assert_eq!(counts[0].0.load(Ordering::Relaxed), 1);
+        assert!(counts[1..].iter().all(|c| c.0.load(Ordering::Relaxed) == 0));
+        drop(pending);
+        assert!(order.state.lock().unwrap().waiters.is_empty());
+    }
+
+    #[tokio::test]
+    async fn stale_duplicates_wake_and_reset_cleans_all_registrations() {
+        let order = OrderedApply::new(0);
+        let first = order.scope();
+        let turn = first.enter(0, 1).await.unwrap();
+        let duplicate = order.scope();
+        let later = order.scope();
+        let mut old = Box::pin(duplicate.enter(0, 1));
+        let mut future = Box::pin(later.enter(10, 1));
+        assert!(futures::poll!(&mut old).is_pending());
+        assert!(futures::poll!(&mut future).is_pending());
+        finish(Some(turn), Some(first)).unwrap();
+        assert!(old.await.is_err());
+        order.reset(10);
+        assert!(future.await.is_err());
+        assert!(order.state.lock().unwrap().waiters.is_empty());
+        drop(duplicate);
+        drop(later);
+        let current = order.scope();
+        finish(Some(current.enter(10, 1).await.unwrap()), Some(current)).unwrap();
+    }
+
+    #[tokio::test]
+    async fn cancelled_wait_unregisters_and_checkpoint_release_wakes_successor() {
+        let order = OrderedApply::new(0);
+        let checkpoint = order.checkpoint().await.unwrap();
+        let scope = order.scope();
+        let mut wait = Box::pin(scope.enter(0, 1));
+        assert!(futures::poll!(&mut wait).is_pending());
+        drop(wait);
+        assert!(order.state.lock().unwrap().waiters.is_empty());
+        let mut wait = Box::pin(scope.enter(0, 1));
+        assert!(futures::poll!(&mut wait).is_pending());
+        drop(checkpoint);
+        let turn = wait.await.unwrap();
+        finish(Some(turn), Some(scope)).unwrap();
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_ranges_make_contiguous_progress_after_checkpoint_release() {
+        let order = OrderedApply::new(0);
+        let checkpoint = order.checkpoint().await.unwrap();
+        let mut tasks = tokio::task::JoinSet::new();
+        for offset in (0..512).rev() {
+            let scope = order.scope();
+            tasks.spawn(async move {
+                let turn = scope.enter(offset, 1).await.unwrap();
+                finish(Some(turn), Some(scope)).unwrap();
+            });
+        }
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while order.state.lock().unwrap().waiters.len() != 512 {
+                tokio::task::yield_now().await;
+            }
+            drop(checkpoint);
+            while let Some(result) = tasks.join_next().await {
+                result.unwrap();
+            }
+        })
+        .await
+        .unwrap();
+        assert_eq!(order.applied_next().unwrap(), 512);
+        assert!(order.state.lock().unwrap().waiters.is_empty());
+    }
+
     #[tokio::test]
     async fn checkpoint_fences_application_and_distinguishes_event_zero() {
         let order = OrderedApply::new(0);

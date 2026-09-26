@@ -89,6 +89,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Ordered queue application wakes only ranges that can proceed at the current
+  frontier. Reset and failure still wake all invalidated waiters, and cancellation
+  removes its registration. This prevents concurrent publishers from creating a
+  wake-up storm that can stall delivery and heartbeat processing under saturation.
+
 - Checkpoint reset drains outstanding fsync completions before replacing log
   files and resetting durability. An older completion can no longer republish
   its previous frontier after the reset or overwrite the new manifest boundary.
