@@ -22,7 +22,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::durability::{DurableFrontier, DurableWatermark};
-use crate::reader::{OwnedRecord, to_owned};
+use crate::reader::{OwnedRecord, ScanByteBudget, to_owned};
 use crate::record::decode_record_prefix;
 
 /// One flush worth of encoded records, covering `[base_offset, next_offset)`.
@@ -122,7 +122,17 @@ impl TailCache {
     /// - `Some(recs)`: every record in `[from, min(from + max, durable))` at the
     ///   captured frontier. This can be shorter than `max`, or empty when `from`
     ///   is at/past the frontier; a cache hit never returns a partial range.
+    #[cfg(test)]
     pub(crate) fn read_from(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
+        self.read_from_with_byte_budget(from, max, usize::MAX)
+    }
+
+    pub(crate) fn read_from_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
         if self.byte_budget == 0 || max == 0 {
             return None;
         }
@@ -163,6 +173,7 @@ impl TailCache {
         // has the `upper - from` records requested.
         let mut out = Vec::with_capacity((upper - from) as usize);
         let mut expected = from;
+        let mut budget = ScanByteBudget::new(max_bytes);
         for (base, next, buf) in &bufs {
             let mut decoded_next = *base;
             let mut pos = 0usize;
@@ -178,9 +189,10 @@ impl TailCache {
                     if rec.offset != expected {
                         return None;
                     }
+                    budget.observe(&rec);
                     out.push(to_owned(rec));
                     expected += 1;
-                    if expected == upper {
+                    if expected == upper || budget.finished {
                         return Some(out);
                     }
                 }

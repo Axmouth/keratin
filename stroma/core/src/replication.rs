@@ -637,6 +637,21 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_message_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
+            .await
+    }
+
+    /// Retain one lookahead record when byte-limited, allowing the broker to trim
+    /// the prefix without treating a byte boundary as a fully returned range.
+    pub async fn read_owner_message_records_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let role = qh.role();
@@ -661,7 +676,7 @@ impl Stroma {
             let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
                 let reader = read_log.reader();
-                reader.scan_from(from, max)
+                reader.scan_from_with_byte_budget(from, max, max_bytes)
             })
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?
@@ -694,6 +709,20 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_event_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
+            .await
+    }
+
+    /// Byte-bounded event prefix, with the same lookahead contract as message reads.
+    pub async fn read_owner_event_records_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let role = qh.role();
@@ -718,7 +747,7 @@ impl Stroma {
             let read_log = log.clone();
             let raw = tokio::task::spawn_blocking(move || {
                 let reader = read_log.reader();
-                reader.scan_from(from, max)
+                reader.scan_from_with_byte_budget(from, max, max_bytes)
             })
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?

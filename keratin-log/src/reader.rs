@@ -30,6 +30,35 @@ impl OwnedRecord {
     }
 }
 
+/// Shared cache/file scan accounting. Preserve the first record even when it
+/// exceeds the budget, then include the first record beyond the accepted prefix.
+pub(crate) struct ScanByteBudget {
+    remaining: usize,
+    first: bool,
+    pub(crate) finished: bool,
+}
+
+impl ScanByteBudget {
+    pub(crate) fn new(max_bytes: usize) -> Self {
+        Self {
+            remaining: max_bytes,
+            first: true,
+            finished: false,
+        }
+    }
+
+    pub(crate) fn observe(&mut self, record: &DecodedRecord<'_>) {
+        let bytes = RECORD_HEADER_LEN
+            .saturating_add(record.headers.len())
+            .saturating_add(record.payload.len());
+        if !self.first && bytes > self.remaining {
+            self.finished = true;
+        }
+        self.first = false;
+        self.remaining = self.remaining.saturating_sub(bytes);
+    }
+}
+
 pub struct LogReader {
     root: PathBuf,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
@@ -72,18 +101,43 @@ impl LogReader {
     }
 
     pub fn scan_from(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
-        // A hit covers the entire requested range up to the captured durable
-        // frontier. Tail-following requests can therefore finish from memory
-        // even when fewer than `max` records are currently durable.
-        if let Some(recs) = self.tail_cache.read_from(from, max) {
+        self.scan_from_with_byte_budget(from, max, usize::MAX)
+    }
+
+    /// Scan a bounded prefix, including one lookahead record beyond the byte
+    /// budget when present. Callers can trim that record while distinguishing
+    /// a truncated prefix from the end of the requested range. The first record
+    /// is always included, even when oversized. Bytes include headers, payload
+    /// and the fixed record header, excluding the CRC. `max` remains a hard cap.
+    pub fn scan_from_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> io::Result<Vec<OwnedRecord>> {
+        // A hit covers the requested prefix up to the byte/count limit or the
+        // captured durable frontier, including the byte-boundary lookahead.
+        if let Some(recs) = self
+            .tail_cache
+            .read_from_with_byte_budget(from, max, max_bytes)
+        {
             return Ok(recs);
         }
 
-        self.scan_from_disk(from, max)
+        self.scan_from_disk_with_byte_budget(from, max, max_bytes)
     }
 
     /// Verify retained durable records without trusting cached record contents.
     pub fn scan_from_disk(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
+        self.scan_from_disk_with_byte_budget(from, max, usize::MAX)
+    }
+
+    fn scan_from_disk_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> io::Result<Vec<OwnedRecord>> {
         // Bound the file scan at the durable frontier so it stops at the known end
         // of durable data and never reads a written-but-not-yet-durable record or
         // the preallocated zero padding beyond it. An empty / nothing-durable log
@@ -93,8 +147,9 @@ impl LogReader {
 
         let mut out = Vec::with_capacity(max);
         let mut cur = from;
+        let mut budget = ScanByteBudget::new(max_bytes);
 
-        while out.len() < max && durable.covers(cur) {
+        while out.len() < max && !budget.finished && durable.covers(cur) {
             let base = match self.find_segment_base(cur)? {
                 Some(b) => b,
                 None => {
@@ -114,7 +169,16 @@ impl LogReader {
             let before_cur = cur;
             let before_len = out.len();
 
-            self.scan_forward_exact(&mut log, pos, &mut cur, None, &mut out, max, durable)?;
+            self.scan_forward_exact(
+                &mut log,
+                pos,
+                &mut cur,
+                None,
+                &mut out,
+                max,
+                durable,
+                &mut budget,
+            )?;
 
             if cur == before_cur && out.len() == before_len {
                 if let Some(next) = self.next_segment_base(base) {
@@ -193,6 +257,7 @@ impl LogReader {
         out: &mut Vec<OwnedRecord>,
         max: usize,
         durable: DurableFrontier,
+        budget: &mut ScanByteBudget,
     ) -> io::Result<()> {
         const SLAB: usize = 4096 * 8; // SSD page aligned
 
@@ -239,8 +304,9 @@ impl LogReader {
                     *cur = rec.offset + 1;
 
                     if want.map(|o| rec.offset == o).unwrap_or(true) {
+                        budget.observe(&rec);
                         out.push(to_owned(rec));
-                        if out.len() >= max {
+                        if out.len() >= max || budget.finished {
                             return Ok(());
                         }
                     }

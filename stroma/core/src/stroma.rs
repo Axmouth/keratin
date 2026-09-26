@@ -6583,6 +6583,55 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn owner_replication_byte_budget_keeps_contiguous_event_and_message_prefixes() {
+        let dir = test_dir!("owner_replication_byte_budget");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        for _ in 0..5 {
+            publish_one(&stroma, "topic", 0, None).await;
+        }
+        let OwnerReplicationRead::Batch(messages) = stroma
+            .read_owner_message_records_with_byte_budget("topic", 0, None, 0, 100, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("message batch");
+        };
+        assert_eq!(
+            messages.records.len(),
+            2,
+            "oversized first record and lookahead"
+        );
+        assert_eq!(messages.next_offset, 2);
+        let OwnerReplicationRead::Batch(full) = stroma
+            .read_owner_event_records("topic", 0, None, 0, 100)
+            .await
+            .unwrap()
+        else {
+            panic!("event batch");
+        };
+        assert!(full.records.len() > 2);
+        let OwnerReplicationRead::Batch(events) = stroma
+            .read_owner_event_records_with_byte_budget("topic", 0, None, 0, 100, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("event batch");
+        };
+        assert_eq!(events.records, full.records[..2]);
+        assert_eq!(events.next_offset, 2);
+        let OwnerReplicationRead::Batch(next) = stroma
+            .read_owner_event_records_with_byte_budget("topic", 0, None, events.next_offset, 100, 1)
+            .await
+            .unwrap()
+        else {
+            panic!("next event batch");
+        };
+        assert_eq!(next.records, full.records[2..4]);
+    }
+
+    #[tokio::test]
     async fn owner_replication_read_returns_message_and_event_records() {
         let dir = test_dir!("owner_replication_read_records");
         let stroma = Stroma::open(
