@@ -64,3 +64,5 @@ The analogy is loose, but points to:
 ## Status
 
 Early and evolving. The core ideas are in place, but details and guarantees may change. Performance is considered satisfactory for intended use cases, but optimizations and improvements are likely as the design matures and more use cases are explored.
+
+Historical design records are indexed in the [archive](archive/README.md).

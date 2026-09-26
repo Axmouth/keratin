@@ -8,8 +8,9 @@
 > `Arc::from(write_buf)` copy rather than `mem::take` (the flushed batch is
 > usually small under group commit, so copying `len` bytes beats moving the
 > full-capacity buffer and reallocating one per flush); the read entry point is
-> `read_from` (not `read_into`); and `scan_from` serves the cache only on full
-> coverage (`recs.len() == max`) rather than stitching a partial suffix.
+> `read_from` (not `read_into`); and `scan_from` accepts full
+> coverage up to the captured durable frontier, including a durable tail shorter
+> than the requested page.
 
 ## Why
 
@@ -204,30 +205,22 @@ locked by the unit tests there plus `tests/tail_cache.rs`.
    decodes on read via the same `decode_record_prefix` the file path uses, so
    cache-served and file-served records are byte-identical (locked by the
    `cache_read_matches_file_read` integration test).
-6. **Cache/file durable asymmetry.** The file scan path is NOT durable-gated (it
-   returns whatever has been appended to the segment, possibly past durable); the
-   cache path IS. `scan_from` bridges this by taking the cache result only when it
-   fully covers the request (`recs.len() == max`) which, because the cache caps at
-   durable, can only happen when the whole range is durable, so the two paths
-   return identical records. Production delivery (`poll_ready` ->
-   `scan_messages_from`) requests exactly the durable-ready count, so the cache
-   hits. A fixed-page reader that overshoots durable (the e2e bench when caught
-   up) falls to the file. See follow-up 1.
+6. **Durable scan boundary.** Both cached and disk-backed scans stop at the
+   captured durable frontier. A cache hit must cover every requested durable
+   offset. A short page at the durable tail can therefore finish in memory.
+   Cache gaps or decode failures fall back to the validating file scan. Recovery
+   verification uses the disk path explicitly.
 7. **Node-local.** `tail_cache_bytes` is a per-node, non-replicated knob (a
    hardware-dependent memory/latency tradeoff, per settings-discipline). Event
    logs run with it at `0`.
 
-## Review follow-ups (open)
+## Review follow-ups
 
-Design findings from the post-ship review, not yet actioned:
+The durable scan boundary is implemented. The remaining items are investigations:
 
-1. **Unify `scan_from` on a durable-gated file path**, then serve the cached
-   durable prefix and let the caller re-poll, replacing the all-or-nothing
-   `recs.len() == max` gate. This lets fixed-page tail-followers (and the
-   validating bench) hit the cache in the caught-up steady state, and closes the
-   asymmetry in invariant 6 (a replica scan can currently ship
-   flushed-but-unsynced records to followers via the file path). Behavior change:
-   needs broker-side verification and its own review.
+1. **Completed: durable scan parity.** Both paths are bounded by the durable
+   frontier, and fixed-page readers can hit the cache when caught up. The
+   former all-or-nothing page-size check has been removed.
 2. **Stream partitions.** Durable stream msg-logs carry the tail cache but serve
    their live tail from the broker `StreamRing`, so the cache is populated yet
    rarely read. Consider `tail_cache_bytes = 0` for stream partitions (as event
