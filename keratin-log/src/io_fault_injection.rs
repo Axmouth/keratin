@@ -8,7 +8,7 @@ use std::{
     os::unix::fs::MetadataExt,
     path::Path,
     sync::{
-        Arc, LazyLock, Mutex,
+        Arc, Condvar, LazyLock, Mutex,
         atomic::{AtomicUsize, Ordering},
     },
 };
@@ -24,6 +24,7 @@ struct Entry {
     fault: Fault,
     hits: Arc<AtomicUsize>,
     remaining: usize,
+    gate: Option<Arc<Gate>>,
 }
 static FAULTS: LazyLock<Mutex<HashMap<(u64, u64), Entry>>> =
     LazyLock::new(|| Mutex::new(HashMap::new()));
@@ -31,17 +32,40 @@ fn key(file: &File) -> io::Result<(u64, u64)> {
     let m = file.metadata()?;
     Ok((m.dev(), m.ino()))
 }
+struct Gate {
+    released: Mutex<bool>,
+    changed: Condvar,
+}
+impl Gate {
+    fn release(&self) {
+        *self.released.lock().unwrap() = true;
+        self.changed.notify_all();
+    }
+    fn wait(&self) {
+        let mut open = self.released.lock().unwrap();
+        while !*open {
+            open = self.changed.wait(open).unwrap();
+        }
+    }
+}
 pub struct ArmedFault {
     key: (u64, u64),
     hits: Arc<AtomicUsize>,
+    gate: Option<Arc<Gate>>,
 }
 impl ArmedFault {
+    pub fn release(&self) {
+        if let Some(gate) = &self.gate {
+            gate.release();
+        }
+    }
     pub fn hits(&self) -> usize {
         self.hits.load(Ordering::SeqCst)
     }
 }
 impl Drop for ArmedFault {
     fn drop(&mut self) {
+        self.release();
         FAULTS.lock().unwrap().remove(&self.key);
     }
 }
@@ -61,12 +85,29 @@ pub fn arm_repeated(path: &Path, fault: Fault, remaining: usize) -> io::Result<A
                 Entry {
                     fault,
                     hits: hits.clone(),
-                    remaining
+                    remaining,
+                    gate: None
                 }
             )
             .is_none()
     );
-    Ok(ArmedFault { key, hits })
+    Ok(ArmedFault {
+        key,
+        hits,
+        gate: None,
+    })
+}
+/// Hold the real file operation until the test observes follower persistence.
+/// Dropping the guard releases the worker even when the test unwinds.
+pub fn arm_gated(path: &Path, fault: Fault) -> io::Result<ArmedFault> {
+    let mut armed = arm(path, fault)?;
+    let gate = Arc::new(Gate {
+        released: Mutex::new(false),
+        changed: Condvar::new(),
+    });
+    FAULTS.lock().unwrap().get_mut(&armed.key).unwrap().gate = Some(gate.clone());
+    armed.gate = Some(gate);
+    Ok(armed)
 }
 fn take(file: &File, write: bool) -> io::Result<Option<Fault>> {
     let key = key(file)?;
@@ -77,6 +118,11 @@ fn take(file: &File, write: bool) -> io::Result<Option<Fault>> {
             entry.hits.fetch_add(1, Ordering::SeqCst);
             entry.remaining -= 1;
             let fault = entry.fault;
+            let gate = entry.gate.clone();
+            drop(faults);
+            if let Some(gate) = gate {
+                gate.wait();
+            }
             return Ok(Some(fault));
         }
     }
@@ -110,6 +156,30 @@ pub(crate) fn sync_data(file: &File) -> io::Result<()> {
 mod tests {
     use super::*;
     use std::io::{Read, Seek, SeekFrom};
+
+    #[test]
+    fn dropping_gated_fault_releases_worker() {
+        let dir = crate::test_dir!("gated_fault");
+        let path = dir.root.join("segment");
+        let file = File::create(&path).unwrap();
+        let fault = arm_gated(&path, Fault::Fsync).unwrap();
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || sender.send(sync_data(&file)).unwrap());
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        while fault.hits() == 0 {
+            assert!(std::time::Instant::now() < deadline);
+            std::thread::yield_now();
+        }
+        assert!(receiver.try_recv().is_err());
+        drop(fault);
+        assert!(
+            receiver
+                .recv_timeout(std::time::Duration::from_secs(5))
+                .unwrap()
+                .is_err()
+        );
+        worker.join().unwrap();
+    }
 
     #[test]
     fn partial_fault_writes_real_prefix_and_retry_can_replace_it() {
