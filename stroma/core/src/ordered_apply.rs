@@ -237,6 +237,15 @@ pub(crate) struct Turn {
     complete: bool,
 }
 impl Turn {
+    #[cfg(feature = "replication-actor-batch-experiment")]
+    pub(crate) fn replay_fence(&self) -> ReplayFence {
+        ReplayFence {
+            order: self.order.clone(),
+            generation: self.generation,
+            next: self.next,
+        }
+    }
+
     pub(crate) fn complete(mut self) -> crate::Result<()> {
         let mut s = self.order.state.lock().unwrap();
         if s.generation != self.generation || s.failed {
@@ -259,6 +268,42 @@ impl Drop for Turn {
         if !self.complete {
             poison(&self.order, self.generation);
         }
+    }
+}
+
+/// Only bounded synchronous queue mutations may execute inside this fence.
+/// The lock keeps generation reset and cancellation behind an executing chunk.
+#[cfg(feature = "replication-actor-batch-experiment")]
+#[derive(Debug, Clone)]
+pub(crate) struct ReplayFence {
+    order: Arc<OrderedApply>,
+    generation: u64,
+    next: u64,
+}
+
+#[cfg(feature = "replication-actor-batch-experiment")]
+impl ReplayFence {
+    pub(crate) fn apply<T>(
+        &self,
+        first: u64,
+        last: u64,
+        apply: impl FnOnce() -> T,
+    ) -> crate::Result<T> {
+        let state = self.order.state.lock().unwrap();
+        if state.generation != self.generation
+            || state.failed
+            || !state.active
+            || first < state.next
+            || first > last
+            || last >= self.next
+        {
+            return Err(crate::StromaError::Io(
+                "replicated actor chunk invalidated".into(),
+            ));
+        }
+        let result = apply();
+        drop(state);
+        Ok(result)
     }
 }
 
@@ -324,6 +369,26 @@ mod tests {
         assert!(counts[1..].iter().all(|c| c.0.load(Ordering::Relaxed) == 0));
         drop(pending);
         assert!(order.state.lock().unwrap().waiters.is_empty());
+    }
+
+    #[cfg(feature = "replication-actor-batch-experiment")]
+    #[tokio::test]
+    async fn replay_fence_rejects_cancelled_reset_and_out_of_range_chunks() {
+        let order = OrderedApply::new(0);
+        let scope = order.scope();
+        let turn = scope.enter(0, 10).await.unwrap();
+        let fence = turn.replay_fence();
+        assert_eq!(fence.apply(0, 9, || 17).unwrap(), 17);
+        assert!(fence.apply(0, 10, || panic!("out of range")).is_err());
+        drop(turn);
+        assert!(fence.apply(0, 9, || panic!("cancelled")).is_err());
+        order.reset(0);
+        let new_scope = order.scope();
+        let new_turn = new_scope.enter(0, 10).await.unwrap();
+        assert!(fence.apply(0, 9, || panic!("stale generation")).is_err());
+        finish(Some(new_turn), Some(new_scope)).unwrap();
+        drop(scope);
+        assert_eq!(order.applied_next().unwrap(), 10);
     }
 
     #[tokio::test]

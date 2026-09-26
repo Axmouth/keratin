@@ -1029,6 +1029,14 @@ impl Stroma {
                 if count > 0 {
                     let scope = qh.ordered_apply_scope();
                     let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
+                    #[cfg(feature = "replication-actor-batch-experiment")]
+                    if qh.kind() == PartitionKind::Queue && turn.is_some() {
+                        self.apply_replicated_actor_chunks(batch.events, skip, batch.first_offset, &qh,
+                            turn.as_ref().unwrap().replay_fence()).await?;
+                        crate::ordered_apply::finish(turn, scope)?;
+                        *apply_state = false;
+                        return Ok(ReplicatedQueueApplyOutcome { message_log, event_log });
+                    }
                     for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
                         self.apply_event_inmem(event, &qh).await?;
                         qh.applied_upto()
@@ -1048,4 +1056,97 @@ impl Stroma {
             event_log,
         })
     }
+    #[cfg(feature = "replication-actor-batch-experiment")]
+    async fn apply_replicated_actor_chunks(
+        &self,
+        events: Vec<StromaEvent>,
+        skip: usize,
+        first: u64,
+        qh: &crate::state::QueueHandleInner,
+        fence: crate::ordered_apply::ReplayFence,
+    ) -> Result<()> {
+        use crate::state::{QueueCommand, ReplicatedActorBatch};
+        async fn flush(
+            qh: &crate::state::QueueHandleInner,
+            records: &mut Vec<(u64, QueueCommand)>,
+            fence: &crate::ordered_apply::ReplayFence,
+        ) -> Result<()> {
+            if records.is_empty() {
+                return Ok(());
+            }
+            let (response, rx) = tokio::sync::oneshot::channel();
+            qh.command_enqueue(QueueCommand::ReplayBatch {
+                batch: Box::new(ReplicatedActorBatch {
+                    records: std::mem::take(records),
+                    fence: fence.clone(),
+                }),
+                response,
+            })
+            .await
+            .map_err(io_err)?;
+            rx.await.map_err(|_| StromaError::QueueActorGone)?
+        }
+        let mut records = Vec::new();
+        for (index, event) in events.into_iter().enumerate().skip(skip) {
+            let offset = first + index as u64;
+            let command = match event {
+                StromaEvent::Enqueue {
+                    off,
+                    retries,
+                    expire_at,
+                } => QueueCommand::Enqueue {
+                    offset: off,
+                    retries,
+                    expire_at,
+                    response: None,
+                },
+                StromaEvent::EnqueueMany { reqs } => QueueCommand::EnqueueMany {
+                    reqs,
+                    response: None,
+                },
+                StromaEvent::CancelEnqueueMany { offs } => QueueCommand::CancelEnqueueMany {
+                    offs,
+                    response: None,
+                },
+                StromaEvent::MarkInflightMany { reqs } => QueueCommand::MarkInflightMany {
+                    reqs,
+                    response: None,
+                },
+                StromaEvent::Ack { off } => QueueCommand::Ack {
+                    offset: off,
+                    response: None,
+                },
+                StromaEvent::AckMany { reqs } => QueueCommand::AckMany {
+                    reqs,
+                    response: None,
+                },
+                StromaEvent::ReleaseInflightMany { reqs } => QueueCommand::ReleaseInflightMany {
+                    reqs,
+                    response: None,
+                },
+                StromaEvent::Nack { off, requeue } => QueueCommand::Nack {
+                    offset: off,
+                    requeue,
+                    not_before: None,
+                    response: None,
+                },
+                StromaEvent::NackMany { reqs } => QueueCommand::NackMany {
+                    reqs,
+                    response: None,
+                },
+                event => {
+                    flush(qh, &mut records, &fence).await?;
+                    self.apply_event_inmem(event, qh).await?;
+                    qh.applied_upto().fetch_max(offset, Ordering::Release);
+                    continue;
+                }
+            };
+            records.push((offset, command));
+            if records.len() == 64 {
+                flush(qh, &mut records, &fence).await?;
+            }
+        }
+        flush(qh, &mut records, &fence).await
+    }
+
 }

@@ -10,6 +10,7 @@ default = ["ordered-queue-apply"]
 ordered-queue-apply = []
 # Compatibility alias for saved benchmark commands.
 ordered-queue-apply-experiment = ["ordered-queue-apply"]
+replication-actor-batch-experiment = ["ordered-queue-apply"]
 
 # tokio_unstable is an opt-in tokio flag (set via RUSTFLAGS="--cfg tokio_unstable")
 # that enables named tasks for tokio-console. Register it so the conditional

@@ -379,6 +379,11 @@ pub struct QueueInternalState {
 // Every QueueState method will be processed by a relevant Command sequentially on a single task, so we don't need to worry about concurrent mutations or complex locking.
 #[derive(Debug)]
 pub enum QueueCommand {
+    #[cfg(feature = "replication-actor-batch-experiment")]
+    ReplayBatch {
+        batch: Box<ReplicatedActorBatch>,
+        response: oneshot::Sender<crate::Result<()>>,
+    },
     Shutdown {
         response: Option<oneshot::Sender<()>>,
     },
@@ -578,9 +583,18 @@ pub struct QueueStateCheckpointSnapshot {
     pub state_snapshot: Vec<u8>,
 }
 
+#[cfg(feature = "replication-actor-batch-experiment")]
+#[derive(Debug)]
+pub struct ReplicatedActorBatch {
+    pub(crate) records: Vec<(u64, QueueCommand)>,
+    pub(crate) fence: crate::ordered_apply::ReplayFence,
+}
+
 impl QueueCommand {
     pub fn prio(&self) -> CommandPrio {
         match self {
+            #[cfg(feature = "replication-actor-batch-experiment")]
+            QueueCommand::ReplayBatch { .. } => CommandPrio::Medium,
             // === Lifecycle / control — must preempt everything ===
 
             // === Recovery / loading — one-shot at startup, not in contention ===
@@ -671,6 +685,8 @@ impl QueueCommand {
 
     pub fn variant_name(&self) -> &str {
         match self {
+            #[cfg(feature = "replication-actor-batch-experiment")]
+            QueueCommand::ReplayBatch { .. } => "ReplayBatch",
             QueueCommand::Shutdown { .. } => "Shutdown",
             QueueCommand::Enqueue { .. } => "Enqueue",
             QueueCommand::EnqueueMany { .. } => "EnqueueMany",
@@ -1743,6 +1759,24 @@ impl QueueHandleInner {
         let prio = cmd.prio();
 
         match cmd {
+            #[cfg(feature = "replication-actor-batch-experiment")]
+            QueueCommand::ReplayBatch { batch, response } => {
+                let ReplicatedActorBatch { records, fence } = *batch;
+                // Internal construction permits only ordinary queue mutations.
+                // Never recurse into checkpoint or ordering commands here.
+                let result = if records.is_empty() || records.len() > 64 {
+                    Err(StromaError::InvalidArgument("invalid replay chunk size".into()))
+                } else {
+                    fence.apply(records[0].0, records.last().unwrap().0, || {
+                        for (offset, command) in records {
+                            let (_, changed) = Self::process_command(state, command, handle);
+                            dirty |= changed;
+                            handle.applied_upto.fetch_max(offset, Ordering::Release);
+                        }
+                    })
+                };
+                let _ = response.send(result);
+            }
             QueueCommand::Shutdown { response } => {
                 // No more commands will be processed after this, so we can ignore the rest of the channel.
                 if let Some(r) = response {

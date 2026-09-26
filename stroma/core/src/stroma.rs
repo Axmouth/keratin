@@ -7894,6 +7894,75 @@ mod tests {
         shutdown_stroma("empty_checkpoint_after_restart", &reopened).await;
     }
 
+    #[cfg(feature = "replication-actor-batch-experiment")]
+    #[tokio::test]
+    async fn replicated_actor_chunks_preserve_order_overlap_and_fallback_boundaries() {
+        let dir = test_dir!("replicated_actor_chunks");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        stroma.become_queue_follower("t", 0, None).await.unwrap();
+        let mut events = Vec::new();
+        for off in 0..80 {
+            events.push(StromaEvent::Enqueue {
+                off,
+                retries: 0,
+                expire_at: None,
+            });
+            events.push(StromaEvent::Nack { off, requeue: true });
+        }
+        // This event uses the original path and forces a chunk boundary.
+        events.insert(
+            70,
+            StromaEvent::MarkInflight {
+                off: 0,
+                deadline: u64::MAX,
+            },
+        );
+        events.push(StromaEvent::Ack { off: 0 });
+        let count = events.len() as u64;
+        let messages: Vec<_> = (0..80)
+            .map(|_| Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![7],
+            })
+            .collect();
+        for _ in 0..2 {
+            stroma
+                .apply_replicated_queue_batch(
+                    "t",
+                    0,
+                    None,
+                    Some(ReplicatedMessageBatch {
+                        epoch: 0,
+                        first_offset: 0,
+                        records: messages.clone(),
+                        durability: None,
+                    }),
+                    Some(ReplicatedEventBatch {
+                        epoch: 0,
+                        first_offset: 0,
+                        events: events.clone(),
+                        durability: None,
+                    }),
+                )
+                .await
+                .unwrap();
+            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
+            let h = qh.resolve().unwrap();
+            assert_eq!(h.ordered_applied_next().unwrap(), Some(count));
+            assert_eq!(h.applied_upto().load(Ordering::Acquire), count - 1);
+            assert_eq!(h.full_debug_info().await.state.ready_count, 79);
+            assert_eq!(
+                h.work_queue().unwrap().retries(1).await,
+                1,
+                "overlap must not reapply NACK"
+            );
+        }
+        shutdown_stroma("replicated_actor_chunks", &stroma).await;
+    }
+
     #[tokio::test]
     async fn follower_promotion_refuses_partial_replication() {
         let owner_dir = test_dir!("partial_replication_owner");
