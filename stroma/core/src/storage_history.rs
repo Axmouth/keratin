@@ -196,12 +196,20 @@ impl Stroma {
             })
     }
 
+    fn ensure_view_active(&self) -> Result<()> {
+        if self.retired_view.load(Ordering::Acquire) {
+            return Err(StromaError::InvalidArgument("retired staging view cannot mutate installed storage".into()));
+        }
+        Ok(())
+    }
+
     pub(super) fn ensure_storage_history_admitted(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
     ) -> Result<()> {
+        self.ensure_view_active()?;
         let group = normalize_group(group);
         let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
         let receipt = self.checked_storage_history(topic, part, group)?;
@@ -261,6 +269,7 @@ impl Stroma {
     /// Fast live-replication guard. Admission is process-local and cannot be
     /// reconstructed from a receipt by restarting or replacing a storage root.
     pub fn verify_admitted_storage_history(&self, prepared: &PreparedStorageHistory) -> Result<()> {
+        self.ensure_view_active()?;
         let key = (
             Box::<str>::from(prepared.topic.as_str()),
             prepared.partition,
@@ -526,6 +535,7 @@ impl Stroma {
             let mut _lifecycle = stroma
                 .lock_partition_lifecycle(&topic, part, group.as_deref())
                 .await;
+            stroma.ensure_view_active()?;
             let path = stroma.storage_history_path(&topic, part, group.as_deref());
             let old = stroma
                 .checked_storage_history(&topic, part, group.as_deref())?
@@ -655,6 +665,7 @@ impl Stroma {
         resume: bool,
     ) -> Result<()> {
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        self.ensure_view_active()?;
         let path = self.storage_history_path(topic, part, group);
         let intent_path = self.snap_dir(topic, part, group).join("storage.preparing");
         let activated_path = self.snap_dir(topic, part, group).join("storage.activated");
@@ -933,6 +944,203 @@ mod tests {
             )
             .await
             .unwrap();
+    }
+
+    async fn reseed_fixture(st: &Stroma) -> (PreparedStorageHistory, Stroma) {
+        initialize(st).await.unwrap();
+        st.become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        learner_message(st).await;
+        let receipt = PreparedStorageHistory {
+            topic: "q".into(),
+            partition: 0,
+            group: None,
+            stream: false,
+            binding: binding(),
+            storage_instance: st.storage_session,
+        };
+        let view = st
+            .prepare_queue_reseed_storage(receipt.clone(), [41; 32])
+            .await
+            .unwrap();
+        view.become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        (receipt, view)
+    }
+
+    #[tokio::test]
+    async fn reseed_preserves_original_until_complete_then_switches() {
+        let dir = keratin_log::test_dir!("reseed_safe_switch");
+        let st = open(&dir.root).await;
+        let (receipt, view) = reseed_fixture(&st).await;
+        assert!(
+            st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0)
+                .await
+                .is_err(),
+            "an empty replacement must not erase old confirmed data"
+        );
+        assert_eq!(
+            st.queue_replication_next_offsets("q", 0, None)
+                .await
+                .unwrap(),
+            (1, 1)
+        );
+        learner_message(&view).await;
+        st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 1, 1)
+            .await
+            .unwrap();
+        assert!(view.verify_admitted_storage_history(&receipt).is_err());
+        assert!(view.resume_unaccepted_storage_history("q",0,None,binding()).await.is_err(),"cancelled old staging handle cannot reacquire writer admission");
+        st.become_queue_follower_with_epoch("q", 0, None, 7)
+            .await
+            .unwrap();
+        st.verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+            .await
+            .unwrap();
+        assert_eq!(
+            st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(),
+            Some((7, 1, 1))
+        );
+        assert!(
+            st.prepare_queue_reseed_storage(receipt.clone(), [41; 32])
+                .await
+                .is_err(),
+            "retry cannot obtain a resettable view of the live replacement"
+        );
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+            .await
+            .unwrap();
+        assert!(
+            st.partition_root("q", 0, None)
+                .starts_with(dir.root.join("recovery-installed"))
+        );
+        st.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reseed_original_can_witness_recovery_during_copy_and_seal_blocks_switch() {
+        let dir = keratin_log::test_dir!("reseed_owner_loss");
+        let st = open(&dir.root).await;
+        let (receipt, view) = reseed_fixture(&st).await;
+        let seal = RecoverySealRequest {
+            transition: [45; 32],
+            fence_epoch: 8,
+        };
+        let evidence = st
+            .seal_replica_for_recovery("q", 0, None, seal.clone())
+            .await
+            .unwrap();
+        assert_eq!((evidence.message_next, evidence.event_next), (1, 1));
+        let page = st
+            .read_sealed_replica(
+                "q",
+                0,
+                None,
+                PartitionKind::Queue,
+                RecoveryReadRequest {
+                    seal,
+                    history_id: evidence.history.id,
+                    source: RecoveryReadSource::Messages,
+                    from: 0,
+                    max_records: 8,
+                    max_bytes: 65536,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.records[0].payload, b"retained");
+        learner_message(&view).await;
+        assert!(
+            st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+                .await
+                .is_err()
+        );
+        st.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn reseed_crash_child() {
+        let Some(root) = std::env::var_os("STROMA_RESEED_CRASH_ROOT") else {
+            return;
+        };
+        let st = open(Path::new(&root)).await;
+        let (receipt, view) = reseed_fixture(&st).await;
+        learner_message(&view).await;
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+            .await
+            .unwrap();
+        panic!("child did not stop at reseed boundary");
+    }
+
+    #[tokio::test]
+    async fn reseed_sigkill_keeps_complete_recovery_evidence_on_either_side_of_switch() {
+        for boundary in ["reseed_before_switch", "reseed_retired", "reseed_switched"] {
+            let dir = keratin_log::test_dir!("reseed_sigkill");
+            let ready = dir.root.join("child.ready");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stroma::storage_history::tests::reseed_crash_child",
+                    "--nocapture",
+                ])
+                .env("STROMA_RESEED_CRASH_ROOT", &dir.root)
+                .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
+                .env("STROMA_INSTALL_CRASH_READY", &ready)
+                .stdout(std::process::Stdio::null())
+                .stderr(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let started = std::time::Instant::now();
+            while !ready.exists() {
+                assert!(
+                    child.try_wait().unwrap().is_none(),
+                    "child exited before {boundary}"
+                );
+                if started.elapsed() > std::time::Duration::from_secs(20) {
+                    let _ = child.kill();
+                    let _ = child.wait();
+                    panic!("timeout at {boundary}");
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            child.kill().unwrap();
+            child.wait().unwrap();
+            let st = open(&dir.root).await;
+            let seal = RecoverySealRequest {
+                transition: [49; 32],
+                fence_epoch: 8,
+            };
+            let evidence = st
+                .seal_replica_for_recovery("q", 0, None, seal.clone())
+                .await
+                .unwrap();
+            assert_eq!(
+                (evidence.message_next, evidence.event_next),
+                (1, 1),
+                "{boundary}"
+            );
+            let page = st
+                .read_sealed_replica(
+                    "q",
+                    0,
+                    None,
+                    PartitionKind::Queue,
+                    RecoveryReadRequest {
+                        seal,
+                        history_id: evidence.history.id,
+                        source: RecoveryReadSource::Messages,
+                        from: 0,
+                        max_records: 8,
+                        max_bytes: 65536,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(page.records[0].payload, b"retained", "{boundary}");
+            st.shutdown().await.unwrap();
+        }
     }
 
     #[tokio::test]

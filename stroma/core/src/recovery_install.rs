@@ -72,6 +72,291 @@ impl Route {
     }
 }
 impl Stroma {
+    /// Requires external revocation of this replica's write-quorum membership.
+    /// The live route remains untouched throughout copying and is still usable
+    /// as recovery evidence if the owner disappears.
+    pub async fn prepare_queue_reseed_storage(
+        &self,
+        receipt: PreparedStorageHistory,
+        intent: [u8; 32],
+    ) -> Result<Self> {
+        if !cfg!(unix) || intent == [0; 32] || receipt.stream {
+            return Err(invalid(
+                "queue reseed requires an exact intent and durable directories",
+            ));
+        }
+        self.verify_admitted_storage_history(&receipt)?;
+        let route = Route {
+            topic: receipt.topic.clone(),
+            partition: receipt.partition,
+            group: receipt.group.clone(),
+            generation: Some(Generation {
+                plan: intent,
+                instance: self.storage_session,
+            }),
+        };
+        if self
+            .recovery_routes
+            .get(&key(
+                &receipt.topic,
+                receipt.partition,
+                receipt.group.as_deref(),
+            ))
+            .is_some_and(|current| *current == route)
+        {
+            return Err(invalid(
+                "reseed already installed, resume admission without resetting storage",
+            ));
+        }
+        let view = self
+            .reseed_views
+            .entry(intent)
+            .or_insert_with(|| self.generation_view(route.root(&self.root)))
+            .clone();
+        let prepared = view
+            .resume_unaccepted_storage_history(
+                &receipt.topic,
+                receipt.partition,
+                receipt.group.as_deref(),
+                receipt.binding.clone(),
+            )
+            .await?;
+        if prepared != receipt {
+            return Err(invalid("reseed storage identity changed"));
+        }
+        Ok(view)
+    }
+
+    /// A lost admission reply must resume from the installed cut, never reset
+    /// the replacement that now carries the original replica's evidence.
+    pub fn installed_queue_reseed_cut(
+        &self,
+        receipt: &PreparedStorageHistory,
+        intent: [u8; 32],
+    ) -> Result<Option<(u64, u64, u64)>> {
+        self.verify_admitted_storage_history(receipt)?;
+        let route = Route {
+            topic: receipt.topic.clone(),
+            partition: receipt.partition,
+            group: receipt.group.clone(),
+            generation: Some(Generation {
+                plan: intent,
+                instance: self.storage_session,
+            }),
+        };
+        if !self
+            .recovery_routes
+            .get(&key(
+                &receipt.topic,
+                receipt.partition,
+                receipt.group.as_deref(),
+            ))
+            .is_some_and(|r| *r == route)
+        {
+            return Ok(None);
+        }
+        let saved: Option<(PreparedStorageHistory, u64, u64, u64)> = read_meta(
+            &self
+                .route_dir(&receipt.topic, receipt.partition, receipt.group.as_deref())
+                .join(format!(
+                    "reseed-complete-{}",
+                    blake3::Hash::from_bytes(intent)
+                )),
+        )?;
+        let Some((saved, epoch, messages, events)) = saved else {
+            return Err(invalid("installed reseed completion receipt absent"));
+        };
+        if saved != *receipt {
+            return Err(invalid("installed reseed receipt differs"));
+        }
+        Ok(Some((epoch, messages, events)))
+    }
+
+    /// Publish only a complete replacement that covers the original durable
+    /// tails. Caller must hold fresh consensus authorization for this intent.
+    /// Sealing and route publication serialize on the same lifecycle lock.
+    pub async fn install_queue_reseed_storage(
+        &self,
+        receipt: PreparedStorageHistory,
+        intent: [u8; 32],
+        epoch: u64,
+        message_target: u64,
+        event_target: u64,
+    ) -> Result<()> {
+        let st = self.clone();
+        tokio::spawn(async move {
+            let topic = &receipt.topic;
+            let part = receipt.partition;
+            let group = receipt.group.as_deref();
+            st.verify_admitted_storage_history(&receipt)?;
+            let route = Route {
+                topic: topic.clone(),
+                partition: part,
+                group: receipt.group.clone(),
+                generation: Some(Generation {
+                    plan: intent,
+                    instance: st.storage_session,
+                }),
+            };
+            let resource = key(topic, part, group);
+            if st
+                .recovery_routes
+                .get(&resource)
+                .is_some_and(|current| *current == route)
+            {
+                st.verify_queue_learner_caught_up(
+                    topic,
+                    part,
+                    group,
+                    epoch,
+                    message_target,
+                    event_target,
+                )
+                .await?;
+                return Ok(());
+            }
+            let view = st
+                .reseed_views
+                .get(&intent)
+                .ok_or_else(|| invalid("reseed stage absent"))?
+                .clone();
+            view.verify_admitted_storage_history(&receipt)?;
+            let old_ticket = st.queue_handle(topic, part, group).await?;
+            let old = old_ticket.resolve()?;
+            let ready = view
+                .verify_queue_learner_caught_up(
+                    topic,
+                    part,
+                    group,
+                    epoch,
+                    message_target,
+                    event_target,
+                )
+                .await?;
+            let replacement_ticket = view.queue_handle(topic, part, group).await?;
+            let replacement = replacement_ticket.resolve()?;
+            let _lifecycle = st.lock_partition_lifecycle(topic, part, group).await;
+            for (storage, expected) in [(&st, &*old), (&view, &*replacement)] {
+                let registry=storage.queue_handles.load();
+                if slot_lookup_no_alloc(&registry,topic,part,group)
+                    .and_then(|slot|slot.handle.get())
+                    .is_none_or(|handle|!std::ptr::eq(handle.as_ref(),expected)) {
+                    return Err(invalid("reseed incarnation changed during verification"));
+                }
+            }
+            let _old_apply = old.follower_apply_state().await;
+            let new_apply = replacement.follower_apply_state().await;
+            st.verify_admitted_storage_history(&receipt)?;
+            st.ensure_partition_not_sealed(topic, part, group)?;
+            old.ensure_not_recovery_sealed()?;
+            replacement.ensure_not_recovery_sealed()?;
+            if *new_apply
+                || replacement.role()!=QueueRole::Follower
+                || replacement.msg_log().current_epoch()!=epoch
+                || replacement.event_log().current_epoch()!=epoch
+                || replacement.ordered_applied_next()?!=Some(ready.event_next)
+                || !matches!(old.role(), QueueRole::Follower | QueueRole::Frozen)
+                || old.msg_log().current_epoch() != epoch
+                || old.event_log().current_epoch() != epoch
+                || ready.message_next < old.msg_log().next_offset()
+                || ready.event_next < old.event_log().next_offset()
+                || ready.message_next != replacement.msg_log().next_offset()
+                || ready.event_next != replacement.event_log().next_offset()
+            {
+                return Err(invalid(
+                    "reseed replacement does not cover the unchanged original history",
+                ));
+            }
+            if let Some(wq)=replacement.as_work_queue() {
+                if wq.required_message_next().await.map_err(io_err)?>ready.message_next {
+                    return Err(invalid("reseed payload dependency changed during verification"));
+                }
+            }
+            let route_dir = st.route_dir(topic, part, group);
+            fs::create_dir_all(&route_dir).map_err(io_err)?;
+            fs::OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .write(true)
+                .open(route_dir.join(".keratin.lock"))
+                .map_err(io_err)?;
+            let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
+            let cached = st.recovery_routes.get(&resource).map(|r| r.clone());
+            let disk: Option<Route> = read_meta(&route_dir.join("active"))?;
+            if disk != cached {
+                return Err(invalid("reseed route changed in another process"));
+            }
+            // Keep an explicit durable pointer to the original generation. No
+            // original payload, event or checkpoint file is overwritten.
+            save_meta(
+                &route_dir.join(format!(
+                    "reseed-original-{}",
+                    blake3::Hash::from_bytes(intent)
+                )),
+                &cached.unwrap_or(Route {
+                    topic: topic.clone(),
+                    partition: part,
+                    group: receipt.group.clone(),
+                    generation: None,
+                }),
+            )?;
+            let complete_path = route_dir.join(format!(
+                "reseed-complete-{}",
+                blake3::Hash::from_bytes(intent)
+            ));
+            if let Some((saved, saved_epoch, messages, events)) =
+                read_meta::<(PreparedStorageHistory, u64, u64, u64)>(&complete_path)?
+            {
+                if saved != receipt
+                    || saved_epoch != epoch
+                    || messages > ready.message_next
+                    || events > ready.event_next
+                {
+                    return Err(invalid(
+                        "reseed no longer covers its prepared completion cut",
+                    ));
+                }
+            } else {
+                save_meta(
+                    &complete_path,
+                    &(receipt.clone(), epoch, ready.message_next, ready.event_next),
+                )?;
+            }
+            boundary("reseed_before_switch");
+            // Cancelled callers can still hold a staging view. Revoke that
+            // view under the lifecycle lock before its files become live.
+            view.retired_view.store(true, Ordering::Release);
+            view.admitted_histories.remove(&resource);
+            for handle in [&old, &replacement] {
+                handle.begin_recovery_seal();
+                handle.quiesce_for_teardown().await;
+                handle.cancel_background_tasks();
+                handle.recovery_gate.retire_snapshots().await?;
+                if let Some(wq) = handle.as_work_queue() {
+                    wq.shutdown().await;
+                }
+                handle.msg_log().shutdown().await.map_err(io_err)?;
+                handle.event_log().shutdown().await.map_err(io_err)?;
+            }
+            st.remove_queue(topic, part, group);
+            view.remove_queue(topic, part, group);
+            boundary("reseed_retired");
+            let scratch = route_dir.join("next");
+            if scratch.try_exists().map_err(io_err)? {
+                fs::remove_file(&scratch).map_err(io_err)?;
+            }
+            save_meta(&scratch, &route)?;
+            fs::rename(&scratch, route_dir.join("active")).map_err(io_err)?;
+            recovery_seal::sync_directories(&route_dir)?;
+            st.recovery_routes.insert(resource, route);
+            st.reseed_views.remove(&intent);
+            boundary("reseed_switched");
+            Ok(())
+        })
+        .await
+        .map_err(io_err)?
+    }
+
     fn route_dir(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.root
             .join("recovery-routes")
@@ -126,6 +411,9 @@ impl Stroma {
     fn generation_view(&self, root: PathBuf) -> Self {
         let mut view = self.clone();
         view.root = root;
+        view.reseed_views = Arc::new(DashMap::new());
+        view.retired_view = Arc::new(AtomicBool::new(false));
+        view.quarantined = Arc::new(DashMap::new());
         view.recovery_routes = Arc::new(DashMap::new());
         view.queue_handles = Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new())));
         view.admitted_histories = Arc::new(DashMap::new());

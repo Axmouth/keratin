@@ -655,8 +655,21 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_inner(topic, part, group, from, max, false)
+        self.read_owner_message_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
             .await
+    }
+
+    /// Byte-bounded durable prefix, including one lookahead record.
+    pub async fn read_owner_message_records_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_message_records_inner(topic, part, group, from, max, max_bytes, false).await
     }
 
     /// Tentative bytes for a fenced, enrolled queue history only. The caller
@@ -670,8 +683,21 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_inner(topic, part, group, from, max, true)
+        self.read_owner_message_records_early_with_byte_budget(topic, part, group, from, max, usize::MAX)
             .await
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_message_records_early_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_message_records_inner(topic, part, group, from, max, max_bytes, true).await
     }
 
     async fn read_owner_message_records_inner(
@@ -681,6 +707,7 @@ impl Stroma {
         group: Option<&str>,
         from: Offset,
         max: usize,
+        max_bytes: usize,
         early: bool,
     ) -> Result<OwnerReplicationRead<Message>> {
         let qh = self.queue_handle(topic, part, group).await?;
@@ -710,11 +737,11 @@ impl Stroma {
                 let reader = read_log.reader();
                 #[cfg(feature = "early-replication-experiment")]
                 if early {
-                    return reader.scan_for_replication(from, max);
+                    return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
                 }
                 #[cfg(not(feature = "early-replication-experiment"))]
                 let _ = early;
-                reader.scan_from(from, max)
+                reader.scan_from_with_byte_budget(from, max, max_bytes)
             })
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?
@@ -752,8 +779,21 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_inner(topic, part, group, from, max, false)
+        self.read_owner_event_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
             .await
+    }
+
+    /// Byte-bounded durable prefix, including one lookahead record.
+    pub async fn read_owner_event_records_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_event_records_inner(topic, part, group, from, max, max_bytes, false).await
     }
 
     /// Tentative bytes for a fenced, enrolled queue history only. The caller
@@ -767,8 +807,21 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_inner(topic, part, group, from, max, true)
+        self.read_owner_event_records_early_with_byte_budget(topic, part, group, from, max, usize::MAX)
             .await
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_event_records_early_with_byte_budget(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_event_records_inner(topic, part, group, from, max, max_bytes, true).await
     }
 
     async fn read_owner_event_records_inner(
@@ -778,6 +831,7 @@ impl Stroma {
         group: Option<&str>,
         from: Offset,
         max: usize,
+        max_bytes: usize,
         early: bool,
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
         let qh = self.queue_handle(topic, part, group).await?;
@@ -807,11 +861,11 @@ impl Stroma {
                 let reader = read_log.reader();
                 #[cfg(feature = "early-replication-experiment")]
                 if early {
-                    return reader.scan_for_replication(from, max);
+                    return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
                 }
                 #[cfg(not(feature = "early-replication-experiment"))]
                 let _ = early;
-                reader.scan_from(from, max)
+                reader.scan_from_with_byte_budget(from, max, max_bytes)
             })
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?

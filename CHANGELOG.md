@@ -18,6 +18,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Add compaction retention constraints for queue replication and a separate
+  replacement-generation path for admitted follower repair. Original storage stays
+  available as recovery evidence until a durable, fully applied replacement covers
+  both original log tails. A completion receipt resumes interrupted admission
+  without resetting the installed copy.
+
 - Recovery limit errors carry bounded numeric diagnostics for inspection, replay,
   snapshot output and staging budgets. Reports identify accepted work and refused
   work without payloads. The limits and recovery authority remain unchanged.

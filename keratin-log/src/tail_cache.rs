@@ -22,7 +22,7 @@ use std::sync::Arc;
 use parking_lot::RwLock;
 
 use crate::durability::{DurableFrontier, DurableWatermark};
-use crate::reader::{OwnedRecord, to_owned};
+use crate::reader::{OwnedRecord, ScanByteBudget, to_owned};
 use crate::record::decode_record_prefix;
 
 /// One flush worth of encoded records, covering `[base_offset, next_offset)`.
@@ -137,21 +137,41 @@ impl TailCache {
     /// - `Some(recs)`: every record in `[from, min(from + max, durable))` at the
     ///   captured frontier. This can be shorter than `max`, or empty when `from`
     ///   is at/past the frontier; a cache hit never returns a partial range.
+    #[cfg(test)]
     pub(crate) fn read_from(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
-        self.read_bounded(from, max, Some(self.durable_frontier().first_non_durable()))
+        self.read_from_with_byte_budget(from, max, usize::MAX)
     }
 
-    /// Tentative replication only: cache miss falls back to durable reads. An
-    /// oversized flush retained by the ordinary cache is excluded from this path.
-    #[cfg(feature = "early-replication-experiment")]
+    pub(crate) fn read_from_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.read_bounded(from, max, max_bytes, Some(self.durable_frontier().first_non_durable()))
+    }
+
+    #[cfg(all(test, feature = "early-replication-experiment"))]
     pub(crate) fn read_written(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
-        self.read_bounded(from, max, None)
+        self.read_written_with_byte_budget(from, max, usize::MAX)
+    }
+
+    /// Tentative replication only. Oversized cached flushes miss this path.
+    #[cfg(feature = "early-replication-experiment")]
+    pub(crate) fn read_written_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.read_bounded(from, max, max_bytes, None)
     }
 
     fn read_bounded(
         &self,
         from: u64,
         max: usize,
+        max_bytes: usize,
         durable: Option<u64>,
     ) -> Option<Vec<OwnedRecord>> {
         if self.byte_budget == 0 || max == 0 {
@@ -196,6 +216,7 @@ impl TailCache {
         // has the `upper - from` records requested.
         let mut out = Vec::with_capacity((upper - from) as usize);
         let mut expected = from;
+        let mut budget = ScanByteBudget::new(max_bytes);
         for (base, next, buf) in &bufs {
             let mut decoded_next = *base;
             let mut pos = 0usize;
@@ -211,9 +232,10 @@ impl TailCache {
                     if rec.offset != expected {
                         return None;
                     }
+                    budget.observe(&rec);
                     out.push(to_owned(rec));
                     expected += 1;
-                    if expected == upper {
+                    if expected == upper || budget.finished {
                         return Some(out);
                     }
                 }
@@ -302,6 +324,26 @@ mod tests {
         let (b, n, bytes) = encode_batch(0, 1, 16);
         disabled.push_batch(b, n, bytes);
         assert!(disabled.read_written(0, 1).is_none());
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    #[test]
+    fn tentative_byte_budget_keeps_lookahead_and_ordinary_visibility() {
+        let c = cache(1 << 20, 0);
+        let (b, n, bytes) = encode_batch(0, 10, 128);
+        c.push_batch(b, n, bytes);
+        let record_bytes = crate::record::RECORD_HEADER_LEN + 1 + 128;
+        let bounded = c.read_written_with_byte_budget(0, 10, record_bytes * 2).unwrap();
+        assert_eq!(bounded.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let oversized = c.read_written_with_byte_budget(3, 10, 1).unwrap();
+        assert_eq!(oversized.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(c.read_written_with_byte_budget(3, 1, 1).unwrap().len(), 1);
+        assert!(c.read_from_with_byte_budget(0, 10, record_bytes * 2).unwrap().is_empty());
+        c.durable.advance(DurableFrontier::from_exclusive(10));
+        let durable = c.read_from_with_byte_budget(0, 10, record_bytes * 2).unwrap();
+        assert_eq!(durable.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0, 1, 2]);
+        c.clear();
+        assert!(c.read_written_with_byte_budget(0, 10, record_bytes * 2).is_none());
     }
 
     #[test]

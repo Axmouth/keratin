@@ -1,5 +1,7 @@
 # Stroma QueueHandle -> ticket/re-resolve redesign (execution-ready plan)
 
+Historical design record. See the current [repository overview](../../README.md) for implemented behavior.
+
 Status: IMPLEMENTED + green (2026-06-20). Full keratin workspace 285 passed; fibril
 builds across the boundary; mouse 5/5 + bear 3/3 deterministic. Bench below.
 Full problem analysis + rationale: fibril DESIGN_NOTES.md "Stroma queue-handle lifecycle".

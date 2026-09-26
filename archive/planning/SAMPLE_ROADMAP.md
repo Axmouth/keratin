@@ -1,4 +1,7 @@
+# Original workspace roadmap
 
+
+Historical design record. See the current [repository overview](../../README.md) for implemented behavior.
 ## Phase 0: Repo & crate boundaries
 
 Create a workspace:
