@@ -101,6 +101,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- The single-log queue experiment rejects forward payload references before
+  owner or follower append, including cancellation directives. Rejected frames
+  leave the apply fence clean unless an earlier frame already mutated an open
+  replication group.
+- Direct NACK, inflight-release and discard paths now settle their metadata log
+  positions before advancing ordered application. Their live settled frontier
+  matches follower replay and cold recovery.
+
 - Ordered queue application wakes only ranges that can proceed at the current
   frontier. Reset and failure still wake all invalidated waiters, and cancellation
   removes its registration. This prevents concurrent publishers from creating a

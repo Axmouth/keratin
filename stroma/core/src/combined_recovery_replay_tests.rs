@@ -95,9 +95,11 @@ fn combined_recovery_keeps_old_live_payload_across_compacted_checkpoints() {
 
 #[test]
 fn combined_recovery_rejects_forward_references_and_nonpayload_live_positions() {
-    let ev = events(vec![payload_event(None), StromaEvent::Ack { off: 2 }, payload_event(None)]);
-    let error = drive_checkpoints(combined_inspector(&ev, Default::default()), [[&[], &ev], [&[], &ev]], [&[], &[]]).err().unwrap();
-    assert!(error.contains("forward payload reference"));
+    for forward in [StromaEvent::Ack { off: 2 }, StromaEvent::CancelEnqueueMany { offs: vec![2] }] {
+        let ev = events(vec![payload_event(None), forward, payload_event(None)]);
+        let error = drive_checkpoints(combined_inspector(&ev, Default::default()), [[&[], &ev], [&[], &ev]], [&[], &[]]).err().unwrap();
+        assert!(error.contains("forward payload reference"));
+    }
     let ev = events(vec![payload_event(None), StromaEvent::Ack { off: 0 }]);
     let mut bad = crate::QueueInternalState::new("q".into(), 0);
     bad.ack(0); bad.enqueue(1, 0, None);

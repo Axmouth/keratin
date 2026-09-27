@@ -236,7 +236,7 @@ impl Stroma {
                 }
                 other => {
                     if other
-                        .max_referenced_msg_offset()
+                        .max_combined_referenced_offset()
                         .is_some_and(|target| target >= off)
                     {
                         return Err(StromaError::Corruption(
@@ -388,7 +388,7 @@ pub(super) fn recover_events(
             let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
             let carries_payload = matches!(event, StromaEvent::PayloadEnqueue { .. });
             if event
-                .max_referenced_msg_offset()
+                .max_combined_referenced_offset()
                 .is_some_and(|off| off >= record.offset)
             {
                 return Err(StromaError::Corruption(

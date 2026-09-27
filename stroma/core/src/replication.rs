@@ -1019,6 +1019,19 @@ impl Stroma {
                 return Err(StromaError::InvalidArgument("combined queue event received by a two-log queue".into()));
             }
         }
+        // Validate the entire incoming frame before enqueueing any writes or
+        // setting the dirty-apply fence. This also covers open durability groups.
+        if qh.optional_message_log().is_none() {
+            if let Some(batch) = &events {
+                batch.first_offset.checked_add(batch.events.len() as u64)
+                    .ok_or_else(|| StromaError::InvalidArgument("combined event offset exhausted".into()))?;
+                for (index, event) in batch.events.iter().enumerate() {
+                    if event.max_combined_referenced_offset().is_some_and(|off| off >= batch.first_offset + index as u64) {
+                        return Err(StromaError::InvalidArgument("combined follower event has a forward payload reference".into()));
+                    }
+                }
+            }
+        }
         let messages = if qh.optional_message_log().is_none() {
             if let Some(batch) = &messages {
                 if !batch.records.is_empty() || batch.first_offset != 0 || batch.epoch != qh.message_lane_epoch() {

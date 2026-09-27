@@ -1085,7 +1085,7 @@ async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_recor
         if !missing_receipt {
             let err = st.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
                 epoch: 7, first_offset: 0, durability: Some(KDurability::AfterFsync),
-                events: vec![StromaEvent::Ack { off: 0 }, StromaEvent::Ack { off: 0 }],
+                events: vec![StromaEvent::AckMany { reqs: vec![] }, StromaEvent::Ack { off: 0 }],
             })).await.unwrap_err();
             assert!(err.to_string().contains("retained payload enqueue"), "{err}");
             assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 2).await.is_err());
@@ -1214,4 +1214,153 @@ async fn combined_reseed_sigkill_preserves_recoverable_payloads_on_either_route(
         assert_eq!(payload, vec![42; 2048], "{boundary}");
         st.shutdown().await.unwrap();
     }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_direct_settlement_paths_leave_no_metadata_frontier_holes() {
+    let dir = keratin_log::test_dir!("combined_direct_settlements");
+    let st = open(&dir.root.join("owner")).await;
+    assert_eq!(publish(&st, false).await, 0);
+    assert_eq!(publish(&st, false).await, 1);
+    let delivered = st.poll_ready("q", 0, None, 2, u64::MAX - 1, u64::MAX).await.unwrap();
+    assert_eq!(delivered.iter().map(|m| m.0).collect::<Vec<_>>(), [0, 1]);
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.nack_enqueue("q", 0, None, 0, true, completion).await.unwrap();
+    rx.await.unwrap().unwrap();
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.release_inflight_many("q", 0, None, vec![AckEventMeta { off: 1 }], completion).await.unwrap();
+    rx.await.unwrap().unwrap();
+    ack(&st, 0).await;
+    ack(&st, 1).await;
+    // The default discard policy takes NACK's second durable commit path.
+    let discarded = publish(&st, false).await;
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    st.nack_enqueue("q", 0, None, discarded, false, completion).await.unwrap();
+    rx.await.unwrap().unwrap();
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    let next = h.event_log().next_offset();
+    assert_eq!(next, discarded + 3);
+    assert_eq!(h.work_queue().unwrap().settled_until().await, next);
+    let crate::OwnerReplicationRead::Batch(batch) = st.read_owner_event_records("q", 0, None, 0, 100).await.unwrap() else { panic!("retained history") };
+    let follower = open(&dir.root.join("follower")).await;
+    follower.become_queue_follower_with_epoch("q", 0, None, batch.epoch).await.unwrap();
+    follower.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
+        epoch: batch.epoch, first_offset: 0, events: batch.records.into_iter().map(|(_, event)| event).collect(),
+        durability: Some(KDurability::AfterFsync),
+    })).await.unwrap();
+    let fq = follower.queue_handle("q", 0, None).await.unwrap();
+    let fh = fq.resolve().unwrap();
+    assert_eq!(fh.work_queue().unwrap().settled_until().await, next);
+    let mut owner_state = crate::QueueInternalState::new("q".into(), 0);
+    owner_state.load_snapshot(&h.force_encode_snapshot(next - 1).await.unwrap()).unwrap();
+    let mut replica_state = crate::QueueInternalState::new("q".into(), 0);
+    replica_state.load_snapshot(&fh.force_encode_snapshot(next - 1).await.unwrap()).unwrap();
+    assert_eq!(owner_state.recovery_state_digest(), replica_state.recovery_state_digest());
+    follower.shutdown().await.unwrap();
+    drop(fh);
+    drop(fq);
+    drop(follower);
+    drop(h);
+    drop(q);
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st = open(&dir.root.join("owner")).await;
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    assert_eq!(h.work_queue().unwrap().settled_until().await, next);
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_owner_rejects_future_references_before_mutation() {
+    let dir = keratin_log::test_dir!("combined_owner_reference_preflight");
+    let st = open(&dir.root).await;
+    let (completion, rx) = KeratinAppendCompletion::pair();
+    assert!(st.ack_enqueue("q", 0, None, 0, completion).await.is_err());
+    assert!(rx.await.is_err());
+    assert_eq!(publish(&st, false).await, 0);
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    for invalid in [1, u64::MAX] {
+        let (completion, rx) = KeratinAppendCompletion::pair();
+        assert!(st.ack_enqueue_many("q", 0, None, vec![AckEventMeta { off: 0 }, AckEventMeta { off: invalid }], completion).await.is_err());
+        assert!(rx.await.is_err());
+        let (completion, rx) = KeratinAppendCompletion::pair();
+        assert!(st.nack_enqueue_many("q", 0, None, vec![
+            NackEventMeta { off: 0, requeue: true, not_before: None },
+            NackEventMeta { off: invalid, requeue: true, not_before: None },
+        ], completion).await.is_err());
+        assert!(rx.await.is_err());
+        let (completion, rx) = KeratinAppendCompletion::pair();
+        assert!(st.release_inflight_many("q", 0, None, vec![AckEventMeta { off: invalid }], completion).await.is_err());
+        assert!(rx.await.is_err());
+        assert!(st.append_events_durable("q", 0, None, vec![
+            StromaEvent::Ack { off: 0 }, StromaEvent::CancelEnqueueMany { offs: vec![invalid] },
+        ], KDurability::AfterFsync).await.is_err());
+        assert_eq!(h.event_log().next_offset(), 1);
+        assert_eq!(h.work_queue().unwrap().retries(0).await, 0);
+        assert_eq!(h.work_queue().unwrap().settled_until().await, 0);
+    }
+    ack(&st, 0).await;
+    assert_eq!(publish(&st, false).await, 2);
+    assert_eq!(st.poll_ready("q", 0, None, 10, u64::MAX - 1, u64::MAX).await.unwrap().iter().map(|m| m.0).collect::<Vec<_>>(), [2]);
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
+    let dir = keratin_log::test_dir!("combined_follower_reference_preflight");
+    let st = open(&dir.root).await;
+    st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    let payload = StromaEvent::PayloadEnqueue {
+        not_before: None, expire_at: None, headers: headers().encode().unwrap(), payload: vec![42],
+    };
+    for invalid in [StromaEvent::Ack { off: 1 }, StromaEvent::CancelEnqueueMany { offs: vec![u64::MAX] }] {
+        let error = st.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
+            epoch: 7, first_offset: 0, events: vec![payload.clone(), invalid], durability: Some(KDurability::AfterFsync),
+        })).await.unwrap_err();
+        assert!(error.to_string().contains("forward payload reference"), "{error}");
+        assert_eq!(h.event_log().next_offset(), 0);
+        assert_eq!(h.ordered_applied_next().unwrap(), Some(0));
+        assert!(!*h.follower_apply_state().await);
+    }
+    assert!(st.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
+        epoch: 7, first_offset: u64::MAX, events: vec![payload.clone()], durability: Some(KDurability::AfterFsync),
+    })).await.unwrap_err().to_string().contains("offset exhausted"));
+    assert_eq!(h.event_log().next_offset(), 0);
+    for _ in 0..2 {
+        let batch = ReplicatedEventBatch { epoch: 7, first_offset: 0,
+            events: vec![payload.clone(), StromaEvent::Nack { off: 0, requeue: true }], durability: Some(KDurability::AfterFsync) };
+        st.apply_replicated_queue_batch("q", 0, None, None, Some(batch)).await.unwrap();
+    }
+    assert_eq!(h.event_log().next_offset(), 2);
+    assert_eq!(h.ordered_applied_next().unwrap(), Some(2));
+    assert_eq!(h.work_queue().unwrap().retries(0).await, 1);
+    assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42]);
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_open_group_keeps_dirty_fence_when_later_frame_is_invalid() {
+    use futures::StreamExt;
+    let dir = keratin_log::test_dir!("combined_open_reference_preflight");
+    let st = open(&dir.root).await;
+    st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+    let first = ReplicatedEventBatch { epoch: 7, first_offset: 0, durability: None,
+        events: vec![StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: headers().encode().unwrap(), payload: vec![42] }] };
+    let invalid = || ReplicatedEventBatch { epoch: 7, first_offset: 1, durability: None,
+        events: vec![StromaEvent::Ack { off: 1 }] };
+    let frames = futures::stream::iter([Ok((None, Some(first))), Ok((None, Some(invalid())))]).boxed();
+    let error = st.apply_open_replicated_queue_batch("q", 0, None, frames).await.unwrap_err();
+    assert!(error.to_string().contains("forward payload reference"), "{error}");
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    assert_eq!(h.event_log().next_offset(), 1);
+    assert_eq!(h.ordered_applied_next().unwrap(), Some(0));
+    assert!(*h.follower_apply_state().await);
+    assert!(st.apply_replicated_queue_batch("q", 0, None, None, Some(invalid())).await.unwrap_err().to_string().contains("incomplete follower apply"));
+    st.shutdown().await.unwrap();
 }

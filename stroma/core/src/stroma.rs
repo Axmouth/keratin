@@ -2557,6 +2557,27 @@ impl Stroma {
         Ok(())
     }
 
+    /// Owner state operations can reference only already-assigned payload
+    /// positions. The tail is sampled while an owner-operation lease prevents
+    /// destructive transitions. Concurrent appends can only advance this bound.
+    fn owner_event_msg(&self, qh: &QueueHandleInner, event: &StromaEvent) -> Result<Message> {
+        if self.queue_payloads_in_event_log() && qh.kind() == PartitionKind::Queue
+            && event.max_combined_referenced_offset().is_some_and(|off| off >= qh.event_log().next_offset())
+        {
+            return Err(StromaError::InvalidArgument("combined owner event has a forward payload reference".into()));
+        }
+        event_msg(event)
+    }
+
+    /// Direct actor operations still need to settle their non-payload log slot
+    /// before publishing the ordered application boundary.
+    async fn settle_metadata_record(&self, qh: &QueueHandleInner, offset: Offset) -> Result<()> {
+        if self.queue_payloads_in_event_log() && qh.kind() == PartitionKind::Queue {
+            self.apply_event_inmem(StromaEvent::Ack { off: offset }, qh).await?;
+        }
+        Ok(())
+    }
+
     async fn append_events_durable(
         &self,
         tp: &str,
@@ -2594,7 +2615,7 @@ impl Stroma {
         let event_log = qh.event_log();
         let mut msgs = Vec::with_capacity(evs.len());
         for ev in &evs {
-            msgs.push(event_msg(ev)?);
+            msgs.push(self.owner_event_msg(&qh, ev)?);
         }
         let msgs_count = msgs.len();
         let bytes_count: usize = msgs.iter().map(|m| m.bytes_len()).sum();
@@ -5007,11 +5028,12 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, event_log) = {
+        let (owner_operation, event_log, event_msg) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.event_log())
+            let lease = h.begin_owner_operation().await?;
+            let message = self.owner_event_msg(&h, &ev)?;
+            (lease, h.event_log(), message)
         };
-        let event_msg = event_msg(&ev)?;
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
@@ -5035,11 +5057,12 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, event_log) = {
+        let (owner_operation, event_log, event_msg) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.event_log())
+            let lease = h.begin_owner_operation().await?;
+            let message = self.owner_event_msg(&h, &ev)?;
+            (lease, h.event_log(), message)
         };
-        let event_msg = event_msg(&ev)?;
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
@@ -5089,7 +5112,7 @@ impl Stroma {
         let event_log = qh.event_log();
 
         let event = StromaEvent::ReleaseInflightMany { reqs: reqs.clone() };
-        let m = event_msg(&event)?;
+        let m = self.owner_event_msg(&qh, &event)?;
         let ordered_scope = qh.ordered_apply_scope();
         let ar = event_log
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
@@ -5105,6 +5128,7 @@ impl Stroma {
             .release_inflight_many(reqs)
             .await
             .map_err(|err| StromaError::Io(err.to_string()))?;
+        self.settle_metadata_record(&qh, ar.base_offset).await?;
 
         if ordered_scope.is_some() {
             qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
@@ -5147,7 +5171,7 @@ impl Stroma {
 
         // Phase 1: durable Nack write
         let nack_event = StromaEvent::NackMany { reqs: reqs.clone() };
-        let m = event_msg(&nack_event)?;
+        let m = self.owner_event_msg(&h, &nack_event)?;
         let ordered_scope = h.ordered_apply_scope();
         let ar = event_log
             .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
@@ -5170,6 +5194,7 @@ impl Stroma {
             .map_err(io_err)?;
             rx.await.map_err(|_| StromaError::QueueActorGone)?
         };
+        self.settle_metadata_record(&h, ar.base_offset).await?;
         if ordered_scope.is_some() {
             h.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
         }
@@ -5200,7 +5225,7 @@ impl Stroma {
             };
             // (DeadLetterCommit on replay = ack, same effect.)
             // Could also use a distinct DiscardPending event; using commit keeps event types minimal.
-            let m = event_msg(&ev)?;
+            let m = self.owner_event_msg(&h, &ev)?;
             let ordered_scope = h.ordered_apply_scope();
             let discard_ar = event_log
                 .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
@@ -5208,6 +5233,7 @@ impl Stroma {
                 .map_err(io_err)?;
             let turn = crate::ordered_apply::enter(&ordered_scope, discard_ar.base_offset, discard_ar.count as u64).await?;
             h.work_queue()?.discard_pending_dlq(to_discard).await?;
+            self.settle_metadata_record(&h, discard_ar.base_offset).await?;
             if ordered_scope.is_some() {
                 h.applied_upto().fetch_max(discard_ar.base_offset + discard_ar.count as u64 - 1, Ordering::Release);
             }
@@ -5219,7 +5245,7 @@ impl Stroma {
             let ev = StromaEvent::DeadLetter {
                 reqs: to_dlq.clone(),
             };
-            let event_msg = event_msg(&ev)?;
+            let event_msg = self.owner_event_msg(&h, &ev)?;
             let ordered_scope = h.ordered_apply_scope();
             let dlq_ar = event_log
                 .append_batch(
@@ -5522,11 +5548,7 @@ impl Stroma {
         _owner_operation: OwnerOperationLease,
     ) -> Result<()> {
         let ev = StromaEvent::DeadLetterCommit { offs: offs.clone() };
-        let Ok(m) = event_msg(&ev) else {
-            return Err(StromaError::Encode(
-                "Failed to encode DeadLetterCommit event".into(),
-            ));
-        };
+        let m = self.owner_event_msg(qh, &ev)?;
 
         let ordered_scope = qh.ordered_apply_scope();
         let ar = qh

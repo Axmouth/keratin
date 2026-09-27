@@ -432,6 +432,16 @@ impl StromaEvent {
         }
     }
 
+    /// Combined-log references must precede their containing record, including
+    /// cancellation directives. A future cancellation could settle a message
+    /// that has not been published yet.
+    pub(crate) fn max_combined_referenced_offset(&self) -> Option<Offset> {
+        match self {
+            Self::CancelEnqueueMany { offs } => offs.iter().copied().max(),
+            _ => self.max_referenced_msg_offset(),
+        }
+    }
+
     /// The highest message-log offset this event references, if any.
     ///
     /// Used by recovery to verify the event log does not reference messages the

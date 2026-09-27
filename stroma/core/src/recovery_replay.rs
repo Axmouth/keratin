@@ -261,7 +261,7 @@ impl QueueReplay {
         if payload && !combined {
             return Err("payload-bearing event in a separate-log history".into());
         }
-        if combined && !payload && ev.max_referenced_msg_offset().is_some_and(|off| off >= record.offset) {
+        if combined && !payload && ev.max_combined_referenced_offset().is_some_and(|off| off >= record.offset) {
             return Err("combined recovery event has a forward payload reference".into());
         }
         let refs = ev.referenced_msg_offsets();
