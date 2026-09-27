@@ -22,7 +22,7 @@ async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
 }
 
 pub async fn append_one(
-    st: &Arc<Stroma>,
+    st: &Stroma,
     tp: &str,
     part: u32,
     group: Option<&str>,
@@ -49,9 +49,10 @@ async fn truncated_delta_does_not_corrupt_state() {
 
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
-    for i in 0..1000 {
+    for index in 0..1000 {
+        let i = append_one(&st, "t", 0, None, b"live").await;
         st.mark_inflight_one("t", 0, None, i, 1000).await.unwrap();
-        if i % 4 == 0 {
+        if index % 4 == 0 {
             st.ack_one("t", 0, None, i).await.unwrap();
         }
     }
@@ -146,37 +147,6 @@ async fn enqueue_is_durable_and_replayed_no_snap() {
     assert!(st2.is_ready("t", 0, None, 0).await.unwrap());
 }
 
-// #[tokio::test]
-// async fn crash_between_message_and_enqueue_event_is_safe() {
-//     let test_dir = test_dir!("test_data");
-//     let st = Arc::new(
-//         Stroma::open(
-//             &test_dir.root,
-//             StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
-//             SnapshotConfig::default(),
-//         )
-//         .await
-//         .unwrap(),
-//     );
-
-//     let (c, rx) = KeratinAppendCompletion::pair();
-//     st.append_message("t", 0,  None, b"x", c).await.unwrap();
-//     let offset = rx.await.unwrap().unwrap().base_offset;
-
-//     drop(st);
-
-//     let st2 = Stroma::open(
-//         &test_dir.root,
-//         StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
-//         SnapshotConfig::default(),
-//     )
-//     .await
-//     .unwrap();
-//     st2.validate().unwrap();
-
-//     assert!(st2.is_ready("t", 0,  None, offset).unwrap());
-// }
-
 #[tokio::test]
 async fn expiry_is_durable_across_restart() {
     let (st, dir) = open_test_stroma().await;
@@ -205,12 +175,9 @@ async fn expiry_is_durable_across_restart() {
     assert!(st2.is_ready("t", 0, None, off).await.unwrap());
 }
 
-/// End-to-end for the parallel durable-append path: a batch of immediate
-/// publishes, each confirmed only on BOTH logs being durable, must all survive a
-/// restart and be deliverable. Guards the confirmed <=> durable <=> delivered
-/// invariant across the parallel append + fold recovery.
+/// Every durable confirmation in a publish batch must survive a restart.
 #[tokio::test]
-async fn parallel_publish_batch_confirmed_survives_restart() {
+async fn publish_batch_confirmed_survives_restart() {
     use stroma_core::PublishItem;
     let (st, dir) = open_test_stroma().await;
 
@@ -235,7 +202,7 @@ async fn parallel_publish_batch_confirmed_survives_restart() {
         .collect();
     st.append_message_batch("t", 0, None, items).await.unwrap();
 
-    // Await every confirmation (fires only once both logs are durable).
+    // Await every confirmation after the queue log becomes durable.
     let mut offsets = Vec::new();
     for rx in rxs {
         offsets.push(rx.await.unwrap().unwrap().base_offset);
@@ -259,9 +226,7 @@ async fn parallel_publish_batch_confirmed_survives_restart() {
     }
 }
 
-/// A delayed publish (`not_before`) now takes the parallel path too. It is confirmed
-/// only once both logs are durable, stays undelivered until its deadline, survives a
-/// restart still delayed, and fires once the deadline passes.
+/// A confirmed delayed payload survives restart and activates at its deadline.
 #[tokio::test]
 async fn delayed_publish_confirmed_survives_restart() {
     use stroma_core::PublishItem;

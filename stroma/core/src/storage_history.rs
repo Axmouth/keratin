@@ -128,7 +128,12 @@ pub(super) fn persist(path: &Path, receipt: &Receipt) -> Result<()> {
 }
 
 impl Stroma {
-    pub(super) fn storage_history_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
+    pub(super) fn storage_history_path(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> PathBuf {
         self.snap_dir(topic, part, group).join("storage.history")
     }
 
@@ -198,7 +203,9 @@ impl Stroma {
 
     fn ensure_view_active(&self) -> Result<()> {
         if self.retired_view.load(Ordering::Acquire) {
-            return Err(StromaError::InvalidArgument("retired staging view cannot mutate installed storage".into()));
+            return Err(StromaError::InvalidArgument(
+                "retired staging view cannot mutate installed storage".into(),
+            ));
         }
         Ok(())
     }
@@ -213,11 +220,23 @@ impl Stroma {
         let group = normalize_group(group);
         let key = (Box::<str>::from(topic), part, group.map(Box::<str>::from));
         let receipt = self.checked_storage_history(topic, part, group)?;
-        if receipt.is_none() && self.snap_dir(topic, part, group).join("storage.preparing").try_exists().map_err(io_err)? {
-            return Err(StromaError::HistoryAdmissionRequired { topic: topic.into(), partition: part, group: group.map(str::to_owned) });
+        if receipt.is_none()
+            && self
+                .snap_dir(topic, part, group)
+                .join("storage.preparing")
+                .try_exists()
+                .map_err(io_err)?
+        {
+            return Err(StromaError::HistoryAdmissionRequired {
+                topic: topic.into(),
+                partition: part,
+                group: group.map(str::to_owned),
+            });
         }
         if receipt.is_none() && self.has_recovery_installation(topic, part, group)? {
-            return Err(StromaError::Corruption("installed recovery lost its storage receipt".into()));
+            return Err(StromaError::Corruption(
+                "installed recovery lost its storage receipt".into(),
+            ));
         }
         match receipt {
             Some(receipt)
@@ -248,10 +267,22 @@ impl Stroma {
         group: Option<&str>,
     ) -> Result<()> {
         if self.has_recovery_installation(topic, part, group)?
-            || self.snap_dir(topic, part, group).join("storage.preparing").try_exists().map_err(io_err)?
-            || self.snap_dir(topic, part, group).join("storage.activated").try_exists().map_err(io_err)?
+            || self
+                .snap_dir(topic, part, group)
+                .join("storage.preparing")
+                .try_exists()
+                .map_err(io_err)?
+            || self
+                .snap_dir(topic, part, group)
+                .join("storage.activated")
+                .try_exists()
+                .map_err(io_err)?
         {
-            return Err(StromaError::HistoryAdmissionRequired { topic:topic.into(),partition:part,group:normalize_group(group).map(str::to_owned) });
+            return Err(StromaError::HistoryAdmissionRequired {
+                topic: topic.into(),
+                partition: part,
+                group: normalize_group(group).map(str::to_owned),
+            });
         }
         if self
             .checked_storage_history(topic, part, normalize_group(group))?
@@ -392,7 +423,16 @@ impl Stroma {
         // log shutdown, even if the caller drops its future.
         tokio::spawn(async move {
             stroma
-                .initialize_history_inner(&topic, part, group.as_deref(), kind, binding, true, None, false)
+                .initialize_history_inner(
+                    &topic,
+                    part,
+                    group.as_deref(),
+                    kind,
+                    binding,
+                    true,
+                    None,
+                    false,
+                )
                 .await
         })
         .await
@@ -566,22 +606,12 @@ impl Stroma {
                         true,
                     )
                     .await?;
-                let messages = if stroma.queue_payloads_in_event_log() { None } else {
-                    Some(open_preparation_log(&stroma, stroma.msg_tp_part_dir(&topic, part, group.as_deref()), stroma.keratin_cfg_msg).await?)
-                };
-                let events = match open_preparation_log(
+                let events = open_preparation_log(
                     &stroma,
                     stroma.tp_part_dir(&topic, part, group.as_deref()),
                     stroma.queue_event_log_config(),
                 )
-                .await
-                {
-                    Ok(events) => events,
-                    Err(e) => {
-                        if let Some(log) = &messages { let _ = log.shutdown().await; }
-                        return Err(e);
-                    }
-                };
+                .await?;
                 let result = (|| {
                     if read(&path)?.as_ref() != Some(&old) {
                         return Err(StromaError::InvalidArgument(
@@ -596,10 +626,9 @@ impl Stroma {
                     fs::rename(&next, &path).map_err(io_err)?;
                     recovery_seal::sync_directories(path.parent().unwrap())
                 })();
-                let (m, e) = tokio::join!(async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } }, events.shutdown());
+                let close = events.shutdown().await;
                 result?;
-                m.map_err(io_err)?;
-                e.map_err(io_err)?;
+                close.map_err(io_err)?;
             }
             // Materialization and eviction must never temporarily grant a
             // learner an owner role to background timer/expiry maintenance.
@@ -620,7 +649,9 @@ impl Stroma {
                     handle.freeze_owner_and_wait_operations().await?;
                 }
                 handle.become_follower();
-                for log in handle.physical_logs() { log.become_follower(); }
+                for log in handle.physical_logs() {
+                    log.become_follower();
+                }
             }
             recovery_stage::persist_exact(
                 &stroma
@@ -665,8 +696,13 @@ impl Stroma {
         let path = self.storage_history_path(topic, part, group);
         let intent_path = self.snap_dir(topic, part, group).join("storage.preparing");
         let activated_path = self.snap_dir(topic, part, group).join("storage.activated");
-        if !admit && (activated_path.try_exists().map_err(io_err)? || self.has_recovery_installation(topic, part, group)?) {
-            return Err(StromaError::InvalidArgument("activated storage requires history recovery".into()));
+        if !admit
+            && (activated_path.try_exists().map_err(io_err)?
+                || self.has_recovery_installation(topic, part, group)?)
+        {
+            return Err(StromaError::InvalidArgument(
+                "activated storage requires history recovery".into(),
+            ));
         }
         let receipt = Receipt {
             topic: topic.into(),
@@ -725,7 +761,9 @@ impl Stroma {
             r == receipt
         };
         if intent.as_ref().is_some_and(|r| !same_history(r)) {
-            return Err(StromaError::InvalidArgument("preparation intent differs from history".into()));
+            return Err(StromaError::InvalidArgument(
+                "preparation intent differs from history".into(),
+            ));
         }
         if let Some(existing) = &existing {
             if *existing != receipt && !(resume && intent.is_some() && same_history(existing)) {
@@ -771,13 +809,26 @@ impl Stroma {
             }
             // Take the physical log locks before persisting. Another storage instance
             // cannot write these logs concurrently with initial binding.
-            let messages = if kind == PartitionKind::Queue && self.queue_payloads_in_event_log() {
-                if self.msg_tp_part_dir(topic, part, group).try_exists().map_err(io_err)? {
-                    return Err(StromaError::InvalidArgument("combined preparation found an unexpected separate message log".into()));
+            let messages = if kind == PartitionKind::Queue {
+                if self
+                    .msg_tp_part_dir(topic, part, group)
+                    .try_exists()
+                    .map_err(io_err)?
+                {
+                    return Err(StromaError::InvalidArgument(
+                        "combined preparation found an unexpected separate message log".into(),
+                    ));
                 }
                 None
             } else {
-                Some(open_preparation_log(self, self.msg_tp_part_dir(topic, part, group), self.keratin_cfg_msg).await?)
+                Some(
+                    open_preparation_log(
+                        self,
+                        self.msg_tp_part_dir(topic, part, group),
+                        self.keratin_cfg_msg,
+                    )
+                    .await?,
+                )
             };
             let events = match open_preparation_log(
                 self,
@@ -788,17 +839,22 @@ impl Stroma {
             {
                 Ok(events) => events,
                 Err(error) => {
-                    if let Some(log) = &messages { let _ = log.shutdown().await; }
+                    if let Some(log) = &messages {
+                        let _ = log.shutdown().await;
+                    }
                     return Err(error);
                 }
             };
             let result = async {
                 if read(&path)? != existing {
-                    return Err(StromaError::InvalidArgument("storage receipt changed during preparation".into()));
+                    return Err(StromaError::InvalidArgument(
+                        "storage receipt changed during preparation".into(),
+                    ));
                 }
                 preparation_boundary("logs");
-                if messages.as_ref().is_some_and(|log| log.next_offset() != 0 || log.head_offset() != 0 || log.current_epoch() != 0)
-                    || events.next_offset() != 0
+                if messages.as_ref().is_some_and(|log| {
+                    log.next_offset() != 0 || log.head_offset() != 0 || log.current_epoch() != 0
+                }) || events.next_offset() != 0
                     || events.head_offset() != 0
                     || events.current_epoch() != 0
                 {
@@ -819,7 +875,9 @@ impl Stroma {
                         // All physical log locks are held. Only the local session changes;
                         // the history binding and pristine logs remain intact.
                         let next = path.with_file_name("storage.history.next");
-                        if next.try_exists().map_err(io_err)? { fs::remove_file(&next).map_err(io_err)?; }
+                        if next.try_exists().map_err(io_err)? {
+                            fs::remove_file(&next).map_err(io_err)?;
+                        }
                         persist(&next, &saved)?;
                         fs::rename(&next, &path).map_err(io_err)?;
                         recovery_seal::sync_directories(path.parent().unwrap())?;
@@ -833,7 +891,12 @@ impl Stroma {
             }
             .await;
             let (message_close, event_close) = tokio::join!(
-                async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } },
+                async {
+                    match messages {
+                        Some(log) => log.shutdown().await,
+                        None => Ok(()),
+                    }
+                },
                 events.shutdown(),
             );
             result?;
@@ -877,10 +940,16 @@ async fn open_preparation_log(
 
 fn preparation_boundary(_name: &str) {
     #[cfg(test)]
-    if std::env::var("STROMA_PREPARATION_CRASH_BOUNDARY").ok().as_deref() == Some(_name) {
+    if std::env::var("STROMA_PREPARATION_CRASH_BOUNDARY")
+        .ok()
+        .as_deref()
+        == Some(_name)
+    {
         let marker = std::env::var("STROMA_PREPARATION_CRASH_MARKER").unwrap();
         fs::write(marker, b"ready").unwrap();
-        loop { std::thread::park(); }
+        loop {
+            std::thread::park();
+        }
     }
 }
 
@@ -912,33 +981,27 @@ mod tests {
             .await
     }
 
+    fn retained_event() -> StromaEvent {
+        StromaEvent::PayloadEnqueue {
+            not_before: None,
+            expire_at: None,
+            headers: vec![],
+            payload: b"retained".to_vec(),
+        }
+    }
+
     async fn learner_message(stroma: &Stroma) {
         stroma
             .apply_replicated_queue_batch(
                 "q",
                 0,
                 None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 7,
-                    first_offset: 0,
-                    durability: Some(KDurability::AfterFsync),
-                    records: vec![Message {
-                        flags: 0,
-                        headers: vec![],
-                        payload: b"retained".to_vec(),
-                    }],
-                }),
+                None,
                 Some(ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
                     durability: Some(KDurability::AfterFsync),
-                    events: vec![StromaEvent::EnqueueMany {
-                        reqs: vec![EnqueueEventMeta {
-                            off: 0,
-                            retries: 0,
-                            expire_at: None,
-                        }],
-                    }],
+                    events: vec![retained_event()],
                 }),
             )
             .await
@@ -984,23 +1047,28 @@ mod tests {
             st.queue_replication_next_offsets("q", 0, None)
                 .await
                 .unwrap(),
-            (1, 1)
+            (0, 1)
         );
         learner_message(&view).await;
-        st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 1, 1)
+        st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1)
             .await
             .unwrap();
         assert!(view.verify_admitted_storage_history(&receipt).is_err());
-        assert!(view.resume_unaccepted_storage_history("q",0,None,binding()).await.is_err(),"cancelled old staging handle cannot reacquire writer admission");
+        assert!(
+            view.resume_unaccepted_storage_history("q", 0, None, binding())
+                .await
+                .is_err(),
+            "cancelled old staging handle cannot reacquire writer admission"
+        );
         st.become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
-        st.verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
             .await
             .unwrap();
         assert_eq!(
             st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(),
-            Some((7, 1, 1))
+            Some((7, 0, 1))
         );
         assert!(
             st.prepare_queue_reseed_storage(receipt.clone(), [41; 32])
@@ -1008,7 +1076,7 @@ mod tests {
                 .is_err(),
             "retry cannot obtain a resettable view of the live replacement"
         );
-        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
             .await
             .unwrap();
         assert!(
@@ -1031,7 +1099,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, seal.clone())
             .await
             .unwrap();
-        assert_eq!((evidence.message_next, evidence.event_next), (1, 1));
+        assert_eq!((evidence.message_next, evidence.event_next), (0, 1));
         let page = st
             .read_sealed_replica(
                 "q",
@@ -1041,7 +1109,7 @@ mod tests {
                 RecoveryReadRequest {
                     seal,
                     history_id: evidence.history.id,
-                    source: RecoveryReadSource::Messages,
+                    source: RecoveryReadSource::Events,
                     from: 0,
                     max_records: 8,
                     max_bytes: 65536,
@@ -1049,10 +1117,10 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(page.records[0].payload, b"retained");
+        assert_eq!(page.records[0].payload, retained_event().encode().unwrap());
         learner_message(&view).await;
         assert!(
-            st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+            st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
                 .await
                 .is_err()
         );
@@ -1067,7 +1135,7 @@ mod tests {
         let st = open(Path::new(&root)).await;
         let (receipt, view) = reseed_fixture(&st).await;
         learner_message(&view).await;
-        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1, 1)
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
             .await
             .unwrap();
         panic!("child did not stop at reseed boundary");
@@ -1117,7 +1185,7 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 (evidence.message_next, evidence.event_next),
-                (1, 1),
+                (0, 1),
                 "{boundary}"
             );
             let page = st
@@ -1129,7 +1197,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal,
                         history_id: evidence.history.id,
-                        source: RecoveryReadSource::Messages,
+                        source: RecoveryReadSource::Events,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1137,7 +1205,11 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(page.records[0].payload, b"retained", "{boundary}");
+            assert_eq!(
+                page.records[0].payload,
+                retained_event().encode().unwrap(),
+                "{boundary}"
+            );
             st.shutdown().await.unwrap();
         }
     }
@@ -1230,7 +1302,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal,
                         history_id: evidence.history.id,
-                        source: RecoveryReadSource::Messages,
+                        source: RecoveryReadSource::Events,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1238,7 +1310,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(page.records[0].payload, b"retained");
+            assert_eq!(page.records[0].payload, retained_event().encode().unwrap());
             st.shutdown().await.unwrap();
         }
     }
@@ -1262,19 +1334,19 @@ mod tests {
         assert_eq!((empty.message_next, empty.event_next), (0, 0));
         assert!(
             stroma
-                .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
                 .await
                 .is_err()
         );
         learner_message(&stroma).await;
         assert!(
             stroma
-                .verify_queue_learner_caught_up("q", 0, None, 8, 1, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 8, 0, 1)
                 .await
                 .is_err()
         );
         stroma
-            .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
             .await
             .unwrap();
         stroma.evict("q", 0, None).await.unwrap();
@@ -1313,10 +1385,10 @@ mod tests {
                 .queue_replication_next_offsets("q", 0, None)
                 .await
                 .unwrap(),
-            (1, 1)
+            (0, 1)
         );
         resumed
-            .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
             .await
             .unwrap();
         resumed
@@ -1325,7 +1397,7 @@ mod tests {
             .unwrap();
         assert!(
             resumed
-                .verify_queue_learner_caught_up("q", 0, None, 7, 1, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
                 .await
                 .is_err()
         );
@@ -1344,7 +1416,7 @@ mod tests {
                 .unwrap();
             learner_message(&stroma).await;
             let handle = stroma.queue_handle("q", 0, None).await.unwrap();
-            let old_messages = stroma.msg_tp_part_dir("q", 0, None);
+            let old_messages = stroma.tp_part_dir("q", 0, None);
             let seal = RecoverySealRequest {
                 transition: if already_sealed { [6; 32] } else { [8; 32] },
                 fence_epoch: 8,
@@ -1367,7 +1439,7 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(prepared.binding, next);
-            assert_ne!(stroma.msg_tp_part_dir("q", 0, None), old_messages);
+            assert_ne!(stroma.tp_part_dir("q", 0, None), old_messages);
             assert!(old_messages.exists());
             if let Ok(old) = handle.resolve() {
                 assert!(old.begin_owner_operation().await.is_err());
@@ -1378,7 +1450,7 @@ mod tests {
                 .unwrap();
             assert!(
                 stroma
-                    .verify_queue_learner_caught_up("q", 0, None, 8, 1, 1)
+                    .verify_queue_learner_caught_up("q", 0, None, 8, 0, 1)
                     .await
                     .is_err()
             );
@@ -1395,7 +1467,7 @@ mod tests {
             }
             assert_eq!(
                 (retained_seal.message_next, retained_seal.event_next),
-                (1, 1)
+                (0, 1)
             );
             let page = stroma
                 .read_sealed_replica(
@@ -1406,7 +1478,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal: seal.clone(),
                         history_id: retained_seal.history.id,
-                        source: RecoveryReadSource::Messages,
+                        source: RecoveryReadSource::Events,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1414,7 +1486,7 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert_eq!(page.records[0].payload, b"retained");
+            assert_eq!(page.records[0].payload, retained_event().encode().unwrap());
             stroma.shutdown().await.unwrap();
             drop(handle);
             drop(retained);
@@ -1475,25 +1547,7 @@ mod tests {
             .become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
-        stroma
-            .apply_replicated_queue_batch(
-                "q",
-                0,
-                None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 7,
-                    first_offset: 0,
-                    durability: Some(KDurability::AfterFsync),
-                    records: vec![Message {
-                        flags: 0,
-                        headers: vec![],
-                        payload: b"retained".to_vec(),
-                    }],
-                }),
-                None,
-            )
-            .await
-            .unwrap();
+        learner_message(&stroma).await;
         stroma
             .admit_prepared_storage_history(prepared.clone())
             .await
@@ -1558,9 +1612,8 @@ mod tests {
             .unwrap();
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
         let handle = ticket.resolve().unwrap();
-        // Model an event append whose payload append did not complete. This
-        // suffix is normally repaired locally; a bound writer must reconcile
-        // its replicas before reusing this offset in the same accepted history.
+        // Inject a forward reference directly on disk. Reopen must reject it
+        // without truncating the accepted history or reusing the offset.
         handle
             .event_log()
             .append_batch(
@@ -1605,36 +1658,7 @@ mod tests {
             .become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
-        stroma
-            .apply_replicated_queue_batch(
-                "q",
-                0,
-                None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 7,
-                    first_offset: 0,
-                    durability: Some(KDurability::AfterFsync),
-                    records: vec![Message {
-                        flags: 0,
-                        headers: vec![],
-                        payload: b"retained".to_vec(),
-                    }],
-                }),
-                Some(ReplicatedEventBatch {
-                    epoch: 7,
-                    first_offset: 0,
-                    durability: Some(KDurability::AfterFsync),
-                    events: vec![StromaEvent::EnqueueMany {
-                        reqs: vec![EnqueueEventMeta {
-                            off: 0,
-                            retries: 0,
-                            expire_at: None,
-                        }],
-                    }],
-                }),
-            )
-            .await
-            .unwrap();
+        learner_message(&stroma).await;
         stroma
             .become_queue_owner_with_epoch("q", 0, None, 7)
             .await
@@ -1685,13 +1709,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
+        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
         assert_eq!(sealed.history.version, 2);
         assert_eq!(sealed.history.storage_history, Some(original));
         let request = RecoveryReadRequest {
             seal: sealed.request.clone(),
             history_id: sealed.history.id,
-            source: RecoveryReadSource::Messages,
+            source: RecoveryReadSource::Events,
             from: 0,
             max_records: 8,
             max_bytes: 65536,
@@ -1700,7 +1724,7 @@ mod tests {
             .read_sealed_replica("q", 0, None, PartitionKind::Queue, request.clone())
             .await
             .unwrap();
-        assert_eq!(page.records[0].payload, b"retained");
+        assert_eq!(page.records[0].payload, retained_event().encode().unwrap());
         fs::remove_file(reopened.storage_history_path("q", 0, None)).unwrap();
         assert!(
             reopened
@@ -2050,7 +2074,8 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(sealed.message_next, 1);
+        assert_eq!(sealed.message_next, 0);
+        assert_eq!(sealed.event_next, 1);
         reopened.shutdown().await.unwrap();
     }
 
@@ -2157,12 +2182,9 @@ mod tests {
         stroma
             .write_partition_kind("q", 0, None, PartitionKind::Queue)
             .unwrap();
-        // The real preparation opens both empty logs before publishing a receipt.
-        let messages = stroma.msg_log_init("q", 0, None).await.unwrap();
+        // Preparation opens the empty queue log before publishing a receipt.
         let events = stroma.event_log_init("q", 0, None).await.unwrap();
-        messages.shutdown().await.unwrap();
         events.shutdown().await.unwrap();
-        drop(messages);
         drop(events);
         let receipt = Receipt {
             topic: "q".into(),
@@ -2235,7 +2257,7 @@ mod tests {
             .unwrap();
         let state = crate::state::QueueInternalState::new("q".into(), 0);
         let install = FollowerStateCheckpointInstall {
-            combined_log: false,
+            combined_log: true,
             event_start_offset: 0,
             message_epoch: 7,
             event_epoch: 7,
@@ -2248,7 +2270,7 @@ mod tests {
             stroma
                 .install_follower_state_checkpoint("q", 0, None, install)
                 .await,
-            Err(StromaError::HistoryAdmissionRequired { .. })
+            Err(StromaError::InvalidArgument(message)) if message.contains("excluded learner authorization")
         ));
         assert!(
             !stroma

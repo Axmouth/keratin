@@ -14,12 +14,8 @@ impl QueueReplicationRetention for NoLaggingReplicas {
     }
 }
 
-async fn open(root: &Path) -> Stroma { open_layout(root, false).await }
-async fn open_layout(root: &Path, combined: bool) -> Stroma {
-    #[cfg(feature = "combined-queue-log-experiment")]
-    let options = StromaOptions { combined_queue_log: combined, ..Default::default() };
-    #[cfg(not(feature = "combined-queue-log-experiment"))]
-    let options = { assert!(!combined); StromaOptions::default() };
+async fn open(root: &Path) -> Stroma {
+    let options = StromaOptions::default();
     let mut config = KeratinConfig::test_default();
     config.segment_max_bytes = 1024;
     let st = Stroma::open_with_options(
@@ -105,7 +101,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
         .unwrap();
     {
         let h = ticket.resolve().unwrap();
-        assert_eq!(h.msg_log().unwrap().head_offset(), 0);
+        assert_eq!(h.payload_log().head_offset(), 0);
         assert!(h.event_log().head_offset() <= base.pin.event_next);
         assert!(h.event_log().next_offset() > base.pin.event_next);
     }
@@ -135,7 +131,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
     st.truncate_partition_log(ticket.clone(), boundary.event_next())
         .await
         .unwrap();
-    assert!(ticket.resolve().unwrap().msg_log().unwrap().head_offset() > 0);
+    assert!(ticket.resolve().unwrap().payload_log().head_offset() > 0);
     assert!(st.read_queue_checkpoint_base(base.pin).await.is_err());
     st.shutdown().await.unwrap();
 }
@@ -290,7 +286,7 @@ async fn corrupt_retention_blocks_compaction_without_blocking_publish() {
     );
     assert!(st.truncate_messages_before("q", 0, None, 4).await.is_err());
     publish(&st, 1).await;
-    assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().head_offset(), 0);
+    assert_eq!(ticket.resolve().unwrap().payload_log().head_offset(), 0);
     assert!(
         st.read_queue_checkpoint_base(base.pin.clone())
             .await
@@ -378,7 +374,8 @@ async fn capsules_reconcile_unequal_bases_and_ignore_later_application() {
     assert_eq!(ca.contents, cb.contents);
     assert_eq!(ca.snapshot, cb.snapshot);
     assert_eq!(ca.contents.event_next, target.event_next);
-    assert_eq!(ca.contents.required_message_next, 24);
+    // Twenty-four payloads plus five ACK records precede the cut.
+    assert_eq!(ca.contents.required_message_next, 29);
     assert_ne!(ca.digest().unwrap(), cb.digest().unwrap()); // Local storage/base identities differ.
     let replay = a
         .build_queue_checkpoint_capsule(
@@ -530,7 +527,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             target.event_next
         );
         assert_eq!(
-            ticket.resolve().unwrap().msg_log().unwrap().head_offset(),
+            ticket.resolve().unwrap().payload_log().head_offset(),
             target.message_head
         );
         publish(&st, 4).await;
@@ -582,8 +579,8 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             )
             .await
             .unwrap();
-        assert_eq!(sealed.history.event_head, capsule.contents.event_next);
-        assert_eq!(sealed.history.message_next, 16);
+        assert_eq!(sealed.history.event_head, capsule.contents.message_head);
+        assert_eq!(sealed.history.message_next, 0);
         st.shutdown().await.unwrap();
     }
 }
@@ -593,8 +590,7 @@ async fn agreement_crash_child() {
     let Some(root) = std::env::var_os("STROMA_AGREEMENT_CRASH_ROOT") else {
         return;
     };
-    let combined = std::env::var("STROMA_AGREEMENT_COMBINED").as_deref() == Ok("true");
-    let st = open_layout(Path::new(&root), combined).await;
+    let st = open(Path::new(&root)).await;
     let storage = admitted(&st).await;
     publish(&st, 12).await;
     st.ack_batch("q".into(), 0, None, &(0..8).collect::<Vec<_>>())
@@ -636,7 +632,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
             let _ = self.0.wait();
         }
     }
-    for combined in [false, true].into_iter().filter(|c| !c || cfg!(feature = "combined-queue-log-experiment")) {
+    {
         for boundary in [
             "agreement_base",
             "agreement_pin",
@@ -655,7 +651,6 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                         "stroma::agreed_checkpoint::tests::agreement_crash_child",
                         "--nocapture",
                     ])
-                    .env("STROMA_AGREEMENT_COMBINED", combined.to_string())
                     .env("STROMA_AGREEMENT_CRASH_ROOT", &dir.root)
                     .env("STROMA_CHECKPOINT_CRASH_READY", &ready)
                     .env("STROMA_CHECKPOINT_CRASH_BOUNDARY", boundary)
@@ -676,7 +671,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
             .unwrap();
             child.0.kill().unwrap();
             child.0.wait().unwrap();
-            let st = open_layout(&dir.root, combined).await;
+            let st = open(&dir.root).await;
             assert!(st.queue_handle("q", 0, None).await.is_err());
             let seal = st
                 .seal_replica_for_recovery(
@@ -690,7 +685,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                 )
                 .await
                 .unwrap();
-            assert_eq!(seal.history.message_next, if combined { 0 } else { 12 }, "{boundary}");
+            assert_eq!(seal.history.message_next, 0, "{boundary}");
             assert_eq!(seal.history.event_next, 20, "{boundary}");
             assert!(
                 seal.history.payload_bounds().0 <= 8,
@@ -772,8 +767,8 @@ async fn missing_agreed_capsule_falls_back_but_corruption_cannot_authorize_recov
             .await;
         if missing {
             let seal = seal.unwrap();
-            assert_eq!(seal.history.message_next, 5);
-            assert_eq!(seal.history.event_head, 4);
+            assert_eq!(seal.history.message_next, 0);
+            assert_eq!(seal.history.event_head, 0);
             assert_eq!(
                 st.recovery_snapshot_path("q", 0, None).unwrap(),
                 st.snap_file("q", 0, None)

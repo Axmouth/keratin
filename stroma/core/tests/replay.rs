@@ -187,11 +187,28 @@ async fn snapshot_delta_replay_is_deterministic() {
 
     let st = Stroma::open(&dir.root, kcfg, scfg).await.unwrap();
 
-    for i in 0..500 {
+    for index in 0..500u64 {
+        let (completion, done) = KeratinAppendCompletion::pair();
+        st.append_message(
+            "t",
+            0,
+            None,
+            &MessageHeaders {
+                published: 0,
+                publish_received: 0,
+                content_type: None,
+                extra: Default::default(),
+            },
+            b"live".to_vec(),
+            completion,
+        )
+        .await
+        .unwrap();
+        let i = done.await.unwrap().unwrap().base_offset;
         st.mark_inflight_one("t", 0, None, i, 1000000000 + i)
             .await
             .unwrap();
-        if i.is_multiple_of(3) {
+        if index.is_multiple_of(3) {
             st.ack_one("t", 0, None, i).await.unwrap();
         }
     }
@@ -235,10 +252,12 @@ async fn expired_messages_survive_restart() {
     st.append_message("t", 0, None, &headers, b"x".to_vec(), c)
         .await
         .unwrap();
-    st.mark_inflight_one("t", 0, None, 0, 10).await.unwrap();
     let offset = rx.await.unwrap().unwrap().base_offset;
+    st.mark_inflight_one("t", 0, None, offset, 10)
+        .await
+        .unwrap();
 
-    st.collect_expired(100, 10).await.unwrap();
+    st.requeue_expired(100, 10).await.unwrap();
     st.shutdown().await.unwrap();
     drop(st);
 

@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Work queues store payload-bearing enqueues and state events in one ordered
+  log. Queue layout and unordered-application switches are removed. Existing
+  storage roots without the single-log format marker require fresh storage,
+  with no migration support. Streams retain separate payload and cursor logs.
+
 - Recovery forks that share closed payload segments persist manifest version 3
   before linking. Older binaries reject participating logs; this implementation
   continues to read version 2. Unshared logs retain version 2. See

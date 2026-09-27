@@ -2,12 +2,14 @@
 //! activation authority is produced, including when every shared record matches.
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
+use crate::recovery_replay::{
+    QueueReplay, RecoveryQueueReplayEvidence, RecoveryQueueStateArtifact, RecoveryReplayLimits,
+};
 use crate::{
-    RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
-    RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent, QueueLogLayout,
+    QueueLogLayout, RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
+    RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent,
 };
 use std::collections::BTreeMap;
-use crate::recovery_replay::{QueueReplay, RecoveryQueueReplayEvidence, RecoveryQueueStateArtifact, RecoveryReplayLimits};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySide {
@@ -91,7 +93,6 @@ pub struct RecoveryReferenceGap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySemanticGap {
     UnknownOrMalformedEncoding,
-    #[cfg(feature = "combined-queue-log-experiment")]
     CombinedQueueFormatUnsupported,
     EventEntryLimit,
     StateReplayRequired,
@@ -331,13 +332,19 @@ impl RecoveryPairInspector {
                 return Err("recovery history does not identify requested resource".into());
             }
         }
-        let mut messages = LogPair::new(bounds(&left.history, false), bounds(&right.history, false));
+        let mut messages =
+            LogPair::new(bounds(&left.history, false), bounds(&right.history, false));
         if left.history.log_layout == QueueLogLayout::Combined {
             // valid_version checked the canonical empty-lane identity.
-            for cursor in &mut messages.cursors { cursor.done = true; }
+            for cursor in &mut messages.cursors {
+                cursor.done = true;
+            }
         }
         Ok(Self {
-            logs: [messages, LogPair::new(bounds(&left.history, true), bounds(&right.history, true))],
+            logs: [
+                messages,
+                LogPair::new(bounds(&left.history, true), bounds(&right.history, true)),
+            ],
             seals: [left, right],
             limits,
             references: Default::default(),
@@ -357,13 +364,35 @@ impl RecoveryPairInspector {
     /// comparison. This must precede all reads. The target is common to both
     /// sources and may be zero; all sealed records are still verified, including
     /// records after the target. No authority or activation proof is implied.
-    pub fn with_queue_replay(mut self, event_next: u64, limits: RecoveryReplayLimits) -> Result<Self, String> {
-        if self.stream || self.pages != 0 || self.failed || self.single_source || self.replay.is_some() || self.checkpoint_replay.is_some() {
+    pub fn with_queue_replay(
+        mut self,
+        event_next: u64,
+        limits: RecoveryReplayLimits,
+    ) -> Result<Self, String> {
+        if self.stream
+            || self.pages != 0
+            || self.failed
+            || self.single_source
+            || self.replay.is_some()
+            || self.checkpoint_replay.is_some()
+        {
             return Err("queue replay must be configured once before queue inspection".into());
         }
         self.replay = Some([
-            QueueReplay::new(&self.resource.0, self.resource.1, self.seals[0].history.clone(), event_next, limits)?,
-            QueueReplay::new(&self.resource.0, self.resource.1, self.seals[1].history.clone(), event_next, limits)?,
+            QueueReplay::new(
+                &self.resource.0,
+                self.resource.1,
+                self.seals[0].history.clone(),
+                event_next,
+                limits,
+            )?,
+            QueueReplay::new(
+                &self.resource.0,
+                self.resource.1,
+                self.seals[1].history.clone(),
+                event_next,
+                limits,
+            )?,
         ]);
         Ok(self)
     }
@@ -372,17 +401,39 @@ impl RecoveryPairInspector {
     /// no checkpoint exists). Snapshot pages and retained records are verified
     /// against the resource-bound seals. This produces diagnostic evidence;
     /// authority, timer transitions and installed lineage still require proof.
-    pub fn with_queue_checkpoint_replay(mut self, event_next: u64, limits: RecoveryReplayLimits, max_checkpoint_bytes: u32) -> Result<Self, String> {
-        if self.stream || self.pages != 0 || self.failed || self.single_source || self.replay.is_some() || self.checkpoint_replay.is_some()
-            || max_checkpoint_bytes == 0 || max_checkpoint_bytes > 16 * 1024 * 1024
-        { return Err("invalid checkpoint replay configuration".into()); }
+    pub fn with_queue_checkpoint_replay(
+        mut self,
+        event_next: u64,
+        limits: RecoveryReplayLimits,
+        max_checkpoint_bytes: u32,
+    ) -> Result<Self, String> {
+        if self.stream
+            || self.pages != 0
+            || self.failed
+            || self.single_source
+            || self.replay.is_some()
+            || self.checkpoint_replay.is_some()
+            || max_checkpoint_bytes == 0
+            || max_checkpoint_bytes > 16 * 1024 * 1024
+        {
+            return Err("invalid checkpoint replay configuration".into());
+        }
         if self.seals[0].history.log_layout == QueueLogLayout::Combined {
-            self.live_payloads = Some(LogPair::new(bounds(&self.seals[0].history, true), bounds(&self.seals[1].history, true)));
+            self.live_payloads = Some(LogPair::new(
+                bounds(&self.seals[0].history, true),
+                bounds(&self.seals[1].history, true),
+            ));
         }
         self.checkpoint_replay = Some(CheckpointReplayPlan {
-            target: event_next, limits, max_bytes: max_checkpoint_bytes,
-            buffers: Default::default(), ends: [None; 2],
-            done: self.seals.each_ref().map(|s| s.history.snapshot_digest.is_none()),
+            target: event_next,
+            limits,
+            max_bytes: max_checkpoint_bytes,
+            buffers: Default::default(),
+            ends: [None; 2],
+            done: self
+                .seals
+                .each_ref()
+                .map(|s| s.history.snapshot_digest.is_none()),
         });
         self.initialize_checkpoint_replay()?;
         Ok(self)
@@ -404,14 +455,31 @@ impl RecoveryPairInspector {
     }
 
     fn initialize_checkpoint_replay(&mut self) -> Result<(), String> {
-        let Some(plan) = &mut self.checkpoint_replay else { return Ok(()); };
-        if !plan.done[0] || (!self.single_source && !plan.done[1]) { return Ok(()); }
+        let Some(plan) = &mut self.checkpoint_replay else {
+            return Ok(());
+        };
+        if !plan.done[0] || (!self.single_source && !plan.done[1]) {
+            return Ok(());
+        }
         let build = |i: usize| -> Result<QueueReplay, String> {
             let i = if self.single_source { 0 } else { i };
             let mut replay = if self.seals[i].history.snapshot_digest.is_some() {
-                QueueReplay::from_checkpoint(&self.resource.0, self.resource.1, self.seals[i].history.clone(), plan.target, plan.limits, &plan.buffers[i])?
+                QueueReplay::from_checkpoint(
+                    &self.resource.0,
+                    self.resource.1,
+                    self.seals[i].history.clone(),
+                    plan.target,
+                    plan.limits,
+                    &plan.buffers[i],
+                )?
             } else {
-                QueueReplay::new(&self.resource.0, self.resource.1, self.seals[i].history.clone(), plan.target, plan.limits)?
+                QueueReplay::new(
+                    &self.resource.0,
+                    self.resource.1,
+                    self.seals[i].history.clone(),
+                    plan.target,
+                    plan.limits,
+                )?
             };
             replay.verify_live_payloads();
             Ok(replay)
@@ -426,27 +494,66 @@ impl RecoveryPairInspector {
             return Err("recovery inspection failed; discard partial evidence".into());
         }
         if let Some(plan) = &self.checkpoint_replay {
-            for (i, side) in [RecoverySide::Left, RecoverySide::Right].into_iter().enumerate() {
+            for (i, side) in [RecoverySide::Left, RecoverySide::Right]
+                .into_iter()
+                .enumerate()
+            {
                 if !plan.done[i] && !(self.single_source && i == 1) {
-                    if self.pages >= self.limits.total_pages { return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1)); }
-                    return Ok(Some((side, RecoveryReadRequest {
-                        seal: self.seals[i].request.clone(), history_id: self.seals[i].history.id,
-                        source: RecoveryReadSource::Snapshot, from: plan.buffers[i].len() as u64,
-                        max_records: self.limits.page_records,
-                        max_bytes: self.limits.page_bytes.min(plan.max_bytes),
-                    })));
+                    if self.pages >= self.limits.total_pages {
+                        return Err(Limit::message(
+                            Budget::InspectionPages,
+                            self.limits.total_pages,
+                            self.pages,
+                            1,
+                        ));
+                    }
+                    return Ok(Some((
+                        side,
+                        RecoveryReadRequest {
+                            seal: self.seals[i].request.clone(),
+                            history_id: self.seals[i].history.id,
+                            source: RecoveryReadSource::Snapshot,
+                            from: plan.buffers[i].len() as u64,
+                            max_records: self.limits.page_records,
+                            max_bytes: self.limits.page_bytes.min(plan.max_bytes),
+                        },
+                    )));
                 }
             }
         }
         // Reconstruct state before streaming live payload identities. Ordinary
         // retained-log inspection preserves its original message-first order.
-        let order = if self.checkpoint_replay.is_some() { [1, 0] } else { [0, 1] };
-        let reads = order.into_iter().map(|index| (&self.logs[index], if index == 0 { RecoveryReadSource::Messages } else { RecoveryReadSource::Events }))
-            .chain(self.live_payloads.iter().map(|log| (log, RecoveryReadSource::Events)));
+        let order = if self.checkpoint_replay.is_some() {
+            [1, 0]
+        } else {
+            [0, 1]
+        };
+        let reads = order
+            .into_iter()
+            .map(|index| {
+                (
+                    &self.logs[index],
+                    if index == 0 {
+                        RecoveryReadSource::Messages
+                    } else {
+                        RecoveryReadSource::Events
+                    },
+                )
+            })
+            .chain(
+                self.live_payloads
+                    .iter()
+                    .map(|log| (log, RecoveryReadSource::Events)),
+            );
         for (log, source) in reads {
             if let Some(side) = log.next_side() {
                 if self.pages >= self.limits.total_pages {
-                    return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1));
+                    return Err(Limit::message(
+                        Budget::InspectionPages,
+                        self.limits.total_pages,
+                        self.pages,
+                        1,
+                    ));
                 }
                 let seal = &self.seals[side.index()];
                 return Ok(Some((
@@ -481,20 +588,40 @@ impl RecoveryPairInspector {
         };
         let i = side.index();
         if request.source == RecoveryReadSource::Snapshot {
-            let plan = self.checkpoint_replay.as_mut().ok_or("unexpected snapshot page")?;
+            let plan = self
+                .checkpoint_replay
+                .as_mut()
+                .ok_or("unexpected snapshot page")?;
             let bytes = page.snapshot_bytes.len() as u64;
-            if side != expected_side || page.history_id != request.history_id
-                || page.source != request.source || page.from != request.from
+            if side != expected_side
+                || page.history_id != request.history_id
+                || page.source != request.source
+                || page.from != request.from
                 || !page.records.is_empty()
-                || page.end < 28 || page.next <= page.from || page.next > page.end
-                || page.next - page.from != bytes || bytes > request.max_bytes as u64
+                || page.end < 28
+                || page.next <= page.from
+                || page.next > page.end
+                || page.next - page.from != bytes
+                || bytes > request.max_bytes as u64
                 || plan.ends[i].is_some_and(|end| end != page.end)
-            { return Err("checkpoint page identity, range or budget mismatch".into()); }
+            {
+                return Err("checkpoint page identity, range or budget mismatch".into());
+            }
             if page.end > plan.max_bytes as u64 {
-                return Err(Limit::message(Budget::SnapshotBytes, plan.max_bytes as u64, 0, page.end));
+                return Err(Limit::message(
+                    Budget::SnapshotBytes,
+                    plan.max_bytes as u64,
+                    0,
+                    page.end,
+                ));
             }
             if bytes > self.limits.total_bytes - self.bytes {
-                return Err(Limit::message(Budget::InspectionBytes, self.limits.total_bytes, self.bytes, bytes));
+                return Err(Limit::message(
+                    Budget::InspectionBytes,
+                    self.limits.total_bytes,
+                    self.bytes,
+                    bytes,
+                ));
             }
             plan.ends[i] = Some(page.end);
             plan.buffers[i].extend(page.snapshot_bytes);
@@ -511,8 +638,12 @@ impl RecoveryPairInspector {
         };
         let payload_pass = self.logs.iter().all(|log| log.next_side().is_none());
         let log = if payload_pass {
-            self.live_payloads.as_mut().ok_or("unexpected payload-verification pass")?
-        } else { &mut self.logs[log_index] };
+            self.live_payloads
+                .as_mut()
+                .ok_or("unexpected payload-verification pass")?
+        } else {
+            &mut self.logs[log_index]
+        };
         let cursor = &mut log.cursors[i];
         if side != expected_side
             || page.history_id != request.history_id
@@ -543,15 +674,28 @@ impl RecoveryPairInspector {
             return Err("recovery inspection page exceeds requested byte bound".into());
         }
         if bytes > self.limits.total_bytes - self.bytes {
-            return Err(Limit::message(Budget::InspectionBytes, self.limits.total_bytes, self.bytes, bytes));
+            return Err(Limit::message(
+                Budget::InspectionBytes,
+                self.limits.total_bytes,
+                self.bytes,
+                bytes,
+            ));
         }
         if page.records.len() as u64 > self.limits.total_records - self.records {
-            return Err(Limit::message(Budget::InspectionRecords, self.limits.total_records, self.records, page.records.len() as u64));
+            return Err(Limit::message(
+                Budget::InspectionRecords,
+                self.limits.total_records,
+                self.records,
+                page.records.len() as u64,
+            ));
         }
         for record in &page.records {
             hash_record(&mut cursor.hash, record);
             if payload_pass {
-                self.replay.as_mut().ok_or("payload verification needs replay")?[i].message(record)?;
+                self.replay
+                    .as_mut()
+                    .ok_or("payload verification needs replay")?[i]
+                    .message(record)?;
             } else if log_index == 1 {
                 self.references[i].inspect(record, &self.seals[i].history, self.stream);
                 if let Some(replay) = &mut self.replay {
@@ -560,7 +704,10 @@ impl RecoveryPairInspector {
             } else if let Some(replay) = &mut self.replay {
                 replay[i].message(record)?;
             }
-            if !self.single_source && record.offset >= log.overlap.0 && record.offset < log.overlap.1 {
+            if !self.single_source
+                && record.offset >= log.overlap.0
+                && record.offset < log.overlap.1
+            {
                 let id = record_id(record);
                 if let Some(other) = log.pending.remove(&record.offset) {
                     if id != other && log.first_difference.is_none() {
@@ -635,14 +782,22 @@ impl RecoveryPairInspector {
         let (queue_replay, artifacts) = match (self.replay, artifact_limit) {
             (Some([left, right]), Some(limit)) => {
                 let left = left.finish_artifact(limit)?;
-                let right = if self.single_source { left.clone() } else { right.finish_artifact(limit)? };
+                let right = if self.single_source {
+                    left.clone()
+                } else {
+                    right.finish_artifact(limit)?
+                };
                 let artifacts = [left, right];
                 let evidence = artifacts.each_ref().map(|a| a.evidence().clone());
                 (Some(evidence), Some(artifacts))
             }
             (Some([left, right]), None) => {
                 let left = left.finish()?;
-                let right = if self.single_source { left.clone() } else { right.finish()? };
+                let right = if self.single_source {
+                    left.clone()
+                } else {
+                    right.finish()?
+                };
                 (Some([left, right]), None)
             }
             (None, _) => (None, None),
@@ -672,7 +827,11 @@ impl RecoveryPairInspector {
                 history_ids: [self.seals[0].history.id, self.seals[1].history.id],
                 messages: messages.result(),
                 events: events.result(),
-                references: if self.single_source { [self.references[0].clone(), self.references[0].clone()] } else { self.references },
+                references: if self.single_source {
+                    [self.references[0].clone(), self.references[0].clone()]
+                } else {
+                    self.references
+                },
                 snapshot_digests: [
                     self.seals[0].history.snapshot_digest,
                     self.seals[1].history.snapshot_digest,
@@ -686,13 +845,13 @@ impl RecoveryPairInspector {
             artifacts,
         ))
     }
-
-
 }
 
 /// Strict proof decoding. Ordinary replay remains forward-compatible, but an
 /// evidence consumer must understand every encoded field and bound allocation.
-pub(crate) fn decode_evidence_event(record: &RecoveryRecord) -> Result<StromaEvent, RecoverySemanticGap> {
+pub(crate) fn decode_evidence_event(
+    record: &RecoveryRecord,
+) -> Result<StromaEvent, RecoverySemanticGap> {
     let payload = &record.payload;
     if payload.len() >= 16 {
         let tag = u16::from_be_bytes(payload[10..12].try_into().unwrap());
@@ -705,8 +864,10 @@ pub(crate) fn decode_evidence_event(record: &RecoveryRecord) -> Result<StromaEve
     }
     let event = StromaEvent::decode(payload)
         .map_err(|_| RecoverySemanticGap::UnknownOrMalformedEncoding)?;
-    if record.flags != 0 || !record.headers.is_empty()
-        || event.encode().ok().as_deref() != Some(payload.as_slice()) {
+    if record.flags != 0
+        || !record.headers.is_empty()
+        || event.encode().ok().as_deref() != Some(payload.as_slice())
+    {
         return Err(RecoverySemanticGap::UnknownOrMalformedEncoding);
     }
     Ok(event)
@@ -754,10 +915,12 @@ impl RecoveryReferenceInspection {
             }
         };
         match event {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => {
                 if history.log_layout != QueueLogLayout::Combined {
-                    self.gap(record.offset, RecoverySemanticGap::CombinedQueueFormatUnsupported);
+                    self.gap(
+                        record.offset,
+                        RecoverySemanticGap::CombinedQueueFormatUnsupported,
+                    );
                     return;
                 }
                 reference(record.offset);
@@ -805,7 +968,8 @@ impl RecoveryReferenceInspection {
                     reference(off);
                 }
             }
-            StromaEvent::CancelEnqueueMany { .. } | StromaEvent::ResetQueue { .. }
+            StromaEvent::CancelEnqueueMany { .. }
+            | StromaEvent::ResetQueue { .. }
             | StromaEvent::ActivateDelayed { .. } => {
                 self.gap(record.offset, RecoverySemanticGap::StateReplayRequired)
             }
@@ -835,40 +999,72 @@ mod tests {
     use super::*;
     use crate::{EnqueueEventMeta, RecoverySealRequest};
 
-
     // Kept with these helpers so sealed page identity and digest validation use
     // exactly the same path as retained-history comparisons.
     include!("recovery_checkpoint_tests.rs");
-    #[cfg(feature = "combined-queue-log-experiment")]
     include!("combined_recovery_replay_tests.rs");
 
     #[test]
     fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {
         let msg = messages(0, 2);
         let ev = events(vec![
-            StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None },
-            StromaEvent::MarkInflight { off: 0, deadline: 500 },
+            StromaEvent::Enqueue {
+                off: 0,
+                retries: 0,
+                expire_at: None,
+            },
+            StromaEvent::MarkInflight {
+                off: 0,
+                deadline: 500,
+            },
             StromaEvent::Ack { off: 0 },
-            StromaEvent::Enqueue { off: 1, retries: 2, expire_at: Some(800) },
+            StromaEvent::Enqueue {
+                off: 1,
+                retries: 2,
+                expire_at: Some(800),
+            },
         ]);
         for target in 0..=4 {
             let seal = seal(0, &msg, 0, &ev);
-            let pair = inspector(seal.clone(), seal, RecoveryInspectionLimits {
-                page_records: 1, ..Default::default()
-            }).with_queue_replay(target, Default::default()).unwrap();
+            let pair = inspector(
+                seal.clone(),
+                seal,
+                RecoveryInspectionLimits {
+                    page_records: 1,
+                    ..Default::default()
+                },
+            )
+            .with_queue_replay(target, Default::default())
+            .unwrap();
             let report = run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap();
             let [a, b] = report.queue_replay.unwrap();
             assert_eq!(a, b);
             assert_eq!(a.event_next, target);
             let mut expected = crate::QueueInternalState::new("q".into(), 0);
-            if target >= 1 { expected.enqueue(0, 0, None); }
-            if target >= 2 { expected.mark_inflight(0, 500); }
-            if target >= 3 { expected.ack(0); }
-            if target >= 4 { expected.enqueue(1, 2, Some(800)); }
+            if target >= 1 {
+                expected.enqueue(0, 0, None);
+            }
+            if target >= 2 {
+                expected.mark_inflight(0, 500);
+            }
+            if target >= 3 {
+                expected.ack(0);
+            }
+            if target >= 4 {
+                expected.enqueue(1, 2, Some(800));
+            }
             assert_eq!(a.state_digest, expected.recovery_state_digest());
-            assert!(report.remaining_proofs.contains(&RecoveryProofRequirement::CommonOriginAndInstalledLineage));
+            assert!(
+                report
+                    .remaining_proofs
+                    .contains(&RecoveryProofRequirement::CommonOriginAndInstalledLineage)
+            );
             // A common target is evidence only for that cut, not either sealed tail.
-            assert!(report.remaining_proofs.contains(&RecoveryProofRequirement::StateReplayAndDependencies));
+            assert!(
+                report
+                    .remaining_proofs
+                    .contains(&RecoveryProofRequirement::StateReplayAndDependencies)
+            );
         }
     }
 
@@ -877,61 +1073,141 @@ mod tests {
         let a = messages(0, 1);
         let mut b = a.clone();
         b[0].payload = b"different confirmed work".to_vec();
-        let ev = events(vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }, StromaEvent::Ack { off: 0 }]);
+        let ev = events(vec![
+            StromaEvent::Enqueue {
+                off: 0,
+                retries: 0,
+                expire_at: None,
+            },
+            StromaEvent::Ack { off: 0 },
+        ]);
         let pair = inspector(seal(0, &a, 0, &ev), seal(0, &b, 0, &ev), Default::default())
-            .with_queue_replay(2, Default::default()).unwrap();
+            .with_queue_replay(2, Default::default())
+            .unwrap();
         let report = run(pair, [[&a, &ev], [&b, &ev]]).unwrap();
         let [a, b] = report.queue_replay.unwrap();
         assert_eq!(a.state_digest, b.state_digest);
         assert_eq!(a.event_prefix_digest, b.event_prefix_digest);
         assert_ne!(a.message_digest, b.message_digest);
         assert_ne!(a.history_id, b.history_id);
-        assert!(matches!(report.messages.overlap, RecoveryOverlap::Divergent { .. }));
+        assert!(matches!(
+            report.messages.overlap,
+            RecoveryOverlap::Divergent { .. }
+        ));
     }
 
     #[test]
     fn replay_requires_whole_enqueue_batch_coverage_or_completed_cancellation() {
         let msg = messages(0, 1);
         let ev = events(vec![
-            StromaEvent::EnqueueMany { reqs: vec![
-                EnqueueEventMeta { off: 0, retries: 0, expire_at: None },
-                EnqueueEventMeta { off: 7, retries: 0, expire_at: None },
-            ] },
+            StromaEvent::EnqueueMany {
+                reqs: vec![
+                    EnqueueEventMeta {
+                        off: 0,
+                        retries: 0,
+                        expire_at: None,
+                    },
+                    EnqueueEventMeta {
+                        off: 7,
+                        retries: 0,
+                        expire_at: None,
+                    },
+                ],
+            },
             StromaEvent::CancelEnqueueMany { offs: vec![7] },
         ]);
         let check = |target| {
-            let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-                .with_queue_replay(target, Default::default()).unwrap();
+            let pair = inspector(
+                seal(0, &msg, 0, &ev),
+                seal(0, &msg, 0, &ev),
+                Default::default(),
+            )
+            .with_queue_replay(target, Default::default())
+            .unwrap();
             run(pair, [[&msg, &ev], [&msg, &ev]])
         };
-        assert!(check(1).unwrap_err().contains("uncancelled missing message 7"));
+        assert!(
+            check(1)
+                .unwrap_err()
+                .contains("uncancelled missing message 7")
+        );
         let result = check(2).unwrap().queue_replay.unwrap();
         assert_eq!(result[0].required_message_next, 1);
         // A later ACK of a missing payload must not turn it into valid evidence.
-        let ev = events(vec![StromaEvent::Ack { off: 7 }, StromaEvent::CancelEnqueueMany { offs: vec![7] }]);
-        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-            .with_queue_replay(2, Default::default()).unwrap();
-        assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap_err().contains("missing message 7"));
+        let ev = events(vec![
+            StromaEvent::Ack { off: 7 },
+            StromaEvent::CancelEnqueueMany { offs: vec![7] },
+        ]);
+        let pair = inspector(
+            seal(0, &msg, 0, &ev),
+            seal(0, &msg, 0, &ev),
+            Default::default(),
+        )
+        .with_queue_replay(2, Default::default())
+        .unwrap();
+        assert!(
+            run(pair, [[&msg, &ev], [&msg, &ev]])
+                .unwrap_err()
+                .contains("missing message 7")
+        );
     }
 
     #[test]
     fn replay_delayed_retry_ttl_and_dlq_match_state_operations() {
-        use crate::{DeadLetterMeta, DeadLetterReason, DeclareMeta, DLQDiscardPolicyWire, NackEventMeta};
+        use crate::{
+            DLQDiscardPolicyWire, DeadLetterMeta, DeadLetterReason, DeclareMeta, NackEventMeta,
+        };
         let msg = messages(0, 4);
-        let meta = DeclareMeta { dlq_policy: Some(DLQDiscardPolicyWire::Discard), dlq_max_retries: Some(5), default_message_ttl_ms: Some(80) };
+        let meta = DeclareMeta {
+            dlq_policy: Some(DLQDiscardPolicyWire::Discard),
+            dlq_max_retries: Some(5),
+            default_message_ttl_ms: Some(80),
+        };
         let ev = events(vec![
             StromaEvent::Declare(meta.clone()),
-            StromaEvent::Enqueue { off: 0, retries: 2, expire_at: Some(500) },
-            StromaEvent::MarkInflight { off: 0, deadline: 200 },
-            StromaEvent::NackMany { reqs: vec![NackEventMeta { off: 0, requeue: true, not_before: Some(300) }] },
-            StromaEvent::EnqueueDelayed { off: 1, not_before: 400 },
-            StromaEvent::EnqueueDelayed { off: 2, not_before: 600 },
+            StromaEvent::Enqueue {
+                off: 0,
+                retries: 2,
+                expire_at: Some(500),
+            },
+            StromaEvent::MarkInflight {
+                off: 0,
+                deadline: 200,
+            },
+            StromaEvent::NackMany {
+                reqs: vec![NackEventMeta {
+                    off: 0,
+                    requeue: true,
+                    not_before: Some(300),
+                }],
+            },
+            StromaEvent::EnqueueDelayed {
+                off: 1,
+                not_before: 400,
+            },
+            StromaEvent::EnqueueDelayed {
+                off: 2,
+                not_before: 600,
+            },
             StromaEvent::CancelEnqueueMany { offs: vec![2] },
-            StromaEvent::DeadLetter { reqs: vec![DeadLetterMeta { off: 3, retry_count: 4, reason: DeadLetterReason::RetriesExhausted,
-                target_tp: "dlq".into(), target_part: 0, target_group: None }] },
+            StromaEvent::DeadLetter {
+                reqs: vec![DeadLetterMeta {
+                    off: 3,
+                    retry_count: 4,
+                    reason: DeadLetterReason::RetriesExhausted,
+                    target_tp: "dlq".into(),
+                    target_part: 0,
+                    target_group: None,
+                }],
+            },
         ]);
-        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-            .with_queue_replay(ev.len() as u64, Default::default()).unwrap();
+        let pair = inspector(
+            seal(0, &msg, 0, &ev),
+            seal(0, &msg, 0, &ev),
+            Default::default(),
+        )
+        .with_queue_replay(ev.len() as u64, Default::default())
+        .unwrap();
         let report = run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap();
         let mut state = crate::QueueInternalState::new("q".into(), 0);
         state.apply_declare(&meta);
@@ -942,7 +1218,10 @@ mod tests {
         state.enqueue_delayed(2, 600);
         state.cancel_enqueue_many(&[2]);
         state.mark_pending_dlq_many(&[3]);
-        assert_eq!(report.queue_replay.unwrap()[0].state_digest, state.recovery_state_digest());
+        assert_eq!(
+            report.queue_replay.unwrap()[0].state_digest,
+            state.recovery_state_digest()
+        );
     }
 
     #[test]
@@ -950,52 +1229,136 @@ mod tests {
         let msg = messages(0, 1);
         for event in [
             StromaEvent::Ack { off: u64::MAX },
-            StromaEvent::ResetQueue { tp: "q".into(), part: 0, group: None },
+            StromaEvent::ResetQueue {
+                tp: "q".into(),
+                part: 0,
+                group: None,
+            },
             StromaEvent::StreamTruncate { before: 0 },
         ] {
             let ev = events(vec![event]);
-            let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-                .with_queue_replay(1, Default::default()).unwrap();
+            let pair = inspector(
+                seal(0, &msg, 0, &ev),
+                seal(0, &msg, 0, &ev),
+                Default::default(),
+            )
+            .with_queue_replay(1, Default::default())
+            .unwrap();
             assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).is_err());
         }
         let ev = events(vec![StromaEvent::Ack { off: 0 }]);
-        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-            .with_queue_replay(1, RecoveryReplayLimits { operations_per_replica: 1 }).unwrap();
-        assert!(run(pair, [[&msg, &ev], [&msg, &ev]]).unwrap_err().contains("operation budget"));
+        let pair = inspector(
+            seal(0, &msg, 0, &ev),
+            seal(0, &msg, 0, &ev),
+            Default::default(),
+        )
+        .with_queue_replay(
+            1,
+            RecoveryReplayLimits {
+                operations_per_replica: 1,
+            },
+        )
+        .unwrap();
+        assert!(
+            run(pair, [[&msg, &ev], [&msg, &ev]])
+                .unwrap_err()
+                .contains("operation budget")
+        );
         let mut future = ev.clone();
         future[0].payload.push(42);
-        let pair = inspector(seal(0, &msg, 0, &future), seal(0, &msg, 0, &future), Default::default())
-            .with_queue_replay(1, Default::default()).unwrap();
-        assert!(run(pair, [[&msg, &future], [&msg, &future]]).unwrap_err().contains("UnknownOrMalformed"));
+        let pair = inspector(
+            seal(0, &msg, 0, &future),
+            seal(0, &msg, 0, &future),
+            Default::default(),
+        )
+        .with_queue_replay(1, Default::default())
+        .unwrap();
+        assert!(
+            run(pair, [[&msg, &future], [&msg, &future]])
+                .unwrap_err()
+                .contains("UnknownOrMalformed")
+        );
         let compacted = seal(1, &[], 1, &[]);
-        assert!(inspector(compacted.clone(), compacted, Default::default()).with_queue_replay(1, Default::default()).is_err());
-        assert!(inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default()).with_queue_replay(2, Default::default()).is_err());
+        assert!(
+            inspector(compacted.clone(), compacted, Default::default())
+                .with_queue_replay(1, Default::default())
+                .is_err()
+        );
+        assert!(
+            inspector(
+                seal(0, &msg, 0, &ev),
+                seal(0, &msg, 0, &ev),
+                Default::default()
+            )
+            .with_queue_replay(2, Default::default())
+            .is_err()
+        );
         // Reconstructing an early target does not permit corruption after it.
-        let pair = inspector(seal(0, &msg, 0, &ev), seal(0, &msg, 0, &ev), Default::default())
-            .with_queue_replay(0, Default::default()).unwrap();
-        assert!(run(pair, [[&msg, &future], [&msg, &ev]]).unwrap_err().contains("sealed digest"));
+        let pair = inspector(
+            seal(0, &msg, 0, &ev),
+            seal(0, &msg, 0, &ev),
+            Default::default(),
+        )
+        .with_queue_replay(0, Default::default())
+        .unwrap();
+        assert!(
+            run(pair, [[&msg, &future], [&msg, &ev]])
+                .unwrap_err()
+                .contains("sealed digest")
+        );
     }
     #[test]
     fn single_source_verifies_once_without_hiding_corruption_or_relaxing_budgets() {
         let msg = messages(0, 4);
         let sealed = seal(0, &msg, 0, &[]);
-        let limits = RecoveryInspectionLimits { total_records: 4, ..Default::default() };
-        assert!(run(inspector(sealed.clone(), sealed.clone(), limits), [[&msg, &[]], [&msg, &[]]]).unwrap_err().contains("records budget"));
-        let single = || inspector(sealed.clone(), sealed.clone(), limits).with_single_source().unwrap();
+        let limits = RecoveryInspectionLimits {
+            total_records: 4,
+            ..Default::default()
+        };
+        assert!(
+            run(
+                inspector(sealed.clone(), sealed.clone(), limits),
+                [[&msg, &[]], [&msg, &[]]]
+            )
+            .unwrap_err()
+            .contains("records budget")
+        );
+        let single = || {
+            inspector(sealed.clone(), sealed.clone(), limits)
+                .with_single_source()
+                .unwrap()
+        };
         let report = run(single(), [[&msg, &[]], [&msg, &[]]]).unwrap();
         assert_eq!(report.records, 4);
         let mut corrupt = msg.clone();
         corrupt[0].payload[0] ^= 1;
-        assert!(run(single(), [[&corrupt, &[]], [&msg, &[]]]).unwrap_err().contains("sealed digest"));
+        assert!(
+            run(single(), [[&corrupt, &[]], [&msg, &[]]])
+                .unwrap_err()
+                .contains("sealed digest")
+        );
         let different = seal(0, &corrupt, 0, &[]);
-        assert!(inspector(sealed.clone(), different, limits).with_single_source().is_err());
+        assert!(
+            inspector(sealed.clone(), different, limits)
+                .with_single_source()
+                .is_err()
+        );
         let mut started = single();
         let (side, request) = started.next_read().unwrap().unwrap();
         started.accept_page(side, page(&request, &msg, 4)).unwrap();
         assert!(started.with_single_source().is_err());
-        let too_small = RecoveryInspectionLimits { total_records: 3, ..limits };
-        let check = inspector(sealed.clone(), sealed, too_small).with_single_source().unwrap();
-        assert!(run(check, [[&msg, &[]], [&msg, &[]]]).unwrap_err().contains("records budget"));
+        let too_small = RecoveryInspectionLimits {
+            total_records: 3,
+            ..limits
+        };
+        let check = inspector(sealed.clone(), sealed, too_small)
+            .with_single_source()
+            .unwrap();
+        assert!(
+            run(check, [[&msg, &[]], [&msg, &[]]])
+                .unwrap_err()
+                .contains("records budget")
+        );
     }
 
     #[test]
@@ -1004,8 +1367,16 @@ mod tests {
         let mut right = left.clone();
         right.history.log_layout = crate::QueueLogLayout::Combined;
         let error = RecoveryPairInspector::new(
-            "q", 0, None, false, left, right, RecoveryInspectionLimits::default(),
-        ).err().expect("mixed layouts must fail");
+            "q",
+            0,
+            None,
+            false,
+            left,
+            right,
+            RecoveryInspectionLimits::default(),
+        )
+        .err()
+        .expect("mixed layouts must fail");
         assert!(error.contains("different queue log layouts"));
     }
 
@@ -1409,10 +1780,18 @@ mod tests {
             }
             let error = run(
                 inspector(left.clone(), left.clone(), limits),
-                [[&msg, &[]], [&msg, &[]]]
-            ).unwrap_err();
+                [[&msg, &[]], [&msg, &[]]],
+            )
+            .unwrap_err();
             let budget = Limit::from_message(&error).unwrap();
-            assert_eq!(budget.budget, [Budget::InspectionPages, Budget::InspectionRecords, Budget::InspectionBytes][case]);
+            assert_eq!(
+                budget.budget,
+                [
+                    Budget::InspectionPages,
+                    Budget::InspectionRecords,
+                    Budget::InspectionBytes
+                ][case]
+            );
             assert_eq!(budget.limit, 1);
             assert!(budget.requested > budget.limit - budget.completed);
             assert!(!budget.unchanged_retry_can_help);
@@ -1552,8 +1931,8 @@ mod tests {
     #[tokio::test]
     async fn real_sealed_storage_pages_compare_different_tails_without_serving_or_mutation() {
         use crate::{
-            KDurability, KeratinConfig, Message, PartitionKind, ReplicatedMessageBatch,
-            SnapshotConfig, Stroma, StromaKeratinConfig,
+            KDurability, KeratinConfig, PartitionKind, ReplicatedEventBatch, SnapshotConfig,
+            Stroma, StromaKeratinConfig,
         };
         let left_dir = crate::test_dir!("inspect_left");
         let right_dir = crate::test_dir!("inspect_right");
@@ -1568,6 +1947,20 @@ mod tests {
             .await
             .unwrap();
             storage
+                .initialize_empty_storage_history(
+                    "q",
+                    0,
+                    None,
+                    PartitionKind::Queue,
+                    crate::StorageHistoryBinding {
+                        resource_incarnation: [1; 16],
+                        accepted_history: [2; 16],
+                        writer_session: [3; 16],
+                    },
+                )
+                .await
+                .unwrap();
+            storage
                 .become_queue_follower_with_epoch("q", 0, None, 7)
                 .await
                 .unwrap();
@@ -1576,20 +1969,21 @@ mod tests {
                     "q",
                     0,
                     None,
-                    Some(ReplicatedMessageBatch {
+                    None,
+                    Some(ReplicatedEventBatch {
                         epoch: 7,
                         first_offset: 0,
                         durability: Some(KDurability::AfterFsync),
-                        records: messages(0, len)
+                        events: messages(0, len)
                             .into_iter()
-                            .map(|r| Message {
-                                flags: r.flags,
+                            .map(|r| StromaEvent::PayloadEnqueue {
+                                not_before: None,
+                                expire_at: None,
                                 headers: r.headers,
                                 payload: r.payload,
                             })
                             .collect(),
                     }),
-                    None,
                 )
                 .await
                 .unwrap();
@@ -1626,7 +2020,7 @@ mod tests {
         }
         let report = check.finish().unwrap();
         assert_eq!(
-            report.messages.overlap,
+            report.events.overlap,
             RecoveryOverlap::Matching { from: 0, next: 2 }
         );
         assert_ne!(report.history_ids[0], report.history_ids[1]);

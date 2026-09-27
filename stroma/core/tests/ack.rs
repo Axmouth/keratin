@@ -58,11 +58,11 @@ async fn out_of_order_acks_never_skip_frontier() {
 }
 
 #[tokio::test]
-async fn acked_offsets_never_resurrect() {
+async fn future_ack_is_rejected_and_acked_offsets_never_resurrect() {
     let (st, _test_dir) = open_test_stroma().await;
 
-    // ACK offset 5 before it exists
-    st.ack_one("t", 0, None, 5).await.unwrap();
+    // Future references are invalid in the single log and must not consume an offset.
+    assert!(st.ack_one("t", 0, None, 5).await.is_err());
     let headers = MessageHeaders {
         published: Default::default(),
         publish_received: Default::default(),
@@ -85,6 +85,8 @@ async fn acked_offsets_never_resurrect() {
         }
     }
 
+    st.ack_one("t", 0, None, 5).await.unwrap();
+    st.nack_one("t", 0, None, 5, true).await.unwrap();
     assert!(st.is_settled("t", 0, None, 5).await.unwrap());
     assert!(!st.is_ready("t", 0, None, 5).await.unwrap());
 }

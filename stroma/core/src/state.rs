@@ -995,81 +995,6 @@ impl EngineHandle {
     }
 }
 
-/// Reserved under the publication lock, before detached durability tasks run.
-#[derive(Debug, Default)]
-pub(crate) struct PublishOrder {
-    previous_apply: Option<oneshot::Receiver<()>>,
-}
-
-impl PublishOrder {
-    pub(crate) fn reserve_apply(&mut self) -> PublishApplyTurn {
-        let (complete, next) = oneshot::channel();
-        PublishApplyTurn {
-            previous: self.previous_apply.replace(next),
-            complete,
-        }
-    }
-}
-
-pub(crate) struct PublishApplyTurn {
-    previous: Option<oneshot::Receiver<()>>,
-    complete: oneshot::Sender<()>,
-}
-
-impl PublishApplyTurn {
-    pub(crate) async fn wait(&mut self) -> std::io::Result<()> {
-        if let Some(previous) = self.previous.take() {
-            previous.await.map_err(|_| {
-                std::io::Error::other(
-                    "preceding publish application did not complete; queue recovery required",
-                )
-            })?;
-        }
-        Ok(())
-    }
-
-    pub(crate) fn complete(self) {
-        let _ = self.complete.send(());
-    }
-}
-
-#[cfg(test)]
-mod publish_apply_order_tests {
-    use super::PublishOrder;
-
-    #[tokio::test]
-    async fn abandoned_application_fails_the_remaining_chain_closed() {
-        let mut order = PublishOrder::default();
-        let first = order.reserve_apply();
-        let mut second = order.reserve_apply();
-        let mut third = order.reserve_apply();
-        drop(first);
-        assert!(second.wait().await.is_err());
-        drop(second);
-        assert!(third.wait().await.is_err());
-        drop(third);
-        assert!(order.reserve_apply().wait().await.is_err());
-    }
-
-    #[tokio::test]
-    async fn completion_releases_only_the_next_application() {
-        let mut order = PublishOrder::default();
-        let mut first = order.reserve_apply();
-        let mut second = order.reserve_apply();
-        let mut third = order.reserve_apply();
-        first.wait().await.unwrap();
-        let mut second_wait = Box::pin(second.wait());
-        let mut third_wait = Box::pin(third.wait());
-        assert!(futures::poll!(&mut second_wait).is_pending());
-        assert!(futures::poll!(&mut third_wait).is_pending());
-        first.complete();
-        second_wait.await.unwrap();
-        assert!(futures::poll!(&mut third_wait).is_pending());
-        second.complete();
-        third_wait.await.unwrap();
-    }
-}
-
 /// Shared with blocking snapshot jobs without pinning a queue incarnation.
 #[derive(Debug, Default)]
 pub(crate) struct RecoveryGate {
@@ -1169,14 +1094,6 @@ pub struct QueueHandleInner {
     owner_operations_paused: Arc<AtomicBool>,
     owner_operations_resumed: Arc<Notify>,
 
-    // Serializes the parallel-publish event-log APPEND per partition so events
-    // reach the event log in msg-offset order. The recovery fold and the owner
-    // replication gate both assume event-log order matches msg-offset order;
-    // without this, concurrent publishes race to append their EnqueueMany and a
-    // crash that strands a middle publish can truncate a confirmed one. Held only
-    // across staging + the event send, never the fsync waits, so the two fsyncs
-    // still overlap.
-    publish_event_order: Arc<tokio::sync::Mutex<PublishOrder>>,
     /// Serializes follower apply, checkpoint install and promotion. True means
     /// an apply/install was interrupted or failed and requires recovery/resync.
     follower_apply: tokio::sync::Mutex<bool>,
@@ -1365,7 +1282,7 @@ impl QueueHandleInner {
         let dirty_since_snapshot_loop = dirty_since_snapshot.clone();
 
         let applied_upto = Arc::new(AtomicU64::new(0));
-        let ordered_apply = (cfg!(feature = "ordered-queue-apply") && kind == PartitionKind::Queue)
+        let ordered_apply = (kind == PartitionKind::Queue)
             .then(|| crate::ordered_apply::OrderedApply::new(event_log.next_offset()));
         let last_snapshot_timestamp = Arc::new(AtomicU64::new(0));
         let last_snapshot_event_offset = Arc::new(AtomicU64::new(0));
@@ -1418,7 +1335,6 @@ impl QueueHandleInner {
             owner_operations_drained,
             owner_operations_paused,
             owner_operations_resumed,
-            publish_event_order: Arc::new(tokio::sync::Mutex::new(PublishOrder::default())),
             follower_apply: tokio::sync::Mutex::new(false),
             default_message_ttl_ms: Arc::new(AtomicU64::new(0)),
             global_dlq,
@@ -3003,15 +2919,10 @@ impl QueueHandleInner {
         self.event_log.clone()
     }
 
-    /// Per-partition lock serializing the parallel-publish event-log append order.
-    /// See the field docs on `QueueHandleInner`.
     pub(crate) async fn follower_apply_state(&self) -> tokio::sync::MutexGuard<'_, bool> {
         self.follower_apply.lock().await
     }
 
-    pub(crate) fn publish_event_order(&self) -> Arc<tokio::sync::Mutex<PublishOrder>> {
-        self.publish_event_order.clone()
-    }
 
     pub fn applied_upto(&self) -> Arc<AtomicU64> {
         self.applied_upto.clone()
@@ -3771,7 +3682,7 @@ impl QueueInternalState {
     }
 
     /// Undo enqueues for offsets whose message payload never became durable (the
-    /// parallel append cancel path). Removes them from the ready set and every
+    /// cancellation). Removes them from the ready set and every
     /// per-offset tracker so they are never delivered. Only ever targets
     /// never-settled tail offsets (the producer was not confirmed); a settled
     /// offset is left untouched.

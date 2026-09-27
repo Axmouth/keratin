@@ -1,6 +1,6 @@
 //! Bounded pages from sealed storage, verified without opening ordinary writers.
-use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use super::*;
+use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use keratin_log::{FrozenLogReader, lock_existing_log};
 use std::io::Read;
 
@@ -89,7 +89,8 @@ impl RecoverySequentialRead {
         // A completed combined event scan can restart at its retained head for
         // live-payload verification. No incomplete scan may rewind.
         let repeat_combined = self.history.log_layout == QueueLogLayout::Combined
-            && request.source == RecoveryReadSource::Events && self.next == self.end
+            && request.source == RecoveryReadSource::Events
+            && self.next == self.end
             && request.from == head;
         if self.source != Some(request.source) || repeat_combined {
             if self.source.is_some() && self.next != self.end {
@@ -140,7 +141,12 @@ impl RecoverySequentialRead {
             let size = 18 + record.headers.len() + record.payload.len();
             if size > request.max_bytes as usize - used {
                 if page.records.is_empty() {
-                    return Err(invalid(&Limit::message(Budget::RecordBytes, request.max_bytes as u64, 0, size as u64)));
+                    return Err(invalid(&Limit::message(
+                        Budget::RecordBytes,
+                        request.max_bytes as u64,
+                        0,
+                        size as u64,
+                    )));
                 }
                 self.pending = Some(record);
                 break;
@@ -306,7 +312,9 @@ impl Stroma {
                     Some(logs)
                 } else {
                     for (index, root) in roots.iter().enumerate() {
-                        if index == 0 && history.log_layout == QueueLogLayout::Combined { continue; }
+                        if index == 0 && history.log_layout == QueueLogLayout::Combined {
+                            continue;
+                        }
                         cold_locks.push(lock_existing_log(root).map_err(io_err)?);
                     }
                     None
@@ -356,8 +364,12 @@ impl Stroma {
                     snapshot_bytes: vec![],
                 };
                 if sequential {
-                    if request.source == RecoveryReadSource::Messages && history.log_layout == QueueLogLayout::Combined {
-                        if request.from != 0 { return Err(invalid("combined message lane cursor must be zero")); }
+                    if request.source == RecoveryReadSource::Messages
+                        && history.log_layout == QueueLogLayout::Combined
+                    {
+                        if request.from != 0 {
+                            return Err(invalid("combined message lane cursor must be zero"));
+                        }
                     } else if request.source != RecoveryReadSource::Snapshot {
                         let index = if request.source == RecoveryReadSource::Messages {
                             0
@@ -392,7 +404,9 @@ impl Stroma {
                             }
                             page.end = end;
                         }
-                        if index == 0 && history.log_layout == QueueLogLayout::Combined { continue; }
+                        if index == 0 && history.log_layout == QueueLogLayout::Combined {
+                            continue;
+                        }
                         let reader = FrozenLogReader::open(
                             &roots[index],
                             request.seal.fence_epoch,
@@ -422,7 +436,12 @@ impl Stroma {
                                         if page.records.is_empty() {
                                             return Err(io::Error::new(
                                                 io::ErrorKind::InvalidInput,
-                                                Limit::message(Budget::RecordBytes, request.max_bytes as u64, 0, size as u64),
+                                                Limit::message(
+                                                    Budget::RecordBytes,
+                                                    request.max_bytes as u64,
+                                                    0,
+                                                    size as u64,
+                                                ),
                                             ));
                                         }
                                         full = true;
@@ -584,6 +603,19 @@ mod tests {
         )
         .await
         .unwrap();
+        s.initialize_empty_storage_history(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            StorageHistoryBinding {
+                resource_incarnation: [1; 16],
+                accepted_history: [2; 16],
+                writer_session: [3; 16],
+            },
+        )
+        .await
+        .unwrap();
         s.become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
@@ -592,24 +624,16 @@ mod tests {
                 "q",
                 0,
                 None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 7,
-                    first_offset: offset,
-                    durability: Some(KDurability::AfterFsync),
-                    records: vec![Message {
-                        flags: offset as u16,
-                        headers: vec![2, 3],
-                        payload: vec![offset as u8; 80],
-                    }],
-                }),
+                None,
                 Some(ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: offset,
                     durability: Some(KDurability::AfterFsync),
-                    events: vec![StromaEvent::Enqueue {
-                        off: offset,
-                        retries: 0,
+                    events: vec![StromaEvent::PayloadEnqueue {
+                        not_before: None,
                         expire_at: None,
+                        headers: vec![2, 3],
+                        payload: vec![offset as u8; 80],
                     }],
                 }),
             )
@@ -630,10 +654,10 @@ mod tests {
         RecoveryReadRequest {
             seal,
             history_id: sealed.history.id,
-            source: RecoveryReadSource::Messages,
+            source: RecoveryReadSource::Events,
             from: 0,
             max_records: 2,
-            max_bytes: 200,
+            max_bytes: 300,
         }
     }
     async fn read(s: &Stroma, request: RecoveryReadRequest) -> Result<RecoveryReadPage> {
@@ -716,12 +740,15 @@ mod tests {
                 0 => bad.from = request.from,
                 1 => bad.from += 1,
                 2 => {
-                    bad.source = RecoveryReadSource::Events;
+                    bad.source = RecoveryReadSource::Messages;
                     bad.from = 0;
                 }
                 3 => bad.history_id[0] ^= 1,
                 4 => bad.seal.transition[0] ^= 1,
-                _ => { bad.source = RecoveryReadSource::Snapshot; bad.from = 0; },
+                _ => {
+                    bad.source = RecoveryReadSource::Snapshot;
+                    bad.from = 0;
+                }
             }
             assert!(sequential(&s, bad, cursor).await.is_err(), "case {change}");
             assert_eq!(s.recovery_stream_slots.available_permits(), 2);
@@ -736,7 +763,7 @@ mod tests {
         let mut request = seal(&s).await;
         let (page, mut cursor) = sequential(&s, request.clone(), None).await.unwrap();
         request.from = page.next;
-        let mut paths: Vec<_> = fs::read_dir(s.msg_tp_part_dir("q", 0, None).join("segments"))
+        let mut paths: Vec<_> = fs::read_dir(s.tp_part_dir("q", 0, None).join("segments"))
             .unwrap()
             .map(|e| e.unwrap().path())
             .filter(|p| p.extension().is_some_and(|e| e == "log"))
@@ -777,7 +804,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
         let handle = ticket.resolve().unwrap();
-        let head = handle.msg_log().unwrap().truncate_before(4).await.unwrap();
+        let head = handle.event_log().truncate_before(4).await.unwrap();
         drop(handle);
         drop(ticket);
         let mut request = seal(&s).await;
@@ -845,7 +872,17 @@ mod tests {
         let before = files(&dir.root);
         let first = read(&s, request.clone()).await.unwrap();
         assert_eq!((first.next, first.end, first.records.len()), (2, 6, 2));
-        assert_eq!(first.records[1].payload, vec![1; 80]);
+        assert_eq!(
+            first.records[1].payload,
+            StromaEvent::PayloadEnqueue {
+                not_before: None,
+                expire_at: None,
+                headers: vec![2, 3],
+                payload: vec![1; 80]
+            }
+            .encode()
+            .unwrap()
+        );
         let mut second = request.clone();
         second.from = first.next;
         assert_eq!(read(&s, second).await.unwrap().next, 4);
@@ -878,10 +915,10 @@ mod tests {
                 fence_epoch: 8,
             },
             history_id: [0; 32],
-            source: RecoveryReadSource::Messages,
+            source: RecoveryReadSource::Events,
             from: 0,
             max_records: 1,
-            max_bytes: 200,
+            max_bytes: 300,
         };
         assert!(read(&s, unsealed).await.is_err());
         let request = seal(&s).await;
@@ -924,7 +961,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let request = seal(&s).await;
         let first = s
-            .msg_tp_part_dir("q", 0, None)
+            .tp_part_dir("q", 0, None)
             .join("segments/00000000000000000000.log");
         let original = fs::read(&first).unwrap();
         for mutation in 0..3 {
@@ -942,13 +979,13 @@ mod tests {
         }
         // Change a valid CRC-protected record beyond the requested two records.
         let path = s
-            .msg_tp_part_dir("q", 0, None)
+            .tp_part_dir("q", 0, None)
             .join("segments/00000000000000000005.log");
         // Segment bases depend on packing; find the last data segment instead.
         let path = if path.exists() {
             path
         } else {
-            let mut p: Vec<_> = fs::read_dir(s.msg_tp_part_dir("q", 0, None).join("segments"))
+            let mut p: Vec<_> = fs::read_dir(s.tp_part_dir("q", 0, None).join("segments"))
                 .unwrap()
                 .map(|e| e.unwrap().path())
                 .filter(|p| p.extension().is_some_and(|e| e == "log"))
@@ -1017,7 +1054,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
         let handle = ticket.resolve().unwrap();
-        let head = handle.msg_log().unwrap().truncate_before(4).await.unwrap();
+        let head = handle.event_log().truncate_before(4).await.unwrap();
         assert!(head > 0 && head < 6);
         drop(handle);
         drop(ticket);
@@ -1026,7 +1063,7 @@ mod tests {
         request.from = head;
         let page = read(&s, request.clone()).await.unwrap();
         assert_eq!(page.records[0].offset, head);
-        let root = s.msg_tp_part_dir("q", 0, None);
+        let root = s.tp_part_dir("q", 0, None);
         s.shutdown().await.unwrap();
         drop(s);
         let s = Stroma::open(
@@ -1059,6 +1096,19 @@ mod tests {
             &dir.root,
             StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
             SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        s.initialize_empty_storage_history(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            StorageHistoryBinding {
+                resource_incarnation: [1; 16],
+                accepted_history: [2; 16],
+                writer_session: [3; 16],
+            },
         )
         .await
         .unwrap();

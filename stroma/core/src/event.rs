@@ -20,7 +20,6 @@ pub enum EventType {
     EnqueueDelayedMany = 3,
     CancelEnqueueMany = 4,
     ActivateDelayed = 5,
-    #[cfg(feature = "combined-queue-log-experiment")]
     PayloadEnqueue = 6,
     MarkInflight = 10,
     MarkInflightMany = 11,
@@ -220,7 +219,6 @@ pub enum DLQDiscardPolicyWire {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StromaEvent {
     /// Experimental original publish. Identity comes from the containing record.
-    #[cfg(feature = "combined-queue-log-experiment")]
     PayloadEnqueue {
         not_before: Option<UnixMillis>,
         expire_at: Option<UnixMillis>,
@@ -246,12 +244,9 @@ pub enum StromaEvent {
     /// Advance delayed publishes/retries at an explicit clock boundary. The
     /// bounded transition is applied in event order on every replica.
     ActivateDelayed { now: UnixMillis, max: u32 },
-    /// Annihilates a previously-emitted enqueue for offsets whose message
-    /// payload never became durable (the parallel msg/event append path where the
-    /// msg fsync failed after the event log already recorded the enqueue). Folded
-    /// against `EnqueueMany` during recovery and apply, so a cancelled offset is
-    /// never delivered and never triggers a dangling-reference check. Only ever
-    /// targets never-delivered offsets (the producer was not confirmed).
+    /// Remove pending enqueues without declaring their offsets settled. The
+    /// targets must precede this record. Single-log publishing does not emit
+    /// cancellation records on I/O failure.
     CancelEnqueueMany {
         offs: Vec<Offset>,
     },
@@ -423,7 +418,6 @@ fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
 }
 
 impl StromaEvent {
-    #[cfg(feature = "combined-queue-log-experiment")]
     pub(crate) fn into_record_state(self, off: Offset) -> Self {
         match self {
             Self::PayloadEnqueue { not_before: Some(not_before), .. } => Self::EnqueueDelayed { off, not_before },
@@ -451,7 +445,6 @@ impl StromaEvent {
     /// (Declare / ResetQueue / Snapshot).
     pub fn max_referenced_msg_offset(&self) -> Option<Offset> {
         match self {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => None,
             StromaEvent::Enqueue { off, .. }
             | StromaEvent::EnqueueDelayed { off, .. }
@@ -494,7 +487,6 @@ impl StromaEvent {
     /// never feeds them through this.
     pub fn referenced_msg_offsets(&self) -> Vec<Offset> {
         match self {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => Vec::new(),
             StromaEvent::Enqueue { off, .. }
             | StromaEvent::EnqueueDelayed { off, .. }
@@ -530,7 +522,6 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { not_before, expire_at, headers, payload } => {
                 put_u16(&mut out, EventType::PayloadEnqueue as u16);
                 put_opt_u64(&mut out, *not_before);
@@ -777,7 +768,6 @@ impl StromaEvent {
         // a field spliced into the fixed-stride entries.
         let ty = rd_u16(bytes, &mut i)?;
         match ty {
-            #[cfg(feature = "combined-queue-log-experiment")]
             x if x == EventType::PayloadEnqueue as u16 => {
                 let not_before = rd_opt_u64(bytes, &mut i)?;
                 let expire_at = rd_opt_u64(bytes, &mut i)?;

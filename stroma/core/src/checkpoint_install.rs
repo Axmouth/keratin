@@ -20,7 +20,10 @@ struct Journal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Phase {
     Pending(FollowerStateCheckpointInstall),
-    Complete { digest: [u8; 32], backfill: Option<Box<FollowerStateCheckpointInstall>> },
+    Complete {
+        digest: [u8; 32],
+        backfill: Option<Box<FollowerStateCheckpointInstall>>,
+    },
 }
 
 fn digest(install: &FollowerStateCheckpointInstall) -> Result<[u8; 32]> {
@@ -32,11 +35,14 @@ fn validate(
     part: u32,
     install: &FollowerStateCheckpointInstall,
 ) -> Result<(QueueInternalState, crate::SnapshotMeta)> {
-    if install.event_start_offset > install.event_next_offset
-        || (!install.combined_log && install.event_start_offset != install.event_next_offset)
-        || (install.combined_log && (!cfg!(feature = "combined-queue-log-experiment")
-            || install.message_next_offset != 0 || install.message_epoch != install.event_epoch)) {
-        return Err(StromaError::InvalidArgument("invalid checkpoint layout or physical start".into()));
+    if !install.combined_log
+        || install.event_start_offset > install.event_next_offset
+        || install.message_next_offset != 0
+        || install.message_epoch != install.event_epoch
+    {
+        return Err(StromaError::InvalidArgument(
+            "invalid checkpoint layout or physical start".into(),
+        ));
     }
     if install.applied_event_offset != install.event_next_offset.saturating_sub(1) {
         return Err(StromaError::InvalidArgument(format!(
@@ -54,13 +60,16 @@ fn validate(
             meta.last_snapshot_event_offset, install.applied_event_offset,
         )));
     }
-    let payload_start = if install.combined_log { install.event_start_offset } else { install.message_next_offset };
+    let payload_start = install.event_start_offset;
     if payload_start > state.lowest_not_settled_offset()
-        || (install.combined_log && state.required_message_next() > install.event_next_offset) {
+        || state.required_message_next() > install.event_next_offset
+    {
         return Err(StromaError::InvalidArgument(format!(
-            "checkpoint message continuation {} skips state-referenced messages from {}",
-            install.message_next_offset,
+            "checkpoint payload range {}..{} does not cover state-referenced messages from {} through {}",
+            payload_start,
+            install.event_next_offset,
             state.lowest_not_settled_offset(),
+            state.required_message_next(),
         )));
     }
     Ok((state, meta))
@@ -179,7 +188,8 @@ impl Stroma {
         Ok(())
     }
 
-    /// Persist an installation intent before resetting either follower log.
+    /// The legacy unauthenticated reset entry point rejects single-log queues.
+    /// Use exact excluded-learner authorization for checkpoint installation.
     /// Cancellation does not cancel a started installation; failures retain a
     /// journal which ordinary access/restart will finish before exposing state.
     pub async fn install_follower_state_checkpoint(
@@ -255,11 +265,15 @@ impl Stroma {
         install: &FollowerStateCheckpointInstall,
         learner: Option<&PreparedStorageHistory>,
     ) -> Result<()> {
-        if install.combined_log != self.queue_payloads_in_event_log() {
-            return Err(StromaError::InvalidArgument("checkpoint layout differs from local queue format".into()));
+        if !install.combined_log {
+            return Err(StromaError::InvalidArgument(
+                "checkpoint layout differs from local queue format".into(),
+            ));
         }
-        if install.combined_log && learner.is_none() {
-            return Err(StromaError::InvalidArgument("combined checkpoint reset requires excluded learner authorization".into()));
+        if learner.is_none() {
+            return Err(StromaError::InvalidArgument(
+                "combined checkpoint reset requires excluded learner authorization".into(),
+            ));
         }
 
         loop {
@@ -353,7 +367,7 @@ impl Stroma {
     ) -> Result<()> {
         if install.combined_log != h.optional_message_log().is_none()
             || (h.message_lane_epoch(), h.event_log().current_epoch())
-            != (install.message_epoch, install.event_epoch)
+                != (install.message_epoch, install.event_epoch)
         {
             return Err(StromaError::InvalidArgument(format!(
                 "checkpoint epochs ({}, {}) do not match local epochs ({}, {})",
@@ -419,10 +433,8 @@ impl Stroma {
             Phase::Pending(install) => {
                 let (state, meta) = validate(topic, part, install)?;
                 Self::checkpoint_epochs(h, install)?;
-                for log in h.physical_logs() { log.become_follower(); }
-                if !install.combined_log {
-                    h.msg_log()?.destructive_reset_to_checkpoint_at_epoch(install.message_next_offset, install.message_epoch)
-                        .await.map_err(io_err)?;
+                for log in h.physical_logs() {
+                    log.become_follower();
                 }
                 self.checkpoint_boundary("messages")?;
                 h.event_log()
@@ -482,21 +494,43 @@ impl Stroma {
     }
 
     pub(super) fn permits_combined_checkpoint_backfill(
-        &self, topic: &str, part: u32, group: Option<&str>, next: u64, snapshot: &[u8], log: &Keratin,
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        next: u64,
+        snapshot: &[u8],
+        log: &Keratin,
     ) -> Result<bool> {
-        if !self.queue_payloads_in_event_log()
-            || !self.snap_dir(topic, part, group).join("storage.learner").try_exists().map_err(io_err)? {
+        if !self
+            .snap_dir(topic, part, group)
+            .join("storage.learner")
+            .try_exists()
+            .map_err(io_err)?
+        {
             return Ok(false);
         }
-        let Some(journal) = self.checkpoint_journal(topic, part, group)? else { return Ok(false); };
-        let Phase::Complete { digest: expected, backfill: Some(install) } = journal.phase else { return Ok(false); };
+        let Some(journal) = self.checkpoint_journal(topic, part, group)? else {
+            return Ok(false);
+        };
+        let Phase::Complete {
+            digest: expected,
+            backfill: Some(install),
+        } = journal.phase
+        else {
+            return Ok(false);
+        };
         validate(topic, part, &install)?;
-        Ok(install.combined_log && digest(&install)? == expected
-            && journal.history.is_some() && journal.history == self.storage_history_binding(topic, part, group)?
+        Ok(install.combined_log
+            && digest(&install)? == expected
+            && journal.history.is_some()
+            && journal.history == self.storage_history_binding(topic, part, group)?
             && install.event_epoch == log.current_epoch()
-            && install.event_next_offset == next && install.state_snapshot == snapshot
+            && install.event_next_offset == next
+            && install.state_snapshot == snapshot
             && install.event_start_offset == log.head_offset()
-            && log.next_offset() >= install.event_start_offset && log.next_offset() < next)
+            && log.next_offset() >= install.event_start_offset
+            && log.next_offset() < next)
     }
 
     fn publish_checkpoint_snapshot_and_receipt(&self, mut journal: Journal) -> Result<()> {
@@ -519,8 +553,11 @@ impl Stroma {
         recovery_seal::sync_directories(&self.root.join("tmp"))?;
         self.checkpoint_boundary("snapshot")?;
         let hash = digest(install)?;
-        let backfill = install.combined_log.then(|| Box::new(install.clone()));
-        journal.phase = Phase::Complete { digest: hash, backfill };
+        let backfill = Some(Box::new(install.clone()));
+        journal.phase = Phase::Complete {
+            digest: hash,
+            backfill,
+        };
         persist_journal(
             &self.checkpoint_journal_path(
                 &journal.topic,
@@ -597,18 +634,19 @@ impl Stroma {
                     message_epoch = install.message_epoch, event_epoch = install.event_epoch,
                     message_next = install.message_next_offset, event_next = install.event_next_offset,
                     "resuming interrupted checkpoint before ordinary log recovery");
-                if install.combined_log != self.queue_payloads_in_event_log() {
-                    return Err(StromaError::Corruption("checkpoint journal layout mismatch".into()));
-                }
-                let mut logs = vec![(self.tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
-                    install.event_start_offset, install.event_epoch)];
                 if !install.combined_log {
-                    logs.push((self.msg_tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
-                        install.message_next_offset, install.message_epoch));
+                    return Err(StromaError::Corruption(
+                        "checkpoint journal layout mismatch".into(),
+                    ));
                 }
+                let logs = vec![(
+                    self.tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
+                    install.event_start_offset,
+                    install.event_epoch,
+                )];
                 Keratin::rebuild_for_checkpoint_recovery(logs)
-                .await
-                .map_err(io_err)?;
+                    .await
+                    .map_err(io_err)?;
                 self.checkpoint_boundary("cold_logs")?;
                 let stroma = self.clone();
                 tokio::task::spawn_blocking(move || {
@@ -640,7 +678,7 @@ impl Stroma {
 #[cfg(all(test, unix))]
 mod tests {
     use super::*;
-    use keratin_log::{Message, test_dir};
+    use keratin_log::test_dir;
 
     async fn open(root: &Path) -> Stroma {
         Stroma::open(
@@ -658,8 +696,8 @@ mod tests {
             state.enqueue(offset, 0, None);
         }
         FollowerStateCheckpointInstall {
-            combined_log: false,
-            event_start_offset: count,
+            combined_log: true,
+            event_start_offset: 0,
             message_epoch: 7,
             event_epoch: 7,
             message_next_offset: 0,
@@ -669,18 +707,61 @@ mod tests {
         }
     }
 
+    fn binding() -> StorageHistoryBinding {
+        StorageHistoryBinding {
+            resource_incarnation: [1; 16],
+            accepted_history: [2; 16],
+            writer_session: [3; 16],
+        }
+    }
+
+    async fn admit(stroma: &Stroma) {
+        stroma
+            .prepare_queue_learner_storage("q", 0, None, binding(), [4; 32])
+            .await
+            .unwrap();
+    }
+
     async fn follower(stroma: &Stroma) {
+        admit(stroma).await;
         stroma
             .become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
     }
 
+    async fn install(stroma: &Stroma, checkpoint: FollowerStateCheckpointInstall) -> Result<()> {
+        stroma
+            .install_queue_learner_checkpoint(
+                PreparedStorageHistory {
+                    topic: "q".into(),
+                    partition: 0,
+                    group: None,
+                    stream: false,
+                    binding: binding(),
+                    storage_instance: stroma.storage_session,
+                },
+                checkpoint,
+            )
+            .await
+            .map(|_| ())
+    }
+
+    fn payload(bytes: &[u8]) -> StromaEvent {
+        StromaEvent::PayloadEnqueue {
+            not_before: None,
+            expire_at: None,
+            headers: vec![],
+            payload: bytes.to_vec(),
+        }
+    }
+
     async fn assert_installed(stroma: &Stroma, count: u64) {
+        admit(stroma).await;
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
-        assert_eq!(h.msg_log().unwrap().next_offset(), 0);
-        assert_eq!(h.event_log().next_offset(), count);
+        assert_eq!(h.message_lane_next(), 0);
+        assert_eq!(h.event_log().next_offset(), 0);
         assert_eq!(h.full_debug_info().await.state.ready_count, count as usize);
         if count > 0 {
             assert_eq!(h.role(), QueueRole::Follower);
@@ -747,7 +828,7 @@ mod tests {
                     st.queue_replication_next_offsets("q", 0, None)
                         .await
                         .unwrap(),
-                    (0, count)
+                    (0, 0)
                 );
                 if count > 0 {
                     assert!(
@@ -759,22 +840,18 @@ mod tests {
                         "q",
                         0,
                         None,
-                        Some(ReplicatedMessageBatch {
+                        None,
+                        Some(ReplicatedEventBatch {
                             epoch: 7,
                             first_offset: 0,
                             durability: Some(KDurability::AfterFsync),
-                            records: vec![Message {
-                                flags: 0,
-                                headers: vec![],
-                                payload: b"backfill".to_vec(),
-                            }],
+                            events: vec![payload(b"backfill")],
                         }),
-                        None,
                     )
                     .await
                     .unwrap();
                 }
-                st.verify_queue_learner_caught_up("q", 0, None, 7, count, count)
+                st.verify_queue_learner_caught_up("q", 0, None, 7, 0, count)
                     .await
                     .unwrap();
                 st.install_queue_learner_checkpoint(renewed, checkpoint(count))
@@ -784,7 +861,7 @@ mod tests {
                     st.queue_replication_next_offsets("q", 0, None)
                         .await
                         .unwrap(),
-                    (count, count)
+                    (0, count)
                 );
                 st.shutdown().await.unwrap();
             }
@@ -800,10 +877,7 @@ mod tests {
             let stroma = open(&dir.root).await;
             follower(&stroma).await;
             *stroma.checkpoint_fault.lock().unwrap() = Some(boundary);
-            let err = stroma
-                .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-                .await
-                .unwrap_err();
+            let err = install(&stroma, checkpoint(2)).await.unwrap_err();
             assert!(err.to_string().contains(boundary), "{err}");
             let h = slot_lookup_no_alloc(&stroma.queue_handles.load(), "q", 0, None)
                 .unwrap()
@@ -828,10 +902,7 @@ mod tests {
                 let stroma = open(&dir.root).await;
                 follower(&stroma).await;
                 *stroma.checkpoint_fault.lock().unwrap() = Some(boundary);
-                stroma
-                    .install_follower_state_checkpoint("q", 0, None, checkpoint(count))
-                    .await
-                    .unwrap_err();
+                install(&stroma, checkpoint(count)).await.unwrap_err();
                 stroma.shutdown().await.unwrap();
                 drop(stroma);
                 let stroma = open(&dir.root).await;
@@ -846,63 +917,44 @@ mod tests {
         let dir = test_dir!("checkpoint_receipt_preserves_backfill");
         let stroma = open(&dir.root).await;
         follower(&stroma).await;
-        let install = checkpoint(2);
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, install.clone())
-            .await
-            .unwrap();
+        let target = checkpoint(2);
+        install(&stroma, target.clone()).await.unwrap();
         stroma
             .apply_replicated_queue_batch(
                 "q",
                 0,
                 None,
-                Some(ReplicatedMessageBatch {
+                None,
+                Some(ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
-                    records: vec![
-                        Message {
-                            flags: 0,
-                            headers: vec![],
-                            payload: b"a".to_vec(),
-                        },
-                        Message {
-                            flags: 0,
-                            headers: vec![],
-                            payload: b"b".to_vec(),
-                        },
-                    ],
+                    events: vec![payload(b"a"), payload(b"b")],
                     durability: Some(KDurability::AfterFsync),
                 }),
-                None,
             )
             .await
             .unwrap();
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, install.clone())
-            .await
-            .unwrap();
+        install(&stroma, target.clone()).await.unwrap();
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().next_offset(), 2);
+        assert_eq!(ticket.resolve().unwrap().event_log().next_offset(), 2);
         stroma.shutdown().await.unwrap();
         drop(stroma);
         let stroma = open(&dir.root).await;
-        // Check before any role transition or reinstallation can hide a replay.
+        // Renew admission without resetting storage, then inspect before a role transition.
+        admit(&stroma).await;
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().next_offset(), 2);
+        assert_eq!(ticket.resolve().unwrap().event_log().next_offset(), 2);
         follower(&stroma).await;
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, install)
-            .await
-            .unwrap();
+        install(&stroma, target).await.unwrap();
         let records = ticket
             .resolve()
             .unwrap()
-            .msg_log().unwrap()
+            .event_log()
             .reader()
             .scan_from(0, 10)
             .unwrap();
         assert_eq!(records.len(), 2);
-        assert_eq!(records[1].payload, b"b");
+        assert_eq!(records[1].payload, payload(b"b").encode().unwrap());
         stroma.shutdown().await.unwrap();
     }
 
@@ -912,21 +964,21 @@ mod tests {
         let stroma = open(&dir.root).await;
         follower(&stroma).await;
         *stroma.checkpoint_fault.lock().unwrap() = Some("intent");
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-            .await
-            .unwrap_err();
-        let messages = stroma.msg_tp_part_dir("q", 0, None);
+        install(&stroma, checkpoint(2)).await.unwrap_err();
         let events = stroma.tp_part_dir("q", 0, None);
         stroma.shutdown().await.unwrap();
         drop(stroma);
         // Model interruption inside reset, before valid new segment headers exist.
-        fs::remove_dir_all(messages.join("segments")).unwrap();
         for entry in fs::read_dir(events.join("segments")).unwrap() {
             fs::write(entry.unwrap().path(), b"partial").unwrap();
         }
         let stroma = open(&dir.root).await;
         *stroma.checkpoint_fault.lock().unwrap() = Some("cold_logs");
+        let error = stroma
+            .prepare_queue_learner_storage("q", 0, None, binding(), [4; 32])
+            .await
+            .unwrap_err();
+        assert!(error.to_string().contains("cold_logs"), "{error}");
         assert!(stroma.queue_handle("q", 0, None).await.is_err());
         stroma.shutdown().await.unwrap();
         drop(stroma);
@@ -948,11 +1000,7 @@ mod tests {
             .clone();
         let io = h.recovery_gate.snapshot_io.lock();
         let other = stroma.clone();
-        let install = tokio::spawn(async move {
-            other
-                .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-                .await
-        });
+        let install = tokio::spawn(async move { install(&other, checkpoint(2)).await });
         tokio::time::timeout(std::time::Duration::from_secs(5), async {
             while !h.recovery_gate.checkpoint_pending.load(Ordering::Acquire) {
                 tokio::task::yield_now().await;
@@ -978,10 +1026,7 @@ mod tests {
         let stroma = open(&dir.root).await;
         follower(&stroma).await;
         *stroma.checkpoint_fault.lock().unwrap() = Some("intent");
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-            .await
-            .unwrap_err();
+        install(&stroma, checkpoint(2)).await.unwrap_err();
         assert!(stroma.ensure_checkpoint_not_pending("q", 0, None).is_err());
         assert!(stroma.destroy_partition("q", 0, None).await.is_err());
         assert!(
@@ -1031,7 +1076,7 @@ mod tests {
         stroma.shutdown().await.unwrap();
         drop(stroma);
         let journal = Journal {
-            history: None,
+            history: Some(binding()),
             topic: "another-queue".into(),
             partition: 0,
             group: None,
@@ -1040,16 +1085,18 @@ mod tests {
         persist_journal(&path, &journal).unwrap();
         let stroma = open(&dir.root).await;
         assert!(matches!(
-            stroma.queue_handle("q", 0, None).await,
+            stroma
+                .prepare_queue_learner_storage("q", 0, None, binding(), [4; 32])
+                .await,
             Err(StromaError::Corruption(_))
         ));
-        assert_eq!(
-            stroma.debug_snapshot().await.unwrap().queues[0].role,
-            QueueRole::Frozen
-        );
+        assert!(stroma.queue_handle("q", 0, None).await.is_err());
+        assert!(stroma.admitted_histories.is_empty());
         fs::write(path, b"damaged").unwrap();
         assert!(matches!(
-            stroma.queue_handle("q", 0, None).await,
+            stroma
+                .prepare_queue_learner_storage("q", 0, None, binding(), [4; 32])
+                .await,
             Err(StromaError::Corruption(_))
         ));
         stroma.shutdown().await.unwrap();
@@ -1069,10 +1116,7 @@ mod tests {
         let gate = h.recovery_gate.clone();
         let generation = gate.checkpoint_generation.load(Ordering::Acquire);
         let blob = QueueInternalState::new("q".into(), 0).encode_snapshot(0);
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-            .await
-            .unwrap();
+        install(&stroma, checkpoint(2)).await.unwrap();
         // Resume the blocking half of a snapshot prepared before installation.
         let write = || stroma.write_queue_snapshot("q", 0, None, 0, &blob);
         let installed = fs::read(stroma.snap_file("q", 0, None)).unwrap();
@@ -1098,10 +1142,7 @@ mod tests {
         };
         let stroma = open(Path::new(&root)).await;
         follower(&stroma).await;
-        stroma
-            .install_follower_state_checkpoint("q", 0, None, checkpoint(2))
-            .await
-            .unwrap();
+        install(&stroma, checkpoint(2)).await.unwrap();
         panic!("child should have stopped at a checkpoint boundary");
     }
 

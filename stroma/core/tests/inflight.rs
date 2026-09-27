@@ -164,10 +164,10 @@ async fn enqueue_happens_before_mark_inflight_visibility() {
 }
 
 #[tokio::test]
-async fn inflight_before_enqueue_is_ignored() {
+async fn inflight_before_enqueue_is_rejected() {
     let (st, _td) = open_test_stroma().await;
 
-    st.mark_inflight_one("t", 0, None, 0, 100).await.unwrap();
+    assert!(st.mark_inflight_one("t", 0, None, 0, 100).await.is_err());
     assert!(!st.is_inflight_or_settled("t", 0, None, 0).await.unwrap());
 
     let (completion, rx) = KeratinAppendCompletion::pair();
@@ -182,6 +182,7 @@ async fn inflight_before_enqueue_is_ignored() {
         .unwrap();
     let ar = rx.await.unwrap().unwrap();
     let offset = ar.base_offset;
+    assert_eq!(offset, 0, "rejected reference must not append metadata");
 
     // Must still not be inflight unless re-issued
     assert!(

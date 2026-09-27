@@ -14,7 +14,7 @@ pub trait QueueReplicationRetention: std::fmt::Debug + Send + Sync {
     ) -> Result<(u64, u64)>;
 }
 
-#[cfg(all(test, feature = "ordered-queue-apply"))]
+#[cfg(test)]
 mod tests {
     use super::*;
 
@@ -69,6 +69,9 @@ mod tests {
             .unwrap();
             rx.await.unwrap().unwrap();
         }
+        // Settle the prefix so payload retention no longer pins it. The
+        // follower floor must still protect the same records until it advances.
+        for off in 0..16 { st.ack_one("q", 0, None, off).await.unwrap(); }
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
         Stroma::periodic_snapshot_step(&st, &ticket).await.unwrap();

@@ -879,10 +879,8 @@ impl Stroma {
             .map_err(io_err)?;
             let mut expected = from;
             let mut records = Vec::with_capacity(raw.len());
-            #[cfg(feature = "combined-queue-log-experiment")]
             let mut combined_bytes = 0usize;
             for record in raw {
-                #[cfg(feature = "combined-queue-log-experiment")]
                 if qh.has_combined_log() {
                     // The reader includes one lookahead record. Payload-bearing
                     // events now need the same cap the message lane had. Always
@@ -1010,7 +1008,6 @@ impl Stroma {
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
     ) -> Result<(ReplicatedQueueApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
-        #[cfg(feature = "combined-queue-log-experiment")]
         {
             if qh.has_combined_log() && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
                 return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
@@ -1056,7 +1053,6 @@ impl Stroma {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
-        #[cfg(feature = "combined-queue-log-experiment")]
         let events = {
             let mut events = events;
             if qh.has_combined_log() {
@@ -1185,7 +1181,6 @@ impl Stroma {
                 };
                 // Snapshot backfill may skip old state events, but its physical
                 // payload dependencies must be checked before that cut is ready.
-                #[cfg(feature = "combined-queue-log-experiment")]
                 if qh.has_combined_log() && skip > 0
                     && applied_next.is_some_and(|next| batch.first_offset.saturating_add(batch.events.len() as u64) >= next) {
                     self.verify_combined_payload_coverage(qh, false).await?;
@@ -1194,7 +1189,6 @@ impl Stroma {
                 if count > 0 {
                     let scope = qh.ordered_apply_scope();
                     let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
-                    #[cfg(feature = "combined-queue-log-experiment")]
                     if qh.has_combined_log() {
                         self.apply_combined_records(batch.events.into_iter().skip(skip).collect(),batch.first_offset+skip as u64,qh).await?;
                         qh.applied_upto().fetch_max(batch.first_offset+skip as u64+count as u64-1,Ordering::Release);

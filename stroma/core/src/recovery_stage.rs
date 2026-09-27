@@ -271,7 +271,6 @@ pub(super) fn scan_parts(
             };
             hash_record(&mut hash);
             if live.contains(&record.offset) {
-                #[cfg(feature = "combined-queue-log-experiment")]
                 if s.payload_log.source == RecoveryReadSource::Events {
                     let record = RecoveryRecord { offset: record.offset, flags: record.flags,
                         headers: record.headers.to_vec(), payload: record.payload.to_vec() };
@@ -299,13 +298,10 @@ impl QueueRecoveryStageSpec {
     pub(super) fn validate_payload_log(&self) -> Result<()> {
         let p = &self.payload_log;
         let valid = p.head <= p.next && match p.source {
-            RecoveryReadSource::Messages => p.head == self.message_head
-                && p.next == self.message_next && p.digest == self.message_digest,
-            RecoveryReadSource::Events => cfg!(feature = "combined-queue-log-experiment")
-                && self.message_head == 0 && self.message_next == 0
+            RecoveryReadSource::Events => self.message_head == 0 && self.message_next == 0
                 && self.message_digest == recovery_history::empty_log_digest()
                 && p.next == self.event_next,
-            RecoveryReadSource::Snapshot => false,
+            RecoveryReadSource::Messages | RecoveryReadSource::Snapshot => false,
         };
         if !valid { return Err(invalid("recovery payload source differs from exact selected baseline")); }
         Ok(())
@@ -315,18 +311,14 @@ impl QueueRecoveryStageSpec {
 impl Stroma {
     pub(super) fn validate_recovery_payload_layout(&self, spec: &QueueRecoveryStageSpec) -> Result<()> {
         spec.validate_payload_log()?;
-        if (spec.payload_log.source == RecoveryReadSource::Events) != self.queue_payloads_in_event_log() {
+        if spec.payload_log.source != RecoveryReadSource::Events {
             return Err(invalid("recovery staging layout differs from local queue format"));
         }
         Ok(())
     }
 
     pub(super) fn recovery_payload_path(&self, spec: &QueueRecoveryStageSpec) -> PathBuf {
-        if spec.payload_log.source == RecoveryReadSource::Events {
-            self.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref())
-        } else {
-            self.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref())
-        }
+        self.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref())
     }
 
     /// Open/resume non-serving staging after the caller freshly authorizes its

@@ -79,7 +79,6 @@ pub use recovery_stage::{
 mod agreed_checkpoint;
 #[path = "stroma/checkpoint_capture.rs"]
 mod checkpoint_capture;
-#[cfg(feature = "combined-queue-log-experiment")]
 #[path = "stroma/combined.rs"]
 mod combined;
 #[path = "checkpoint_install.rs"]
@@ -124,8 +123,8 @@ pub struct QueuePublishCommit {
     pub event_epoch: u64,
 }
 
-/// Called once, before individual successful completions, after both logs and
-/// queue application complete. The callback must do bounded, nonblocking work.
+/// Called once, before individual successful completions, after log durability
+/// and queue application complete. The callback must do bounded, nonblocking work.
 pub type QueuePublishObserver = Box<dyn FnOnce(QueuePublishCommit) + Send>;
 
 pub struct PublishItem {
@@ -198,8 +197,6 @@ pub const DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StromaOptions {
-    #[cfg(feature = "combined-queue-log-experiment")]
-    pub combined_queue_log: bool,
     /// How often the background worker sweeps already-materialized stream
     /// partitions to enforce their retention policy. `None` (or zero) disables the
     /// sweep, for example when an external scheduler drives retention instead. The
@@ -211,8 +208,6 @@ impl Default for StromaOptions {
     fn default() -> Self {
         Self {
             stream_retention_sweep_interval_ms: Some(DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS),
-            #[cfg(feature = "combined-queue-log-experiment")]
-            combined_queue_log: std::env::var("STROMA_COMBINED_QUEUE_LOG").as_deref() == Ok("1"),
         }
     }
 }
@@ -772,13 +767,9 @@ pub struct QuarantineInfo {
 /// What recovery found wrong with the event log at `event_offset`.
 #[derive(Debug, Clone)]
 enum RecoveryMismatchKind {
-    /// An event references a message offset the message log has not durably
-    /// accepted (a dangling forward reference - only possible as a lost-tail
-    /// suffix, since events are written after their messages).
-    DanglingReference { msg_offset: u64, msg_tail: u64 },
-    /// An event record failed to decode (corruption). Unlike a dangling ref this
-    /// is the genuinely mid-log failure; the safe repair is the same - truncate
-    /// at the bad record (skipping it would drop a state transition).
+    /// An event record failed decoding or reference validation. Skipping it
+    /// would drop a state transition. Explicit local repair truncates the suffix
+    /// only when the storage history is unbound.
     CorruptRecord { detail: String },
 }
 
@@ -800,8 +791,6 @@ struct RecoveryScanOutcome {
 
 #[derive(Debug, Clone)]
 pub struct Stroma {
-    #[cfg(feature = "combined-queue-log-experiment")]
-    pub(crate) combined_queue_log: bool,
     pub(crate) start_time: Instant,
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg_msg: KeratinConfig,
@@ -929,12 +918,7 @@ impl Stroma {
     ) -> Result<Self> {
         let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
-        #[cfg(feature = "combined-queue-log-experiment")]
-        combined::prepare_root(&root, options.combined_queue_log)?;
-        #[cfg(not(feature = "combined-queue-log-experiment"))]
-        if root.join("combined-queue-log.v1").exists() {
-            return Err(StromaError::InvalidArgument("combined queue log requires the experimental build".into()));
-        }
+        combined::prepare_root(&root)?;
         fs::create_dir_all(root.join("events")).map_err(io_err)?;
         fs::create_dir_all(root.join("messages")).map_err(io_err)?;
         fs::create_dir_all(root.join("snapshots")).map_err(io_err)?;
@@ -945,8 +929,6 @@ impl Stroma {
         let keratin_cfg_event = keratin_cfg.event_log;
 
         let st = Self {
-            #[cfg(feature = "combined-queue-log-experiment")]
-            combined_queue_log: options.combined_queue_log,
             start_time,
             root,
             keratin_cfg_msg,
@@ -1309,17 +1291,13 @@ impl Stroma {
     /// Combined queues inherit the payload writer's capacities and cadence.
     /// Keep the small event configuration for metadata/global-store logs.
     fn queue_event_log_config(&self) -> KeratinConfig {
-        #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
-            return KeratinConfig {
-                default_durability: if self.keratin_cfg_msg.default_durability == KDurability::AfterFsync
-                    || self.keratin_cfg_event.default_durability == KDurability::AfterFsync {
-                    KDurability::AfterFsync
-                } else { KDurability::AfterWrite },
-                ..self.keratin_cfg_msg
-            };
+        KeratinConfig {
+            default_durability: if self.keratin_cfg_msg.default_durability == KDurability::AfterFsync
+                || self.keratin_cfg_event.default_durability == KDurability::AfterFsync {
+                KDurability::AfterFsync
+            } else { KDurability::AfterWrite },
+            ..self.keratin_cfg_msg
         }
-        self.keratin_cfg_event
     }
 
     fn partition_event_log_config(&self, kind: PartitionKind) -> KeratinConfig {
@@ -1621,7 +1599,7 @@ impl Stroma {
                 .get_or_try_init(|| async {
                     self.ensure_partition_not_sealed(tp, part, group)?;
                     let kind = self.read_partition_kind(tp, part, group);
-                    let msg_log = if kind == PartitionKind::Queue && self.queue_payloads_in_event_log() {
+                    let msg_log = if kind == PartitionKind::Queue {
                         None
                     } else {
                         Some(self.msg_log_init(tp, part, group).await?)
@@ -2110,7 +2088,6 @@ impl Stroma {
             return Ok(());
         }
         match ev {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => return Err(io::Error::new(io::ErrorKind::InvalidData, "payload enqueue needs record offset")),
             StromaEvent::Enqueue {
                 off,
@@ -2293,17 +2270,9 @@ impl Stroma {
         Ok(())
     }
 
-    pub fn queue_payloads_in_event_log(&self) -> bool {
-        #[cfg(feature = "combined-queue-log-experiment")]
-        { return self.combined_queue_log; }
-        #[cfg(not(feature = "combined-queue-log-experiment"))]
-        { false }
-    }
-
     /// Resolve this partition's payload lane. Live handles avoid filesystem reads
     /// on replication progress reports. Cold partitions use their durable kind.
     pub fn partition_payloads_in_event_log(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
-        if !self.queue_payloads_in_event_log() { return false; }
         let group = normalize_group(group);
         let current = self.queue_handles.load();
         if let Some(h) = slot_lookup_no_alloc(&current, tp, part, group).and_then(|s| s.handle.get()) {
@@ -2317,7 +2286,6 @@ impl Stroma {
     }
 
     pub(crate) async fn apply_record_inmem(&self, ev: StromaEvent, off: u64, qh: &QueueHandleInner) -> Result<()> {
-        #[cfg(feature = "combined-queue-log-experiment")]
         if qh.has_combined_log() { return self.apply_combined_records(vec![ev], off, qh).await; }
         let _ = off;
         self.apply_event_inmem(ev, qh).await
@@ -2333,7 +2301,6 @@ impl Stroma {
             return Ok(());
         }
         match ev {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => return Err(StromaError::InvalidArgument("payload enqueue needs record offset".into())),
             StromaEvent::Enqueue {
                 off,
@@ -2584,7 +2551,7 @@ impl Stroma {
     /// positions. The tail is sampled while an owner-operation lease prevents
     /// destructive transitions. Concurrent appends can only advance this bound.
     fn owner_event_msg(&self, qh: &QueueHandleInner, event: &StromaEvent) -> Result<Message> {
-        if self.queue_payloads_in_event_log() && qh.kind() == PartitionKind::Queue
+        if qh.kind() == PartitionKind::Queue
             && event.max_combined_referenced_offset().is_some_and(|off| off >= qh.event_log().next_offset())
         {
             return Err(StromaError::InvalidArgument("combined owner event has a forward payload reference".into()));
@@ -2595,7 +2562,7 @@ impl Stroma {
     /// Direct actor operations still need to settle their non-payload log slot
     /// before publishing the ordered application boundary.
     async fn settle_metadata_record(&self, qh: &QueueHandleInner, offset: Offset) -> Result<()> {
-        if self.queue_payloads_in_event_log() && qh.kind() == PartitionKind::Queue {
+        if qh.kind() == PartitionKind::Queue {
             self.apply_event_inmem(StromaEvent::Ack { off: offset }, qh).await?;
         }
         Ok(())
@@ -2682,70 +2649,6 @@ impl Stroma {
             .observe(start.elapsed());
 
         Ok(new_upto)
-    }
-
-    /// Await the event-log and msg-log durabilities (both already appended)
-    /// concurrently so the two fsyncs overlap, then apply the events in memory
-    /// gated on `msg_barrier` - the message payload becoming durable - so an offset
-    /// is never delivered before its payload is durable even though the event log
-    /// may be fsynced first. Returns `Ok(Some(new_upto))` when both logs are durable
-    /// and the events were applied, `Ok(None)` when the payload did NOT become
-    /// durable (the caller annihilates the durable Enqueue with a `CancelEnqueue`),
-    /// or `Err` on an event-log append failure. The event append itself is issued
-    /// by the caller under the per-partition publish-order lock, so the event log
-    /// stays in msg-offset order.
-    async fn gate_and_apply_enqueue(
-        &self,
-        qh: QueueHandle,
-        evs: Vec<StromaEvent>,
-        event_rx: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
-        msg_barrier: tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>>,
-        msgs_count: usize,
-        bytes_count: usize,
-        ordered_scope: Option<crate::ordered_apply::Scope>,
-    ) -> Result<Option<Offset>> {
-        let qh = qh.resolve()?;
-        let start = Instant::now();
-        // Await BOTH durabilities concurrently so the two fsyncs overlap (join polls
-        // both from the first wake - awaiting them sequentially serializes the pair).
-        let (event_res, msg_res) = tokio::join!(event_rx, msg_barrier);
-        let ar = match event_res {
-            Ok(inner) => inner.map_err(io_err)?,
-            Err(_) => return Err(io_err("event writer dropped")),
-        };
-
-        // Gate the in-memory apply on the message payload becoming durable. If it
-        // did not, the event-log Enqueue is durable but must not be applied or
-        // delivered; the caller annihilates it with a CancelEnqueue.
-        match msg_res {
-            Ok(Ok(_)) => {}
-            _ => return Ok(None),
-        }
-
-        self.metrics
-            .event_log_appends
-            .observe(msgs_count, bytes_count);
-        if ordered_scope.is_none() {
-            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Relaxed);
-        }
-        qh.set_dirty_snapshot(true);
-
-        let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
-        for (i, ev) in evs.into_iter().enumerate() {
-            self.apply_record_inmem(ev, ar.base_offset + i as u64, &qh).await?;
-        }
-        if ordered_scope.is_some() {
-            qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
-        }
-        crate::ordered_apply::finish(turn, ordered_scope)?;
-
-        let event_next = ar.base_offset + ar.count as u64;
-        self.metrics
-            .event_log_appends
-            .batches
-            .latency
-            .observe(start.elapsed());
-        Ok(Some(event_next))
     }
 
     // ---------------- Public API used by Storage shim ----------------
@@ -3503,12 +3406,11 @@ impl Stroma {
         res
     }
 
-    fn recover_events_from_log(
+    fn recover_stream_events_from_log(
         event_log: Arc<Keratin>,
         mut cur: u64,
         tail: u64,
         applied_upto: Arc<AtomicU64>,
-        msg_tail: u64,
     ) -> Result<RecoveryScanOutcome> {
         let reader = event_log.reader();
 
@@ -3539,94 +3441,11 @@ impl Stroma {
             }
         }
 
-        // Fold: the parallel durable-append path can leave the event log with an
-        // Enqueue for an offset whose message payload never became durable - later
-        // annihilated by a `CancelEnqueueMany` (runtime msg-fsync failure) or left
-        // dangling (crash between the two fsyncs). Track the non-durable enqueue
-        // references not yet cancelled; the valid prefix is everything up to the
-        // last point that set is empty. An unresolved tail (a genuine
-        // crash-dangling and everything after it) is truncated - it is always
-        // UNCONFIRMED (confirm requires both logs durable), so dropping it loses
-        // nothing acknowledged. Because msg offsets are monotonic and durability
-        // is a contiguous prefix, the non-durable enqueues form a contiguous
-        // event-log tail, so this never drops a confirmed enqueue (at worst it
-        // drops interleaved acks of already-durable messages, which is at-most
-        // redelivery under the at-least-once contract).
-        let mut pending: std::collections::HashSet<Offset> = std::collections::HashSet::new();
-        let mut valid_len = 0usize;
-        for (i, (ev_off, ev)) in scanned.iter().enumerate() {
-            if let StromaEvent::CancelEnqueueMany { offs } = ev {
-                for o in offs {
-                    pending.remove(o);
-                }
-            } else if ev
-                .max_referenced_msg_offset()
-                .is_some_and(|max| max >= msg_tail)
-            {
-                // Only enqueue tails can be explained by the parallel append
-                // crash window. Other missing references may describe lost
-                // confirmed history; quarantine rather than manufacture that
-                // explanation and silently discard them.
-                let is_enqueue = matches!(
-                    ev,
-                    StromaEvent::Enqueue { .. }
-                        | StromaEvent::EnqueueMany { .. }
-                        | StromaEvent::EnqueueDelayed { .. }
-                        | StromaEvent::EnqueueDelayedMany { .. }
-                );
-                if !is_enqueue {
-                    corrupt = Some(RecoveryMismatchFound {
-                        event_offset: *ev_off,
-                        kind: RecoveryMismatchKind::CorruptRecord {
-                            detail: format!("non-enqueue event at {ev_off} depends on message at or beyond durable tail {msg_tail}"),
-                        },
-                    });
-                    break;
-                }
-                // Only walk (and allocate) the per-offset list when this event
-                // actually references the non-durable tail; the common no-crash
-                // case (every reference below msg_tail) skips it entirely.
-                for o in ev.referenced_msg_offsets() {
-                    if o >= msg_tail {
-                        pending.insert(o);
-                    }
-                }
-            }
-            if pending.is_empty() {
-                valid_len = i + 1;
-            }
-        }
-
-        // A dangling suffix (pending never returned to empty) is reported at its
-        // truncation point - the first event of the unresolved tail - and always
-        // precedes any corrupt record (which, if present, is at the very end of
-        // the scan). Everything at or after `valid_len` is dropped.
-        let mismatch = if let Some(mut corruption) = corrupt {
-            // A dangling enqueue must not mask genuine corruption later in the
-            // scanned suffix. Preserve evidence and require the configured
-            // corruption policy; explicit repair still cuts at the valid prefix.
-            if valid_len < scanned.len() {
-                corruption.event_offset = scanned[valid_len].0;
-            }
-            Some(corruption)
-        } else if valid_len < scanned.len() {
-            let (trunc_off, trunc_ev) = &scanned[valid_len];
-            let msg_offset = trunc_ev
-                .referenced_msg_offsets()
-                .into_iter()
-                .filter(|o| *o >= msg_tail)
-                .max()
-                .unwrap_or(msg_tail);
-            Some(RecoveryMismatchFound {
-                event_offset: *trunc_off,
-                kind: RecoveryMismatchKind::DanglingReference {
-                    msg_offset,
-                    msg_tail,
-                },
-            })
-        } else {
-            None
-        };
+        // Stream payloads and cursor events remain independent. Queue-specific
+        // events are ignored by stream application and cannot authorize a
+        // two-log queue suffix repair.
+        let valid_len = scanned.len();
+        let mismatch = corrupt;
 
         let mut events = Vec::with_capacity(valid_len);
         for (ev_off, ev) in scanned.into_iter().take(valid_len) {
@@ -3670,7 +3489,6 @@ impl Stroma {
         // load snapshot...
 
         let mut cur = 0u64;
-        #[cfg(feature = "combined-queue-log-experiment")]
         let mut pending_combined_backfill = false;
 
         // Legacy snapshots encode an inclusive applied offset, so zero also
@@ -3688,7 +3506,6 @@ impl Stroma {
                     || (applied_upto.event_next() > event_log.next_offset() && !learner_backfill)) {
                 return Err(StromaError::Corruption("exact checkpoint does not cover retained event prefix".into()));
             }
-            #[cfg(feature = "combined-queue-log-experiment")]
             { pending_combined_backfill = learner_backfill; }
             if learner_backfill {
                 h.become_follower();
@@ -3723,9 +3540,6 @@ impl Stroma {
 
         let tail = event_log.next_offset();
         let applied_upto = h.applied_upto();
-        // The message log's durable tail: an event may not reference a message
-        // offset at or beyond this (the message is not durable -> dangling ref).
-        let msg_tail = h.message_lane_next();
 
         self.metrics
             .recovery
@@ -3741,16 +3555,14 @@ impl Stroma {
             }
         }
 
-        #[cfg(feature = "combined-queue-log-experiment")]
         let combined_mode = h.has_combined_log();
         let RecoveryScanOutcome {
             events,
             events_count,
             mismatch,
         } = tokio::task::spawn_blocking(move || {
-            #[cfg(feature = "combined-queue-log-experiment")]
             if combined_mode { return combined::recover_events(event_log,cur,tail,applied_upto); }
-            Self::recover_events_from_log(event_log, cur, tail, applied_upto, msg_tail)
+            Self::recover_stream_events_from_log(event_log, cur, tail, applied_upto)
         })
         .await
         .map_err(|err| StromaError::Io(err.to_string()))??;
@@ -3760,15 +3572,6 @@ impl Stroma {
             // session. Preserve these bytes for coordinated recovery instead.
             self.require_unbound_storage_history(tp, part, group)?;
             let reason = match &m.kind {
-                RecoveryMismatchKind::DanglingReference {
-                    msg_offset,
-                    msg_tail,
-                } => format!(
-                    "event log references message offset {msg_offset} but the message log is \
-                     only durable up to {msg_tail} (repair drops the event-log suffix from \
-                     offset {})",
-                    m.event_offset
-                ),
                 RecoveryMismatchKind::CorruptRecord { detail } => format!(
                     "corrupt event record at offset {}: {detail} (repair drops the event-log \
                      suffix from offset {})",
@@ -3776,76 +3579,56 @@ impl Stroma {
                 ),
             };
 
-            // A dangling reference is the EXPECTED artifact of the parallel
-            // durable-append path (the event log was fsynced ahead of the message
-            // log and a crash lost the message tail). The dangling suffix is
-            // always UNCONFIRMED, so truncate-to-valid and continue - never
-            // quarantine. The mismatch policy governs genuine corruption only.
-            let quarantine_eligible = match &m.kind {
-                RecoveryMismatchKind::DanglingReference { .. } => {
-                    tracing::warn!(
-                        "recovery: {tp}/{part}/{group:?}: {reason}; truncating the event log to \
-                         {} and continuing",
+            let policy = RecoveryMismatchPolicy::from_u8(
+                self.recovery_mismatch_policy.load(Ordering::Acquire),
+            );
+            match policy {
+                RecoveryMismatchPolicy::Ignore => {
+                    tracing::error!(
+                        "recovery: {tp}/{part}/{group:?}: {reason}; on_mismatch=Ignore -> \
+                         truncating the event log to {} and continuing (POSSIBLE DATA LOSS)",
                         m.event_offset
                     );
                     self.truncate_event_log_tail(&h, m.event_offset).await?;
-                    false
+                    // fall through and apply only the valid prefix in `events`
                 }
-                RecoveryMismatchKind::CorruptRecord { .. } => true,
-            };
-
-            if quarantine_eligible {
-                let policy = RecoveryMismatchPolicy::from_u8(
-                    self.recovery_mismatch_policy.load(Ordering::Acquire),
-                );
-                match policy {
-                    RecoveryMismatchPolicy::Ignore => {
-                        tracing::error!(
-                            "recovery: {tp}/{part}/{group:?}: {reason}; on_mismatch=Ignore -> \
-                             truncating the event log to {} and continuing (POSSIBLE DATA LOSS)",
-                            m.event_offset
-                        );
-                        self.truncate_event_log_tail(&h, m.event_offset).await?;
-                        // fall through and apply only the valid prefix in `events`
-                    }
-                    RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
-                        tracing::error!(
-                            "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
-                        );
-                        let was_present = self
-                            .quarantined
-                            .insert(
-                                (
-                                    Box::<str>::from(tp),
-                                    part,
-                                    normalize_group(group).map(Box::<str>::from),
-                                ),
-                                QuarantineInfo {
-                                    topic: tp.to_string(),
-                                    partition: part,
-                                    group: group.map(|g| g.to_string()),
-                                    reason: reason.clone(),
-                                    truncate_event_offset: m.event_offset,
-                                },
-                            )
-                            .is_some();
-                        if !was_present {
-                            self.metrics
-                                .recovery
-                                .quarantined
-                                .fetch_add(1, Ordering::Relaxed);
-                        }
+                RecoveryMismatchPolicy::Quarantine | RecoveryMismatchPolicy::Refuse => {
+                    tracing::error!(
+                        "recovery: QUARANTINING {tp}/{part}/{group:?}: {reason} (policy={policy:?})"
+                    );
+                    let was_present = self
+                        .quarantined
+                        .insert(
+                            (
+                                Box::<str>::from(tp),
+                                part,
+                                normalize_group(group).map(Box::<str>::from),
+                            ),
+                            QuarantineInfo {
+                                topic: tp.to_string(),
+                                partition: part,
+                                group: group.map(|g| g.to_string()),
+                                reason: reason.clone(),
+                                truncate_event_offset: m.event_offset,
+                            },
+                        )
+                        .is_some();
+                    if !was_present {
                         self.metrics
                             .recovery
-                            .quarantines_total
+                            .quarantined
                             .fetch_add(1, Ordering::Relaxed);
-                        return Err(StromaError::RecoveryMismatch {
-                            topic: tp.to_string(),
-                            partition: part,
-                            group: group.map(|g| g.to_string()),
-                            reason,
-                        });
                     }
+                    self.metrics
+                        .recovery
+                        .quarantines_total
+                        .fetch_add(1, Ordering::Relaxed);
+                    return Err(StromaError::RecoveryMismatch {
+                        topic: tp.to_string(),
+                        partition: part,
+                        group: group.map(|g| g.to_string()),
+                        reason,
+                    });
                 }
             }
         }
@@ -3873,7 +3656,6 @@ impl Stroma {
             self.apply_event_inmem(ev, &h).await?;
         }
 
-        #[cfg(feature = "combined-queue-log-experiment")]
         if h.has_combined_log() {
             self.verify_combined_payload_coverage(&h, pending_combined_backfill).await?;
         }
@@ -4261,9 +4043,8 @@ impl Stroma {
 }
 
 impl Stroma {
-    /// Append a batch of messages with one msg-log batch and one event-log batch.
-    /// Each client gets its own completion that fires with its assigned offset
-    /// after both the msg-log AND event-log batches complete durably.
+    /// Append payload-bearing enqueue records in one durable batch. Each client
+    /// receives its record offset after persistence and ordered state application.
     pub async fn append_message_batch(
         &self,
         tp: &str,
@@ -4313,7 +4094,7 @@ impl Stroma {
         // clock). A message's own expire_at wins; otherwise the default applies.
         let default_expire_at = default_ttl_ms.map(|ttl| unix_millis().saturating_add(ttl));
 
-        // Build msg_log batch and extract per client completions.
+        // Build payload records and extract per-client completions.
         // Per message header encode failures fail just that one completion.
         let mut messages = Vec::with_capacity(items.len());
         let mut completion_items = Vec::with_capacity(items.len());
@@ -4355,216 +4136,7 @@ impl Stroma {
             return Ok(());
         }
 
-        #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
-            return self.append_combined(qh, messages, completion_items, observer, owner_operation).await;
-        }
-        let msg_log = qh.resolve()?.msg_log()?;
-        let durability = self.keratin_cfg_msg.default_durability;
-
-        // Parallel durable append (immediate AND delayed publishes): get the
-        // assigned offsets at STAGING and fire the event-log Enqueue immediately, so
-        // the two fsyncs overlap instead of serializing. The in-memory apply
-        // (delivery visibility) and the producer confirm are BOTH gated on both logs
-        // being durable, so nothing is delivered or confirmed before its payload is
-        // durable. On a message fsync failure the durable Enqueue is annihilated
-        // with a CancelEnqueue (which now also drops a not-yet-fired delayed
-        // enqueue) so live and recovered state stay consistent (the producer is not
-        // confirmed and retries).
-        let stroma = self.clone();
-        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
-        let (staged_tx, staged_rx) = tokio::sync::oneshot::channel();
-
-        // Resolve once for the per-partition ordering lock + the event log.
-        let (order_lock, event_log) = {
-            let r = qh.resolve()?;
-            (r.publish_event_order(), r.event_log())
-        };
-
-        // Hold the per-partition publish-order lock across staging + the event-log
-        // SEND, so EnqueueMany events reach the event log in msg-offset order.
-        // Concurrent publishes would otherwise race to append their event, and a
-        // crash stranding a middle publish could truncate a confirmed one on the
-        // fold. The lock is released before the durability waits, so the msg and
-        // event fsyncs still overlap.
-        let mut order_guard = order_lock.lock_owned().await;
-        msg_log
-            .append_batch_enqueue_staged(messages, Some(durability), msg_completion, staged_tx)
-            .map_err(io_err)?;
-        // Every path past this point must complete the producers: the messages are
-        // staged, so a silent drop would hang them.
-        let base = match staged_rx.await {
-            Ok(off) => off,
-            Err(_) => {
-                for ci in completion_items {
-                    ci.completion
-                        .complete(Err(IoError::new("staged-offset channel closed")));
-                }
-                return Ok(());
-            }
-        };
-        // Split the batch into immediate and delayed enqueues (a delayed publish
-        // does not carry a TTL yet, matching the serial path). Both event kinds are
-        // appended together under the ordering lock, so they stay in msg-offset order
-        // and a crash-at-seam leaves both dangling for the fold to drop.
-        let mut immediate = Vec::new();
-        let mut delayed = Vec::new();
-        for (i, ci) in completion_items.iter().enumerate() {
-            let off = base + i as u64;
-            match ci.meta.not_before {
-                None => immediate.push(EnqueueEventMeta {
-                    off,
-                    retries: 0,
-                    expire_at: ci.meta.expire_at,
-                }),
-                Some(nb) => delayed.push(EnqueueDelayedEventMeta {
-                    off,
-                    not_before: nb,
-                }),
-            }
-        }
-        let count = completion_items.len() as u64;
-        let mut events = Vec::with_capacity(2);
-        if !immediate.is_empty() {
-            events.push(StromaEvent::EnqueueMany { reqs: immediate });
-        }
-        if !delayed.is_empty() {
-            events.push(StromaEvent::EnqueueDelayedMany { reqs: delayed });
-        }
-
-        // Encode the event and issue the event-log append SEND under the lock, so
-        // the send order matches the msg-offset order established above.
-        let mut event_msgs = Vec::with_capacity(events.len());
-        let mut encode_err = None;
-        for ev in &events {
-            match event_msg(ev) {
-                Ok(m) => event_msgs.push(m),
-                Err(e) => {
-                    encode_err = Some(e.to_string());
-                    break;
-                }
-            }
-        }
-        let msgs_count = event_msgs.len();
-        let bytes_count: usize = event_msgs.iter().map(|m| m.bytes_len()).sum();
-        let ordered_scope = qh.resolve()?.ordered_apply_scope();
-        let event_rx = match encode_err {
-            None => event_log
-                .append_batch_enqueue_receiver(event_msgs, Some(durability))
-                .map_err(|e| e.to_string()),
-            Some(e) => Err(e),
-        };
-        let event_rx = match event_rx {
-            Ok(rx) => rx,
-            Err(msg) => {
-                drop(order_guard);
-                for ci in completion_items {
-                    ci.completion.complete(Err(IoError::new(msg.clone())));
-                }
-                return Ok(());
-            }
-        };
-        // Reserve visibility order while append order is still held. Writers
-        // continue staging/flushing later batches while applications wait.
-        let message_epoch = msg_log.current_epoch();
-        let event_epoch = event_log.current_epoch();
-        let mut apply_turn = order_guard.reserve_apply();
-        drop(order_guard);
-        #[cfg(test)]
-        let apply_pause = self
-            .publish_apply_pause
-            .lock()
-            .unwrap()
-            .clone()
-            .filter(|pause| pause.topic == tp && pause.base == base);
-
-        tokio::spawn(async move {
-            let owner_operation = owner_operation;
-            #[cfg(test)]
-            if let Some(pause) = apply_pause {
-                pause.entered.notify_one();
-                pause.release.notified().await;
-            }
-            let outcome = match apply_turn.wait().await {
-                Ok(()) => {
-                    stroma
-                        .gate_and_apply_enqueue(
-                            qh.clone(),
-                            events,
-                            event_rx,
-                            msg_rx,
-                            msgs_count,
-                            bytes_count,
-                            ordered_scope,
-                        )
-                        .await
-                }
-                Err(err) => Err(io_err(err)),
-            };
-
-            let release_next = match outcome {
-                Ok(Some(event_next)) => {
-                    if let Some(observer) = observer {
-                        observer(QueuePublishCommit {
-                            message_next: base + count,
-                            event_next,
-                            message_epoch,
-                            event_epoch,
-                        });
-                    }
-                    // Both logs durable, events applied: confirm the producers.
-                    for (i, ci) in completion_items.into_iter().enumerate() {
-                        ci.completion.complete(Ok(AppendResult {
-                            base_offset: base + i as u64,
-                            count: 1,
-                        }));
-                    }
-                    true
-                }
-                Ok(None) => {
-                    // Message payload not durable: annihilate the durable Enqueue so
-                    // it is never delivered and recovery folds it away. The offsets
-                    // are the contiguous range assigned above, rebuilt only here so
-                    // the happy path allocates nothing.
-                    let offs: Vec<Offset> = (0..count).map(|i| base + i).collect();
-                    let cancel = StromaEvent::CancelEnqueueMany { offs };
-                    let cancelled = stroma
-                        .append_events_durable_leased(qh, vec![cancel], durability, owner_operation)
-                        .await;
-                    if let Err(e) = &cancelled {
-                        // The durable Enqueue is now left dangling on a live leader.
-                        // Recovery still folds it away (it references a non-durable
-                        // offset), but log rather than swallow. This is the scenario
-                        // that could stall replication until recovery.
-                        tracing::error!(
-                            base,
-                            count,
-                            "failed to append CancelEnqueueMany for a non-durable batch: {e}"
-                        );
-                    }
-                    for ci in completion_items {
-                        ci.completion
-                            .complete(Err(IoError::new("message payload not durable")));
-                    }
-                    cancelled.is_ok()
-                }
-                Err(err) => {
-                    // Event-log append failed: no apply, producer retries. A durable
-                    // message with no enqueue event is a harmless orphan payload.
-                    let msg = err.to_string();
-                    for ci in completion_items {
-                        ci.completion.complete(Err(IoError::new(msg.clone())));
-                    }
-                    false
-                }
-            };
-            // An abandoned or failed application cannot release later batches.
-            if release_next {
-                apply_turn.complete();
-            }
-        });
-
-        Ok(())
+        self.append_combined(qh, messages, completion_items, observer, owner_operation).await
     }
 
     pub async fn append_message(
@@ -4616,7 +4188,6 @@ impl Stroma {
         expire_at: Option<UnixMillis>,
         event_completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<()> {
-        let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let qh = self.queue_handle(tp, part, group).await?;
         let owner_operation = {
             let h = qh.resolve()?;
@@ -4636,69 +4207,16 @@ impl Stroma {
             headers: headers.encode()?,
             payload,
         };
-        #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
-            return self.append_combined(qh, vec![message], vec![CompletionItem {
-                meta: ItemMeta { not_before: None, expire_at },
-                completion: event_completion,
-            }], None, owner_operation).await;
-        }
-        let msg_log = qh.resolve()?.msg_log()?;
-        msg_log
-            .append_enqueue(message, None, msg_completion)
-            .map_err(io_err)?;
-        let stroma = self.clone();
-        tokio::spawn(async move {
-            let msg_res = msg_rx.await;
-
-            let msg_append_result = match msg_res {
-                Ok(Ok(ar)) => ar,
-                Ok(Err(err)) => {
-                    tracing::error!("Got res for write to msg log: {err:?}");
-                    event_completion.complete(Err(err));
-                    return;
-                }
-                Err(_err) => {
-                    event_completion.complete(Err(IoError::new("Channel closed")));
-                    return;
-                }
-            };
-            let msg_offset = msg_append_result.base_offset;
-
-            // TODO: emit Enqueue event too in some form
-            let ev = StromaEvent::Enqueue {
-                retries: 0,
-                off: msg_offset,
-                expire_at,
-            };
-
-            let durability = stroma.keratin_cfg_msg.default_durability;
-
-            let event_res = stroma
-                .append_events_durable_leased(qh.clone(), vec![ev], durability, owner_operation)
-                .await;
-
-            match event_res {
-                Ok(_event_offset) => {
-                    event_completion.complete(Ok(AppendResult {
-                        base_offset: msg_offset,
-                        count: 1,
-                    }));
-                }
-                Err(err) => {
-                    tracing::error!("Got res for write to event log: {err:?}");
-                    event_completion.complete(Err(IoError::new(err)));
-                }
-            };
-        });
-
-        Ok(())
+        self.append_combined(qh, vec![message], vec![CompletionItem {
+            meta: ItemMeta { not_before: None, expire_at },
+            completion: event_completion,
+        }], None, owner_operation).await
     }
 
     // ---------------- Stream (Plexus) engine API ----------------
     //
     // These operate on stream partitions (PartitionKind::Stream). The substrate is
-    // shared with the work queue (message log, event log, durable append,
+    // shared with the work queue (log storage, durable append,
     // replication, recovery, snapshot IO); only the per-partition engine differs.
     // fibril owns consumer matching, fan-out, the live ring, and filtering on top
     // of these primitives. Streams (currently) have no group dimension.
@@ -5592,7 +5110,6 @@ impl Stroma {
         qh: &QueueHandleInner,
         off: Offset,
     ) -> Result<Option<Message>> {
-        #[cfg(feature = "combined-queue-log-experiment")]
         if qh.has_combined_log() {
             return combined::fetch_payload(qh, off);
         }
@@ -5626,69 +5143,10 @@ impl Stroma {
             return Ok(Vec::new());
         }
 
-        let mut i = 0;
-
         let qh = self.queue_handle(tp, part, group).await?;
-
-        let stroma = self.clone();
         let closure = move || {
-            #[cfg(feature = "combined-queue-log-experiment")]
-            if stroma.combined_queue_log { let h = qh.resolve()?; return combined::read_selected(&h, &offs); }
-            let res: Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> = {
-                let mut out: Vec<(u64, MessageHeaders, Vec<u8>, u32)> =
-                    Vec::with_capacity(offs.len());
-                while i < offs.len() {
-                    let (start, _retries) = offs[i];
-                    let mut len = 1;
-
-                    // ---- group contiguous offsets ----
-                    // TODO: we might be able to skip since we now save ranges?
-                    while i + len < offs.len() && offs[i + len].0 == start + len as u64 {
-                        len += 1;
-                    }
-
-                    // ---- batch fetch ----
-                    let h = qh.resolve()?;
-                    let batch: Vec<(u64, Vec<u8>, MessageHeaders)> =
-                        stroma.scan_messages_from(&h, start, len)?;
-
-                    // ---- fast path: perfect match ----
-                    // The run is contiguous (start..start+len), matching offs[i..i+len],
-                    // so retries come positionally from offs - no per-poll HashMap.
-                    if batch.len() == len {
-                        for (k, (off, payload, headers)) in batch.into_iter().enumerate() {
-                            out.push((off, headers, payload, offs[i + k].1));
-                        }
-                    } else {
-                        // ---- slow path: handle holes (rare but important) ----
-                        // build small lookup map
-                        let mut map = HashMap::with_capacity(batch.len());
-                        for (off, payload, headers) in batch {
-                            map.insert(off, (headers, payload));
-                        }
-
-                        for j in 0..len {
-                            let off = start + j as u64;
-                            if let Some((headers, payload)) = map.remove(&off) {
-                                out.push((off, headers, payload, offs[i + j].1));
-                            } else {
-                                // extremely rare: log inconsistency or race
-                                tracing::warn!(
-                                    "Missing payload for offset {} in batch fetch (tp={}, part={}, group={:?})",
-                                    off,
-                                    qh.topic(),
-                                    qh.partition(),
-                                    qh.group(),
-                                );
-                            }
-                        }
-                    }
-
-                    i += len;
-                }
-                Ok(out)
-            };
-            res
+            let h = qh.resolve()?;
+            combined::read_selected(&h, &offs)
         };
 
         let out = tokio::task::spawn_blocking(closure)
@@ -5704,7 +5162,6 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
-        #[cfg(feature = "combined-queue-log-experiment")]
         if qh.has_combined_log() { return combined::scan_payloads(qh, from, max); }
         let log = qh.msg_log()?;
         let reader = log.reader();
@@ -5794,7 +5251,6 @@ impl Stroma {
         let qh = ticket.resolve()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
-        #[cfg(feature = "combined-queue-log-experiment")]
         if qh.has_combined_log() {
             let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
             let live = qh.work_queue()?.lowest_not_settled_offset().await;
@@ -6042,7 +5498,6 @@ impl Stroma {
         let tp = qh.topic();
         let part = qh.partition();
         let group = qh.group();
-        #[cfg(feature = "combined-queue-log-experiment")]
         if qh.has_combined_log() {
             let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
             let live = qh.work_queue()?.lowest_not_settled_offset().await;
@@ -6358,6 +5813,21 @@ mod tests {
     use super::*;
     use crate::state::QueueInternalState;
 
+    fn test_history_binding() -> StorageHistoryBinding {
+        StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] }
+    }
+    async fn test_history(st: &Stroma, topic: &str) -> PreparedStorageHistory {
+        st.initialize_empty_storage_history(topic, 0, None, PartitionKind::Queue, test_history_binding()).await.unwrap();
+        st.durable_storage_history_receipt(topic, 0, None).unwrap().unwrap()
+    }
+    async fn test_learner(st: &Stroma, topic: &str) -> PreparedStorageHistory {
+        st.prepare_queue_learner_storage(topic, 0, None, test_history_binding(), [4; 32]).await.unwrap()
+    }
+    fn test_payload(bytes: &[u8]) -> StromaEvent {
+        StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: MessageHeaders { published: 0, publish_received: 0, content_type: None, extra: Default::default() }.encode().unwrap(), payload: bytes.to_vec() }
+    }
+
+
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
     async fn later_durable_batch_cannot_overtake_paused_earlier_apply() {
         let dir = test_dir!("publish_apply_order");
@@ -6404,11 +5874,11 @@ mod tests {
                     .unwrap();
             }
         }
-        // Both disk writers can finish batch 1 while application of batch 0 is paused.
+        // The writer can finish batch 1 while application of batch 0 is paused.
         let queue = st.queue_handle("ordered", 0, None).await.unwrap();
         let handle = queue.resolve().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.msg_log().unwrap().durable_offset() < 1 || handle.event_log().durable_offset() < 1 {
+            while handle.event_log().durable_offset() < 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -6457,6 +5927,73 @@ mod tests {
 
     fn test_keratin_config() -> StromaKeratinConfig {
         StromaKeratinConfig::from_message_log(KeratinConfig::default())
+    }
+
+
+    async fn checkpoint_backfill_case(export: bool) {
+        let dir = test_dir!("single_log_checkpoint_backfill");
+        let owner = Stroma::open(&dir.root.join("owner"), test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        let follower_root = dir.root.join("follower");
+        let mut follower = Stroma::open(&follower_root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        publish_one(&owner, "topic", 0, None).await;
+        publish_one(&owner, "topic", 0, None).await;
+        let owner_ticket = owner.queue_handle("topic", 0, None).await.unwrap();
+        let h = owner_ticket.resolve().unwrap();
+        let generation = h.role_generation();
+        let cut = owner.export_owner_state_checkpoint("topic", 0, None).await.unwrap();
+        assert!(cut.combined_log);
+        assert_eq!((cut.message_checkpoint_offset, cut.message_next_offset, cut.event_start_offset, cut.event_next_offset, cut.applied_event_offset), (0, 0, 0, 2, 1));
+        let repeated = owner.export_owner_state_checkpoint("topic", 0, None).await.unwrap();
+        let mut first_state = QueueInternalState::new("topic".into(), 0);
+        let mut second_state = QueueInternalState::new("topic".into(), 0);
+        first_state.load_snapshot(&cut.state_snapshot).unwrap();
+        second_state.load_snapshot(&repeated.state_snapshot).unwrap();
+        assert_eq!(first_state.recovery_state_digest(), second_state.recovery_state_digest());
+        assert_eq!((repeated.message_next_offset, repeated.event_next_offset), (0, 2));
+        assert_eq!(h.role_generation(), generation);
+        assert_eq!(h.role(), QueueRole::Owner);
+        let install = FollowerStateCheckpointInstall {
+            combined_log: true, event_start_offset: 0, message_epoch: cut.message_epoch, event_epoch: cut.event_epoch,
+            message_next_offset: 0, event_next_offset: 2, applied_event_offset: 1,
+            state_snapshot: if export { cut.state_snapshot } else { h.encode_snapshot(1).await.unwrap() },
+        };
+        let receipt = test_learner(&follower, "topic").await;
+        follower.become_queue_follower("topic", 0, None).await.unwrap();
+        let result = follower.install_queue_learner_checkpoint(receipt, install.clone()).await.unwrap();
+        assert_eq!((result.message_next_offset, result.event_next_offset, result.applied_event_offset), (0, 0, 1));
+        assert_eq!(result.snapshot_meta.last_snapshot_event_offset, 1);
+        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
+            QueuePromotionOutcome::EventLogBehind { local_next_offset: 0, expected_next_offset: 2 });
+        assert!(!matches!(follower.promote_queue_follower_to_local_tail("topic", 0, None, 1).await.unwrap(), QueuePromotionOutcome::Promoted { .. }));
+        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
+        follower.shutdown().await.unwrap();
+        drop(follower);
+        follower = Stroma::open(&follower_root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        assert!(follower.queue_handle("topic", 0, None).await.is_err());
+        let receipt = test_learner(&follower, "topic").await;
+        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
+        assert!(!matches!(follower.promote_queue_follower_to_local_tail("topic", 0, None, 1).await.unwrap(), QueuePromotionOutcome::Promoted { .. }));
+        let OwnerReplicationRead::Batch(batch) = owner.read_owner_event_records("topic", 0, None, 0, 10).await.unwrap() else { panic!("retained events") };
+        assert_eq!(batch.records.len(), 2);
+        for (offset, event) in batch.records {
+            follower.apply_replicated_queue_batch("topic", 0, None, None, Some(ReplicatedEventBatch {
+                epoch: batch.epoch, first_offset: offset, events: vec![event], durability: Some(KDurability::AfterFsync),
+            })).await.unwrap();
+            if offset == 0 {
+                assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
+                    QueuePromotionOutcome::EventLogBehind { local_next_offset: 1, expected_next_offset: 2 });
+            }
+        }
+        follower.install_queue_learner_checkpoint(receipt, install).await.unwrap();
+        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
+            QueuePromotionOutcome::Promoted { message_next_offset: 0, event_next_offset: 2, applied_event_offset: Some(1) });
+        let delivered = follower.poll_ready("topic", 0, None, 10, unix_millis()+30_000, u64::MAX).await.unwrap();
+        assert_eq!(delivered.len(), 2);
+        assert_eq!((delivered[0].0, delivered[1].0), (0, 1));
+        assert_eq!(delivered[0].2, b"x");
+        assert_eq!(delivered[1].2, b"x");
+        owner.shutdown().await.unwrap();
+        follower.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -6749,12 +6286,8 @@ mod tests {
         else {
             panic!("message batch");
         };
-        assert_eq!(
-            messages.records.len(),
-            2,
-            "oversized first record and lookahead"
-        );
-        assert_eq!(messages.next_offset, 2);
+        assert!(messages.records.is_empty());
+        assert_eq!(messages.next_offset, 0);
         let OwnerReplicationRead::Batch(full) = stroma
             .read_owner_event_records("topic", 0, None, 0, 100)
             .await
@@ -6770,8 +6303,8 @@ mod tests {
         else {
             panic!("event batch");
         };
-        assert_eq!(events.records, full.records[..2]);
-        assert_eq!(events.next_offset, 2);
+        assert_eq!(events.records, full.records[..1]);
+        assert_eq!(events.next_offset, 1);
         let OwnerReplicationRead::Batch(next) = stroma
             .read_owner_event_records_with_byte_budget("topic", 0, None, events.next_offset, 100, 1)
             .await
@@ -6779,7 +6312,7 @@ mod tests {
         else {
             panic!("next event batch");
         };
-        assert_eq!(next.records, full.records[2..4]);
+        assert_eq!(next.records, full.records[1..2]);
     }
 
     #[tokio::test]
@@ -6805,10 +6338,8 @@ mod tests {
         };
         assert_eq!(messages.epoch, 0);
         assert_eq!(messages.requested_offset, 0);
-        assert_eq!(messages.next_offset, 1);
-        assert_eq!(messages.records.len(), 1);
-        assert_eq!(messages.records[0].0, 0);
-        assert_eq!(messages.records[0].1.payload, b"x");
+        assert_eq!(messages.next_offset, 0);
+        assert!(messages.records.is_empty());
 
         let events = stroma
             .read_owner_event_records("topic", 0, None, 0, 10)
@@ -6820,17 +6351,8 @@ mod tests {
         assert_eq!(events.epoch, 0);
         assert_eq!(events.requested_offset, 0);
         assert_eq!(events.next_offset, 1);
-        assert_eq!(
-            events.records,
-            vec![(
-                0,
-                StromaEvent::Enqueue {
-                    off: 0,
-                    retries: 0,
-                    expire_at: None
-                }
-            )]
-        );
+        assert_eq!(events.records.len(), 1);
+        assert!(matches!(&events.records[0], (0, StromaEvent::PayloadEnqueue { payload, .. }) if payload == b"x"));
 
         shutdown_stroma("owner_replication_read_records", &stroma).await;
     }
@@ -6848,30 +6370,6 @@ mod tests {
 
         publish_one(&stroma, "topic", 0, None).await;
         publish_one(&stroma, "topic", 0, None).await;
-
-        let messages = stroma
-            .read_owner_message_records("topic", 0, None, 0, 1)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(messages) = messages else {
-            panic!("expected message batch");
-        };
-        assert_eq!(messages.requested_offset, 0);
-        assert_eq!(messages.next_offset, 1);
-        assert_eq!(messages.records.len(), 1);
-        assert_eq!(messages.records[0].0, 0);
-
-        let messages = stroma
-            .read_owner_message_records("topic", 0, None, messages.next_offset, 1)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(messages) = messages else {
-            panic!("expected message batch");
-        };
-        assert_eq!(messages.requested_offset, 1);
-        assert_eq!(messages.next_offset, 2);
-        assert_eq!(messages.records.len(), 1);
-        assert_eq!(messages.records[0].0, 1);
 
         let events = stroma
             .read_owner_event_records("topic", 0, None, 0, 1)
@@ -6992,14 +6490,14 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        qh.msg_log().unwrap().become_follower();
-        qh.msg_log().unwrap()
+        qh.event_log().become_follower();
+        qh.event_log()
             .destructive_reset_to_checkpoint(7)
             .await
             .unwrap();
-        qh.msg_log().unwrap().become_owner();
+        qh.event_log().become_owner();
 
-        let read = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 5, 5, 7).unwrap();
+        let read = owner_replication_gap::<StromaEvent>("event", &qh.event_log(), 5, 5, 7).unwrap();
         let OwnerReplicationRead::CheckpointRequired {
             epoch,
             requested_offset,
@@ -7034,7 +6532,7 @@ mod tests {
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
 
-        let read = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 0, 0, 7).unwrap();
+        let read = owner_replication_gap::<StromaEvent>("event", &qh.event_log(), 0, 0, 7).unwrap();
         let OwnerReplicationRead::CheckpointRequired {
             epoch,
             requested_offset,
@@ -7066,7 +6564,7 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        let err = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 0, 3, 7).unwrap_err();
+        let err = owner_replication_gap::<StromaEvent>("event", &qh.event_log(), 0, 3, 7).unwrap_err();
         assert!(matches!(err, StromaError::Corruption(_)));
 
         shutdown_stroma("owner_replication_gap_without_head_advance", &stroma).await;
@@ -7086,36 +6584,9 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        qh.msg_log().unwrap().become_follower();
         qh.event_log().become_follower();
-        qh.msg_log().unwrap()
-            .destructive_reset_to_checkpoint(1)
-            .await
-            .unwrap();
-        qh.event_log()
-            .destructive_reset_to_checkpoint(1)
-            .await
-            .unwrap();
-        qh.msg_log().unwrap().become_owner();
+        qh.event_log().destructive_reset_to_checkpoint(1).await.unwrap();
         qh.event_log().become_owner();
-
-        let messages = stroma
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::CheckpointRequired {
-            epoch,
-            requested_offset,
-            head_offset,
-            next_offset,
-        } = messages
-        else {
-            panic!("expected message checkpoint requirement");
-        };
-        assert_eq!(epoch, 0);
-        assert_eq!(requested_offset, 0);
-        assert_eq!(head_offset, 1);
-        assert_eq!(next_offset, 1);
 
         let events = stroma
             .read_owner_event_records("topic", 0, None, 0, 10)
@@ -7144,6 +6615,7 @@ mod tests {
         )
         .await
         .unwrap();
+        let receipt = test_history(&stroma, "topic").await;
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
@@ -7153,18 +6625,15 @@ mod tests {
             .become_queue_follower_with_epoch("topic", 0, None, 7)
             .await
             .unwrap();
-        let message_records = qh.msg_log().unwrap().reader().scan_from(0, 10).unwrap();
         let event_records = qh.event_log().reader().scan_from(0, 10).unwrap();
         let before_state = qh.full_debug_info().await;
         for (message_epoch, event_epoch) in [(6, 7), (7, 6), (8, 7), (7, 8), (6, 6)] {
             let error = stroma
-                .install_follower_state_checkpoint(
-                    "topic",
-                    0,
-                    None,
+                .install_queue_learner_checkpoint(
+                    receipt.clone(),
                     FollowerStateCheckpointInstall {
-                        combined_log: false,
-                        event_start_offset: 1,
+                        combined_log: true,
+                        event_start_offset: 0,
                         message_epoch,
                         event_epoch,
                         message_next_offset: 0,
@@ -7179,14 +6648,13 @@ mod tests {
                 matches!(error, StromaError::InvalidArgument(_)),
                 "{error:?}"
             );
-            assert!(error.to_string().contains("epoch"));
-            for log in [qh.msg_log().unwrap(), qh.event_log()] {
+            assert!(error.to_string().contains("epoch") || error.to_string().contains("layout"), "{error}");
+            for log in [qh.event_log()] {
                 assert_eq!(log.current_epoch(), 7);
                 assert_eq!(log.head_offset(), 0);
                 assert_eq!(log.next_offset(), 2);
             }
             for (log, before) in [
-                (qh.msg_log().unwrap(), &message_records),
                 (qh.event_log(), &event_records),
             ] {
                 let after = log.reader().scan_from(0, 10).unwrap();
@@ -7215,19 +6683,18 @@ mod tests {
         .await
         .unwrap();
 
+        let receipt = test_history(&stroma, "topic").await;
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
         let snapshot = qh.encode_snapshot(0).await.unwrap();
 
         let err = stroma
-            .install_follower_state_checkpoint(
-                "topic",
-                0,
-                None,
+            .install_queue_learner_checkpoint(
+                receipt.clone(),
                 FollowerStateCheckpointInstall {
-                    combined_log: false,
-                    event_start_offset: 1,
+                    combined_log: true,
+                    event_start_offset: 0,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 0,
@@ -7260,6 +6727,7 @@ mod tests {
         .await
         .unwrap();
 
+        let receipt = test_history(&stroma, "topic").await;
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
@@ -7270,16 +6738,14 @@ mod tests {
             .unwrap();
 
         let err = stroma
-            .install_follower_state_checkpoint(
-                "topic",
-                0,
-                None,
+            .install_queue_learner_checkpoint(
+                receipt.clone(),
                 FollowerStateCheckpointInstall {
-                    combined_log: false,
-                    event_start_offset: 2,
+                    combined_log: true,
+                    event_start_offset: 0,
                     message_epoch: 0,
                     event_epoch: 0,
-                    message_next_offset: 1,
+                    message_next_offset: 0,
                     event_next_offset: 2,
                     applied_event_offset: 1,
                     state_snapshot: snapshot,
@@ -7303,6 +6769,7 @@ mod tests {
         .await
         .unwrap();
 
+        let receipt = test_history(&stroma, "topic").await;
         publish_one(&stroma, "topic", 0, None).await;
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
@@ -7314,16 +6781,14 @@ mod tests {
             .unwrap();
 
         let err = stroma
-            .install_follower_state_checkpoint(
-                "topic",
-                0,
-                None,
+            .install_queue_learner_checkpoint(
+                receipt.clone(),
                 FollowerStateCheckpointInstall {
-                    combined_log: false,
+                    combined_log: true,
                     event_start_offset: 2,
                     message_epoch: 0,
                     event_epoch: 0,
-                    message_next_offset: 2,
+                    message_next_offset: 0,
                     event_next_offset: 2,
                     applied_event_offset: 1,
                     state_snapshot: snapshot,
@@ -7332,168 +6797,14 @@ mod tests {
             .await
             .unwrap_err();
         assert!(matches!(err, StromaError::InvalidArgument(_)));
+        assert!(err.to_string().contains("checkpoint payload"), "{err}");
 
         shutdown_stroma("follower_state_checkpoint_validates_messages", &stroma).await;
     }
 
     #[tokio::test]
     async fn follower_state_checkpoint_install_resets_logs_but_messages_still_need_replication() {
-        let owner_dir = test_dir!("state_checkpoint_owner");
-        let owner = Stroma::open(
-            &owner_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        let follower_dir = test_dir!("state_checkpoint_follower");
-        let follower = Stroma::open(
-            &follower_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-
-        publish_one(&owner, "topic", 0, None).await;
-        publish_one(&owner, "topic", 0, None).await;
-        let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
-        let owner_qh = owner_qh.resolve().unwrap();
-        let state_snapshot = owner_qh.encode_snapshot(1).await.unwrap();
-
-        follower
-            .become_queue_follower("topic", 0, None)
-            .await
-            .unwrap();
-        let outcome = follower
-            .install_follower_state_checkpoint(
-                "topic",
-                0,
-                None,
-                FollowerStateCheckpointInstall {
-                    combined_log: false,
-                    event_start_offset: 2,
-                    message_epoch: 0,
-                    event_epoch: 0,
-                    message_next_offset: 0,
-                    event_next_offset: 2,
-                    applied_event_offset: 1,
-                    state_snapshot,
-                },
-            )
-            .await
-            .unwrap();
-        assert_eq!(outcome.message_next_offset, 0);
-        assert_eq!(outcome.event_next_offset, 2);
-        assert_eq!(outcome.applied_event_offset, 1);
-        assert_eq!(outcome.snapshot_meta.last_snapshot_event_offset, 1);
-
-        let not_ready = follower
-            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            not_ready,
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2,
-            }
-        );
-
-        // Local-tail promotion and the direct owner role API must enforce the
-        // snapshot dependency even without externally supplied target tails.
-        assert!(matches!(
-            follower
-                .promote_queue_follower_to_local_tail("topic", 0, None, 1)
-                .await
-                .unwrap(),
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2
-            }
-        ));
-        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
-        assert!(matches!(
-            follower
-                .promote_queue_follower_if_caught_up("topic", 0, None, 0, 2)
-                .await
-                .unwrap(),
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2
-            }
-        ));
-        shutdown_stroma("checkpoint_before_backfill", &follower).await;
-        drop(follower);
-        let follower = Stroma::open(
-            &follower_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        let h = follower.queue_handle("topic", 0, None).await.unwrap();
-        assert_eq!(h.resolve().unwrap().role(), QueueRole::Follower);
-        assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
-        assert!(matches!(
-            follower
-                .promote_queue_follower_to_local_tail("topic", 0, None, 1)
-                .await
-                .unwrap(),
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2
-            }
-        ));
-
-        let message_read = owner
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(message_read) = message_read else {
-            panic!("expected owner message batch");
-        };
-        follower
-            .apply_replicated_queue_batch(
-                "topic",
-                0,
-                None,
-                Some(ReplicatedMessageBatch {
-                    epoch: message_read.epoch,
-                    first_offset: message_read.records[0].0,
-                    records: message_read
-                        .records
-                        .into_iter()
-                        .map(|(_, message)| message)
-                        .collect(),
-                    durability: None,
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let promoted = follower
-            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            promoted,
-            QueuePromotionOutcome::Promoted {
-                message_next_offset: 2,
-                event_next_offset: 2,
-                applied_event_offset: Some(1),
-            }
-        );
-
-        let delivered = follower
-            .poll_ready("topic", 0, None, 10, unix_millis() + 30_000, u64::MAX)
-            .await
-            .unwrap();
-        assert_eq!(delivered.len(), 2);
-
-        shutdown_stroma("state_checkpoint_owner", &owner).await;
-        shutdown_stroma("state_checkpoint_follower", &follower).await;
+        checkpoint_backfill_case(false).await;
     }
 
     #[tokio::test]
@@ -7652,149 +6963,7 @@ mod tests {
 
     #[tokio::test]
     async fn owner_state_checkpoint_export_installs_on_follower_then_messages_catch_up() {
-        let owner_dir = test_dir!("owner_state_checkpoint_export_owner");
-        let owner = Stroma::open(
-            &owner_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        let follower_dir = test_dir!("owner_state_checkpoint_export_follower");
-        let follower = Stroma::open(
-            &follower_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-
-        publish_one(&owner, "topic", 0, None).await;
-        publish_one(&owner, "topic", 0, None).await;
-        let owner_qh = owner.queue_handle("topic", 0, None).await.unwrap();
-        let owner_qh = owner_qh.resolve().unwrap();
-        let owner_role_generation = owner_qh.role_generation();
-
-        let checkpoint = owner
-            .export_owner_state_checkpoint("topic", 0, None)
-            .await
-            .unwrap();
-        assert_eq!(checkpoint.message_checkpoint_offset, 0);
-        assert_eq!(checkpoint.message_next_offset, 2);
-        assert_eq!(checkpoint.event_next_offset, 2);
-        assert_eq!(checkpoint.applied_event_offset, 1);
-        assert_eq!(owner_qh.role(), QueueRole::Owner);
-        assert_eq!(owner_qh.role_generation(), owner_role_generation);
-
-        let repeated_checkpoint = owner
-            .export_owner_state_checkpoint("topic", 0, None)
-            .await
-            .unwrap();
-        assert_eq!(repeated_checkpoint.message_checkpoint_offset, 0);
-        assert_eq!(repeated_checkpoint.message_next_offset, 2);
-        assert_eq!(repeated_checkpoint.event_next_offset, 2);
-        assert_eq!(repeated_checkpoint.applied_event_offset, 1);
-        assert_eq!(owner_qh.role(), QueueRole::Owner);
-        assert_eq!(owner_qh.role_generation(), owner_role_generation);
-
-        let owner_read_after_export = owner
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        assert!(matches!(
-            owner_read_after_export,
-            OwnerReplicationRead::Batch(_)
-        ));
-
-        follower
-            .become_queue_follower("topic", 0, None)
-            .await
-            .unwrap();
-        follower
-            .install_follower_state_checkpoint(
-                "topic",
-                0,
-                None,
-                FollowerStateCheckpointInstall {
-                    combined_log: checkpoint.combined_log,
-                    event_start_offset: checkpoint.event_start_offset,
-                    message_epoch: checkpoint.message_epoch,
-                    event_epoch: checkpoint.event_epoch,
-                    message_next_offset: checkpoint.message_checkpoint_offset,
-                    event_next_offset: checkpoint.event_next_offset,
-                    applied_event_offset: checkpoint.applied_event_offset,
-                    state_snapshot: checkpoint.state_snapshot,
-                },
-            )
-            .await
-            .unwrap();
-
-        let not_ready = follower
-            .promote_queue_follower_if_caught_up(
-                "topic",
-                0,
-                None,
-                checkpoint.message_next_offset,
-                checkpoint.event_next_offset,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            not_ready,
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: checkpoint.message_checkpoint_offset,
-                expected_next_offset: checkpoint.message_next_offset,
-            }
-        );
-
-        let message_read = owner
-            .read_owner_message_records("topic", 0, None, checkpoint.message_checkpoint_offset, 10)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(message_read) = message_read else {
-            panic!("expected owner message batch");
-        };
-        follower
-            .apply_replicated_queue_batch(
-                "topic",
-                0,
-                None,
-                Some(ReplicatedMessageBatch {
-                    epoch: message_read.epoch,
-                    first_offset: message_read.records[0].0,
-                    records: message_read
-                        .records
-                        .into_iter()
-                        .map(|(_, message)| message)
-                        .collect(),
-                    durability: None,
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-
-        let promoted = follower
-            .promote_queue_follower_if_caught_up(
-                "topic",
-                0,
-                None,
-                checkpoint.message_next_offset,
-                checkpoint.event_next_offset,
-            )
-            .await
-            .unwrap();
-        assert_eq!(
-            promoted,
-            QueuePromotionOutcome::Promoted {
-                message_next_offset: 2,
-                event_next_offset: 2,
-                applied_event_offset: Some(1),
-            }
-        );
-
-        shutdown_stroma("owner_state_checkpoint_export_owner", &owner).await;
-        shutdown_stroma("owner_state_checkpoint_export_follower", &follower).await;
+        checkpoint_backfill_case(true).await;
     }
 
     #[tokio::test]
@@ -7839,16 +7008,7 @@ mod tests {
             panic!("expected owner event batch");
         };
 
-        let messages = Some(ReplicatedMessageBatch {
-            epoch: message_read.epoch,
-            first_offset: message_read.records[0].0,
-            records: message_read
-                .records
-                .into_iter()
-                .map(|(_, message)| message)
-                .collect(),
-            durability: None,
-        });
+        assert!(message_read.records.is_empty());
         let events = Some(ReplicatedEventBatch {
             epoch: event_read.epoch,
             first_offset: event_read.records[0].0,
@@ -7861,18 +7021,18 @@ mod tests {
         });
 
         follower
-            .apply_replicated_queue_batch("topic", 0, None, messages, events)
+            .apply_replicated_queue_batch("topic", 0, None, None, events)
             .await
             .unwrap();
 
         let outcome = follower
-            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
+            .promote_queue_follower_if_caught_up("topic", 0, None, 0, 2)
             .await
             .unwrap();
         assert_eq!(
             outcome,
             QueuePromotionOutcome::Promoted {
-                message_next_offset: 2,
+                message_next_offset: 0,
                 event_next_offset: 2,
                 applied_event_offset: Some(1),
             }
@@ -7891,94 +7051,30 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn parallel_follower_partial_failure_drains_both_writers_and_blocks_promotion() {
-        for fail_messages in [true, false] {
-            let dir = test_dir!("parallel_follower_partial");
-            let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
-                .await
-                .unwrap();
-            stroma.become_queue_follower("t", 0, None).await.unwrap();
-            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
-            let h = qh.resolve().unwrap();
-            if fail_messages {
-                h.msg_log().unwrap().shutdown().await.unwrap();
-            } else {
-                h.event_log().shutdown().await.unwrap();
-            }
-            let result = stroma
-                .apply_replicated_queue_batch(
-                    "t",
-                    0,
-                    None,
-                    Some(ReplicatedMessageBatch {
-                        epoch: 0,
-                        first_offset: 0,
-                        records: vec![Message {
-                            flags: 0,
-                            headers: vec![],
-                            payload: b"payload".to_vec(),
-                        }],
-                        durability: None,
-                    }),
-                    Some(ReplicatedEventBatch {
-                        epoch: 0,
-                        first_offset: 0,
-                        events: vec![StromaEvent::EnqueueMany {
-                            reqs: vec![EnqueueEventMeta {
-                                off: 0,
-                                retries: 0,
-                                expire_at: None,
-                            }],
-                        }],
-                        durability: None,
-                    }),
-                )
-                .await;
-            assert!(result.is_err());
-            // The other writer's completion was drained before returning error.
-            assert_eq!(h.msg_log().unwrap().next_offset(), if fail_messages { 0 } else { 1 });
-            assert_eq!(
-                h.event_log().next_offset(),
-                if fail_messages { 1 } else { 0 }
-            );
-            assert_eq!(h.full_debug_info().await.state.ready_count, 0);
-            assert!(
-                stroma
-                    .promote_queue_follower_to_local_tail("t", 0, None, 1)
-                    .await
-                    .is_err()
-            );
-            assert!(
-                stroma
-                    .promote_queue_follower_if_caught_up(
-                        "t",
-                        0,
-                        None,
-                        h.msg_log().unwrap().next_offset(),
-                        h.event_log().next_offset()
-                    )
-                    .await
-                    .is_err()
-            );
-            assert!(stroma.become_queue_owner("t", 0, None).await.is_err());
-            assert_eq!(h.role(), QueueRole::Follower);
-            drop(h);
-            shutdown_stroma("parallel_partial", &stroma).await;
-            drop(stroma);
-            let reopened =
-                Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
-                    .await
-                    .unwrap();
-            let reopened_qh = reopened.queue_handle("t", 0, None).await.unwrap();
-            let h = reopened_qh.resolve().unwrap();
-            assert_eq!(
-                h.full_debug_info().await.state.ready_count,
-                0,
-                "unconfirmed partial batch cannot reappear as queue work"
-            );
-            drop(h);
-            shutdown_stroma("parallel_partial_reopen", &reopened).await;
-        }
+    async fn follower_writer_failure_blocks_application_and_promotion() {
+        let dir = test_dir!("follower_writer_failure");
+        let st = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        st.become_queue_follower("t", 0, None).await.unwrap();
+        let ticket = st.queue_handle("t", 0, None).await.unwrap();
+        let h = ticket.resolve().unwrap();
+        h.event_log().shutdown().await.unwrap();
+        assert!(st.apply_replicated_queue_batch("t", 0, None, None, Some(ReplicatedEventBatch {
+            epoch: 0, first_offset: 0, events: vec![test_payload(b"payload")], durability: Some(KDurability::AfterFsync),
+        })).await.is_err());
+        assert_eq!(h.event_log().next_offset(), 0);
+        assert_eq!(h.full_debug_info().await.state.ready_count, 0);
+        assert!(*h.follower_apply_state().await);
+        assert!(st.promote_queue_follower_to_local_tail("t", 0, None, 1).await.is_err());
+        assert!(st.promote_queue_follower_if_caught_up("t", 0, None, 0, 0).await.is_err());
+        assert!(st.become_queue_owner("t", 0, None).await.is_err());
+        assert_eq!(h.role(), QueueRole::Follower);
+        st.shutdown().await.unwrap();
+        drop(h);
+        drop(st);
+        let st = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        let ticket = st.queue_handle("t", 0, None).await.unwrap();
+        assert_eq!(ticket.resolve().unwrap().full_debug_info().await.state.ready_count, 0);
+        st.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -7987,15 +7083,14 @@ mod tests {
         let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
             .unwrap();
+        let receipt = test_learner(&stroma, "t").await;
         stroma.become_queue_follower("t", 0, None).await.unwrap();
         let snapshot = QueueInternalState::new("t".into(), 0).encode_snapshot(0);
         stroma
-            .install_follower_state_checkpoint(
-                "t",
-                0,
-                None,
+            .install_queue_learner_checkpoint(
+                receipt,
                 FollowerStateCheckpointInstall {
-                    combined_log: false,
+                    combined_log: true,
                     event_start_offset: 0,
                     message_epoch: 0,
                     event_epoch: 0,
@@ -8012,32 +7107,17 @@ mod tests {
                 "t",
                 0,
                 None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 0,
-                    first_offset: 0,
-                    records: vec![Message {
-                        flags: 0,
-                        headers: vec![],
-                        payload: b"first".to_vec(),
-                    }],
-                    durability: None,
-                }),
+                None,
                 Some(ReplicatedEventBatch {
                     epoch: 0,
                     first_offset: 0,
-                    events: vec![StromaEvent::EnqueueMany {
-                        reqs: vec![EnqueueEventMeta {
-                            off: 0,
-                            retries: 0,
-                            expire_at: None,
-                        }],
-                    }],
+                    events: vec![test_payload(b"first")],
                     durability: None,
                 }),
             )
             .await
             .unwrap();
-        // Keep the old empty checkpoint: emulate a crash after both logs commit
+        // Keep the old empty checkpoint after the queue log commits
         // and before a newer state snapshot replaces it.
         let qh = stroma.queue_handle("t", 0, None).await.unwrap();
         qh.resolve().unwrap().set_dirty_snapshot(false);
@@ -8046,6 +7126,7 @@ mod tests {
         let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
             .unwrap();
+        test_learner(&reopened, "t").await;
         let qh = reopened.queue_handle("t", 0, None).await.unwrap();
         assert_eq!(
             qh.resolve()
@@ -8061,123 +7142,20 @@ mod tests {
 
     #[tokio::test]
     async fn follower_promotion_refuses_partial_replication() {
-        let owner_dir = test_dir!("partial_replication_owner");
-        let owner = Stroma::open(
-            &owner_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        publish_one(&owner, "topic", 0, None).await;
-        publish_one(&owner, "topic", 0, None).await;
-
-        let message_read = owner
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        let event_read = owner
-            .read_owner_event_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(message_read) = message_read else {
-            panic!("expected owner message batch");
-        };
-        let OwnerReplicationRead::Batch(event_read) = event_read else {
-            panic!("expected owner event batch");
-        };
-
-        let messages_only_dir = test_dir!("partial_replication_messages_only");
-        let messages_only = Stroma::open(
-            &messages_only_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        messages_only
-            .become_queue_follower("topic", 0, None)
-            .await
-            .unwrap();
-        messages_only
-            .apply_replicated_queue_batch(
-                "topic",
-                0,
-                None,
-                Some(ReplicatedMessageBatch {
-                    epoch: message_read.epoch,
-                    first_offset: message_read.records[0].0,
-                    records: message_read
-                        .records
-                        .clone()
-                        .into_iter()
-                        .map(|(_, message)| message)
-                        .collect(),
-                    durability: None,
-                }),
-                None,
-            )
-            .await
-            .unwrap();
-        let outcome = messages_only
-            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            QueuePromotionOutcome::EventLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2,
-            }
-        );
-
-        let events_only_dir = test_dir!("partial_replication_events_only");
-        let events_only = Stroma::open(
-            &events_only_dir.root,
-            test_keratin_config(),
-            SnapshotConfig { every_events: 1 },
-        )
-        .await
-        .unwrap();
-        events_only
-            .become_queue_follower("topic", 0, None)
-            .await
-            .unwrap();
-        events_only
-            .apply_replicated_queue_batch(
-                "topic",
-                0,
-                None,
-                None,
-                Some(ReplicatedEventBatch {
-                    epoch: event_read.epoch,
-                    first_offset: event_read.records[0].0,
-                    events: event_read
-                        .records
-                        .clone()
-                        .into_iter()
-                        .map(|(_, event)| event)
-                        .collect(),
-                    durability: None,
-                }),
-            )
-            .await
-            .unwrap();
-        let outcome = events_only
-            .promote_queue_follower_if_caught_up("topic", 0, None, 2, 2)
-            .await
-            .unwrap();
-        assert_eq!(
-            outcome,
-            QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: 0,
-                expected_next_offset: 2,
-            }
-        );
-
-        shutdown_stroma("partial_replication_owner", &owner).await;
-        shutdown_stroma("partial_replication_messages_only", &messages_only).await;
-        shutdown_stroma("partial_replication_events_only", &events_only).await;
+        let dir = test_dir!("partial_single_log_replication");
+        let st = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
+        st.become_queue_follower("topic", 0, None).await.unwrap();
+        for next in 0..2 {
+            assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
+                QueuePromotionOutcome::EventLogBehind { local_next_offset: next, expected_next_offset: 2 });
+            st.apply_replicated_queue_batch("topic", 0, None, None, Some(ReplicatedEventBatch {
+                epoch: 0, first_offset: next, events: vec![test_payload(&[next as u8])], durability: Some(KDurability::AfterFsync),
+            })).await.unwrap();
+        }
+        assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
+            QueuePromotionOutcome::Promoted { message_next_offset: 0, event_next_offset: 2, applied_event_offset: Some(1) });
+        assert_eq!(st.poll_ready("topic", 0, None, 10, unix_millis()+30_000, u64::MAX).await.unwrap().len(), 2);
+        st.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -8421,9 +7399,9 @@ mod tests {
             assert_eq!(qh.applied_upto().load(Ordering::Acquire), 1);
 
             let second = publish_one(&stroma, "topic-a", 0, None).await;
-            assert_eq!(second, 1);
+            assert_eq!(second, 2);
             let third = publish_one(&stroma, "topic-a", 0, None).await;
-            assert_eq!(third, 2);
+            assert_eq!(third, 3);
 
             shutdown_stroma("snapshot_recovery_replay_start/write", &stroma).await;
         }
@@ -8456,12 +7434,12 @@ mod tests {
         let second = page
             .items
             .iter()
-            .find(|item| item.state.offset == 1)
+            .find(|item| item.state.offset == 2)
             .expect("offset 1 should be present after recovery");
         let third = page
             .items
             .iter()
-            .find(|item| item.state.offset == 2)
+            .find(|item| item.state.offset == 3)
             .expect("offset 2 should be present after recovery");
 
         assert_eq!(first.state.retry_count, 1);
@@ -8791,8 +7769,8 @@ mod tests {
         let msg_dir = stroma.msg_tp_part_dir("orders", 3, None);
         let event_dir = stroma.tp_part_dir("orders", 3, None);
         assert!(
-            msg_dir.exists(),
-            "message dir should exist after materialize"
+            !msg_dir.exists(),
+            "queue materialization must not create a payload-only directory"
         );
         assert!(
             event_dir.exists(),
@@ -8801,7 +7779,7 @@ mod tests {
 
         // Drop a marker into the on-disk tree so we can prove the storage is
         // actually deleted (not just unindexed) and a recreate starts fresh.
-        let marker = msg_dir.join("marker.proof");
+        let marker = event_dir.join("marker.proof");
         fs::write(&marker, b"present").unwrap();
 
         let outcome = test_step(
@@ -8830,8 +7808,8 @@ mod tests {
         .unwrap();
         assert_eq!(stroma.indexed_queue_count(), 1);
         assert!(
-            msg_dir.exists(),
-            "message dir should be recreated on materialize"
+            event_dir.exists(),
+            "queue log directory should be recreated on materialize"
         );
         assert!(
             !marker.exists(),
@@ -9290,68 +8268,30 @@ mod tests {
         .await;
     }
 
-    /// Recovery must FAIL LOUD (not silently apply) when the event log references
-    /// a message the message log never durably accepted, default to quarantining
-    /// just that partition (broker stays usable), and be repairable.
+    /// Impossible single-log references preserve evidence until explicit repair.
     #[tokio::test]
-    async fn recovery_auto_truncates_dangling_event_reference() {
-        let dir = test_dir!("recovery_dangling_event_ref");
-        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
-            .await
-            .unwrap();
-
-        // Materialize an empty partition, then inject an event referencing a
-        // message offset that does not exist (the message log is empty), as a
-        // crash that lost the message tail would leave behind.
+    async fn recovery_quarantines_forward_reference_until_explicit_repair() {
+        let dir = test_dir!("single_log_forward_reference");
+        let st = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
         {
-            let qh = stroma.queue_handle("t", 0, None).await.unwrap();
-            let qh = qh.resolve().unwrap();
-            let bogus = StromaEvent::Enqueue {
-                off: 0,
-                retries: 0,
-                expire_at: None,
-            };
-            qh.event_log()
-                .append_batch(vec![event_msg(&bogus).unwrap()], None)
-                .await
-                .unwrap();
+            let ticket = st.queue_handle("t", 0, None).await.unwrap();
+            ticket.resolve().unwrap().event_log().append_batch(vec![event_msg(&StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }).unwrap()], Some(KDurability::AfterFsync)).await.unwrap();
         }
-        assert_eq!(
-            stroma.unmaterialize("t", 0, None).await.unwrap(),
-            EvictOutcome::Evicted
-        );
-
-        // A different partition stays healthy: blast radius is the one queue.
-        stroma.queue_handle("healthy", 0, None).await.unwrap();
-
-        // Re-recovery now AUTO-TRUNCATES the dangling suffix instead of
-        // quarantining: a dangling reference is the expected artifact of the
-        // parallel durable-append path (the event log fsynced ahead of the
-        // message log, crash lost the message tail), and it is always UNCONFIRMED,
-        // so it is dropped and the partition recovers cleanly with no operator
-        // intervention. (Genuine corruption still quarantines - see the corrupt
-        // record test.)
-        let qh = stroma.queue_handle("t", 0, None).await.unwrap();
-        let qh = qh.resolve().unwrap();
-        assert!(qh.recovery_complete());
-        assert!(!stroma.is_quarantined("t", 0, None));
-        assert_eq!(stroma.quarantined_partitions().len(), 0);
-        assert_eq!(
-            stroma.metrics.recovery.quarantined.load(Ordering::Relaxed),
-            0
-        );
-        assert_eq!(
-            stroma
-                .metrics
-                .recovery
-                .quarantines_total
-                .load(Ordering::Relaxed),
-            0
-        );
-        // The healthy partition is unaffected.
-        assert!(stroma.queue_handle("healthy", 0, None).await.is_ok());
-
-        shutdown_stroma("recovery_auto_truncates_dangling_event_reference", &stroma).await;
+        st.unmaterialize("t", 0, None).await.unwrap();
+        assert!(matches!(st.queue_handle("t", 0, None).await, Err(StromaError::RecoveryMismatch { .. })));
+        assert!(st.is_quarantined("t", 0, None));
+        let info = st.quarantined_partitions();
+        assert_eq!(info.len(), 1);
+        assert_eq!(info[0].truncate_event_offset, 0);
+        assert!(info[0].reason.contains("forward payload reference"));
+        assert!(st.queue_handle("healthy", 0, None).await.is_ok());
+        let log = st.event_log_init("t", 0, None).await.unwrap();
+        assert_eq!(log.next_offset(), 1);
+        log.shutdown().await.unwrap();
+        st.repair_partition("t", 0, None).await.unwrap();
+        assert!(!st.is_quarantined("t", 0, None));
+        assert!(st.queue_handle("t", 0, None).await.is_ok());
+        st.shutdown().await.unwrap();
     }
 
     #[tokio::test]
@@ -9392,9 +8332,8 @@ mod tests {
         {
             let handle = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = handle.resolve().unwrap();
-            qh.msg_log().unwrap().append_batch(vec![Message { flags: 0, headers: vec![], payload: b"confirmed".to_vec() }], Some(KDurability::AfterFsync)).await.unwrap();
             qh.event_log().append_batch(vec![
-                event_msg(&StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }).unwrap(),
+                event_msg(&test_payload(b"confirmed")).unwrap(),
                 event_msg(&StromaEvent::Enqueue { off: 1, retries: 0, expire_at: None }).unwrap(),
             ], Some(KDurability::AfterFsync)).await.unwrap();
         }
@@ -9402,6 +8341,9 @@ mod tests {
         // Fixture represents a crash before any snapshot of the durable prefix.
         let snapshot = stroma.snap_file("t", 0, None);
         if snapshot.exists() { std::fs::remove_file(&snapshot).unwrap(); }
+        assert!(matches!(stroma.queue_handle("t", 0, None).await, Err(StromaError::RecoveryMismatch { .. })));
+        assert_eq!(stroma.quarantined_partitions()[0].truncate_event_offset, 1);
+        stroma.repair_partition("t", 0, None).await.unwrap();
         {
             let handle = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = handle.resolve().unwrap();
@@ -9416,27 +8358,18 @@ mod tests {
         stroma.shutdown().await.unwrap();
     }
 
-    /// The recovery fold: an Enqueue for a non-durable offset that is later
-    /// annihilated by a CancelEnqueueMany (the runtime msg-fsync-failure path)
-    /// must NOT be treated as a dangling reference. The pair folds to nothing, so
-    /// recovery keeps the whole event log (no truncation) and does not quarantine.
+    /// A valid payload enqueue followed by cancellation remains replayable.
     #[tokio::test]
-    async fn recovery_folds_cancel_against_dangling_enqueue() {
+    async fn recovery_replays_cancellation_of_retained_payload() {
         let dir = test_dir!("recovery_fold_cancel");
         let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
             .unwrap();
 
-        // Inject Enqueue(0) [references offset 0, which the empty msg log does not
-        // have durably] followed by CancelEnqueueMany([0]) that annihilates it.
         {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = qh.resolve().unwrap();
-            let enqueue = StromaEvent::Enqueue {
-                off: 0,
-                retries: 0,
-                expire_at: None,
-            };
+            let enqueue = test_payload(b"cancelled");
             let cancel = StromaEvent::CancelEnqueueMany { offs: vec![0] };
             qh.event_log()
                 .append_batch(
@@ -9451,11 +8384,12 @@ mod tests {
             EvictOutcome::Evicted
         );
 
-        // Recovery folds the pair: no dangling, no quarantine, and the event log
-        // is left intact (both events kept, not truncated).
+        // Cancellation removes the work without truncating either record.
         let qh = stroma.queue_handle("t", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
         assert!(qh.recovery_complete());
+        assert!(!qh.work_queue().unwrap().is_ready(0).await);
+        assert_eq!(qh.full_debug_info().await.state.ready_count, 0);
         assert!(!stroma.is_quarantined("t", 0, None));
         assert_eq!(
             qh.event_log().next_offset(),
@@ -9689,41 +8623,31 @@ mod open_batch_fault_tests {
     use keratin_log::io_fault_injection::{arm, Fault};
 
     #[tokio::test]
-    async fn open_batch_sync_failures_drain_both_logs_without_actor_apply() {
-        for message_fails in [false, true] {
-            for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
-                let dir = keratin_log::test_dir!("open_batch_sync_failure");
-                let st = Stroma::open(
-                    &dir.root,
-                    crate::StromaKeratinConfig::from_message_log(keratin_log::KeratinConfig::test_default()),
-                    crate::SnapshotConfig::default(),
-                ).await.unwrap();
-                st.become_queue_follower("q", 0, None).await.unwrap();
-                let qh = st.queue_handle("q", 0, None).await.unwrap();
-                let h = qh.resolve().unwrap();
-                let path = if message_fails { st.msg_tp_part_dir("q", 0, None) } else { st.tp_part_dir("q", 0, None) }
-                    .join("segments").join("00000000000000000000.log");
-                let armed = arm(&path, fault).unwrap();
-                let frame = (Some(ReplicatedMessageBatch {
-                    epoch: 0, first_offset: 0,
-                    records: vec![Message { flags: 0, headers: vec![], payload: vec![42; 1024] }],
-                    durability: Some(KDurability::AfterFsync),
-                }), Some(ReplicatedEventBatch {
-                    epoch: 0, first_offset: 0,
-                    events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
-                    durability: Some(KDurability::AfterFsync),
-                }));
-                let result = st.apply_open_replicated_queue_batch("q", 0, None, futures::stream::iter([Ok(frame)]).boxed()).await;
-                assert!(result.is_err());
-                assert_eq!(armed.hits(), 1);
-                assert!(!h.work_queue().unwrap().is_ready(0).await);
-                let healthy = if message_fails { h.event_log() } else { h.msg_log().unwrap() };
-                assert!(healthy.retained_durable_cursor(0, 0, 1, 1_000_000).is_ok(), "healthy sync must complete before returning failure");
-                assert!(*h.follower_apply_state().await);
-                drop(armed);
-                // A log whose sync failed may report its sticky error on shutdown.
-                let _ = st.shutdown().await;
-            }
+    async fn open_batch_sync_failures_block_actor_apply_and_promotion() {
+        for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
+            let dir = keratin_log::test_dir!("open_batch_sync_failure");
+            let st = Stroma::open(&dir.root,
+                crate::StromaKeratinConfig::from_message_log(keratin_log::KeratinConfig::test_default()),
+                crate::SnapshotConfig::default()).await.unwrap();
+            st.become_queue_follower("q", 0, None).await.unwrap();
+            let qh = st.queue_handle("q", 0, None).await.unwrap();
+            let h = qh.resolve().unwrap();
+            let path = st.tp_part_dir("q", 0, None).join("segments/00000000000000000000.log");
+            let armed = arm(&path, fault).unwrap();
+            let frame = (None, Some(ReplicatedEventBatch {
+                epoch: 0, first_offset: 0,
+                events: vec![StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![42; 1024] }],
+                durability: Some(KDurability::AfterFsync),
+            }));
+            let result = st.apply_open_replicated_queue_batch("q", 0, None, futures::stream::iter([Ok(frame)]).boxed()).await;
+            assert!(result.is_err());
+            assert_eq!(armed.hits(), 1);
+            assert!(!h.work_queue().unwrap().is_ready(0).await);
+            assert!(*h.follower_apply_state().await);
+            assert!(st.become_queue_owner("q", 0, None).await.is_err());
+            assert!(st.promote_queue_follower_to_local_tail("q", 0, None, 1).await.is_err());
+            drop(armed);
+            let _ = st.shutdown().await;
         }
     }
 }

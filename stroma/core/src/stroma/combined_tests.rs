@@ -11,7 +11,7 @@ async fn open(root: &Path) -> Stroma {
             every_events: u64::MAX,
         },
         StromaOptions {
-            combined_queue_log: true,
+
             ..Default::default()
         },
     )
@@ -257,15 +257,14 @@ async fn event_only_follower_keeps_payloads_and_overlap_does_not_repeat_nack() {
 }
 
 #[test]
-fn format_marker_requires_explicit_mode_and_fresh_storage() {
+fn format_marker_requires_known_format_and_fresh_storage() {
     let dir = keratin_log::test_dir!("combined_marker");
-    prepare_root(&dir.root, true).unwrap();
-    assert!(prepare_root(&dir.root, false).is_err());
-    prepare_root(&dir.root, true).unwrap();
+    prepare_root(&dir.root).unwrap();
+    prepare_root(&dir.root).unwrap();
     let other = dir.root.join("legacy");
     std::fs::create_dir(&other).unwrap();
     std::fs::write(other.join("existing"), b"data").unwrap();
-    assert!(prepare_root(&other, true).is_err());
+    assert!(prepare_root(&other).is_err());
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
@@ -375,7 +374,7 @@ async fn combined_writer_uses_payload_budgets_and_read_cap_allows_one_oversized_
         config,
         SnapshotConfig::default(),
         StromaOptions {
-            combined_queue_log: true,
+
             ..Default::default()
         },
     )
@@ -529,7 +528,7 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
                             every_events: u64::MAX,
                         },
                         StromaOptions {
-                            combined_queue_log: true,
+
                             ..Default::default()
                         },
                     )

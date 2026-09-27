@@ -62,8 +62,7 @@ impl RetainedHistoryIdentity {
         ) && match self.log_layout {
             QueueLogLayout::Separate => true,
             QueueLogLayout::Combined => {
-                cfg!(feature = "combined-queue-log-experiment")
-                    && self.version == 2
+                self.version == 2
                     && self.message_head == 0
                     && self.message_next == 0
                     && self.message_digest == empty_log_digest()
@@ -97,8 +96,13 @@ fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
     let end = log.next_offset();
     hash.update(&next.to_be_bytes());
     hash.update(&end.to_be_bytes());
-    let mut cursor = log.retained_durable_cursor(log.current_epoch(), next, end, u64::MAX).map_err(io_err)?;
-    while let Some(record) = cursor.next_record(keratin_log::MAX_FROZEN_RECORD_BYTES).map_err(io_err)? {
+    let mut cursor = log
+        .retained_durable_cursor(log.current_epoch(), next, end, u64::MAX)
+        .map_err(io_err)?;
+    while let Some(record) = cursor
+        .next_record(keratin_log::MAX_FROZEN_RECORD_BYTES)
+        .map_err(io_err)?
+    {
         hash.update(&record.offset.to_be_bytes());
         hash.update(&record.flags.to_be_bytes());
         hash.update(&(record.headers.len() as u64).to_be_bytes());
@@ -107,7 +111,11 @@ fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
         hash.update(record.payload);
         next += 1;
     }
-    if next != end { return Err(StromaError::Corruption("sealed log ended before durable boundary".into())); }
+    if next != end {
+        return Err(StromaError::Corruption(
+            "sealed log ended before durable boundary".into(),
+        ));
+    }
     Ok(*hash.finalize().as_bytes())
 }
 
@@ -142,11 +150,20 @@ fn read_receipt(path: &Path) -> Result<Option<Receipt>> {
 }
 
 impl Stroma {
-    pub(super) fn recovery_snapshot_path(&self, topic: &str, part: u32, group: Option<&str>) -> Result<PathBuf> {
+    pub(super) fn recovery_snapshot_path(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<PathBuf> {
         let root = self.snap_dir(topic, part, group);
         let receipt = read_receipt(&root.join("recovery.history"))?
             .ok_or_else(|| StromaError::Corruption("sealed snapshot has no receipt".into()))?;
-        Ok(if receipt.checkpoint_snapshot { root.join("recovery.snapshot") } else { self.snap_file(topic, part, group) })
+        Ok(if receipt.checkpoint_snapshot {
+            root.join("recovery.snapshot")
+        } else {
+            self.snap_file(topic, part, group)
+        })
     }
 
     pub(super) fn require_retained_history(
@@ -171,7 +188,7 @@ impl Stroma {
             || &receipt.request != request
             || receipt.history.id != expected_id
             || !receipt.history.valid_version()
-            || (receipt.history.log_layout == QueueLogLayout::Combined) != (!stream && self.queue_payloads_in_event_log())
+            || (receipt.history.log_layout == QueueLogLayout::Combined) != !stream
             || receipt.history.storage_history
                 != self.durable_storage_history_receipt(topic, part, group)?
             || receipt.history.message_head > receipt.history.message_next
@@ -210,33 +227,56 @@ impl Stroma {
         let path = self.snap_dir(topic, part, group).join("recovery.history");
         let stream = self.read_partition_kind(topic, part, group) == PartitionKind::Stream;
         let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
-        let agreed = if stream { None } else {
-            self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages.unwrap_or(events), events)?
+        let agreed = if stream {
+            None
+        } else {
+            self.agreed_recovery_snapshot(
+                topic,
+                part,
+                group,
+                storage_history.as_ref(),
+                messages.unwrap_or(events),
+                events,
+            )?
         };
         let checkpoint_snapshot = agreed.is_some();
         let snapshot = if let Some(bytes) = agreed {
             let root = self.snap_dir(topic, part, group);
             let target = root.join("recovery.snapshot");
             let temporary = root.join("recovery.snapshot.pending");
-            let mut file = fs::OpenOptions::new().create(true).truncate(true).write(true).open(&temporary).map_err(io_err)?;
+            let mut file = fs::OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .write(true)
+                .open(&temporary)
+                .map_err(io_err)?;
             file.write_all(&bytes).map_err(io_err)?;
             file.sync_all().map_err(io_err)?;
             drop(file);
             fs::rename(&temporary, &target).map_err(io_err)?;
             recovery_seal::sync_directories(&root)?;
             target
-        } else { self.snap_file(topic, part, group) };
+        } else {
+            self.snap_file(topic, part, group)
+        };
         // Validate the selected envelope and bind its exact bytes to the seal.
         let snapshot_digest = match self.read_queue_snapshot(&snapshot)? {
             Some(_) => Some(*blake3::hash(&fs::read(snapshot).map_err(io_err)?).as_bytes()),
             None => None,
         };
         let mut history = RetainedHistoryIdentity {
-            log_layout: if messages.is_some() { QueueLogLayout::Separate } else { QueueLogLayout::Combined },
+            log_layout: if messages.is_some() {
+                QueueLogLayout::Separate
+            } else {
+                QueueLogLayout::Combined
+            },
             version: if storage_history.is_some() { 2 } else { 1 },
             storage_history,
             id: [0; 32],
-            message_digest: messages.map(log_digest).transpose()?.unwrap_or_else(empty_log_digest),
+            message_digest: messages
+                .map(log_digest)
+                .transpose()?
+                .unwrap_or_else(empty_log_digest),
             event_digest: log_digest(events)?,
             snapshot_digest,
             message_head: messages.map_or(0, Keratin::head_offset),
@@ -245,7 +285,9 @@ impl Stroma {
             event_next: events.next_offset(),
         };
         if !history.valid_version() {
-            return Err(StromaError::InvalidArgument("unsupported retained history layout or binding".into()));
+            return Err(StromaError::InvalidArgument(
+                "unsupported retained history layout or binding".into(),
+            ));
         }
         let mut hash = blake3::Hasher::new();
         hash.update(b"fibril-retained-history-v1\0");
@@ -311,31 +353,46 @@ mod tests {
             log_layout: QueueLogLayout::Separate,
             version: 2,
             storage_history: Some(PreparedStorageHistory {
-                topic: "q".into(), partition: 0, group: None, stream: false,
+                topic: "q".into(),
+                partition: 0,
+                group: None,
+                stream: false,
                 binding: StorageHistoryBinding {
-                    resource_incarnation: [1; 16], accepted_history: [2; 16],
+                    resource_incarnation: [1; 16],
+                    accepted_history: [2; 16],
                     writer_session: [3; 16],
                 },
                 storage_instance: [4; 16],
             }),
-            id: [0; 32], message_digest: empty_log_digest(), event_digest: [5; 32],
-            snapshot_digest: None, message_head: 0, message_next: 0,
-            event_head: 2, event_next: 9,
+            id: [0; 32],
+            message_digest: empty_log_digest(),
+            event_digest: [5; 32],
+            snapshot_digest: None,
+            message_head: 0,
+            message_next: 0,
+            event_head: 2,
+            event_next: 9,
         };
         let separate = rmp_serde::to_vec_named(&history).unwrap();
         let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
             rmp_serde::from_slice(&separate).unwrap();
         assert!(!keys.contains_key("log_layout"));
-        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&separate).unwrap(), history);
+        assert_eq!(
+            rmp_serde::from_slice::<RetainedHistoryIdentity>(&separate).unwrap(),
+            history
+        );
         assert!(history.valid_version());
         assert_eq!(history.payload_bounds(), (0, 0));
 
         history.log_layout = QueueLogLayout::Combined;
         let combined = rmp_serde::to_vec_named(&history).unwrap();
         assert_ne!(separate, combined);
-        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&combined).unwrap(), history);
+        assert_eq!(
+            rmp_serde::from_slice::<RetainedHistoryIdentity>(&combined).unwrap(),
+            history
+        );
         assert_eq!(history.payload_bounds(), (2, 9));
-        assert_eq!(history.valid_version(), cfg!(feature = "combined-queue-log-experiment"));
+        assert!(history.valid_version());
         let mut unknown = combined;
         let start = unknown.windows(8).position(|b| b == b"combined").unwrap();
         unknown[start..start + 8].copy_from_slice(b"unknown!");
@@ -362,6 +419,19 @@ mod tests {
         )
         .await
         .unwrap();
+        s.initialize_empty_storage_history(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            StorageHistoryBinding {
+                resource_incarnation: [1; 16],
+                accepted_history: [2; 16],
+                writer_session: [3; 16],
+            },
+        )
+        .await
+        .unwrap();
         s.become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
@@ -369,17 +439,18 @@ mod tests {
             "q",
             0,
             None,
-            Some(ReplicatedMessageBatch {
+            None,
+            Some(ReplicatedEventBatch {
                 epoch: 7,
                 first_offset: 0,
-                records: vec![Message {
-                    flags: 0,
+                events: vec![StromaEvent::PayloadEnqueue {
+                    not_before: None,
+                    expire_at: None,
                     headers: vec![],
                     payload: payload.to_vec(),
                 }],
                 durability: Some(KDurability::AfterFsync),
             }),
-            None,
         )
         .await
         .unwrap();
@@ -393,7 +464,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn history_depends_on_contents_not_fence_or_local_append_time() {
+    async fn history_binds_storage_instance_while_content_digest_ignores_fence_and_append_time() {
         let a = test_dir!("history_a");
         let b = test_dir!("history_b");
         let c = test_dir!("history_c");
@@ -413,10 +484,13 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request(8))
             .await
             .unwrap();
-        assert_eq!(x.history, y.history);
+        assert_ne!(x.history.id, y.history.id);
+        assert_ne!(x.history.storage_history.as_ref().unwrap().storage_instance, y.history.storage_history.as_ref().unwrap().storage_instance);
+        assert_eq!(x.history.event_digest, y.history.event_digest);
+        assert_eq!((x.history.event_head, x.history.event_next), (y.history.event_head, y.history.event_next));
         assert_ne!(x.history.id, z.history.id);
-        assert_eq!(x.history.event_digest, z.history.event_digest);
-        assert_ne!(x.history.message_digest, z.history.message_digest);
+        assert_ne!(x.history.event_digest, z.history.event_digest);
+        assert_eq!(x.history.message_digest, z.history.message_digest);
         first.shutdown().await.unwrap();
         second.shutdown().await.unwrap();
         different.shutdown().await.unwrap();
@@ -434,8 +508,8 @@ mod tests {
             .unwrap();
         let segment = "segments/00000000000000000000.log";
         fs::copy(
-            other.msg_tp_part_dir("q", 0, None).join(segment),
-            first.msg_tp_part_dir("q", 0, None).join(segment),
+            other.tp_part_dir("q", 0, None).join(segment),
+            first.tp_part_dir("q", 0, None).join(segment),
         )
         .unwrap();
         assert!(matches!(
@@ -499,7 +573,7 @@ mod tests {
             Err(StromaError::WrongPartitionKind { .. })
         ));
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().current_epoch(), 7);
+        assert_eq!(ticket.resolve().unwrap().event_log().current_epoch(), 7);
         let mut state = crate::QueueInternalState::new("q".into(), 0);
         s.write_queue_snapshot("q", 0, None, 0, &state.encode_snapshot(0))
             .unwrap();

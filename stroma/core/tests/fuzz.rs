@@ -20,9 +20,8 @@ async fn open_test_stroma() -> (Arc<Stroma>, TempDir) {
 
 #[tokio::test]
 async fn random_operations_never_break_invariants() {
-    fastrand::seed(0xC0FFEE);
-
     let (st, _test_dir) = open_test_stroma().await;
+    fastrand::seed(0xC0FFEE);
     let q = st.queue_handle("test", 0, None).await.unwrap();
     let q = q.resolve().unwrap();
     let q = q.work_queue().unwrap();

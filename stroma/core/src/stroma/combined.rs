@@ -1,21 +1,21 @@
-//! Fresh-data experiment. Payload identity is the containing event-log offset.
+//! Queue payload identity is the containing event-log offset.
 use super::*;
 use std::io::Write;
 const MARKER: &str = "combined-queue-log.v1";
 const MAGIC: &[u8] = b"combined-queue-log-v1\n";
 
-pub(super) fn prepare_root(root: &Path, enabled: bool) -> Result<()> {
+pub(super) fn prepare_root(root: &Path) -> Result<()> {
     let marker = root.join(MARKER);
     if marker.exists() {
-        if !enabled || fs::read(&marker).map_err(io_err)? != MAGIC {
+        if fs::read(&marker).map_err(io_err)? != MAGIC {
             return Err(StromaError::InvalidArgument(
-                "combined queue format requires matching experimental mode".into(),
+                "unsupported queue storage format marker".into(),
             ));
         }
-    } else if enabled {
+    } else {
         if root.exists() && fs::read_dir(root).map_err(io_err)?.next().is_some() {
             return Err(StromaError::InvalidArgument(
-                "combined queue experiment requires fresh storage".into(),
+                "single-log queue storage requires a fresh root, older layouts are unsupported".into(),
             ));
         }
         fs::create_dir_all(root).map_err(io_err)?;
@@ -317,6 +317,15 @@ impl Stroma {
                         .map_err(io_err)?
                         .map_err(io_err)?;
                     let h = qh.resolve()?;
+                    #[cfg(test)]
+                    {
+                        let pause = stroma.publish_apply_pause.lock().unwrap().clone()
+                            .filter(|p| p.topic == qh.topic() && p.base == ar.base_offset);
+                        if let Some(pause) = pause {
+                            pause.entered.notify_one();
+                            pause.release.notified().await;
+                        }
+                    }
                     let turn = crate::ordered_apply::enter(&scope, ar.base_offset, ar.count as u64)
                         .await?;
                     stroma
@@ -385,15 +394,30 @@ pub(super) fn recover_events(
             if record.offset != from {
                 return Err(StromaError::Corruption("combined replay offset gap".into()));
             }
-            let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
+            let event = match StromaEvent::decode(&record.payload) {
+                Ok(event) => event,
+                Err(error) => return Ok(RecoveryScanOutcome {
+                    events, events_count: count,
+                    mismatch: Some(RecoveryMismatchFound { event_offset: record.offset,
+                        kind: RecoveryMismatchKind::CorruptRecord { detail: error.to_string() } }),
+                }),
+            };
             let carries_payload = matches!(event, StromaEvent::PayloadEnqueue { .. });
             if event
                 .max_combined_referenced_offset()
                 .is_some_and(|off| off >= record.offset)
             {
-                return Err(StromaError::Corruption(
-                    "combined replay has forward payload reference".into(),
-                ));
+                // A payload enqueue and its bytes occupy the same record. A
+                // forward reference cannot be an ordinary lost second-log tail.
+                // Preserve the valid prefix and use the existing corruption
+                // policy, including its bound-history prohibition on repair.
+                return Ok(RecoveryScanOutcome {
+                    events, events_count: count,
+                    mismatch: Some(RecoveryMismatchFound { event_offset: record.offset,
+                        kind: RecoveryMismatchKind::CorruptRecord {
+                            detail: "single-log replay has forward payload reference".into(),
+                        } }),
+                });
             }
             events.push(event.into_record_state(record.offset));
             if !carries_payload {

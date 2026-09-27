@@ -227,7 +227,6 @@ impl QueueReplay {
             .live_ranges
             .get_or_insert_with(|| self.state.recovery_live_ranges());
         if live.contains(&record.offset) {
-            #[cfg(feature = "combined-queue-log-experiment")]
             if self.history.log_layout == QueueLogLayout::Combined
                 && !matches!(decode_evidence_event(record), Ok(StromaEvent::PayloadEnqueue { .. }))
             {
@@ -253,10 +252,7 @@ impl QueueReplay {
         }
         let ev = decode_evidence_event(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
-        #[cfg(feature = "combined-queue-log-experiment")]
         let payload = matches!(ev, StromaEvent::PayloadEnqueue { .. });
-        #[cfg(not(feature = "combined-queue-log-experiment"))]
-        let payload = false;
         let combined = self.history.log_layout == QueueLogLayout::Combined;
         if payload && !combined {
             return Err("payload-bearing event in a separate-log history".into());
@@ -305,10 +301,8 @@ impl QueueReplay {
         }
         // Same state operations used by the actor, without delivery, clocks,
         // external DLQ copies, priority scheduling or snapshot mutations.
-        #[cfg(feature = "combined-queue-log-experiment")]
         let ev = ev.into_record_state(record.offset);
         match ev {
-            #[cfg(feature = "combined-queue-log-experiment")]
             StromaEvent::PayloadEnqueue { .. } => unreachable!("payload event converted to state operation"),
             StromaEvent::ActivateDelayed { now, max } => {
                 self.state.activate_delayed(now, max as usize);

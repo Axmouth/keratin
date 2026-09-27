@@ -98,18 +98,12 @@ impl Stroma {
             qh.record_checkpoint_persisted(event_next, timestamp);
             if compact {
                 let (message_floor, event_next) = stroma.checkpoint_retention_limits(&qh, message_floor, event_next).await?;
-                #[cfg(feature = "combined-queue-log-experiment")]
-                let event_next = if stroma.combined_queue_log {event_next.min(message_floor)} else {event_next};
+                let event_next = event_next.min(message_floor);
                 qh.event_log()
                     .truncate_before(event_next)
                     .await
                     .map_err(io_err)?;
-                if !stroma.queue_payloads_in_event_log() {
-                    qh.msg_log()?
-                        .truncate_before(message_floor)
-                        .await
-                        .map_err(io_err)?;
-                }
+
             }
             Ok(())
         })
@@ -132,6 +126,6 @@ impl Drop for RestoreDirty<'_> {
     }
 }
 
-#[cfg(all(test, feature = "ordered-queue-apply"))]
+#[cfg(test)]
 #[path = "checkpoint_tests.rs"]
 mod tests;

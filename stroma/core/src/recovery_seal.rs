@@ -136,7 +136,12 @@ fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
 }
 
 impl Stroma {
-    pub(super) fn recovery_seal_path(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
+    pub(super) fn recovery_seal_path(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> PathBuf {
         self.snap_dir(topic, part, group).join("recovery.seal")
     }
 
@@ -282,25 +287,39 @@ impl Stroma {
             Some(handle) => Some(handle.follower_apply_state().await),
             None => None,
         };
-        let combined = actual == PartitionKind::Queue && self.queue_payloads_in_event_log();
-        if combined && self.durable_storage_history_receipt(topic, part, group)?.is_none() {
-            return Err(StromaError::InvalidArgument("combined recovery requires an admitted queue history".into()));
+        let combined = actual == PartitionKind::Queue;
+        if combined
+            && self
+                .durable_storage_history_receipt(topic, part, group)?
+                .is_none()
+        {
+            return Err(StromaError::InvalidArgument(
+                "combined recovery requires an admitted queue history".into(),
+            ));
         }
         let (messages, events) = match &handle {
             Some(handle) => (handle.optional_message_log(), handle.event_log()),
             None => {
-                let messages = if combined { None } else { Some(self.msg_log_init(topic, part, group).await?) };
+                let messages = if combined {
+                    None
+                } else {
+                    Some(self.msg_log_init(topic, part, group).await?)
+                };
                 match self.event_log_init(topic, part, group).await {
                     Ok(events) => (messages, events),
                     Err(err) => {
-                        if let Some(messages) = &messages { let _ = messages.shutdown().await; }
+                        if let Some(messages) = &messages {
+                            let _ = messages.shutdown().await;
+                        }
                         return Err(err);
                     }
                 }
             }
         };
         let result = async {
-            let max_epoch = messages.as_ref().map_or(events.current_epoch(), |m| m.current_epoch().max(events.current_epoch()));
+            let max_epoch = messages.as_ref().map_or(events.current_epoch(), |m| {
+                m.current_epoch().max(events.current_epoch())
+            });
             // Fresh learner authority proves this local copy is outside the
             // active write set. Preserve any earlier seal and its evidence.
             if excluded_learner {
@@ -330,7 +349,9 @@ impl Stroma {
                 partition: part,
                 group: group.map(str::to_owned),
                 request: request.clone(),
-                previous_message_epoch: messages.as_ref().map_or(events.current_epoch(), |m| m.current_epoch()),
+                previous_message_epoch: messages
+                    .as_ref()
+                    .map_or(events.current_epoch(), |m| m.current_epoch()),
                 previous_event_epoch: events.current_epoch(),
             });
             if intent.previous_message_epoch >= request.fence_epoch
@@ -353,10 +374,17 @@ impl Stroma {
                 transition = %blake3::Hash::from_bytes(request.transition),
                 "recovery seal intent durable; fencing physical logs");
             // The durable intent gates restart BEFORE either log fence changes.
-            if let Some(messages) = &messages { messages.freeze(); }
+            if let Some(messages) = &messages {
+                messages.freeze();
+            }
             events.freeze();
             let (message_result, event_result) = tokio::join!(
-                async { match &messages { Some(log) => log.advance_epoch(request.fence_epoch).await.map(|_| ()), None => Ok(()) } },
+                async {
+                    match &messages {
+                        Some(log) => log.advance_epoch(request.fence_epoch).await.map(|_| ()),
+                        None => Ok(()),
+                    }
+                },
                 events.advance_epoch(request.fence_epoch),
             );
             message_result.map_err(io_err)?;
@@ -401,7 +429,12 @@ impl Stroma {
         .await;
         if handle.is_none() {
             let (message_close, event_close) = tokio::join!(
-                async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } },
+                async {
+                    match messages {
+                        Some(log) => log.shutdown().await,
+                        None => Ok(()),
+                    }
+                },
                 events.shutdown(),
             );
             message_close.map_err(io_err)?;
@@ -436,6 +469,20 @@ mod tests {
 
     async fn populated(stroma: &Stroma) -> QueueHandle {
         stroma
+            .initialize_empty_storage_history(
+                "q",
+                0,
+                None,
+                PartitionKind::Queue,
+                StorageHistoryBinding {
+                    resource_incarnation: [1; 16],
+                    accepted_history: [2; 16],
+                    writer_session: [3; 16],
+                },
+            )
+            .await
+            .unwrap();
+        stroma
             .become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
@@ -444,26 +491,16 @@ mod tests {
                 "q",
                 0,
                 None,
-                Some(ReplicatedMessageBatch {
-                    epoch: 7,
-                    first_offset: 0,
-                    durability: Some(KDurability::AfterFsync),
-                    records: vec![Message {
-                        flags: 0,
-                        headers: vec![],
-                        payload: b"confirmed".to_vec(),
-                    }],
-                }),
+                None,
                 Some(ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
                     durability: Some(KDurability::AfterFsync),
-                    events: vec![StromaEvent::EnqueueMany {
-                        reqs: vec![EnqueueEventMeta {
-                            off: 0,
-                            retries: 0,
-                            expire_at: None,
-                        }],
+                    events: vec![StromaEvent::PayloadEnqueue {
+                        not_before: None,
+                        expire_at: None,
+                        headers: vec![],
+                        payload: b"confirmed".to_vec(),
                     }],
                 }),
             )
@@ -482,11 +519,8 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
-        assert_eq!(
-            (h.msg_log().unwrap().current_epoch(), h.event_log().current_epoch()),
-            (8, 8)
-        );
+        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(h.event_log().current_epoch(), 8);
         h.become_owner();
         assert_eq!(h.role(), QueueRole::Frozen);
         assert!(h.begin_owner_operation().await.is_err());
@@ -535,7 +569,7 @@ mod tests {
         let reopened = open(&dir.root).await;
         assert!(matches!(
             reopened.queue_handle("q", 0, None).await,
-            Err(StromaError::RecoverySealed { .. })
+            Err(StromaError::HistoryAdmissionRequired { .. })
         ));
         assert!(
             reopened
@@ -554,8 +588,8 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn seal_resumes_after_intent_or_only_one_log_fence_persisted() {
-        for fence_message_log in [false, true] {
+    async fn seal_resumes_after_intent_or_log_fence_persisted() {
+        for fence_log in [false, true] {
             let dir = test_dir!("recovery_seal_partial_fence");
             let stroma = open(&dir.root).await;
             let qh = populated(&stroma).await;
@@ -573,8 +607,8 @@ mod tests {
             )
             .unwrap();
             h.begin_recovery_seal();
-            if fence_message_log {
-                h.msg_log().unwrap().advance_epoch(8).await.unwrap();
+            if fence_log {
+                h.event_log().advance_epoch(8).await.unwrap();
             }
             drop(h);
             stroma.shutdown().await.unwrap();
@@ -585,11 +619,9 @@ mod tests {
                 .seal_replica_for_recovery("q", 0, None, request())
                 .await
                 .unwrap();
-            assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
-            let messages = reopened.msg_log_init("q", 0, None).await.unwrap();
+            assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
             let events = reopened.event_log_init("q", 0, None).await.unwrap();
-            assert_eq!((messages.current_epoch(), events.current_epoch()), (8, 8));
-            messages.shutdown().await.unwrap();
+            assert_eq!(events.current_epoch(), 8);
             events.shutdown().await.unwrap();
             reopened.shutdown().await.unwrap();
         }
@@ -617,7 +649,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!task.is_finished());
-        assert_eq!(h.msg_log().unwrap().current_epoch(), 7);
+        assert_eq!(h.event_log().current_epoch(), 7);
         task.abort();
         let _ = task.await;
         drop(lease);
@@ -628,25 +660,25 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
+        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
         drop(h);
         stroma.shutdown().await.unwrap();
     }
 
     #[tokio::test]
-    async fn seal_drains_other_fence_when_one_writer_fails_and_retries_after_restart() {
+    async fn seal_keeps_intent_when_writer_fails_and_retries_after_restart() {
         let dir = test_dir!("recovery_seal_failed_writer");
         let stroma = open(&dir.root).await;
         let qh = populated(&stroma).await;
         let h = qh.resolve().unwrap();
-        h.msg_log().unwrap().shutdown().await.unwrap();
+        h.event_log().shutdown().await.unwrap();
         assert!(
             stroma
                 .seal_replica_for_recovery("q", 0, None, request())
                 .await
                 .is_err()
         );
-        assert_eq!(h.event_log().current_epoch(), 8);
+        assert_eq!(h.event_log().current_epoch(), 7);
         assert!(
             read_intent(&stroma.recovery_seal_path("q", 0, None))
                 .unwrap()
@@ -661,7 +693,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
+        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
         reopened.shutdown().await.unwrap();
     }
 
@@ -705,14 +737,9 @@ mod tests {
             let reopened = open(&dir.root).await;
             assert!(matches!(
                 reopened.queue_handle("q", 0, None).await,
-                Err(StromaError::Corruption(_))
+                Err(StromaError::HistoryAdmissionRequired { .. })
             ));
-            assert!(
-                reopened
-                    .seal_replica_for_recovery("q", 0, None, request())
-                    .await
-                    .is_err()
-            );
+            assert!(matches!(reopened.seal_replica_for_recovery("q", 0, None, request()).await, Err(StromaError::Corruption(_))));
             reopened.shutdown().await.unwrap();
         }
     }
@@ -721,6 +748,20 @@ mod tests {
     async fn seal_blocks_startup_suffix_repair_so_evidence_remains_available() {
         let dir = test_dir!("recovery_seal_partial_data");
         let stroma = open(&dir.root).await;
+        stroma
+            .initialize_empty_storage_history(
+                "q",
+                0,
+                None,
+                PartitionKind::Queue,
+                StorageHistoryBinding {
+                    resource_incarnation: [1; 16],
+                    accepted_history: [2; 16],
+                    writer_session: [3; 16],
+                },
+            )
+            .await
+            .unwrap();
         stroma
             .become_queue_follower_with_epoch("q", 0, None, 7)
             .await
@@ -839,6 +880,20 @@ mod tests {
                 .is_err()
         );
         assert!(stroma.create_stream("stream", 0, None).await.is_err());
+        stroma
+            .initialize_empty_storage_history(
+                "empty",
+                0,
+                None,
+                PartitionKind::Queue,
+                StorageHistoryBinding {
+                    resource_incarnation: [1; 16],
+                    accepted_history: [2; 16],
+                    writer_session: [3; 16],
+                },
+            )
+            .await
+            .unwrap();
         let empty = stroma
             .seal_replica_for_recovery("empty", 0, Some("default"), request())
             .await

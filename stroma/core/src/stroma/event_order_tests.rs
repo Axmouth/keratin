@@ -46,11 +46,11 @@ async fn older_message_ack_obeys_selected_application_order() {
             entered: Notify::new(), release: Notify::new(),
         });
         *st.publish_apply_pause.lock().unwrap() = Some(pause.clone());
-        let mut new_confirm = publish(&st, 1).await;
+        let new_confirm = publish(&st, 1).await;
         pause.entered.notified().await;
         let qh = st.queue_handle("ordering", 0, None).await.unwrap();
         let h = qh.resolve().unwrap();
-        while h.msg_log().unwrap().durable_offset() < 1 || h.event_log().durable_offset() < 1 {
+        while h.event_log().durable_offset() < 1 {
             tokio::task::yield_now().await;
         }
 
@@ -59,37 +59,19 @@ async fn older_message_ack_obeys_selected_application_order() {
         let (completion, mut ack_done) = KeratinAppendCompletion::pair();
         st.ack_enqueue_many("ordering", 0, None, vec![AckEventMeta { off: 0 }], completion).await.unwrap();
         let wq = h.work_queue().unwrap();
-        if cfg!(feature = "ordered-queue-apply") {
-            while h.event_log().durable_offset() < 2 {
-                tokio::task::yield_now().await;
-            }
-            assert!(matches!(ack_done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
-            assert!(!wq.is_settled(0).await);
-            assert!(!wq.is_ready(1).await);
-            assert_eq!(h.applied_upto().load(Ordering::Acquire), 0);
-            pause.release.notify_one();
-            new_confirm.await.unwrap().unwrap();
-            ack_done.await.unwrap().unwrap();
-            assert!(wq.is_settled(0).await);
-            assert!(wq.is_ready(1).await);
-            assert_eq!(h.applied_upto().load(Ordering::Acquire), 2);
-            st.shutdown().await.unwrap();
-            return;
-        }
-        let ack_record = ack_done.await.unwrap().unwrap();
-        // The callback reports submission, so also wait for actor-visible ACK.
-        while !wq.is_settled(0).await {
+        while h.event_log().durable_offset() < 2 {
             tokio::task::yield_now().await;
         }
+        assert!(matches!(ack_done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(!wq.is_settled(0).await);
         assert!(!wq.is_ready(1).await);
-        assert!(matches!(new_confirm.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
-        eprintln!("ordering audit: older ACK event={}, sampled applied_upto={}, new message 1 still unapplied",
-            ack_record.base_offset, h.applied_upto().load(Ordering::Acquire));
-
+        assert_eq!(h.applied_upto().load(Ordering::Acquire), 0);
         pause.release.notify_one();
         new_confirm.await.unwrap().unwrap();
+        ack_done.await.unwrap().unwrap();
         assert!(wq.is_settled(0).await);
         assert!(wq.is_ready(1).await);
+        assert_eq!(h.applied_upto().load(Ordering::Acquire), 2);
         st.shutdown().await.unwrap();
     }).await.expect("storage ordering scenario timed out");
 }

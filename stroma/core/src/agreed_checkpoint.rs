@@ -190,8 +190,7 @@ fn reclaim_unpinned(root: &Path, index: &Retention) -> Result<()> {
 
 fn validate_pin(pin: &QueueCheckpointPin) -> Result<()> {
     let s = &pin.storage;
-    if (pin.log_layout == QueueLogLayout::Combined && (!cfg!(feature = "combined-queue-log-experiment")
-            || pin.required_message_next > pin.event_next || pin.event_next > pin.message_next
+    if (pin.log_layout == QueueLogLayout::Combined && ( pin.required_message_next > pin.event_next || pin.event_next > pin.message_next
             || pin.message_head > pin.event_next
             || pin.event_epoch != pin.message_epoch))
         || pin.attempt == [0; 32]
@@ -272,7 +271,7 @@ fn load_base(root: &Path, pin: &QueueCheckpointPin) -> Result<QueueCheckpointBas
 
 impl Stroma {
     fn checkpoint_layout(&self) -> QueueLogLayout {
-        if self.queue_payloads_in_event_log() { QueueLogLayout::Combined } else { QueueLogLayout::Separate }
+        QueueLogLayout::Combined
     }
 
     fn require_checkpoint_layout(&self, pin: &QueueCheckpointPin) -> Result<()> {
@@ -391,10 +390,8 @@ impl Stroma {
                 }
                 // Drain queued mutations whose callers may have been cancelled
                 // after sending a truncate but before observing its completion.
-                let messages = h.payload_log();
                 let events = h.event_log();
-                if stroma.queue_payloads_in_event_log() { events.sync().await.map_err(io_err)?; }
-                else { tokio::try_join!(messages.sync(), events.sync()).map_err(io_err)?; }
+                events.sync().await.map_err(io_err)?;
                 let captured = h.capture_exact_checkpoint(false).await?;
                 let pin = QueueCheckpointPin {
                     log_layout: stroma.checkpoint_layout(),
@@ -558,12 +555,11 @@ impl Stroma {
         let storage = self.clone();
         let protects_followers = h.role() == QueueRole::Owner;
         tokio::task::spawn_blocking(move || {
-            let (replica_message, replica_event) = if protects_followers {
+            let (_, replica_event) = if protects_followers {
                 storage.replication_retention_limits(&topic, part, group.as_deref())?
             } else {
                 (u64::MAX, u64::MAX)
             };
-            let message = if storage.queue_payloads_in_event_log() { message } else { message.min(replica_message) };
             let event = event.min(replica_event);
             let index = load_index(&root, &topic, part, group.as_deref())?;
             Ok(index.pins.values().fold((message, event), |(m, e), pin| {
@@ -579,7 +575,7 @@ impl Stroma {
     }
 }
 
-#[cfg(all(test, unix, feature = "ordered-queue-apply"))]
+#[cfg(all(test, unix))]
 #[path = "agreed_checkpoint_tests.rs"]
 mod tests;
 
@@ -610,8 +606,7 @@ pub struct QueueCheckpointContents {
 }
 impl QueueCheckpointContents {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if (self.log_layout == QueueLogLayout::Combined && (!cfg!(feature = "combined-queue-log-experiment")
-            || self.message_next != self.event_next))
+        if (self.log_layout == QueueLogLayout::Combined && ( self.message_next != self.event_next))
             || self.message_head > self.message_next || self.required_message_next > self.message_next {
             return Err("checkpoint payload bounds do not cover state dependencies".into());
         }

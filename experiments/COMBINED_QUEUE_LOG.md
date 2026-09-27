@@ -1,10 +1,13 @@
 # Combined queue log experiment
 
-This feature is a fresh-data prototype. It is not ready for a main-branch merge
-or production recovery. Enable the `combined-queue-log-experiment` Cargo feature
-and `STROMA_COMBINED_QUEUE_LOG=1`. Ordinary mode retains its separate message and
-event logs for controls and existing data. The mode marker rejects accidental
-opening with the wrong mode. Do not point the experiment at existing ordinary data.
+This worktree is adopting a single log for every work queue. Queue storage has
+no layout feature or environment switch. Ordered application is mandatory.
+Existing roots without the single-log format marker are rejected. There is no
+migration from the previous two-log queue format. Streams keep separate payload
+and cursor logs within new roots.
+
+The adoption branch is still under validation and has not been merged into main.
+A pinned pre-adoption binary retains both layouts for benchmark controls.
 
 Original enqueues contain their headers and payload. Their event offsets identify
 the payload. Subsequent activation, lease and settlement events reference those
@@ -22,8 +25,8 @@ retain their original profile. No byte/count or durability cap is relaxed.
 
 ## Early replication
 
-Compile the existing `early-replication-experiment` feature too. Fibril forwards
-these features through its facade. Set `FIBRIL_EXPERIMENT_EARLY_REPLICATION=1` to
+Compile the `early-replication-experiment` feature. Fibril forwards it through
+its facade. Set `FIBRIL_EXPERIMENT_EARLY_REPLICATION=1` to
 opt in on admitted, history-bound replicated queues. Leave it unset or zero for
 replication after owner fsync. This is a process-start experiment setting, with
 no dashboard control. It does not enable speculative consumer delivery.
@@ -59,8 +62,7 @@ layouts, including stream assignments that have not materialized local storage.
 
 Remaining adoption gates include matched release-mode performance and failover
 timing, larger retained histories and live backlogs, clustered repair after early
-replication leaves an unconfirmed suffix, and removal of the old two-log queue
-runtime. Keep the old layout in a pinned benchmark control. Adoption changes the
+replication leaves an unconfirmed suffix, and conversion of the remaining old-layout test fixtures. Keep the old layout in a pinned benchmark control. Adoption changes the
 queue storage format without migration support, while preserving stream storage.
 Early replication remains opt-in and outside the dashboard.
 
@@ -75,8 +77,7 @@ segment sizes, batching limits and durability settings keep their prior defaults
 Retained-history evidence now carries an explicit QueueLogLayout. Separate is
 the omitted serialization default, preserving existing separate-history identity
 bytes. Combined evidence names its layout, requires a bound queue history and a
-canonical empty compatibility lane, and is rejected by builds without combined
-format support. Pair inspection rejects mixed layouts before fetching pages.
+canonical empty compatibility lane, while streams retain the separate-log discriminator. Pair inspection rejects mixed layouts before fetching pages.
 Recovery reads and installation use the selected physical payload log. Combined
 checkpoints require exact authorized learner installation when backfilling old
 payloads, and promotion remains fenced until those dependencies are verified.
