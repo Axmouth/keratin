@@ -38,8 +38,8 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
                 } else {
                     KDurability::AfterWrite
                 };
-                let mut written = h.msg_log().subscribe_written();
-                h.msg_log()
+                let mut written = h.msg_log().unwrap().subscribe_written();
+                h.msg_log().unwrap()
                     .append_enqueue_receiver(
                         Message {
                             flags: 0,
@@ -69,7 +69,7 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
                     .unwrap();
             }
             assert_eq!(
-                h.msg_log().reader().scan_from(0, 10).unwrap().len() as u64,
+                h.msg_log().unwrap().reader().scan_from(0, 10).unwrap().len() as u64,
                 prefix
             );
             assert_eq!(
@@ -77,7 +77,7 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
                 prefix
             );
             assert!(
-                h.msg_log()
+                h.msg_log().unwrap()
                     .reader()
                     .scan_from(prefix, 10)
                     .unwrap()
@@ -130,7 +130,7 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
             let fh = follower.queue_handle("q", 0, None).await.unwrap();
             let fh = fh.resolve().unwrap();
             assert_eq!(
-                fh.msg_log().reader().scan_from(0, 10).unwrap().len() as u64,
+                fh.msg_log().unwrap().reader().scan_from(0, 10).unwrap().len() as u64,
                 prefix + 1
             );
             assert_eq!(
@@ -138,7 +138,7 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
                 prefix + 1
             );
             assert_eq!(
-                h.msg_log().reader().scan_from(0, 10).unwrap().len() as u64,
+                h.msg_log().unwrap().reader().scan_from(0, 10).unwrap().len() as u64,
                 prefix
             );
 
@@ -185,7 +185,7 @@ async fn follower_can_persist_tentative_bytes_without_releasing_owner_apply() {
             }
             // Already encoded frames retain the old epoch; an explicit fence
             // causes subsequent owner reads to report the new epoch.
-            h.msg_log().advance_epoch(1).await.unwrap();
+            h.msg_log().unwrap().advance_epoch(1).await.unwrap();
             let OwnerReplicationRead::Batch(next) = owner
                 .read_owner_message_records_early("q", 0, None, prefix + 1, 1)
                 .await
@@ -301,9 +301,9 @@ async fn real_publish_completion_waits_for_both_owner_writers_after_early_replic
         );
         assert!(!owner.is_ready("q", 0, None, offset).await.unwrap());
         let (first, second) = if offset == 0 {
-            (h.event_log(), h.msg_log())
+            (h.event_log(), h.msg_log().unwrap())
         } else {
-            (h.msg_log(), h.event_log())
+            (h.msg_log().unwrap(), h.event_log())
         };
         first.advance_epoch(0).await.unwrap();
         assert!(
@@ -430,7 +430,7 @@ async fn owner_fsync_fault_never_confirms_or_delivers_early_follower_bytes() {
                                 replication.as_mut().await.unwrap();
                             }
                             if offset < prefix {
-                                h.msg_log().advance_epoch(0).await.unwrap();
+                                h.msg_log().unwrap().advance_epoch(0).await.unwrap();
                                 h.event_log().advance_epoch(0).await.unwrap();
                                 receipt.await.unwrap().unwrap();
                                 continue;
@@ -446,9 +446,9 @@ async fn owner_fsync_fault_never_confirms_or_delivers_early_follower_bytes() {
                             let mut cancellation_written = h.event_log().subscribe_written();
                             let armed = arm(&path, fault).unwrap();
                             let (failed, healthy) = if failed_message {
-                                (h.msg_log(), h.event_log())
+                                (h.msg_log().unwrap(), h.event_log())
                             } else {
-                                (h.event_log(), h.msg_log())
+                                (h.event_log(), h.msg_log().unwrap())
                             };
                             if failure_first {
                                 failed.advance_epoch(0).await.unwrap();
@@ -500,7 +500,7 @@ async fn owner_fsync_fault_never_confirms_or_delivers_early_follower_bytes() {
                                 replication.as_mut().await.unwrap();
                             }
                             assert_eq!(
-                                h.msg_log().next_offset(),
+                                h.msg_log().unwrap().next_offset(),
                                 prefix + 1,
                                 "failed offset cannot be reassigned while live"
                             );
@@ -508,7 +508,7 @@ async fn owner_fsync_fault_never_confirms_or_delivers_early_follower_bytes() {
                             assert_eq!(
                                 fh.resolve()
                                     .unwrap()
-                                    .msg_log()
+                                    .msg_log().unwrap()
                                     .reader()
                                     .scan_from(0, 10)
                                     .unwrap()
@@ -610,7 +610,7 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
                     assert!(armed.as_ref().unwrap().hits() > 0);
                     assert!(!owner.is_ready("q", 0, None, offset).await.unwrap());
                     let failed = if failed_message {
-                        h.msg_log()
+                        h.msg_log().unwrap()
                     } else {
                         h.event_log()
                     };
@@ -643,7 +643,7 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
                             "partial write entered tentative cache"
                         );
                     }
-                    assert_eq!(h.msg_log().next_offset(), prefix + 1);
+                    assert_eq!(h.msg_log().unwrap().next_offset(), prefix + 1);
                     drop(armed);
                 }
                 let shutdown = owner.shutdown().await;
@@ -660,7 +660,7 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
                         "unexpected shutdown error: {error:?} ({label})"
                     );
                 }
-                for log in [h.event_log(), h.msg_log()] {
+                for log in [h.event_log(), h.msg_log().unwrap()] {
                     let error = tokio::time::timeout(Duration::from_secs(5), log.sync())
                         .await
                         .expect("shutdown must finish both writers")

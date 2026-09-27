@@ -340,14 +340,14 @@ impl Stroma {
         h: &QueueHandleInner,
         install: &FollowerStateCheckpointInstall,
     ) -> Result<()> {
-        if (h.msg_log().current_epoch(), h.event_log().current_epoch())
+        if (h.msg_log()?.current_epoch(), h.event_log().current_epoch())
             != (install.message_epoch, install.event_epoch)
         {
             return Err(StromaError::InvalidArgument(format!(
                 "checkpoint epochs ({}, {}) do not match local epochs ({}, {})",
                 install.message_epoch,
                 install.event_epoch,
-                h.msg_log().current_epoch(),
+                h.msg_log()?.current_epoch(),
                 h.event_log().current_epoch(),
             )));
         }
@@ -407,9 +407,8 @@ impl Stroma {
             Phase::Pending(install) => {
                 let (state, meta) = validate(topic, part, install)?;
                 Self::checkpoint_epochs(h, install)?;
-                h.msg_log().become_follower();
-                h.event_log().become_follower();
-                h.msg_log()
+                for log in h.physical_logs() { log.become_follower(); }
+                h.msg_log()?
                     .destructive_reset_to_checkpoint_at_epoch(
                         install.message_next_offset,
                         install.message_epoch,
@@ -660,7 +659,7 @@ mod tests {
     async fn assert_installed(stroma: &Stroma, count: u64) {
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
-        assert_eq!(h.msg_log().next_offset(), 0);
+        assert_eq!(h.msg_log().unwrap().next_offset(), 0);
         assert_eq!(h.event_log().next_offset(), count);
         assert_eq!(h.full_debug_info().await.state.ready_count, count as usize);
         if count > 0 {
@@ -863,13 +862,13 @@ mod tests {
             .await
             .unwrap();
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().next_offset(), 2);
+        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().next_offset(), 2);
         stroma.shutdown().await.unwrap();
         drop(stroma);
         let stroma = open(&dir.root).await;
         // Check before any role transition or reinstallation can hide a replay.
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().next_offset(), 2);
+        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().next_offset(), 2);
         follower(&stroma).await;
         stroma
             .install_follower_state_checkpoint("q", 0, None, install)
@@ -878,7 +877,7 @@ mod tests {
         let records = ticket
             .resolve()
             .unwrap()
-            .msg_log()
+            .msg_log().unwrap()
             .reader()
             .scan_from(0, 10)
             .unwrap();

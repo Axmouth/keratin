@@ -623,8 +623,7 @@ impl Stroma {
                     handle.freeze_owner_and_wait_operations().await?;
                 }
                 handle.become_follower();
-                handle.msg_log().become_follower();
-                handle.event_log().become_follower();
+                for log in handle.physical_logs() { log.become_follower(); }
             }
             recovery_stage::persist_exact(
                 &stroma

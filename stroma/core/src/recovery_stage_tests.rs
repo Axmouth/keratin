@@ -502,8 +502,8 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         .unwrap();
     let ticket = st.queue_handle("q", 0, None).await.unwrap();
     let h = ticket.resolve().unwrap();
-    assert_eq!(h.msg_log().head_offset(), 1);
-    assert_eq!(h.msg_log().next_offset(), 3);
+    assert_eq!(h.msg_log().unwrap().head_offset(), 1);
+    assert_eq!(h.msg_log().unwrap().next_offset(), 3);
     assert_eq!(h.event_log().next_offset(), 3);
     let mut installed_state = QueueInternalState::new("q".into(), 0);
     installed_state
@@ -527,7 +527,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
     .await
     .unwrap();
     rx.await.unwrap().unwrap();
-    assert_eq!(h.msg_log().next_offset(), 4);
+    assert_eq!(h.msg_log().unwrap().next_offset(), 4);
     assert_eq!(
         st.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
             .await
@@ -537,7 +537,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
     st.admit_prepared_queue_recovery(installed.clone())
         .await
         .unwrap();
-    assert_eq!(h.msg_log().next_offset(), 4);
+    assert_eq!(h.msg_log().unwrap().next_offset(), 4);
     let expected_event_next = h.event_log().next_offset();
     drop(stage);
     st.shutdown().await.unwrap();
@@ -668,7 +668,7 @@ async fn installation_sigkill_resumes_each_publication_boundary_without_old_sour
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
         assert_eq!(
-            (h.msg_log().next_offset(), h.event_log().next_offset()),
+            (h.msg_log().unwrap().next_offset(), h.event_log().next_offset()),
             (3, 3)
         );
         st.shutdown().await.unwrap();
@@ -695,7 +695,7 @@ async fn local_reuse_source(st: &Stroma, divergent: bool) -> RecoverySealRequest
     let ticket = st.queue_handle("q", 0, None).await.unwrap();
     let handle = ticket.resolve().unwrap();
     handle
-        .msg_log()
+        .msg_log().unwrap()
         .append_batch(
             (0..3)
                 .map(|off| keratin_log::Message {
@@ -775,7 +775,7 @@ async fn reuse_checks_actual_payloads_and_installs_private_writable_tail() {
             let ticket = st.queue_handle("q", 0, None).await.unwrap();
             let handle = ticket.resolve().unwrap();
             handle
-                .msg_log()
+                .msg_log().unwrap()
                 .append_batch(
                     vec![keratin_log::Message {
                         payload: vec![42],

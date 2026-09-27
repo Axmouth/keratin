@@ -157,10 +157,9 @@ impl Stroma {
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         qh.freeze_owner_and_wait_operations().await?;
-        qh.msg_log().freeze();
-        qh.event_log().freeze();
+        for log in qh.physical_logs() { log.freeze(); }
 
-        let message_next_offset = qh.msg_log().next_offset();
+        let message_next_offset = qh.message_lane_next();
         let event_next_offset = qh.event_log().next_offset();
         let applied_event_offset = if event_next_offset == 0 {
             None
@@ -169,8 +168,7 @@ impl Stroma {
         };
 
         qh.become_follower();
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
+        for log in qh.physical_logs() { log.become_follower(); }
 
         Ok(QueueDemotionOutcome {
             message_next_offset,
@@ -190,8 +188,7 @@ impl Stroma {
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         qh.become_follower();
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
+        for log in qh.physical_logs() { log.become_follower(); }
         Ok(())
     }
 
@@ -219,14 +216,13 @@ impl Stroma {
             if self.payload_log_for(&qh).next_offset() < required {
                 return Err(crate::StromaError::InvalidArgument(format!(
                     "queue payload backfill incomplete: message next {} requires {required}",
-                    qh.msg_log().next_offset()
+                    qh.message_lane_next()
                 )));
             }
         }
         if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
-        qh.msg_log().become_owner();
-        qh.event_log().become_owner();
+        for log in qh.physical_logs() { log.become_owner(); }
         Ok(())
     }
 
@@ -243,8 +239,7 @@ impl Stroma {
         let h = qh.resolve()?;
         let _operation = h.begin_owner_operation().await?;
         if let Some(epoch) = epoch {
-            h.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
-            h.event_log().advance_epoch(epoch).await.map_err(io_err)?;
+            for log in h.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
         }
         Ok(())
     }
@@ -266,8 +261,7 @@ impl Stroma {
         let qh = qh.resolve()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
-        qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
-        qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
+        for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
         Ok(epoch)
     }
 
@@ -318,9 +312,9 @@ impl Stroma {
         h.ensure_not_recovery_sealed()?;
         let _pause = h.pause_owner_operations_and_wait().await?;
         Ok(crate::QueuePublishCommit {
-            message_next: h.msg_log().next_offset(),
+            message_next: h.message_lane_next(),
             event_next: h.event_log().next_offset(),
-            message_epoch: h.msg_log().current_epoch(),
+            message_epoch: h.message_lane_epoch(),
             event_epoch: h.event_log().current_epoch(),
         })
     }
@@ -343,7 +337,7 @@ impl Stroma {
             ));
         }
         Ok((
-            handle.msg_log().next_offset(),
+            handle.message_lane_next(),
             handle.event_log().next_offset(),
         ))
     }
@@ -358,7 +352,7 @@ impl Stroma {
     ) -> Result<(Offset, Offset)> {
         let qh = self.queue_handle(topic, part, None).await?;
         let qh = qh.resolve()?;
-        Ok((qh.msg_log().next_offset(), qh.event_log().next_offset()))
+        Ok((qh.message_lane_next(), qh.event_log().next_offset()))
     }
 
     pub async fn become_stream_follower_with_epoch(
@@ -426,9 +420,9 @@ impl Stroma {
                 "learner is not a completely applied follower".into(),
             ));
         }
-        let message_next = qh.msg_log().next_offset();
+        let message_next = qh.message_lane_next();
         let event_next = qh.event_log().next_offset();
-        if qh.msg_log().current_epoch() != epoch
+        if qh.message_lane_epoch() != epoch
             || qh.event_log().current_epoch() != epoch
             || message_next < message_target
             || event_next < event_target
@@ -445,7 +439,7 @@ impl Stroma {
                 ));
             }
         }
-        let message_log = qh.msg_log();
+        let message_log = qh.msg_log()?;
         let event_log = qh.event_log();
         let (messages, events) = tokio::join!(message_log.sync(), event_log.sync());
         messages.map_err(io_err)?;
@@ -485,7 +479,7 @@ impl Stroma {
             });
         }
 
-        let message_next_offset = qh.msg_log().next_offset();
+        let message_next_offset = qh.message_lane_next();
         if message_next_offset < expected_message_next_offset {
             return Ok(QueuePromotionOutcome::MessageLogBehind {
                 local_next_offset: message_next_offset,
@@ -541,8 +535,7 @@ impl Stroma {
         }
         if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
-        qh.msg_log().become_owner();
-        qh.event_log().become_owner();
+        for log in qh.physical_logs() { log.become_owner(); }
 
         Ok(QueuePromotionOutcome::Promoted {
             message_next_offset,
@@ -583,7 +576,7 @@ impl Stroma {
             });
         }
 
-        let message_next_offset = qh.msg_log().next_offset();
+        let message_next_offset = qh.message_lane_next();
         let event_next_offset = qh.event_log().next_offset();
         let applied_upto = qh.applied_upto().load(Ordering::Acquire);
         let applied_event_offset = if event_next_offset == 0 {
@@ -614,13 +607,11 @@ impl Stroma {
         // Persist the fencing epoch BEFORE serving as owner: from here on,
         // replicated traffic from the previous (older-epoch) owner is
         // rejected by both logs.
-        qh.msg_log().advance_epoch(epoch).await.map_err(io_err)?;
-        qh.event_log().advance_epoch(epoch).await.map_err(io_err)?;
+        for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
 
         if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
-        qh.msg_log().become_owner();
-        qh.event_log().become_owner();
+        for log in qh.physical_logs() { log.become_owner(); }
 
         Ok(QueuePromotionOutcome::Promoted {
             message_next_offset,
@@ -642,7 +633,7 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         Ok((
-            qh.msg_log().subscribe_written(),
+            qh.payload_log().subscribe_written(),
             qh.event_log().subscribe_written(),
         ))
     }
@@ -720,7 +711,16 @@ impl Stroma {
             });
         }
 
-        let log = qh.msg_log();
+        if qh.optional_message_log().is_none() {
+            if from != 0 {
+                return Err(StromaError::InvalidArgument("combined message lane cursor must be zero".into()));
+            }
+            return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+                epoch: qh.message_lane_epoch(), requested_offset: 0,
+                next_offset: 0, records: Vec::new(),
+            }));
+        }
+        let log = qh.msg_log()?;
         let epoch = log.current_epoch();
         let head_offset = log.head_offset();
         if from < head_offset {
@@ -932,7 +932,7 @@ impl Stroma {
         let _pause = qh.pause_owner_operations_and_wait().await?;
 
         async {
-            let message_next_offset = qh.msg_log().next_offset();
+            let message_next_offset = qh.message_lane_next();
             let event_next_offset = qh.event_log().next_offset();
             let applied_event_offset = event_next_offset.saturating_sub(1);
             let state_checkpoint = if qh.has_ordered_apply() {
@@ -957,7 +957,7 @@ impl Stroma {
             };
 
             Ok(OwnerStateCheckpoint {
-                message_epoch: qh.msg_log().current_epoch(),
+                message_epoch: qh.message_lane_epoch(),
                 event_epoch: qh.event_log().current_epoch(),
                 message_checkpoint_offset: state_checkpoint.message_checkpoint_offset,
                 message_next_offset,
@@ -1014,6 +1014,14 @@ impl Stroma {
                 return Err(StromaError::InvalidArgument("combined queue event received by a two-log queue".into()));
             }
         }
+        let messages = if qh.optional_message_log().is_none() {
+            if let Some(batch) = &messages {
+                if !batch.records.is_empty() || batch.first_offset != 0 || batch.epoch != qh.message_lane_epoch() {
+                    return Err(StromaError::InvalidArgument("invalid combined message lane frame".into()));
+                }
+            }
+            None
+        } else { messages };
         let topic = qh.topic();
         let part = qh.partition();
         let group = qh.group();
@@ -1030,9 +1038,24 @@ impl Stroma {
                     .collect::<Result<Vec<_>>>()
             })
             .transpose()?;
+        #[cfg(feature = "combined-queue-log-experiment")]
+        let events = {
+            let mut events = events;
+            if self.combined_queue_log {
+                if let Some(batch) = &mut events {
+                    for event in &mut batch.events {
+                        if let StromaEvent::PayloadEnqueue { headers, payload, .. } = event {
+                            *headers = Vec::new();
+                            *payload = Vec::new();
+                        }
+                    }
+                }
+            }
+            events
+        };
         let parallel = matches!((&messages, &events), (Some(m), Some(e))
-            if m.epoch == qh.msg_log().current_epoch() && e.epoch == qh.event_log().current_epoch()
-                && m.first_offset <= qh.msg_log().next_offset() && e.first_offset <= qh.event_log().next_offset());
+            if m.epoch == qh.message_lane_epoch() && e.epoch == qh.event_log().current_epoch()
+                && m.first_offset <= qh.message_lane_next() && e.first_offset <= qh.event_log().next_offset());
         let message_next = messages
             .as_ref()
             .map(|b| b.first_offset + b.records.len() as u64);
@@ -1041,7 +1064,7 @@ impl Stroma {
                 Some(batch) => {
                     let count = batch.records.len();
                     match qh
-                        .msg_log()
+                        .msg_log()?
                         .append_replicated_batch(
                             batch.epoch,
                             batch.first_offset,
@@ -1053,7 +1076,7 @@ impl Stroma {
                         Ok(outcome) => Ok(Some(outcome)),
                         Err(error) => Err(crate::replication_diagnostics::overlap_error(
                             error,
-                            qh.msg_log(),
+                            qh.msg_log()?,
                             topic,
                             part,
                             group,
@@ -1184,15 +1207,14 @@ impl Stroma {
         if qh.role() != QueueRole::Follower {
             return Err(StromaError::WrongQueueRole { expected: QueueRole::Follower, actual: qh.role() });
         }
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
+        for log in qh.physical_logs() { log.become_follower(); }
         let mut pending_events = Vec::new();
         let mut sync_messages = false;
         let mut sync_events = false;
         let mut outcomes = Vec::new();
         while let Some(frame) = frames.next().await {
             let (mut messages, mut events) = frame?;
-            sync_messages |= messages.is_some();
+            sync_messages |= messages.as_ref().is_some_and(|b| !b.records.is_empty());
             sync_events |= events.is_some();
             if let Some(batch) = &mut messages { batch.durability = Some(KDurability::AfterWrite); }
             if let Some(batch) = &mut events { batch.durability = Some(KDurability::AfterWrite); }
@@ -1207,10 +1229,10 @@ impl Stroma {
         if !outcomes.is_empty() {
             // Drain both operations even when one fails. Neither staging nor a
             // completed single-log sync is a two-log durable acknowledgment.
-            let messages = qh.msg_log();
+            let messages = qh.optional_message_log();
             let events = qh.event_log();
             let (m, e) = tokio::join!(
-                async { if sync_messages { messages.sync().await } else { Ok(()) } },
+                async { if sync_messages { match messages { Some(log) => log.sync().await, None => Err(std::io::Error::other("missing message log")) } } else { Ok(()) } },
                 async { if sync_events { events.sync().await } else { Ok(()) } },
             );
             m.map_err(io_err)?;
@@ -1248,8 +1270,7 @@ impl Stroma {
                 actual: role,
             });
         }
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
+        for log in qh.physical_logs() { log.become_follower(); }
 
         let (outcome, events, message_next, parallel) = self
             .append_follower_frame(&qh, &mut apply_state, messages, events).await?;

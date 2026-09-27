@@ -294,7 +294,7 @@ impl Stroma {
                 ];
                 let mut cold_locks = Vec::new();
                 let _live_logs = if let Some(handle) = &handle {
-                    let logs = [handle.msg_log(), handle.event_log()];
+                    let logs = [handle.msg_log()?, handle.event_log()];
                     if logs.iter().any(|log| log.role() != KeratinRole::Frozen) {
                         return Err(corrupt("sealed logs are not frozen"));
                     }
@@ -768,7 +768,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
         let handle = ticket.resolve().unwrap();
-        let head = handle.msg_log().truncate_before(4).await.unwrap();
+        let head = handle.msg_log().unwrap().truncate_before(4).await.unwrap();
         drop(handle);
         drop(ticket);
         let mut request = seal(&s).await;
@@ -1008,7 +1008,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
         let handle = ticket.resolve().unwrap();
-        let head = handle.msg_log().truncate_before(4).await.unwrap();
+        let head = handle.msg_log().unwrap().truncate_before(4).await.unwrap();
         assert!(head > 0 && head < 6);
         drop(handle);
         drop(ticket);

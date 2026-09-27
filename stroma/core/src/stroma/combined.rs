@@ -301,7 +301,7 @@ impl Stroma {
             });
         }
         let bytes: usize = records.iter().map(Message::bytes_len).sum();
-        let message_epoch = h.msg_log().current_epoch();
+        let message_epoch = h.message_lane_epoch();
         let event_epoch = event_log.current_epoch();
         let receiver = event_log.append_batch_enqueue_receiver(
             records,

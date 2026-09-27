@@ -287,7 +287,7 @@ impl Stroma {
             None => None,
         };
         let (messages, events) = match &handle {
-            Some(handle) => (handle.msg_log(), handle.event_log()),
+            Some(handle) => (handle.msg_log()?, handle.event_log()),
             None => {
                 let messages = self.msg_log_init(topic, part, group).await?;
                 match self.event_log_init(topic, part, group).await {
@@ -481,7 +481,7 @@ mod tests {
             .unwrap();
         assert_eq!((sealed.message_next, sealed.event_next), (1, 1));
         assert_eq!(
-            (h.msg_log().current_epoch(), h.event_log().current_epoch()),
+            (h.msg_log().unwrap().current_epoch(), h.event_log().current_epoch()),
             (8, 8)
         );
         h.become_owner();
@@ -571,7 +571,7 @@ mod tests {
             .unwrap();
             h.begin_recovery_seal();
             if fence_message_log {
-                h.msg_log().advance_epoch(8).await.unwrap();
+                h.msg_log().unwrap().advance_epoch(8).await.unwrap();
             }
             drop(h);
             stroma.shutdown().await.unwrap();
@@ -614,7 +614,7 @@ mod tests {
         .await
         .unwrap();
         assert!(!task.is_finished());
-        assert_eq!(h.msg_log().current_epoch(), 7);
+        assert_eq!(h.msg_log().unwrap().current_epoch(), 7);
         task.abort();
         let _ = task.await;
         drop(lease);
@@ -636,7 +636,7 @@ mod tests {
         let stroma = open(&dir.root).await;
         let qh = populated(&stroma).await;
         let h = qh.resolve().unwrap();
-        h.msg_log().shutdown().await.unwrap();
+        h.msg_log().unwrap().shutdown().await.unwrap();
         assert!(
             stroma
                 .seal_replica_for_recovery("q", 0, None, request())

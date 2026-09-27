@@ -364,7 +364,7 @@ impl Stroma {
             None => None,
         };
         let messages = match &handle {
-            Some(handle) => handle.msg_log(),
+            Some(handle) => handle.msg_log()?,
             None => Arc::new(
                 self.open_keratin(
                     self.msg_tp_part_dir(&s.topic, s.partition, s.group.as_deref()),

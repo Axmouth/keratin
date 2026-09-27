@@ -256,15 +256,15 @@ impl Stroma {
             replacement.ensure_not_recovery_sealed()?;
             if *new_apply
                 || replacement.role()!=QueueRole::Follower
-                || replacement.msg_log().current_epoch()!=epoch
+                || replacement.msg_log()?.current_epoch()!=epoch
                 || replacement.event_log().current_epoch()!=epoch
                 || replacement.ordered_applied_next()?!=Some(ready.event_next)
                 || !matches!(old.role(), QueueRole::Follower | QueueRole::Frozen)
-                || old.msg_log().current_epoch() != epoch
+                || old.msg_log()?.current_epoch() != epoch
                 || old.event_log().current_epoch() != epoch
-                || ready.message_next < old.msg_log().next_offset()
+                || ready.message_next < old.msg_log()?.next_offset()
                 || ready.event_next < old.event_log().next_offset()
-                || ready.message_next != replacement.msg_log().next_offset()
+                || ready.message_next != replacement.msg_log()?.next_offset()
                 || ready.event_next != replacement.event_log().next_offset()
             {
                 return Err(invalid(
@@ -339,7 +339,7 @@ impl Stroma {
                 if let Some(wq) = handle.as_work_queue() {
                     wq.shutdown().await;
                 }
-                handle.msg_log().shutdown().await.map_err(io_err)?;
+                handle.msg_log()?.shutdown().await.map_err(io_err)?;
                 handle.event_log().shutdown().await.map_err(io_err)?;
             }
             st.remove_queue(topic, part, group);
@@ -587,7 +587,7 @@ impl Stroma {
                 if let Some(wq) = h.as_work_queue() {
                     wq.shutdown().await;
                 }
-                h.msg_log().shutdown().await.map_err(io_err)?;
+                h.msg_log()?.shutdown().await.map_err(io_err)?;
                 h.event_log().shutdown().await.map_err(io_err)?;
             }
             st.remove_queue(&topic, part, group.as_deref());
@@ -777,7 +777,7 @@ impl Stroma {
             if let Some(wq) = h.as_work_queue() {
                 wq.shutdown().await;
             }
-            h.msg_log().shutdown().await.map_err(io_err)?;
+            h.msg_log()?.shutdown().await.map_err(io_err)?;
             h.event_log().shutdown().await.map_err(io_err)?;
         }
         st.remove_queue(&spec.topic, spec.partition, spec.group.as_deref());

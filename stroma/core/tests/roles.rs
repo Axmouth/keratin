@@ -825,20 +825,20 @@ async fn open_follower_batch_stages_before_close_and_applies_after_both_syncs() 
     for offset in 0..2 {
         tx.send(open_frame(offset)).await.unwrap();
         timeout(Duration::from_secs(2), async {
-            while h.msg_log().next_offset() != offset + 1 || h.event_log().next_offset() != offset + 1 {
+            while h.msg_log().unwrap().next_offset() != offset + 1 || h.event_log().next_offset() != offset + 1 {
                 assert!(apply.as_mut().now_or_never().is_none());
                 tokio::task::yield_now().await;
             }
         }).await.unwrap();
         assert!(!h.work_queue().unwrap().is_ready(offset).await);
-        assert!(h.msg_log().retained_durable_cursor(0, 0, offset + 1, 1_000_000).is_err());
+        assert!(h.msg_log().unwrap().retained_durable_cursor(0, 0, offset + 1, 1_000_000).is_err());
         assert!(h.event_log().retained_durable_cursor(0, 0, offset + 1, 1_000_000).is_err());
     }
     drop(tx);
     let outcomes = timeout(Duration::from_secs(2), apply).await.unwrap().unwrap();
     assert_eq!(outcomes.len(), 2);
     for offset in 0..2 { assert!(h.work_queue().unwrap().is_ready(offset).await); }
-    assert!(h.msg_log().retained_durable_cursor(0, 0, 2, 1_000_000).is_ok());
+    assert!(h.msg_log().unwrap().retained_durable_cursor(0, 0, 2, 1_000_000).is_ok());
     assert!(h.event_log().retained_durable_cursor(0, 0, 2, 1_000_000).is_ok());
     st.shutdown().await.unwrap();
 }
@@ -856,7 +856,7 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
         let mut apply = Box::pin(st.apply_open_replicated_queue_batch("q", 0, None, frames));
         tx.send(open_frame(0)).await.unwrap();
         timeout(Duration::from_secs(2), async {
-            while h.msg_log().next_offset() != 1 || h.event_log().next_offset() != 1 {
+            while h.msg_log().unwrap().next_offset() != 1 || h.event_log().next_offset() != 1 {
                 assert!(apply.as_mut().now_or_never().is_none());
                 tokio::task::yield_now().await;
             }

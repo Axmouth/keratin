@@ -105,7 +105,7 @@ impl Stroma {
                     .await
                     .map_err(io_err)?;
                 if !stroma.queue_payloads_in_event_log() {
-                    qh.msg_log()
+                    qh.msg_log()?
                         .truncate_before(message_floor)
                         .await
                         .map_err(io_err)?;

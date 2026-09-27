@@ -400,7 +400,7 @@ mod tests {
             Err(StromaError::WrongPartitionKind { .. })
         ));
         let ticket = s.queue_handle("q", 0, None).await.unwrap();
-        assert_eq!(ticket.resolve().unwrap().msg_log().current_epoch(), 7);
+        assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().current_epoch(), 7);
         let mut state = crate::QueueInternalState::new("q".into(), 0);
         s.write_queue_snapshot("q", 0, None, 0, &state.encode_snapshot(0))
             .unwrap();

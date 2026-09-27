@@ -92,7 +92,7 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
     let q = st.queue_handle("q", 0, None).await.unwrap();
     {
         let h = q.resolve().unwrap();
-        assert_eq!(h.msg_log().next_offset(), 0);
+        assert!(h.optional_message_log().is_none());
         assert_eq!(h.work_queue().unwrap().settled_until().await, 1);
         for budget in [1, 1024, 1024 * 1024, 8 * 1024 * 1024] {
             // Cross chunk and segment boundaries, skip a delayed payload and
@@ -161,8 +161,8 @@ async fn delayed_payload_pins_retention_below_snapshot_replay_boundary() {
         0
     );
     assert!(fetch_payload(&q.resolve().unwrap(), 0).unwrap().is_some());
-    assert_eq!(q.resolve().unwrap().msg_log().next_offset(), 0);
-    assert_eq!(q.resolve().unwrap().msg_log().head_offset(), 0);
+    assert!(q.resolve().unwrap().optional_message_log().is_none());
+    assert_eq!(q.resolve().unwrap().physical_logs().count(), 1);
     st.shutdown().await.unwrap();
     drop(q);
     drop(st);
@@ -417,4 +417,261 @@ async fn combined_writer_uses_payload_budgets_and_read_cap_allows_one_oversized_
     assert_eq!(batch.records[0].0, 1);
     assert_eq!(batch.next_offset, 2);
     st.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
+    use crate::OwnerReplicationRead;
+    let dir = keratin_log::test_dir!("combined_single_log_lifecycle");
+    let st = open(&dir.root).await;
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    assert!(h.optional_message_log().is_none());
+    assert!(h.msg_log().is_err());
+    assert_eq!(h.physical_logs().count(), 1);
+    assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+    st.ensure_queue_owner_epoch("q", 0, None, Some(7))
+        .await
+        .unwrap();
+    let OwnerReplicationRead::Batch(lane) = st
+        .read_owner_message_records("q", 0, None, 0, 100)
+        .await
+        .unwrap()
+    else {
+        panic!()
+    };
+    assert_eq!(
+        (lane.epoch, lane.requested_offset, lane.next_offset),
+        (7, 0, 0)
+    );
+    assert!(lane.records.is_empty());
+    assert!(
+        st.read_owner_message_records("q", 0, None, 1, 100)
+            .await
+            .is_err()
+    );
+    publish(&st, false).await;
+    st.become_queue_follower("q", 0, None).await.unwrap();
+    assert!(
+        st.read_owner_message_records("q", 0, None, 0, 100)
+            .await
+            .is_err()
+    );
+    assert_eq!(
+        st.queue_replication_next_offsets("q", 0, None)
+            .await
+            .unwrap(),
+        (0, 1)
+    );
+    // A malformed absent-lane frame is refused before poisoning follower apply.
+    assert!(
+        st.apply_replicated_queue_batch(
+            "q",
+            0,
+            None,
+            Some(crate::ReplicatedMessageBatch {
+                epoch: 6,
+                first_offset: 0,
+                records: vec![],
+                durability: Some(KDurability::AfterFsync),
+            }),
+            None
+        )
+        .await
+        .is_err()
+    );
+    st.become_queue_owner_with_epoch("q", 0, None, 8)
+        .await
+        .unwrap();
+    assert_eq!(h.message_lane_epoch(), 8);
+    assert!(st.advance_queue_epoch("q", 0, None, 7).await.is_err());
+    drop(h);
+    drop(q);
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st = open(&dir.root).await;
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    assert!(h.optional_message_log().is_none());
+    assert_eq!(h.message_lane_epoch(), 8);
+    assert_eq!(
+        fetch_payload(&h, 0).unwrap().unwrap().payload,
+        vec![42; 2048]
+    );
+    drop(h);
+    st.shutdown().await.unwrap();
+}
+
+#[cfg(all(
+    feature = "early-replication-experiment",
+    feature = "io-fault-injection"
+))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() {
+    use crate::{OwnerReplicationRead, ReplicatedEventBatch};
+    use keratin_log::io_fault_injection::{Fault, arm_gated};
+    for prefix in [0, 1] {
+        for fault in [Fault::FsyncPause, Fault::Fsync, Fault::FsyncAfterSuccess] {
+            let owner_dir = keratin_log::test_dir!("combined_early_owner");
+            let follower_dir = keratin_log::test_dir!("combined_early_follower");
+            let mut stores = Vec::new();
+            for dir in [&owner_dir.root, &follower_dir.root] {
+                let cfg = KeratinConfig {
+                    tail_cache_bytes: 8 * 1024 * 1024,
+                    flush_target_bytes: 8,
+                    ..KeratinConfig::test_default()
+                };
+                stores.push(
+                    Stroma::open_with_options(
+                        dir,
+                        StromaKeratinConfig::from_message_log(cfg),
+                        SnapshotConfig {
+                            every_events: u64::MAX,
+                        },
+                        StromaOptions {
+                            combined_queue_log: true,
+                            ..Default::default()
+                        },
+                    )
+                    .await
+                    .unwrap(),
+                );
+            }
+            let owner = &stores[0];
+            let follower = &stores[1];
+            let q = owner.queue_handle("q", 0, None).await.unwrap();
+            let h = q.resolve().unwrap();
+            if prefix == 1 {
+                assert_eq!(publish(owner, false).await, 0);
+            }
+            follower.become_queue_follower("q", 0, None).await.unwrap();
+            let armed = arm_gated(
+                &owner
+                    .tp_part_dir("q", 0, None)
+                    .join("segments/00000000000000000000.log"),
+                fault,
+            )
+            .unwrap();
+            let (completion, mut rx) = KeratinAppendCompletion::pair();
+            owner
+                .append_message_batch(
+                    "q",
+                    0,
+                    None,
+                    vec![PublishItem {
+                        headers: headers(),
+                        payload: vec![73; 4096],
+                        completion,
+                        not_before: None,
+                        expire_at: None,
+                    }],
+                )
+                .await
+                .unwrap();
+            tokio::time::timeout(Duration::from_secs(5), async {
+                while armed.hits() == 0 {
+                    tokio::time::sleep(Duration::from_millis(1)).await;
+                }
+            })
+            .await
+            .unwrap();
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!h.work_queue().unwrap().is_ready(prefix).await);
+            let OwnerReplicationRead::Batch(durable) = owner
+                .read_owner_event_records("q", 0, None, 0, 100)
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(durable.next_offset, prefix);
+            let OwnerReplicationRead::Batch(tentative) = owner
+                .read_owner_event_records_early("q", 0, None, 0, 100)
+                .await
+                .unwrap()
+            else {
+                panic!()
+            };
+            assert_eq!(tentative.next_offset, prefix + 1);
+            follower
+                .apply_open_replicated_queue_batch(
+                    "q",
+                    0,
+                    None,
+                    Box::pin(futures::stream::iter([Ok((
+                        None,
+                        Some(ReplicatedEventBatch {
+                            epoch: tentative.epoch,
+                            first_offset: 0,
+                            events: tentative
+                                .records
+                                .into_iter()
+                                .map(|(_, event)| event)
+                                .collect(),
+                            durability: Some(KDurability::AfterFsync),
+                        }),
+                    ))])),
+                )
+                .await
+                .unwrap();
+            let fq = follower.queue_handle("q", 0, None).await.unwrap();
+            let fh = fq.resolve().unwrap();
+            assert_eq!(fh.event_log().next_offset(), prefix + 1);
+            assert_eq!(
+                fetch_payload(&fh, prefix).unwrap().unwrap().payload,
+                vec![73; 4096]
+            );
+            assert!(matches!(
+                rx.try_recv(),
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+            ));
+            assert!(!h.work_queue().unwrap().is_ready(prefix).await);
+            armed.release();
+            let result = tokio::time::timeout(Duration::from_secs(5), rx)
+                .await
+                .unwrap()
+                .unwrap();
+            if matches!(fault, Fault::FsyncPause) {
+                assert_eq!(result.unwrap().base_offset, prefix);
+                assert!(h.work_queue().unwrap().is_ready(prefix).await);
+            } else {
+                assert!(result.is_err());
+                assert!(!h.work_queue().unwrap().is_ready(prefix).await);
+                let (completion, rx) = KeratinAppendCompletion::pair();
+                let result = owner
+                    .append_message_batch(
+                        "q",
+                        0,
+                        None,
+                        vec![PublishItem {
+                            headers: headers(),
+                            payload: vec![99],
+                            completion,
+                            not_before: None,
+                            expire_at: None,
+                        }],
+                    )
+                    .await;
+                if result.is_ok() {
+                    assert!(
+                        tokio::time::timeout(Duration::from_secs(5), rx)
+                            .await
+                            .unwrap()
+                            .unwrap()
+                            .is_err()
+                    );
+                }
+            }
+            drop(armed);
+            drop(fh);
+            drop(fq);
+            drop(h);
+            drop(q);
+            let _ = owner.shutdown().await;
+            follower.shutdown().await.unwrap();
+        }
+    }
 }

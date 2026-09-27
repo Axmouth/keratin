@@ -50,7 +50,7 @@ async fn older_message_ack_obeys_selected_application_order() {
         pause.entered.notified().await;
         let qh = st.queue_handle("ordering", 0, None).await.unwrap();
         let h = qh.resolve().unwrap();
-        while h.msg_log().durable_offset() < 1 || h.event_log().durable_offset() < 1 {
+        while h.msg_log().unwrap().durable_offset() < 1 || h.event_log().durable_offset() < 1 {
             tokio::task::yield_now().await;
         }
 

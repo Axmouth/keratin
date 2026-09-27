@@ -962,7 +962,7 @@ fn command_send_error(err: mpsc::error::SendError<QueueCommandPackage>) -> std::
 
 #[derive(Debug, Clone)]
 pub struct QueueSharedBundle {
-    pub msg_log: Arc<Keratin>,
+    pub msg_log: Option<Arc<Keratin>>,
     pub event_log: Arc<Keratin>,
     pub task_group: Arc<TaskGroup>,
     pub metrics: Arc<StromaMetrics>,
@@ -1144,7 +1144,7 @@ pub struct QueueHandleInner {
     partition: u32,
     group: Option<String>,
 
-    msg_log: Arc<Keratin>,
+    msg_log: Option<Arc<Keratin>>,
     event_log: Arc<Keratin>,
 
     applied_upto: Arc<AtomicU64>,
@@ -2957,8 +2957,33 @@ impl QueueHandleInner {
         self.group.as_deref()
     }
 
-    pub fn msg_log(&self) -> Arc<Keratin> {
+    /// A separate payload log exists only in the two-log layout.
+    pub fn msg_log(&self) -> Result<Arc<Keratin>, StromaError> {
+        self.msg_log.clone().ok_or_else(|| StromaError::Unsupported(
+            "combined queue has no separate message log".into(),
+        ))
+    }
+
+    pub fn optional_message_log(&self) -> Option<Arc<Keratin>> {
         self.msg_log.clone()
+    }
+
+    pub fn physical_logs(&self) -> impl Iterator<Item = Arc<Keratin>> + '_ {
+        self.msg_log.iter().cloned().chain(std::iter::once(self.event_log.clone()))
+    }
+
+    pub fn payload_log(&self) -> Arc<Keratin> {
+        self.msg_log.clone().unwrap_or_else(|| self.event_log.clone())
+    }
+
+    /// Wire compatibility: the absent message lane has no records. Its fencing
+    /// epoch follows the sole physical log, rather than a second persisted epoch.
+    pub fn message_lane_next(&self) -> u64 {
+        self.msg_log.as_ref().map_or(0, |log| log.next_offset())
+    }
+
+    pub fn message_lane_epoch(&self) -> u64 {
+        self.msg_log.as_ref().unwrap_or(&self.event_log).current_epoch()
     }
 
     pub fn event_log(&self) -> Arc<Keratin> {

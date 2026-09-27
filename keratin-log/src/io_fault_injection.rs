@@ -19,6 +19,8 @@ pub enum Fault {
     PartialWrite,
     Fsync,
     FsyncAfterSuccess,
+    /// Test-only gate that performs a normal sync after release.
+    FsyncPause,
 }
 struct Entry {
     fault: Fault,

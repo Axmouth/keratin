@@ -1613,7 +1613,7 @@ impl Stroma {
                 .handle
                 .get_or_try_init(|| async {
                     self.ensure_partition_not_sealed(tp, part, group)?;
-                    let msg_log = self.msg_log_init(tp, part, group).await?;
+                    let msg_log = if self.queue_payloads_in_event_log() { None } else { Some(self.msg_log_init(tp, part, group).await?) };
                     let event_log = self.event_log_init(tp, part, group).await?;
 
                     let bundle = QueueSharedBundle {
@@ -1641,8 +1641,7 @@ impl Stroma {
                         .map_err(io_err)?
                     {
                         inner.become_follower();
-                        inner.msg_log().become_follower();
-                        inner.event_log().become_follower();
+                        for log in inner.physical_logs() { log.become_follower(); }
                     }
 
                     if slot.exists_on_disk {
@@ -1788,7 +1787,7 @@ impl Stroma {
             wq.shutdown().await;
         }
         qh.event_log().shutdown().await.map_err(io_err)?;
-        qh.msg_log().shutdown().await.map_err(io_err)?;
+        if let Some(log) = qh.optional_message_log() { log.shutdown().await.map_err(io_err)?; }
 
         // Signal completion to any waiters.
         guard.complete();
@@ -1900,7 +1899,7 @@ impl Stroma {
                 wq.shutdown().await;
             }
             qh.event_log().shutdown().await.map_err(io_err)?;
-            qh.msg_log().shutdown().await.map_err(io_err)?;
+            if let Some(log) = qh.optional_message_log() { log.shutdown().await.map_err(io_err)?; }
         }
 
         // 3. Rename the dirs aside while the tombstone still blocks reopen, then
@@ -1979,8 +1978,7 @@ impl Stroma {
         }
 
         qh.freeze();
-        qh.msg_log().freeze();
-        qh.event_log().freeze();
+        for log in qh.physical_logs() { log.freeze(); }
         Ok(())
     }
 
@@ -2004,8 +2002,7 @@ impl Stroma {
             return Ok(());
         };
         qh.freeze_owner_and_wait_operations().await?;
-        qh.msg_log().freeze();
-        qh.event_log().freeze();
+        for log in qh.physical_logs() { log.freeze(); }
         Ok(())
     }
 
@@ -2293,9 +2290,7 @@ impl Stroma {
     }
 
     pub(crate) fn payload_log_for(&self, qh: &QueueHandleInner) -> Arc<Keratin> {
-        #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log { return qh.event_log(); }
-        qh.msg_log()
+        qh.payload_log()
     }
 
     pub(crate) async fn apply_record_inmem(&self, ev: StromaEvent, off: u64, qh: &QueueHandleInner) -> Result<()> {
@@ -2548,7 +2543,7 @@ impl Stroma {
                 // Best-effort physical reclaim (segment-granular, idempotent). The
                 // logical head advance below is what gates reads and keeps the owner
                 // and followers converged on the same head.
-                let _ = qh.msg_log().truncate_before(before).await;
+                let _ = qh.msg_log()?.truncate_before(before).await;
                 let (tx, rx) = tokio::sync::oneshot::channel();
                 qh.stream_command_enqueue(StreamCommand::ApplyTruncation {
                     new_head: before,
@@ -3098,7 +3093,7 @@ impl Stroma {
             );
             return Ok::<(), StromaError>(());
         }
-        let msg_log = qh.msg_log();
+        let msg_log = qh.msg_log()?;
         // The message-log truncation floor is the lowest un-acked offset for a
         // work queue. A stream has no acks and prunes its message log through its
         // own retention worker, so it contributes no floor here (0 truncates
@@ -3661,12 +3656,11 @@ impl Stroma {
                         tp,
                         part,
                         required,
-                        message_next = h.msg_log().next_offset(),
+                        message_next = h.payload_log().next_offset(),
                         "checkpoint payload backfill incomplete; recovery keeps queue as follower"
                     );
                     h.become_follower();
-                    h.msg_log().become_follower();
-                    h.event_log().become_follower();
+                    for log in h.physical_logs() { log.become_follower(); }
                 }
             }
             h.applied_upto().store(applied_upto.last_applied(), Ordering::Release);
@@ -3677,7 +3671,7 @@ impl Stroma {
         let applied_upto = h.applied_upto();
         // The message log's durable tail: an event may not reference a message
         // offset at or beyond this (the message is not durable -> dangling ref).
-        let msg_tail = h.msg_log().next_offset();
+        let msg_tail = h.message_lane_next();
 
         self.metrics
             .recovery
@@ -3808,7 +3802,7 @@ impl Stroma {
         // commits, so a committed cursor clamps against the real retained window
         // rather than an empty one.
         if h.kind() == PartitionKind::Stream {
-            let next = h.msg_log().next_offset();
+            let next = h.msg_log()?.next_offset();
             let (tx, rx) = tokio::sync::oneshot::channel();
             if h.stream_command_enqueue(StreamCommand::AdvanceTail {
                 next_offset: next,
@@ -4045,7 +4039,10 @@ impl Stroma {
                     // A failed writer must not prevent its sibling from draining.
                     // Preserve the first error after both shutdown attempts.
                     let events = q.event_log().shutdown().await.map_err(io_err);
-                    let messages = q.msg_log().shutdown().await.map_err(io_err);
+                    let messages = match q.optional_message_log() {
+                        Some(log) => log.shutdown().await.map_err(io_err),
+                        None => Ok(()),
+                    };
                     events.and(messages)
                 });
             }
@@ -4258,7 +4255,7 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, msg_log, default_ttl_ms) = {
+        let (owner_operation, default_ttl_ms) = {
             let h = qh.resolve()?;
             // Refuse BEFORE anything is appended: a queue publish routed at a
             // stream partition (a client or broker that has not yet learned
@@ -4274,7 +4271,6 @@ impl Stroma {
             }
             (
                 h.begin_owner_operation().await?,
-                h.msg_log(),
                 h.default_message_ttl_ms(),
             )
         };
@@ -4328,6 +4324,7 @@ impl Stroma {
         if self.combined_queue_log {
             return self.append_combined(qh, messages, completion_items, observer, owner_operation).await;
         }
+        let msg_log = qh.resolve()?.msg_log()?;
         let durability = self.keratin_cfg_msg.default_durability;
 
         // Parallel durable append (immediate AND delayed publishes): get the
@@ -4586,7 +4583,7 @@ impl Stroma {
     ) -> Result<()> {
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, msg_log) = {
+        let owner_operation = {
             let h = qh.resolve()?;
             // Same guard as the batch path: refuse before anything is
             // appended, or queue-kind events would durably poison the
@@ -4597,7 +4594,7 @@ impl Stroma {
                      Publish through the stream API, or use a different topic name"
                 )));
             }
-            (h.begin_owner_operation().await?, h.msg_log())
+            h.begin_owner_operation().await?
         };
         let message = Message {
             flags: 0,
@@ -4611,6 +4608,7 @@ impl Stroma {
                 completion: event_completion,
             }], None, owner_operation).await;
         }
+        let msg_log = qh.resolve()?.msg_log()?;
         msg_log
             .append_enqueue(message, None, msg_completion)
             .map_err(io_err)?;
@@ -4716,7 +4714,7 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, None).await?;
         let (owner_operation, msg_log) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.msg_log())
+            (h.begin_owner_operation().await?, h.msg_log()?)
         };
         let (msg_completion, msg_rx) = KeratinAppendCompletion::pair();
         let message = Message {
@@ -4769,7 +4767,7 @@ impl Stroma {
         let qh = self.queue_handle(tp, part, None).await?;
         let (owner_operation, msg_log) = {
             let h = qh.resolve()?;
-            (h.begin_owner_operation().await?, h.msg_log())
+            (h.begin_owner_operation().await?, h.msg_log()?)
         };
         let mut messages = Vec::with_capacity(records.len());
         for (headers, payload) in records {
@@ -4834,7 +4832,7 @@ impl Stroma {
     /// mid-write (which spikes ephemeral delivery tails).
     pub async fn sync_stream(&self, tp: &str, part: u32) -> Result<()> {
         let qh = self.queue_handle(tp, part, None).await?;
-        let msg_log = qh.resolve()?.msg_log();
+        let msg_log = qh.resolve()?.msg_log()?;
         msg_log.sync().await.map_err(io_err)?;
         Ok(())
     }
@@ -4931,7 +4929,7 @@ impl Stroma {
     ) -> Result<Offset> {
         let qh = self.queue_handle(tp, part, None).await?;
         let h = qh.resolve()?;
-        let msg_log = h.msg_log();
+        let msg_log = h.msg_log()?;
         let reader = msg_log.reader();
         let mut lo = msg_log.head_offset();
         let mut hi = msg_log.next_offset();
@@ -4961,7 +4959,7 @@ impl Stroma {
                 return Ok(None);
             };
             let (config, head, tail) = s.retention_state().await?;
-            let infos = h.msg_log().segment_infos().map_err(io_err)?;
+            let infos = h.msg_log()?.segment_infos().map_err(io_err)?;
             (config, head, tail, infos)
         };
 
@@ -5564,7 +5562,7 @@ impl Stroma {
         if self.combined_queue_log {
             return combined::fetch_payload(qh, off);
         }
-        let log = qh.msg_log();
+        let log = qh.msg_log()?;
         let reader = log.reader();
         let rec = reader.fetch(off).map_err(io_err)?.map(|r| r.to_message());
         Ok(rec)
@@ -5674,7 +5672,7 @@ impl Stroma {
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
         #[cfg(feature = "combined-queue-log-experiment")]
         if self.combined_queue_log { return combined::scan_payloads(qh, from, max); }
-        let log = qh.msg_log();
+        let log = qh.msg_log()?;
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
         got.into_iter()
@@ -5770,7 +5768,7 @@ impl Stroma {
             return qh.event_log().truncate_before(before.min(snapshot).min(live)).await.map_err(io_err);
         }
         let (before, _) = self.checkpoint_retention_limits(&qh, before, u64::MAX).await?;
-        qh.msg_log().truncate_before(before).await.map_err(io_err)
+        qh.msg_log()?.truncate_before(before).await.map_err(io_err)
     }
 
     pub async fn cleanup_topic_partition(
@@ -5873,7 +5871,7 @@ impl Stroma {
                 let qh = self.queue_handle(&tp, part, group.as_deref()).await?;
                 let qh = qh.resolve()?;
                 (
-                    qh.msg_log().estimate_disk_used().await.map_err(io_err)?,
+                    match qh.optional_message_log() { Some(log) => log.estimate_disk_used().await.map_err(io_err)?, None => 0 },
                     qh.event_log().estimate_disk_used().await.map_err(io_err)?,
                 )
             } else {
@@ -6031,7 +6029,7 @@ impl Stroma {
             before_event,
             event_head
         );
-        let msg_log = qh.msg_log();
+        let msg_log = qh.msg_log()?;
         // let safe_msg_truncate = self.safe_truncate_before(tp, part, group).await?;
         // A stream has no ack frontier and prunes via retention, so it offers no
         // message-log floor here (0 truncates nothing).
@@ -6376,7 +6374,7 @@ mod tests {
         let queue = st.queue_handle("ordered", 0, None).await.unwrap();
         let handle = queue.resolve().unwrap();
         tokio::time::timeout(Duration::from_secs(5), async {
-            while handle.msg_log().durable_offset() < 1 || handle.event_log().durable_offset() < 1 {
+            while handle.msg_log().unwrap().durable_offset() < 1 || handle.event_log().durable_offset() < 1 {
                 tokio::task::yield_now().await;
             }
         })
@@ -6960,14 +6958,14 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        qh.msg_log().become_follower();
-        qh.msg_log()
+        qh.msg_log().unwrap().become_follower();
+        qh.msg_log().unwrap()
             .destructive_reset_to_checkpoint(7)
             .await
             .unwrap();
-        qh.msg_log().become_owner();
+        qh.msg_log().unwrap().become_owner();
 
-        let read = owner_replication_gap::<Message>("message", &qh.msg_log(), 5, 5, 7).unwrap();
+        let read = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 5, 5, 7).unwrap();
         let OwnerReplicationRead::CheckpointRequired {
             epoch,
             requested_offset,
@@ -7002,7 +7000,7 @@ mod tests {
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
 
-        let read = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 0, 7).unwrap();
+        let read = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 0, 0, 7).unwrap();
         let OwnerReplicationRead::CheckpointRequired {
             epoch,
             requested_offset,
@@ -7034,7 +7032,7 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        let err = owner_replication_gap::<Message>("message", &qh.msg_log(), 0, 3, 7).unwrap_err();
+        let err = owner_replication_gap::<Message>("message", &qh.msg_log().unwrap(), 0, 3, 7).unwrap_err();
         assert!(matches!(err, StromaError::Corruption(_)));
 
         shutdown_stroma("owner_replication_gap_without_head_advance", &stroma).await;
@@ -7054,9 +7052,9 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
         let qh = stroma.queue_handle("topic", 0, None).await.unwrap();
         let qh = qh.resolve().unwrap();
-        qh.msg_log().become_follower();
+        qh.msg_log().unwrap().become_follower();
         qh.event_log().become_follower();
-        qh.msg_log()
+        qh.msg_log().unwrap()
             .destructive_reset_to_checkpoint(1)
             .await
             .unwrap();
@@ -7064,7 +7062,7 @@ mod tests {
             .destructive_reset_to_checkpoint(1)
             .await
             .unwrap();
-        qh.msg_log().become_owner();
+        qh.msg_log().unwrap().become_owner();
         qh.event_log().become_owner();
 
         let messages = stroma
@@ -7121,7 +7119,7 @@ mod tests {
             .become_queue_follower_with_epoch("topic", 0, None, 7)
             .await
             .unwrap();
-        let message_records = qh.msg_log().reader().scan_from(0, 10).unwrap();
+        let message_records = qh.msg_log().unwrap().reader().scan_from(0, 10).unwrap();
         let event_records = qh.event_log().reader().scan_from(0, 10).unwrap();
         let before_state = qh.full_debug_info().await;
         for (message_epoch, event_epoch) in [(6, 7), (7, 6), (8, 7), (7, 8), (6, 6)] {
@@ -7146,13 +7144,13 @@ mod tests {
                 "{error:?}"
             );
             assert!(error.to_string().contains("epoch"));
-            for log in [qh.msg_log(), qh.event_log()] {
+            for log in [qh.msg_log().unwrap(), qh.event_log()] {
                 assert_eq!(log.current_epoch(), 7);
                 assert_eq!(log.head_offset(), 0);
                 assert_eq!(log.next_offset(), 2);
             }
             for (log, before) in [
-                (qh.msg_log(), &message_records),
+                (qh.msg_log().unwrap(), &message_records),
                 (qh.event_log(), &event_records),
             ] {
                 let after = log.reader().scan_from(0, 10).unwrap();
@@ -7857,7 +7855,7 @@ mod tests {
             let qh = stroma.queue_handle("t", 0, None).await.unwrap();
             let h = qh.resolve().unwrap();
             if fail_messages {
-                h.msg_log().shutdown().await.unwrap();
+                h.msg_log().unwrap().shutdown().await.unwrap();
             } else {
                 h.event_log().shutdown().await.unwrap();
             }
@@ -7892,7 +7890,7 @@ mod tests {
                 .await;
             assert!(result.is_err());
             // The other writer's completion was drained before returning error.
-            assert_eq!(h.msg_log().next_offset(), if fail_messages { 0 } else { 1 });
+            assert_eq!(h.msg_log().unwrap().next_offset(), if fail_messages { 0 } else { 1 });
             assert_eq!(
                 h.event_log().next_offset(),
                 if fail_messages { 1 } else { 0 }
@@ -7910,7 +7908,7 @@ mod tests {
                         "t",
                         0,
                         None,
-                        h.msg_log().next_offset(),
+                        h.msg_log().unwrap().next_offset(),
                         h.event_log().next_offset()
                     )
                     .await
@@ -9346,7 +9344,7 @@ mod tests {
         {
             let handle = stroma.queue_handle("t", 0, None).await.unwrap();
             let qh = handle.resolve().unwrap();
-            qh.msg_log().append_batch(vec![Message { flags: 0, headers: vec![], payload: b"confirmed".to_vec() }], Some(KDurability::AfterFsync)).await.unwrap();
+            qh.msg_log().unwrap().append_batch(vec![Message { flags: 0, headers: vec![], payload: b"confirmed".to_vec() }], Some(KDurability::AfterFsync)).await.unwrap();
             qh.event_log().append_batch(vec![
                 event_msg(&StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }).unwrap(),
                 event_msg(&StromaEvent::Enqueue { off: 1, retries: 0, expire_at: None }).unwrap(),
@@ -9671,7 +9669,7 @@ mod open_batch_fault_tests {
                 assert!(result.is_err());
                 assert_eq!(armed.hits(), 1);
                 assert!(!h.work_queue().unwrap().is_ready(0).await);
-                let healthy = if message_fails { h.event_log() } else { h.msg_log() };
+                let healthy = if message_fails { h.event_log() } else { h.msg_log().unwrap() };
                 assert!(healthy.retained_durable_cursor(0, 0, 1, 1_000_000).is_ok(), "healthy sync must complete before returning failure");
                 assert!(*h.follower_apply_state().await);
                 drop(armed);

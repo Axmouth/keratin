@@ -100,7 +100,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
         .unwrap();
     {
         let h = ticket.resolve().unwrap();
-        assert_eq!(h.msg_log().head_offset(), 0);
+        assert_eq!(h.msg_log().unwrap().head_offset(), 0);
         assert!(h.event_log().head_offset() <= base.pin.event_next);
         assert!(h.event_log().next_offset() > base.pin.event_next);
     }
@@ -130,7 +130,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
     st.truncate_partition_log(ticket.clone(), boundary.event_next())
         .await
         .unwrap();
-    assert!(ticket.resolve().unwrap().msg_log().head_offset() > 0);
+    assert!(ticket.resolve().unwrap().msg_log().unwrap().head_offset() > 0);
     assert!(st.read_queue_checkpoint_base(base.pin).await.is_err());
     st.shutdown().await.unwrap();
 }
@@ -285,7 +285,7 @@ async fn corrupt_retention_blocks_compaction_without_blocking_publish() {
     );
     assert!(st.truncate_messages_before("q", 0, None, 4).await.is_err());
     publish(&st, 1).await;
-    assert_eq!(ticket.resolve().unwrap().msg_log().head_offset(), 0);
+    assert_eq!(ticket.resolve().unwrap().msg_log().unwrap().head_offset(), 0);
     assert!(
         st.read_queue_checkpoint_base(base.pin.clone())
             .await
@@ -525,7 +525,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             target.event_next
         );
         assert_eq!(
-            ticket.resolve().unwrap().msg_log().head_offset(),
+            ticket.resolve().unwrap().msg_log().unwrap().head_offset(),
             target.message_head
         );
         publish(&st, 4).await;
