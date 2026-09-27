@@ -40,6 +40,11 @@ Keratin is currently used by **Stroma** as its durability layer.
 
 Other use cases may emerge over time as the design stabilizes and it is meant to be reusable.
 
+## Diagnostics
+
+[Batch tracing](experiments/BATCH_TRACING.md) captures staging, commit and fsync
+overlap with optional buffered diagnostics.
+
 ## Direction
 
 Areas that may be explored further:

@@ -28,6 +28,23 @@ use crate::{
     util::fsync_dir,
 };
 
+// Instrument the same operation in both builds. Only observation is conditional.
+#[cfg(feature = "writer-stage-trace")]
+macro_rules! observe_stage {
+    ($tracer:ident, $stage:expr, $weight:expr, $body:block) => {{
+        if let Some((tracer, id)) = $tracer {
+            let (records, bytes) = $weight;
+            tracer.trace(id, $stage, records, bytes, || $body)
+        } else {
+            $body
+        }
+    }};
+}
+#[cfg(not(feature = "writer-stage-trace"))]
+macro_rules! observe_stage {
+    ($tracer:ident, $stage:expr, $weight:expr, $body:block) => {{ $body }};
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct AppendResult {
     pub base_offset: u64,
@@ -279,6 +296,11 @@ fn encode_append_payloads_into(
 }
 
 impl Log {
+    #[cfg(feature = "writer-stage-trace")]
+    pub(crate) fn trace_path(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// Reclaim empty staging allocations without touching durability or caches.
     pub(crate) fn maintain_staging(&mut self, now: Instant) {
         self.write_buf.maintain(now);
@@ -730,28 +752,7 @@ impl Log {
         let t_encode = Instant::now();
 
         let mut plan_state = self.append_plan_state(base_offset);
-        #[cfg(not(feature = "writer-stage-trace"))]
-        let plan = encode_append_payloads_into(
-            &mut plan_state,
-            payloads,
-            now_ms,
-            t_encode,
-            &mut self.write_buf,
-            &mut self.idx_buf,
-        )?;
-        #[cfg(feature = "writer-stage-trace")]
-        let plan = if let Some((tracer, work_id)) = tracer {
-            tracer.trace(work_id, "encode", payloads.len(), estimated, || {
-                encode_append_payloads_into(
-                    &mut plan_state,
-                    payloads,
-                    now_ms,
-                    t_encode,
-                    &mut self.write_buf,
-                    &mut self.idx_buf,
-                )
-            })?
-        } else {
+        let plan = observe_stage!(tracer, "encode", (payloads.len(), estimated), {
             encode_append_payloads_into(
                 &mut plan_state,
                 payloads,
@@ -759,8 +760,8 @@ impl Log {
                 t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
-            )?
-        };
+            )
+        })?;
         self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
@@ -1011,28 +1012,7 @@ impl Log {
         let t_encode = Instant::now();
 
         let mut plan_state = self.append_plan_state(base_offset);
-        #[cfg(not(feature = "writer-stage-trace"))]
-        let plan = encode_append_payloads_into(
-            &mut plan_state,
-            std::slice::from_ref(payload),
-            now_ms,
-            t_encode,
-            &mut self.write_buf,
-            &mut self.idx_buf,
-        )?;
-        #[cfg(feature = "writer-stage-trace")]
-        let plan = if let Some((tracer, work_id)) = tracer {
-            tracer.trace(work_id, "encode", 1, estimated, || {
-                encode_append_payloads_into(
-                    &mut plan_state,
-                    std::slice::from_ref(payload),
-                    now_ms,
-                    t_encode,
-                    &mut self.write_buf,
-                    &mut self.idx_buf,
-                )
-            })?
-        } else {
+        let plan = observe_stage!(tracer, "encode", (1, estimated), {
             encode_append_payloads_into(
                 &mut plan_state,
                 std::slice::from_ref(payload),
@@ -1040,8 +1020,8 @@ impl Log {
                 t_encode,
                 &mut self.write_buf,
                 &mut self.idx_buf,
-            )?
-        };
+            )
+        })?;
         self.sync_append_plan_state(plan_state);
 
         self.stats.encode += t_encode.elapsed();
@@ -1083,18 +1063,9 @@ impl Log {
         // write log buffer
         if !self.write_buf.is_empty() {
             let t = Instant::now();
-            #[cfg(feature = "writer-stage-trace")]
-            let bytes = self.write_buf.len();
-            #[cfg(not(feature = "writer-stage-trace"))]
-            self.active.append_bytes(&self.write_buf)?;
-            #[cfg(feature = "writer-stage-trace")]
-            if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "log_write", 0, bytes, || {
-                    self.active.append_bytes(&self.write_buf)
-                })?;
-            } else {
-                self.active.append_bytes(&self.write_buf)?;
-            }
+            observe_stage!(tracer, "log_write", (0, self.write_buf.len()), {
+                self.active.append_bytes(&self.write_buf)
+            })?;
             self.stats.log_write += t.elapsed();
             // Feed the just-written batch to the tail cache so tail-following
             // reads serve it from memory instead of scanning this segment while
@@ -1116,18 +1087,9 @@ impl Log {
         // write idx buffer
         if !self.idx_buf.is_empty() {
             let t = Instant::now();
-            #[cfg(feature = "writer-stage-trace")]
-            let bytes = self.idx_buf.len();
-            #[cfg(not(feature = "writer-stage-trace"))]
-            self.index.append_entries_raw(&self.idx_buf)?;
-            #[cfg(feature = "writer-stage-trace")]
-            if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "index_write", 0, bytes, || {
-                    self.index.append_entries_raw(&self.idx_buf)
-                })?;
-            } else {
-                self.index.append_entries_raw(&self.idx_buf)?;
-            }
+            observe_stage!(tracer, "index_write", (0, self.idx_buf.len()), {
+                self.index.append_entries_raw(&self.idx_buf)
+            })?;
             self.stats.idx_write += t.elapsed();
             self.idx_buf.clear();
         }
@@ -1181,10 +1143,10 @@ impl Log {
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<FsyncJob> {
-        #[cfg(feature = "writer-stage-trace")]
-        self.flush_buffers_inner(tracer)?;
-        #[cfg(not(feature = "writer-stage-trace"))]
-        self.flush_buffers()?;
+        self.flush_buffers_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        )?;
 
         Ok(FsyncJob {
             durable_end: self.next_offset,
@@ -1232,14 +1194,9 @@ impl Log {
 
         // manifest is a hint; persist it on interval
         if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
-            #[cfg(not(feature = "writer-stage-trace"))]
-            self.store_periodic_manifest()?;
-            #[cfg(feature = "writer-stage-trace")]
-            if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_periodic_manifest())?;
-            } else {
-                self.store_periodic_manifest()?;
-            }
+            observe_stage!(tracer, "manifest_write", (0, 0), {
+                self.store_periodic_manifest()
+            })?;
         }
 
         Ok(())
@@ -1264,27 +1221,15 @@ impl Log {
     ) -> io::Result<()> {
         crate::drain_diagnostics::fsync(true);
         self.poll_manifest()?;
-        #[cfg(not(feature = "writer-stage-trace"))]
-        self.fsync_files_and_update_manifest()?;
-        #[cfg(feature = "writer-stage-trace")]
-        if let Some((tracer, work_id)) = tracer {
-            tracer.trace(work_id, "fsync", 0, 0, || {
-                self.fsync_files_and_update_manifest()
-            })?;
-        } else {
-            self.fsync_files_and_update_manifest()?;
-        }
+        observe_stage!(tracer, "fsync", (0, 0), {
+            self.fsync_files_and_update_manifest()
+        })?;
 
         // manifest is a hint; persist it on interval
         if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
-            #[cfg(not(feature = "writer-stage-trace"))]
-            self.store_periodic_manifest()?;
-            #[cfg(feature = "writer-stage-trace")]
-            if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_periodic_manifest())?;
-            } else {
-                self.store_periodic_manifest()?;
-            }
+            observe_stage!(tracer, "manifest_write", (0, 0), {
+                self.store_periodic_manifest()
+            })?;
         }
 
         Ok(())
@@ -1558,8 +1503,14 @@ impl Log {
     /// Advance an exact logical floor covered by an external durable checkpoint.
     /// The caller must serialize checkpoint publication and retain its snapshot.
     pub(crate) fn advance_retained_head(&mut self, before: u64, epoch: u64) -> io::Result<u64> {
-        if epoch != self.current_epoch() || before > self.next_offset || before < self.manifest.head_offset {
-            return Err(io::Error::new(io::ErrorKind::InvalidInput, "checkpoint floor differs from current epoch or retained bounds"));
+        if epoch != self.current_epoch()
+            || before > self.next_offset
+            || before < self.manifest.head_offset
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "checkpoint floor differs from current epoch or retained bounds",
+            ));
         }
         self.flush_buffers()?;
         self.fsync()?;

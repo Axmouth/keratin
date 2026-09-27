@@ -26,6 +26,8 @@ mod commit_policy;
 mod drain_diagnostics;
 #[cfg(feature = "writer-stage-trace")]
 mod writer_stage_trace;
+#[cfg(feature = "writer-stage-trace")]
+pub use writer_stage_trace::{flush_writer_stage_trace, finish_writer_stage_trace};
 
 pub use config::*;
 pub use runtime_config::{LogRuntimeConfig, LogRuntimeSettings, LogRuntimeSnapshot, LogRuntimeStatus};

@@ -18,6 +18,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Optional batch timelines share one bounded collector and clock across log writers,
+  with commit-to-fsync links, offset bounds, drop counters and emission timing.
+  Instrumented and ordinary builds now use the same fsync coalescing loop.
+  The diagnostic output changes from per-writer CSV to versioned JSON Lines.
+  See [batch tracing](experiments/BATCH_TRACING.md).
+
 - Add compaction retention constraints for queue replication and a separate
   replacement-generation path for admitted follower repair. Original storage stays
   available as recovery evidence until a durable, fully applied replacement covers
