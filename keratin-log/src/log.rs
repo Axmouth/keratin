@@ -94,6 +94,7 @@ impl FsyncJob {
     }
 
     pub(crate) fn sync(&self) -> io::Result<Duration> {
+        crate::drain_diagnostics::fsync(false);
         let started = Instant::now();
         self.active.sync_data()?;
         self.index.sync_data()?;
@@ -1258,6 +1259,7 @@ impl Log {
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
+        crate::drain_diagnostics::fsync(true);
         self.poll_manifest()?;
         #[cfg(not(feature = "writer-stage-trace"))]
         self.fsync_files_and_update_manifest()?;

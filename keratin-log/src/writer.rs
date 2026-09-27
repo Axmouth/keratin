@@ -541,6 +541,8 @@ fn writer_loop_inner(
     fsync_done_rx: Receiver<FsyncDone>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
+    let flush_on_drain = std::env::var("KERATIN_FLUSH_ON_DRAIN").as_deref() == Ok("1");
+    crate::drain_diagnostics::init();
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
     let mut last_fsync = Instant::now();
@@ -584,10 +586,12 @@ fn writer_loop_inner(
         // Keep linger synced with adaptive tuning.
         batcher.set_linger(linger);
 
-        // (A) If a batch is due by idle timeout, flush it immediately (no I/O wait).
-        if let Some((FlushReason::Timeout, reqs)) = batcher.flush_if_due(Instant::now())
-            && !reqs.is_empty()
-        {
+        // Close an expired batch, or an unexpired tail when the input has drained.
+        // Emptiness is only a batching hint. A racing enqueue stays ordered in the
+        // channel and is handled next. Commit capacity and durability stay unchanged.
+        if let Some(reqs) = take_ready_batch(&mut batcher, Instant::now(), || {
+            flush_on_drain && writes_rx.is_empty()
+        }) {
             stage_reqs_then_post!(
                 tracer,
                 log,
@@ -1312,6 +1316,22 @@ fn stage_replicated_req(
     Ok(outcome)
 }
 
+/// Check the deadline first so drain counts capture only avoided linger waits.
+fn take_ready_batch<T, W: FnMut(&T) -> (usize, usize)>(
+    batcher: &mut BatcherCore<T, W>,
+    now: Instant,
+    input_drained: impl FnOnce() -> bool,
+) -> Option<Vec<T>> {
+    if let Some((_, reqs)) = batcher.flush_if_due(now) {
+        return Some(reqs);
+    }
+    if batcher.len() > 0 && input_drained() {
+        crate::drain_diagnostics::drain(batcher.total_records() as u64);
+        return Some(batcher.flush());
+    }
+    None
+}
+
 /// Stage a flushed batch of AppendReqs.
 /// Returns total bytes staged (for adaptive linger tuning).
 fn stage_reqs(
@@ -1324,6 +1344,10 @@ fn stage_reqs(
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> usize {
+    crate::drain_diagnostics::stage(
+        reqs.iter().map(|r| r.records.len() as u64).sum(),
+        reqs.iter().map(|r| r.records.bytes_len() as u64).sum(),
+    );
     let now_ms = crate::util::unix_millis();
 
     let mut total_bytes: usize = 0;
@@ -1882,4 +1906,68 @@ fn fail_all_pending(
     }
 
     notify_tx.send(NotifyMsg::Batch(items)).ok();
+}
+
+#[cfg(test)]
+mod drain_batch_tests {
+    use super::*;
+
+    fn batcher() -> BatcherCore<u64, impl FnMut(&u64) -> (usize, usize)> {
+        BatcherCore::new(
+            BatcherConfig {
+                max_items: 8,
+                max_records: 8,
+                max_bytes: 1024,
+                linger: Duration::from_secs(60),
+            },
+            |_| (1, 8),
+        )
+    }
+
+    #[test]
+    fn drain_closes_undued_batch_and_racing_arrival_starts_next() {
+        let now = Instant::now();
+        let mut b = batcher();
+        assert!(matches!(b.push(now, 1), PushResult::None));
+        assert!(matches!(b.push(now, 2), PushResult::None));
+        assert_eq!(take_ready_batch(&mut b, now, || true), Some(vec![1, 2]));
+        assert_eq!(b.deadline(now), Deadline::None);
+        assert!(matches!(b.push(now, 3), PushResult::None));
+        assert_eq!(take_ready_batch(&mut b, now, || true), Some(vec![3]));
+    }
+
+    #[test]
+    fn queued_work_or_disabled_hint_keeps_batch_until_deadline() {
+        let now = Instant::now();
+        let mut b = batcher();
+        assert!(matches!(b.push(now, 1), PushResult::None));
+        assert!(take_ready_batch(&mut b, now, || false).is_none());
+        assert!(matches!(b.push(now, 2), PushResult::None));
+        assert_eq!(
+            take_ready_batch(&mut b, now + Duration::from_secs(60), || panic!(
+                "expired batch must not need the drain hint"
+            )),
+            Some(vec![1, 2])
+        );
+    }
+
+    #[test]
+    fn empty_batch_never_checks_drain_or_produces_work() {
+        let mut b = batcher();
+        assert!(
+            take_ready_batch(&mut b, Instant::now(), || panic!(
+                "empty batch must not poll the input"
+            ))
+            .is_none()
+        );
+    }
+
+    #[test]
+    fn drain_preserves_minimum_interval_and_pipeline_capacity() {
+        let now = Instant::now();
+        assert!(!commit_when_idle(0, &now, Duration::from_secs(60), true, 8));
+        assert!(!commit_when_idle(8, &now, Duration::ZERO, true, 8));
+        assert!(!commit_when_idle(1, &now, Duration::ZERO, false, 8));
+        assert!(commit_when_idle(0, &now, Duration::ZERO, true, 8));
+    }
 }

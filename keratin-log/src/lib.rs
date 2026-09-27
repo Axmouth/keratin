@@ -20,6 +20,7 @@ mod suffix_repair;
 mod tail_cache;
 pub mod util;
 mod writer;
+mod drain_diagnostics;
 #[cfg(feature = "writer-stage-trace")]
 mod writer_stage_trace;
 
