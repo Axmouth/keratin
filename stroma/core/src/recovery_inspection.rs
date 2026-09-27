@@ -233,6 +233,7 @@ pub struct RecoveryPairInspector {
     records: u64,
     bytes: u64,
     failed: bool,
+    single_source: bool,
     resource: (String, u32),
     replay: Option<[QueueReplay; 2]>,
     checkpoint_replay: Option<CheckpointReplayPlan>,
@@ -345,6 +346,7 @@ impl RecoveryPairInspector {
             records: 0,
             bytes: 0,
             failed: false,
+            single_source: false,
             resource: (topic.to_string(), partition),
             replay: None,
             checkpoint_replay: None,
@@ -356,7 +358,7 @@ impl RecoveryPairInspector {
     /// sources and may be zero; all sealed records are still verified, including
     /// records after the target. No authority or activation proof is implied.
     pub fn with_queue_replay(mut self, event_next: u64, limits: RecoveryReplayLimits) -> Result<Self, String> {
-        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() || self.checkpoint_replay.is_some() {
+        if self.stream || self.pages != 0 || self.failed || self.single_source || self.replay.is_some() || self.checkpoint_replay.is_some() {
             return Err("queue replay must be configured once before queue inspection".into());
         }
         self.replay = Some([
@@ -371,7 +373,7 @@ impl RecoveryPairInspector {
     /// against the resource-bound seals. This produces diagnostic evidence;
     /// authority, timer transitions and installed lineage still require proof.
     pub fn with_queue_checkpoint_replay(mut self, event_next: u64, limits: RecoveryReplayLimits, max_checkpoint_bytes: u32) -> Result<Self, String> {
-        if self.stream || self.pages != 0 || self.failed || self.replay.is_some() || self.checkpoint_replay.is_some()
+        if self.stream || self.pages != 0 || self.failed || self.single_source || self.replay.is_some() || self.checkpoint_replay.is_some()
             || max_checkpoint_bytes == 0 || max_checkpoint_bytes > 16 * 1024 * 1024
         { return Err("invalid checkpoint replay configuration".into()); }
         if self.seals[0].history.log_layout == QueueLogLayout::Combined {
@@ -386,10 +388,26 @@ impl RecoveryPairInspector {
         Ok(self)
     }
 
+    /// Verify one exact sealed source without reading or charging its duplicate
+    /// twice. The returned pair contains the same source evidence in both slots
+    /// and must never be interpreted as two independent witnesses.
+    /// Configure replay before selecting this mode, and before accepting pages.
+    pub fn with_single_source(mut self) -> Result<Self, String> {
+        if self.pages != 0 || self.failed || self.seals[0] != self.seals[1] {
+            return Err("single-source inspection requires one exact unread seal".into());
+        }
+        self.single_source = true;
+        for log in self.logs.iter_mut().chain(self.live_payloads.iter_mut()) {
+            log.cursors[1].done = true;
+        }
+        Ok(self)
+    }
+
     fn initialize_checkpoint_replay(&mut self) -> Result<(), String> {
         let Some(plan) = &mut self.checkpoint_replay else { return Ok(()); };
-        if !plan.done.iter().all(|done| *done) { return Ok(()); }
+        if !plan.done[0] || (!self.single_source && !plan.done[1]) { return Ok(()); }
         let build = |i: usize| -> Result<QueueReplay, String> {
+            let i = if self.single_source { 0 } else { i };
             let mut replay = if self.seals[i].history.snapshot_digest.is_some() {
                 QueueReplay::from_checkpoint(&self.resource.0, self.resource.1, self.seals[i].history.clone(), plan.target, plan.limits, &plan.buffers[i])?
             } else {
@@ -409,7 +427,7 @@ impl RecoveryPairInspector {
         }
         if let Some(plan) = &self.checkpoint_replay {
             for (i, side) in [RecoverySide::Left, RecoverySide::Right].into_iter().enumerate() {
-                if !plan.done[i] {
+                if !plan.done[i] && !(self.single_source && i == 1) {
                     if self.pages >= self.limits.total_pages { return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1)); }
                     return Ok(Some((side, RecoveryReadRequest {
                         seal: self.seals[i].request.clone(), history_id: self.seals[i].history.id,
@@ -542,7 +560,7 @@ impl RecoveryPairInspector {
             } else if let Some(replay) = &mut self.replay {
                 replay[i].message(record)?;
             }
-            if record.offset >= log.overlap.0 && record.offset < log.overlap.1 {
+            if !self.single_source && record.offset >= log.overlap.0 && record.offset < log.overlap.1 {
                 let id = record_id(record);
                 if let Some(other) = log.pending.remove(&record.offset) {
                     if id != other && log.first_difference.is_none() {
@@ -616,11 +634,17 @@ impl RecoveryPairInspector {
         }
         let (queue_replay, artifacts) = match (self.replay, artifact_limit) {
             (Some([left, right]), Some(limit)) => {
-                let artifacts = [left.finish_artifact(limit)?, right.finish_artifact(limit)?];
+                let left = left.finish_artifact(limit)?;
+                let right = if self.single_source { left.clone() } else { right.finish_artifact(limit)? };
+                let artifacts = [left, right];
                 let evidence = artifacts.each_ref().map(|a| a.evidence().clone());
                 (Some(evidence), Some(artifacts))
             }
-            (Some([left, right]), None) => (Some([left.finish()?, right.finish()?]), None),
+            (Some([left, right]), None) => {
+                let left = left.finish()?;
+                let right = if self.single_source { left.clone() } else { right.finish()? };
+                (Some([left, right]), None)
+            }
             (None, _) => (None, None),
         };
         let mut remaining_proofs = vec![
@@ -648,7 +672,7 @@ impl RecoveryPairInspector {
                 history_ids: [self.seals[0].history.id, self.seals[1].history.id],
                 messages: messages.result(),
                 events: events.result(),
-                references: self.references,
+                references: if self.single_source { [self.references[0].clone(), self.references[0].clone()] } else { self.references },
                 snapshot_digests: [
                     self.seals[0].history.snapshot_digest,
                     self.seals[1].history.snapshot_digest,
@@ -951,6 +975,29 @@ mod tests {
             .with_queue_replay(0, Default::default()).unwrap();
         assert!(run(pair, [[&msg, &future], [&msg, &ev]]).unwrap_err().contains("sealed digest"));
     }
+    #[test]
+    fn single_source_verifies_once_without_hiding_corruption_or_relaxing_budgets() {
+        let msg = messages(0, 4);
+        let sealed = seal(0, &msg, 0, &[]);
+        let limits = RecoveryInspectionLimits { total_records: 4, ..Default::default() };
+        assert!(run(inspector(sealed.clone(), sealed.clone(), limits), [[&msg, &[]], [&msg, &[]]]).unwrap_err().contains("records budget"));
+        let single = || inspector(sealed.clone(), sealed.clone(), limits).with_single_source().unwrap();
+        let report = run(single(), [[&msg, &[]], [&msg, &[]]]).unwrap();
+        assert_eq!(report.records, 4);
+        let mut corrupt = msg.clone();
+        corrupt[0].payload[0] ^= 1;
+        assert!(run(single(), [[&corrupt, &[]], [&msg, &[]]]).unwrap_err().contains("sealed digest"));
+        let different = seal(0, &corrupt, 0, &[]);
+        assert!(inspector(sealed.clone(), different, limits).with_single_source().is_err());
+        let mut started = single();
+        let (side, request) = started.next_read().unwrap().unwrap();
+        started.accept_page(side, page(&request, &msg, 4)).unwrap();
+        assert!(started.with_single_source().is_err());
+        let too_small = RecoveryInspectionLimits { total_records: 3, ..limits };
+        let check = inspector(sealed.clone(), sealed, too_small).with_single_source().unwrap();
+        assert!(run(check, [[&msg, &[]], [&msg, &[]]]).unwrap_err().contains("records budget"));
+    }
+
     #[test]
     fn mixed_log_layouts_are_rejected_before_inspection() {
         let left = seal(0, &[], 0, &[]);

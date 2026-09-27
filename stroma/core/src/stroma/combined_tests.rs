@@ -722,30 +722,41 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
             assert!(st.queue_handle("q", 0, None).await.is_err());
             assert!(!st.msg_tp_part_dir("q", 0, None).exists());
             assert_eq!(st.seal_replica_for_recovery("q", 0, None, seal.clone()).await.unwrap(), sealed);
-            let mut check = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed.clone(),
-                RecoveryInspectionLimits { page_records: 2, page_bytes: 4096, ..Default::default() }).unwrap()
-                .with_queue_checkpoint_replay(5, Default::default(), 4096).unwrap();
-            let mut cursors = [None, None];
-            let mut repeated = [0, 0];
-            while let Some((side, request)) = check.next_read().unwrap() {
-                let i = match side { crate::recovery_inspection::RecoverySide::Left => 0, crate::recovery_inspection::RecoverySide::Right => 1 };
-                assert_ne!(request.source, RecoveryReadSource::Messages);
-                if request.source == RecoveryReadSource::Events && request.from == sealed.event_head { repeated[i] += 1; }
-                let strict = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request.clone()).await.unwrap();
-                let (page, cursor) = st.read_sealed_replica_sequential("q", 0, None, PartitionKind::Queue, request, cursors[i].take()).await.unwrap();
-                assert_eq!(strict, page);
-                cursors[i] = cursor;
-                check.accept_page(side, page).unwrap();
+            let mut paired = None;
+            for single in [false, true] {
+                let mut check = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed.clone(),
+                    RecoveryInspectionLimits { total_records: if single { 10 } else { 20 }, page_records: 2, page_bytes: 4096, ..Default::default() }).unwrap()
+                    .with_queue_checkpoint_replay(5, Default::default(), 4096).unwrap();
+                if single { check = check.with_single_source().unwrap(); }
+                let mut cursors = [None, None];
+                let mut repeated = [0, 0];
+                while let Some((side, request)) = check.next_read().unwrap() {
+                    let i = match side { crate::recovery_inspection::RecoverySide::Left => 0, crate::recovery_inspection::RecoverySide::Right => 1 };
+                    assert_ne!(request.source, RecoveryReadSource::Messages);
+                    if request.source == RecoveryReadSource::Events && request.from == sealed.event_head { repeated[i] += 1; }
+                    let strict = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request.clone()).await.unwrap();
+                    let (page, cursor) = st.read_sealed_replica_sequential("q", 0, None, PartitionKind::Queue, request, cursors[i].take()).await.unwrap();
+                    assert_eq!(strict, page);
+                    cursors[i] = cursor;
+                    check.accept_page(side, page).unwrap();
+                }
+                assert_eq!(repeated, if single { [2, 0] } else { [2, 2] });
+                let (report, [a, b]) = check.finish_with_queue_artifacts(4096).unwrap();
+                assert_eq!(a, b);
+                assert_eq!(report.records, if single { 10 } else { 20 });
+                if let Some((expected, bytes)) = &paired {
+                    assert_eq!(&a, expected);
+                    assert_eq!(report.bytes * 2, *bytes);
+                } else {
+                    paired = Some((a.clone(), report.bytes));
+                }
+                let mut state = crate::QueueInternalState::new("q".into(), 0);
+                state.load_snapshot(a.state_snapshot()).unwrap();
+                assert!(!state.is_ready(1));
+                assert_eq!(state.recovery_live_ranges().iter().cloned().collect::<Vec<_>>(), vec![1..2]);
+                assert_eq!(a.evidence().payload_log.next, 5);
+                drop(cursors);
             }
-            assert_eq!(repeated, [2, 2]);
-            let (_, [a, b]) = check.finish_with_queue_artifacts(4096).unwrap();
-            assert_eq!(a, b);
-            let mut state = crate::QueueInternalState::new("q".into(), 0);
-            state.load_snapshot(a.state_snapshot()).unwrap();
-            assert!(!state.is_ready(1));
-            assert_eq!(state.recovery_live_ranges().iter().cloned().collect::<Vec<_>>(), vec![1..2]);
-            assert_eq!(a.evidence().payload_log.next, 5);
-            drop(cursors);
         }
         st.shutdown().await.unwrap();
     }
