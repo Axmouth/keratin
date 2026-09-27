@@ -60,7 +60,7 @@ pub use storage_history::{PreparedStorageHistory, StorageHistoryBinding};
 mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
-pub use recovery_history::RetainedHistoryIdentity;
+pub use recovery_history::{QueueLogLayout, RetainedHistoryIdentity};
 #[path = "recovery_read.rs"]
 mod recovery_read;
 pub use recovery_read::{

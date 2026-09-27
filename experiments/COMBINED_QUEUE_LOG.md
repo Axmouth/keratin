@@ -57,3 +57,13 @@ the nested body during delivery. Those are separate optimization candidates.
 Follower actor-apply metadata releases its copied bodies after storage encoding.
 The experimental delivery scan-size override defaults to 1 MiB. Preallocation,
 segment sizes, batching limits and durability settings keep their prior defaults.
+
+## Recovery format groundwork
+
+Retained-history evidence now carries an explicit QueueLogLayout. Separate is
+the omitted serialization default, preserving existing separate-history identity
+bytes. Combined evidence names its layout, requires a bound queue history and a
+canonical empty compatibility lane, and is rejected by builds without combined
+format support. Pair inspection rejects mixed layouts before fetching pages.
+This schema groundwork does not enable combined recovery. The operational guards
+remain until replay, transfer, installation and failover acceptance are complete.

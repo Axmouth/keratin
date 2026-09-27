@@ -886,6 +886,7 @@ fn build_capsule(
     // This private replay input is not a sealed-recovery receipt. Its output is
     // used only to construct a checkpoint capsule after both physical scans.
     let history = RetainedHistoryIdentity {
+        log_layout: Default::default(),
         version: 2,
         storage_history: Some(base.pin.storage.clone()),
         id: base.pin.attempt,

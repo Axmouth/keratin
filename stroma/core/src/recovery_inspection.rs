@@ -289,6 +289,9 @@ impl RecoveryPairInspector {
         {
             return Err("invalid recovery inspection limits".into());
         }
+        if left.history.log_layout != right.history.log_layout {
+            return Err("recovery inspection cannot compare different queue log layouts".into());
+        }
         if left.request != right.request {
             return Err("recovery inspection requires one exact seal transition".into());
         }
@@ -928,6 +931,17 @@ mod tests {
             .with_queue_replay(0, Default::default()).unwrap();
         assert!(run(pair, [[&msg, &future], [&msg, &ev]]).unwrap_err().contains("sealed digest"));
     }
+    #[test]
+    fn mixed_log_layouts_are_rejected_before_inspection() {
+        let left = seal(0, &[], 0, &[]);
+        let mut right = left.clone();
+        right.history.log_layout = crate::QueueLogLayout::Combined;
+        let error = RecoveryPairInspector::new(
+            "q", 0, None, false, left, right, RecoveryInspectionLimits::default(),
+        ).err().expect("mixed layouts must fail");
+        assert!(error.contains("different queue log layouts"));
+    }
+
     fn messages(head: u64, next: u64) -> Vec<RecoveryRecord> {
         (head..next)
             .map(|offset| RecoveryRecord {
@@ -964,6 +978,7 @@ mod tests {
             *cursor.hash.finalize().as_bytes()
         };
         let mut history = RetainedHistoryIdentity {
+            log_layout: Default::default(),
             storage_history: None,
             version: 1,
             id: [0; 32],

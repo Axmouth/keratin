@@ -7,8 +7,26 @@ use std::io::Write;
 
 const MAGIC: &[u8; 8] = b"RHIST\0\0\x01";
 
+/// Physical queue layout bound into recovery evidence. Empty separate queues
+/// remain distinct from a queue whose payloads live in the event records.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum QueueLogLayout {
+    #[default]
+    Separate,
+    Combined,
+}
+impl QueueLogLayout {
+    pub fn is_separate(&self) -> bool {
+        matches!(self, Self::Separate)
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedHistoryIdentity {
+    // Omitting the default preserves existing separate-history identity bytes.
+    #[serde(default, skip_serializing_if = "QueueLogLayout::is_separate")]
+    pub log_layout: QueueLogLayout,
     pub version: u32,
     /// Present for version two: original receipt, included in the content ID.
     /// Its storage instance remains the original instance after a cold reopen.
@@ -41,8 +59,35 @@ impl RetainedHistoryIdentity {
         matches!(
             (self.version, self.storage_history.is_some()),
             (1, false) | (2, true)
-        )
+        ) && match self.log_layout {
+            QueueLogLayout::Separate => true,
+            QueueLogLayout::Combined => {
+                cfg!(feature = "combined-queue-log-experiment")
+                    && self.version == 2
+                    && self.message_head == 0
+                    && self.message_next == 0
+                    && self.message_digest == empty_log_digest()
+                    && self.storage_history.as_ref().is_some_and(|h| !h.stream)
+            }
+        }
     }
+
+    /// Bounds of the physical records carrying payloads, including non-payload
+    /// positions in the combined layout. This is not a count of live messages.
+    pub fn payload_bounds(&self) -> (u64, u64) {
+        match self.log_layout {
+            QueueLogLayout::Separate => (self.message_head, self.message_next),
+            QueueLogLayout::Combined => (self.event_head, self.event_next),
+        }
+    }
+}
+
+fn empty_log_digest() -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    hash.update(b"fibril-retained-log-v1\0");
+    hash.update(&0u64.to_be_bytes());
+    hash.update(&0u64.to_be_bytes());
+    *hash.finalize().as_bytes()
 }
 
 fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
@@ -186,6 +231,7 @@ impl Stroma {
             None => None,
         };
         let mut history = RetainedHistoryIdentity {
+            log_layout: Default::default(),
             version: if storage_history.is_some() { 2 } else { 1 },
             storage_history,
             id: [0; 32],
@@ -254,6 +300,55 @@ impl Stroma {
 mod tests {
     use super::*;
     use keratin_log::test_dir;
+
+    #[test]
+    fn recovery_layout_is_explicit_and_bound_to_serialized_identity() {
+        let mut history = RetainedHistoryIdentity {
+            log_layout: QueueLogLayout::Separate,
+            version: 2,
+            storage_history: Some(PreparedStorageHistory {
+                topic: "q".into(), partition: 0, group: None, stream: false,
+                binding: StorageHistoryBinding {
+                    resource_incarnation: [1; 16], accepted_history: [2; 16],
+                    writer_session: [3; 16],
+                },
+                storage_instance: [4; 16],
+            }),
+            id: [0; 32], message_digest: empty_log_digest(), event_digest: [5; 32],
+            snapshot_digest: None, message_head: 0, message_next: 0,
+            event_head: 2, event_next: 9,
+        };
+        let separate = rmp_serde::to_vec_named(&history).unwrap();
+        let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
+            rmp_serde::from_slice(&separate).unwrap();
+        assert!(!keys.contains_key("log_layout"));
+        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&separate).unwrap(), history);
+        assert!(history.valid_version());
+        assert_eq!(history.payload_bounds(), (0, 0));
+
+        history.log_layout = QueueLogLayout::Combined;
+        let combined = rmp_serde::to_vec_named(&history).unwrap();
+        assert_ne!(separate, combined);
+        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&combined).unwrap(), history);
+        assert_eq!(history.payload_bounds(), (2, 9));
+        assert_eq!(history.valid_version(), cfg!(feature = "combined-queue-log-experiment"));
+        let mut unknown = combined;
+        let start = unknown.windows(8).position(|b| b == b"combined").unwrap();
+        unknown[start..start + 8].copy_from_slice(b"unknown!");
+        assert!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&unknown).is_err());
+
+        history.message_next = 1;
+        assert!(!history.valid_version());
+        history.message_next = 0;
+        history.message_digest = [8; 32];
+        assert!(!history.valid_version());
+        history.message_digest = empty_log_digest();
+        history.storage_history.as_mut().unwrap().stream = true;
+        assert!(!history.valid_version());
+        history.storage_history = None;
+        history.version = 1;
+        assert!(!history.valid_version());
+    }
 
     async fn populated(root: &Path, payload: &[u8]) -> Stroma {
         let s = Stroma::open(
