@@ -4,7 +4,7 @@
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_event, hash_record};
-use crate::{QueueInternalState, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
+use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy)]
@@ -21,11 +21,37 @@ impl Default for RecoveryReplayLimits {
     }
 }
 
+/// Exact retained physical log carrying payloads. Combined records also carry
+/// state events. A state artifact does not authorize truncating this coverage.
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+pub struct RecoveryPayloadLog {
+    pub source: RecoveryReadSource,
+    pub head: u64,
+    pub next: u64,
+    pub digest: [u8; 32],
+}
+impl RetainedHistoryIdentity {
+    pub fn payload_log(&self) -> RecoveryPayloadLog {
+        match self.log_layout {
+            QueueLogLayout::Separate => RecoveryPayloadLog {
+                source: RecoveryReadSource::Messages, head: self.message_head,
+                next: self.message_next, digest: self.message_digest,
+            },
+            QueueLogLayout::Combined => RecoveryPayloadLog {
+                source: RecoveryReadSource::Events, head: self.event_head,
+                next: self.event_next, digest: self.event_digest,
+            },
+        }
+    }
+}
+
 /// Evidence at an exclusive event frontier, reconstructed from event zero.
 /// Equal `state_digest` values alone neither establish ancestry nor preserve
 /// payload identity. Compare input history and establish lineage separately.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryQueueReplayEvidence {
+    pub log_layout: QueueLogLayout,
+    pub payload_log: RecoveryPayloadLog,
     pub version: u32,
     pub event_next: u64,
     pub required_message_next: u64,
@@ -96,7 +122,7 @@ impl QueueReplay {
         if history.event_head != 0 || history.message_head != 0 {
             return Err("recovery replay needs a proven checkpoint for compacted history".into());
         }
-        if target > history.event_next || limits.operations_per_replica == 0 {
+        if !history.valid_version() || target > history.event_next || limits.operations_per_replica == 0 {
             return Err("invalid recovery replay target or operation budget".into());
         }
         let mut prefix_hash = blake3::Hasher::new();
@@ -129,7 +155,7 @@ impl QueueReplay {
         envelope: &[u8],
     ) -> Result<Self, String> {
         // The enclosing inspector verifies the receipt's resource binding.
-        if history.snapshot_digest != Some(*blake3::hash(envelope).as_bytes()) {
+        if !history.valid_version() || history.snapshot_digest != Some(*blake3::hash(envelope).as_bytes()) {
             return Err("checkpoint differs from sealed snapshot digest".into());
         }
         if envelope.len() < 28
@@ -159,7 +185,9 @@ impl QueueReplay {
         let meta = state
             .load_snapshot(&envelope[24..24 + len])
             .map_err(|e| e.to_string())?;
-        if meta.last_snapshot_event_offset != next.saturating_sub(1) {
+        if meta.last_snapshot_event_offset != next.saturating_sub(1)
+            || (history.log_layout == QueueLogLayout::Combined && state.required_message_next() > next)
+        {
             return Err("checkpoint state/envelope boundary mismatch".into());
         }
         let mut prefix_hash = blake3::Hasher::new();
@@ -199,6 +227,12 @@ impl QueueReplay {
             .live_ranges
             .get_or_insert_with(|| self.state.recovery_live_ranges());
         if live.contains(&record.offset) {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            if self.history.log_layout == QueueLogLayout::Combined
+                && !matches!(decode_evidence_event(record), Ok(StromaEvent::PayloadEnqueue { .. }))
+            {
+                return Err("live payload points to a non-payload combined record".into());
+            }
             hash_record(&mut self.live_hash, record);
             self.live_seen += 1;
         }
@@ -219,6 +253,17 @@ impl QueueReplay {
         }
         let ev = decode_evidence_event(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
+        #[cfg(feature = "combined-queue-log-experiment")]
+        let payload = matches!(ev, StromaEvent::PayloadEnqueue { .. });
+        #[cfg(not(feature = "combined-queue-log-experiment"))]
+        let payload = false;
+        let combined = self.history.log_layout == QueueLogLayout::Combined;
+        if payload && !combined {
+            return Err("payload-bearing event in a separate-log history".into());
+        }
+        if combined && !payload && ev.max_referenced_msg_offset().is_some_and(|off| off >= record.offset) {
+            return Err("combined recovery event has a forward payload reference".into());
+        }
         let refs = ev.referenced_msg_offsets();
         let work = 1
             + refs.len() as u64
@@ -245,7 +290,7 @@ impl QueueReplay {
             }
             if cancel {
                 self.missing_enqueues.remove(&off);
-            } else if off >= self.history.message_next {
+            } else if off >= self.history.payload_bounds().1 {
                 if enqueue {
                     // Parallel log append may leave a cancelled, never-confirmed
                     // enqueue. It must be cancelled by this exact target.
@@ -260,9 +305,11 @@ impl QueueReplay {
         }
         // Same state operations used by the actor, without delivery, clocks,
         // external DLQ copies, priority scheduling or snapshot mutations.
+        #[cfg(feature = "combined-queue-log-experiment")]
+        let ev = ev.into_record_state(record.offset);
         match ev {
             #[cfg(feature = "combined-queue-log-experiment")]
-            StromaEvent::PayloadEnqueue { .. } => return Err("combined queue recovery reconciliation is not implemented".into()),
+            StromaEvent::PayloadEnqueue { .. } => unreachable!("payload event converted to state operation"),
             StromaEvent::ActivateDelayed { now, max } => {
                 self.state.activate_delayed(now, max as usize);
             }
@@ -314,6 +361,9 @@ impl QueueReplay {
                     record.offset
                 ));
             }
+        }
+        if combined && !payload {
+            self.state.ack(record.offset);
         }
         hash_record(&mut self.prefix_hash, record);
         self.next += 1;
@@ -370,7 +420,11 @@ impl QueueReplay {
             ));
         }
         let required_message_next = self.state.required_message_next();
-        if required_message_next > self.history.message_next {
+        let (payload_head, mut payload_next) = self.history.payload_bounds();
+        if self.history.log_layout == QueueLogLayout::Combined {
+            payload_next = payload_next.min(self.target);
+        }
+        if required_message_next > payload_next {
             return Err("recovery state exceeds verified payload coverage".into());
         }
         let live_payload_digest = if self.verify_live {
@@ -379,7 +433,7 @@ impl QueueReplay {
                 .unwrap_or_else(|| self.state.recovery_live_ranges());
             let mut count = 0u64;
             for range in live.iter() {
-                if range.start < self.history.message_head || range.end > self.history.message_next
+                if range.start < payload_head || range.end > payload_next
                 {
                     return Err("live checkpoint payload is outside retained coverage".into());
                 }
@@ -395,6 +449,8 @@ impl QueueReplay {
             None
         };
         let evidence = RecoveryQueueReplayEvidence {
+            log_layout: self.history.log_layout,
+            payload_log: self.history.payload_log(),
             version: 2,
             event_next: self.target,
             required_message_next,

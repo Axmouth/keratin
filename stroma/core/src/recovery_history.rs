@@ -171,6 +171,7 @@ impl Stroma {
             || &receipt.request != request
             || receipt.history.id != expected_id
             || !receipt.history.valid_version()
+            || (receipt.history.log_layout == QueueLogLayout::Combined) != (!stream && self.queue_payloads_in_event_log())
             || receipt.history.storage_history
                 != self.durable_storage_history_receipt(topic, part, group)?
             || receipt.history.message_head > receipt.history.message_next
@@ -203,14 +204,15 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         request: RecoverySealRequest,
-        messages: &Keratin,
+        messages: Option<&Keratin>,
         events: &Keratin,
     ) -> Result<RetainedHistoryIdentity> {
         let path = self.snap_dir(topic, part, group).join("recovery.history");
         let stream = self.read_partition_kind(topic, part, group) == PartitionKind::Stream;
         let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
-        let agreed = if stream { None } else {
-            self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages, events)?
+        let agreed = match (stream, messages) {
+            (false, Some(messages)) => self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages, events)?,
+            _ => None,
         };
         let checkpoint_snapshot = agreed.is_some();
         let snapshot = if let Some(bytes) = agreed {
@@ -231,18 +233,21 @@ impl Stroma {
             None => None,
         };
         let mut history = RetainedHistoryIdentity {
-            log_layout: Default::default(),
+            log_layout: if messages.is_some() { QueueLogLayout::Separate } else { QueueLogLayout::Combined },
             version: if storage_history.is_some() { 2 } else { 1 },
             storage_history,
             id: [0; 32],
-            message_digest: log_digest(messages)?,
+            message_digest: messages.map(log_digest).transpose()?.unwrap_or_else(empty_log_digest),
             event_digest: log_digest(events)?,
             snapshot_digest,
-            message_head: messages.head_offset(),
-            message_next: messages.next_offset(),
+            message_head: messages.map_or(0, Keratin::head_offset),
+            message_next: messages.map_or(0, Keratin::next_offset),
             event_head: events.head_offset(),
             event_next: events.next_offset(),
         };
+        if !history.valid_version() {
+            return Err(StromaError::InvalidArgument("unsupported retained history layout or binding".into()));
+        }
         let mut hash = blake3::Hasher::new();
         hash.update(b"fibril-retained-history-v1\0");
         hash.update(

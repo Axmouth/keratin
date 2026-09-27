@@ -216,10 +216,6 @@ impl Stroma {
         expected_kind: PartitionKind,
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
-        }
-
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
                 "durable recovery seals require directory-sync support on this platform".into(),
@@ -286,21 +282,25 @@ impl Stroma {
             Some(handle) => Some(handle.follower_apply_state().await),
             None => None,
         };
+        let combined = self.queue_payloads_in_event_log();
+        if combined && (actual != PartitionKind::Queue || self.durable_storage_history_receipt(topic, part, group)?.is_none()) {
+            return Err(StromaError::InvalidArgument("combined recovery requires an admitted queue history".into()));
+        }
         let (messages, events) = match &handle {
-            Some(handle) => (handle.msg_log()?, handle.event_log()),
+            Some(handle) => (handle.optional_message_log(), handle.event_log()),
             None => {
-                let messages = self.msg_log_init(topic, part, group).await?;
+                let messages = if combined { None } else { Some(self.msg_log_init(topic, part, group).await?) };
                 match self.event_log_init(topic, part, group).await {
                     Ok(events) => (messages, events),
                     Err(err) => {
-                        let _ = messages.shutdown().await;
+                        if let Some(messages) = &messages { let _ = messages.shutdown().await; }
                         return Err(err);
                     }
                 }
             }
         };
         let result = async {
-            let max_epoch = messages.current_epoch().max(events.current_epoch());
+            let max_epoch = messages.as_ref().map_or(events.current_epoch(), |m| m.current_epoch().max(events.current_epoch()));
             // Fresh learner authority proves this local copy is outside the
             // active write set. Preserve any earlier seal and its evidence.
             if excluded_learner {
@@ -330,7 +330,7 @@ impl Stroma {
                 partition: part,
                 group: group.map(str::to_owned),
                 request: request.clone(),
-                previous_message_epoch: messages.current_epoch(),
+                previous_message_epoch: messages.as_ref().map_or(events.current_epoch(), |m| m.current_epoch()),
                 previous_event_epoch: events.current_epoch(),
             });
             if intent.previous_message_epoch >= request.fence_epoch
@@ -351,12 +351,12 @@ impl Stroma {
             .map_err(io_err)??;
             tracing::info!(topic, partition = part, group, fence_epoch = request.fence_epoch,
                 transition = %blake3::Hash::from_bytes(request.transition),
-                "recovery seal intent durable; fencing both logs");
+                "recovery seal intent durable; fencing physical logs");
             // The durable intent gates restart BEFORE either log fence changes.
-            messages.freeze();
+            if let Some(messages) = &messages { messages.freeze(); }
             events.freeze();
             let (message_result, event_result) = tokio::join!(
-                messages.advance_epoch(request.fence_epoch),
+                async { match &messages { Some(log) => log.advance_epoch(request.fence_epoch).await.map(|_| ()), None => Ok(()) } },
                 events.advance_epoch(request.fence_epoch),
             );
             message_result.map_err(io_err)?;
@@ -373,7 +373,7 @@ impl Stroma {
                     part,
                     group_owned.as_deref(),
                     request_owned,
-                    &message_copy,
+                    message_copy.as_deref(),
                     &event_copy,
                 )
             })
@@ -384,7 +384,7 @@ impl Stroma {
                 partition = part,
                 group,
                 fence_epoch = request.fence_epoch,
-                message_next = messages.next_offset(),
+                message_next = messages.as_ref().map_or(0, |m| m.next_offset()),
                 event_next = events.next_offset(),
                 history = %blake3::Hash::from_bytes(history.id),
                 "replica sealed; local bounds require recovery history validation"
@@ -392,15 +392,18 @@ impl Stroma {
             Ok(SealedReplicaFrontiers {
                 request,
                 history,
-                message_head: messages.head_offset(),
-                message_next: messages.next_offset(),
+                message_head: messages.as_ref().map_or(0, |m| m.head_offset()),
+                message_next: messages.as_ref().map_or(0, |m| m.next_offset()),
                 event_head: events.head_offset(),
                 event_next: events.next_offset(),
             })
         }
         .await;
         if handle.is_none() {
-            let (message_close, event_close) = tokio::join!(messages.shutdown(), events.shutdown());
+            let (message_close, event_close) = tokio::join!(
+                async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } },
+                events.shutdown(),
+            );
             message_close.map_err(io_err)?;
             event_close.map_err(io_err)?;
         }

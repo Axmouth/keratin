@@ -86,7 +86,12 @@ impl RecoverySequentialRead {
                 return Err(invalid("snapshot is not a sequential log"));
             }
         };
-        if self.source != Some(request.source) {
+        // A completed combined event scan can restart at its retained head for
+        // live-payload verification. No incomplete scan may rewind.
+        let repeat_combined = self.history.log_layout == QueueLogLayout::Combined
+            && request.source == RecoveryReadSource::Events && self.next == self.end
+            && request.from == head;
+        if self.source != Some(request.source) || repeat_combined {
             if self.source.is_some() && self.next != self.end {
                 return Err(invalid("previous sequential log is incomplete"));
             }
@@ -294,13 +299,14 @@ impl Stroma {
                 ];
                 let mut cold_locks = Vec::new();
                 let _live_logs = if let Some(handle) = &handle {
-                    let logs = [handle.msg_log()?, handle.event_log()];
+                    let logs: Vec<_> = handle.physical_logs().collect();
                     if logs.iter().any(|log| log.role() != KeratinRole::Frozen) {
                         return Err(corrupt("sealed logs are not frozen"));
                     }
                     Some(logs)
                 } else {
-                    for root in &roots {
+                    for (index, root) in roots.iter().enumerate() {
+                        if index == 0 && history.log_layout == QueueLogLayout::Combined { continue; }
                         cold_locks.push(lock_existing_log(root).map_err(io_err)?);
                     }
                     None
@@ -350,7 +356,9 @@ impl Stroma {
                     snapshot_bytes: vec![],
                 };
                 if sequential {
-                    if request.source != RecoveryReadSource::Snapshot {
+                    if request.source == RecoveryReadSource::Messages && history.log_layout == QueueLogLayout::Combined {
+                        if request.from != 0 { return Err(invalid("combined message lane cursor must be zero")); }
+                    } else if request.source != RecoveryReadSource::Snapshot {
                         let index = if request.source == RecoveryReadSource::Messages {
                             0
                         } else {
@@ -384,6 +392,7 @@ impl Stroma {
                             }
                             page.end = end;
                         }
+                        if index == 0 && history.log_layout == QueueLogLayout::Combined { continue; }
                         let reader = FrozenLogReader::open(
                             &roots[index],
                             request.seal.fence_epoch,

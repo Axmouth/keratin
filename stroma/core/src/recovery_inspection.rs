@@ -4,7 +4,7 @@
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::{
     RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
-    RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent,
+    RetainedHistoryIdentity, SealedReplicaFrontiers, StromaEvent, QueueLogLayout,
 };
 use std::collections::BTreeMap;
 use crate::recovery_replay::{QueueReplay, RecoveryQueueReplayEvidence, RecoveryQueueStateArtifact, RecoveryReplayLimits};
@@ -236,6 +236,9 @@ pub struct RecoveryPairInspector {
     resource: (String, u32),
     replay: Option<[QueueReplay; 2]>,
     checkpoint_replay: Option<CheckpointReplayPlan>,
+    // A bounded second event-log pass verifies live payloads after combined
+    // state reconstruction, including payloads older than the snapshot.
+    live_payloads: Option<LogPair>,
 }
 
 struct CheckpointReplayPlan {
@@ -327,11 +330,13 @@ impl RecoveryPairInspector {
                 return Err("recovery history does not identify requested resource".into());
             }
         }
+        let mut messages = LogPair::new(bounds(&left.history, false), bounds(&right.history, false));
+        if left.history.log_layout == QueueLogLayout::Combined {
+            // valid_version checked the canonical empty-lane identity.
+            for cursor in &mut messages.cursors { cursor.done = true; }
+        }
         Ok(Self {
-            logs: [
-                LogPair::new(bounds(&left.history, false), bounds(&right.history, false)),
-                LogPair::new(bounds(&left.history, true), bounds(&right.history, true)),
-            ],
+            logs: [messages, LogPair::new(bounds(&left.history, true), bounds(&right.history, true))],
             seals: [left, right],
             limits,
             references: Default::default(),
@@ -343,6 +348,7 @@ impl RecoveryPairInspector {
             resource: (topic.to_string(), partition),
             replay: None,
             checkpoint_replay: None,
+            live_payloads: None,
         })
     }
     /// Request deterministic queue reconstruction in addition to retained-log
@@ -368,6 +374,9 @@ impl RecoveryPairInspector {
         if self.stream || self.pages != 0 || self.failed || self.replay.is_some() || self.checkpoint_replay.is_some()
             || max_checkpoint_bytes == 0 || max_checkpoint_bytes > 16 * 1024 * 1024
         { return Err("invalid checkpoint replay configuration".into()); }
+        if self.seals[0].history.log_layout == QueueLogLayout::Combined {
+            self.live_payloads = Some(LogPair::new(bounds(&self.seals[0].history, true), bounds(&self.seals[1].history, true)));
+        }
         self.checkpoint_replay = Some(CheckpointReplayPlan {
             target: event_next, limits, max_bytes: max_checkpoint_bytes,
             buffers: Default::default(), ends: [None; 2],
@@ -414,8 +423,9 @@ impl RecoveryPairInspector {
         // Reconstruct state before streaming live payload identities. Ordinary
         // retained-log inspection preserves its original message-first order.
         let order = if self.checkpoint_replay.is_some() { [1, 0] } else { [0, 1] };
-        for index in order {
-            let log = &self.logs[index];
+        let reads = order.into_iter().map(|index| (&self.logs[index], if index == 0 { RecoveryReadSource::Messages } else { RecoveryReadSource::Events }))
+            .chain(self.live_payloads.iter().map(|log| (log, RecoveryReadSource::Events)));
+        for (log, source) in reads {
             if let Some(side) = log.next_side() {
                 if self.pages >= self.limits.total_pages {
                     return Err(Limit::message(Budget::InspectionPages, self.limits.total_pages, self.pages, 1));
@@ -426,11 +436,7 @@ impl RecoveryPairInspector {
                     RecoveryReadRequest {
                         seal: seal.request.clone(),
                         history_id: seal.history.id,
-                        source: if index == 0 {
-                            RecoveryReadSource::Messages
-                        } else {
-                            RecoveryReadSource::Events
-                        },
+                        source,
                         from: log.cursors[side.index()].next,
                         max_records: self.limits.page_records,
                         max_bytes: self.limits.page_bytes,
@@ -485,7 +491,10 @@ impl RecoveryPairInspector {
         } else {
             1
         };
-        let log = &mut self.logs[log_index];
+        let payload_pass = self.logs.iter().all(|log| log.next_side().is_none());
+        let log = if payload_pass {
+            self.live_payloads.as_mut().ok_or("unexpected payload-verification pass")?
+        } else { &mut self.logs[log_index] };
         let cursor = &mut log.cursors[i];
         if side != expected_side
             || page.history_id != request.history_id
@@ -523,7 +532,9 @@ impl RecoveryPairInspector {
         }
         for record in &page.records {
             hash_record(&mut cursor.hash, record);
-            if log_index == 1 {
+            if payload_pass {
+                self.replay.as_mut().ok_or("payload verification needs replay")?[i].message(record)?;
+            } else if log_index == 1 {
                 self.references[i].inspect(record, &self.seals[i].history, self.stream);
                 if let Some(replay) = &mut self.replay {
                     replay[i].apply(record)?;
@@ -713,13 +724,20 @@ impl RecoveryReferenceInspection {
                     required = None;
                 }
             }
-            if off < history.message_head || off >= history.message_next {
+            let (head, next) = history.payload_bounds();
+            if off < head || off >= next {
                 first_missing.get_or_insert(off);
             }
         };
         match event {
             #[cfg(feature = "combined-queue-log-experiment")]
-            StromaEvent::PayloadEnqueue { .. } => { self.gap(record.offset, RecoverySemanticGap::CombinedQueueFormatUnsupported); return; }
+            StromaEvent::PayloadEnqueue { .. } => {
+                if history.log_layout != QueueLogLayout::Combined {
+                    self.gap(record.offset, RecoverySemanticGap::CombinedQueueFormatUnsupported);
+                    return;
+                }
+                reference(record.offset);
+            }
             StromaEvent::Enqueue { off, .. } | StromaEvent::EnqueueDelayed { off, .. } => {
                 reference(off)
             }
@@ -797,6 +815,8 @@ mod tests {
     // Kept with these helpers so sealed page identity and digest validation use
     // exactly the same path as retained-history comparisons.
     include!("recovery_checkpoint_tests.rs");
+    #[cfg(feature = "combined-queue-log-experiment")]
+    include!("combined_recovery_replay_tests.rs");
 
     #[test]
     fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {
