@@ -113,8 +113,10 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     })
 }
 
-/// The exact physical-log dependency of one successfully applied queue batch.
-/// Frontiers are exclusive; epochs identify the log histories that contain it.
+/// Exclusive payload and state frontiers for a successfully applied queue batch.
+/// Single-log queues project both frontiers into event-log coordinates. These
+/// differ from the zero physical message-lane cursor used during replication.
+/// Epochs identify the accepted log history.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuePublishCommit {
     pub message_next: Offset,
