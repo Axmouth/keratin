@@ -106,16 +106,22 @@ pub struct ReplicatedQueueApplyOutcome {
 
 /// Compacted queue state for a follower that fell behind retained event logs.
 ///
-/// This is not a message transfer. Messages at or after `message_next_offset`
-/// still need to be replicated through the message-log replication path before
-/// the follower can safely promote.
+/// This installs state, with payload backfill required before promotion. Separate
+/// queues resume messages at `message_next_offset`. Combined queues resume the
+/// event log at `event_start_offset`, retaining the snapshot's exact applied cut.
+/// Combined checkpoint reset requires an externally authorized excluded learner.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct FollowerStateCheckpointInstall {
+    /// Whether payloads share the queue event log.
+    pub combined_log: bool,
+    /// First physical event record to backfill. State replay starts at event_next_offset.
+    pub event_start_offset: Offset,
     /// Exact source epochs. Assignment/replication fencing must establish these
     /// locally before checkpoint installation; installation cannot advance them.
     pub message_epoch: u64,
     pub event_epoch: u64,
     pub message_next_offset: Offset,
+    /// Exclusive applied state boundary, independent of physical backfill start.
     pub event_next_offset: Offset,
     pub applied_event_offset: Offset,
     pub state_snapshot: Vec<u8>,
@@ -136,10 +142,15 @@ pub struct FollowerStateCheckpointInstallOutcome {
 /// follower must catch up to before promotion.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct OwnerStateCheckpoint {
+    /// Whether payloads share the queue event log.
+    pub combined_log: bool,
+    /// First physical event record to backfill. State replay starts at event_next_offset.
+    pub event_start_offset: Offset,
     pub message_epoch: u64,
     pub event_epoch: u64,
     pub message_checkpoint_offset: Offset,
     pub message_next_offset: Offset,
+    /// Exclusive applied state boundary, independent of physical backfill start.
     pub event_next_offset: Offset,
     pub applied_event_offset: Offset,
     pub state_snapshot: Vec<u8>,
@@ -439,11 +450,7 @@ impl Stroma {
                 ));
             }
         }
-        let message_log = qh.msg_log()?;
-        let event_log = qh.event_log();
-        let (messages, events) = tokio::join!(message_log.sync(), event_log.sync());
-        messages.map_err(io_err)?;
-        events.map_err(io_err)?;
+        for log in qh.physical_logs() { log.sync().await.map_err(io_err)?; }
         Ok(crate::QueuePublishCommit {
             message_next,
             event_next,
@@ -913,10 +920,6 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<OwnerStateCheckpoint> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
-        }
-
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let _apply = qh.follower_apply_state().await;
@@ -957,9 +960,11 @@ impl Stroma {
             };
 
             Ok(OwnerStateCheckpoint {
+                combined_log: self.queue_payloads_in_event_log(),
+                event_start_offset: if self.queue_payloads_in_event_log() { state_checkpoint.message_checkpoint_offset.min(event_next_offset) } else { event_next_offset },
                 message_epoch: qh.message_lane_epoch(),
                 event_epoch: qh.event_log().current_epoch(),
-                message_checkpoint_offset: state_checkpoint.message_checkpoint_offset,
+                message_checkpoint_offset: if self.queue_payloads_in_event_log() { 0 } else { state_checkpoint.message_checkpoint_offset },
                 message_next_offset,
                 event_next_offset,
                 applied_event_offset,
@@ -1165,6 +1170,13 @@ impl Stroma {
                         .min(batch.events.len() as u64) as usize,
                     None => 0,
                 };
+                // Snapshot backfill may skip old state events, but its physical
+                // payload dependencies must be checked before that cut is ready.
+                #[cfg(feature = "combined-queue-log-experiment")]
+                if self.combined_queue_log && skip > 0
+                    && applied_next.is_some_and(|next| batch.first_offset.saturating_add(batch.events.len() as u64) >= next) {
+                    self.verify_combined_payload_coverage(qh, false).await?;
+                }
                 let count = batch.events.len() - skip;
                 if count > 0 {
                     let scope = qh.ordered_apply_scope();

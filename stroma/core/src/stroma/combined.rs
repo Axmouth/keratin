@@ -414,3 +414,30 @@ pub(super) fn recover_events(
 #[cfg(test)]
 #[path = "combined_tests.rs"]
 mod tests;
+
+impl Stroma {
+    pub(crate) async fn verify_combined_payload_coverage(&self, h: &QueueHandleInner, pending_backfill: bool) -> Result<()> {
+        let captured = h.capture_exact_checkpoint(false).await?;
+        let ranges = captured.state.recovery_live_ranges();
+        let log = h.event_log();
+        tokio::task::spawn_blocking(move || {
+            let reader = log.reader();
+            for range in ranges.iter() {
+                let end = if pending_backfill { range.end.min(log.next_offset()) } else { range.end };
+                let mut off = range.start;
+                while off < end {
+                    let records = reader.scan_from_disk(off, (end-off).min(1024) as usize).map_err(io_err)?;
+                    if records.is_empty() { return Err(StromaError::Corruption("live combined payload was not retained".into())); }
+                    for record in records {
+                        if record.offset != off || !matches!(StromaEvent::decode(&record.payload).map_err(decode_err)?, StromaEvent::PayloadEnqueue{..}) {
+                            return Err(StromaError::Corruption("live state does not identify a retained payload enqueue".into()));
+                        }
+                        off += 1;
+                    }
+                }
+            }
+            Ok::<_, StromaError>(())
+        }).await.map_err(io_err)??;
+        Ok(())
+    }
+}

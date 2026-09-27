@@ -80,10 +80,6 @@ impl Stroma {
         receipt: PreparedStorageHistory,
         intent: [u8; 32],
     ) -> Result<Self> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
-        }
-
         if !cfg!(unix) || intent == [0; 32] || receipt.stream {
             return Err(invalid(
                 "queue reseed requires an exact intent and durable directories",
@@ -256,15 +252,15 @@ impl Stroma {
             replacement.ensure_not_recovery_sealed()?;
             if *new_apply
                 || replacement.role()!=QueueRole::Follower
-                || replacement.msg_log()?.current_epoch()!=epoch
+                || replacement.message_lane_epoch()!=epoch
                 || replacement.event_log().current_epoch()!=epoch
                 || replacement.ordered_applied_next()?!=Some(ready.event_next)
                 || !matches!(old.role(), QueueRole::Follower | QueueRole::Frozen)
-                || old.msg_log()?.current_epoch() != epoch
+                || old.message_lane_epoch() != epoch
                 || old.event_log().current_epoch() != epoch
-                || ready.message_next < old.msg_log()?.next_offset()
+                || ready.message_next < old.message_lane_next()
                 || ready.event_next < old.event_log().next_offset()
-                || ready.message_next != replacement.msg_log()?.next_offset()
+                || ready.message_next != replacement.message_lane_next()
                 || ready.event_next != replacement.event_log().next_offset()
             {
                 return Err(invalid(
@@ -272,7 +268,7 @@ impl Stroma {
                 ));
             }
             if let Some(wq)=replacement.as_work_queue() {
-                if wq.required_message_next().await.map_err(io_err)?>ready.message_next {
+                if wq.required_message_next().await.map_err(io_err)?>replacement.payload_log().next_offset() {
                     return Err(invalid("reseed payload dependency changed during verification"));
                 }
             }
@@ -339,8 +335,7 @@ impl Stroma {
                 if let Some(wq) = handle.as_work_queue() {
                     wq.shutdown().await;
                 }
-                handle.msg_log()?.shutdown().await.map_err(io_err)?;
-                handle.event_log().shutdown().await.map_err(io_err)?;
+                for log in handle.physical_logs() { log.shutdown().await.map_err(io_err)?; }
             }
             st.remove_queue(topic, part, group);
             view.remove_queue(topic, part, group);
@@ -457,10 +452,6 @@ impl Stroma {
         binding: StorageHistoryBinding,
         intent: [u8; 32],
     ) -> Result<PreparedStorageHistory> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
-        }
-
         if !cfg!(unix) || intent == [0; 32] {
             return Err(invalid(
                 "learner generation requires durable directories and an exact intent",
@@ -587,8 +578,7 @@ impl Stroma {
                 if let Some(wq) = h.as_work_queue() {
                     wq.shutdown().await;
                 }
-                h.msg_log()?.shutdown().await.map_err(io_err)?;
-                h.event_log().shutdown().await.map_err(io_err)?;
+                for log in h.physical_logs() { log.shutdown().await.map_err(io_err)?; }
             }
             st.remove_queue(&topic, part, group.as_deref());
             st.admitted_histories.remove(&resource_key);

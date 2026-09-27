@@ -20,7 +20,7 @@ struct Journal {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Phase {
     Pending(FollowerStateCheckpointInstall),
-    Complete { digest: [u8; 32] },
+    Complete { digest: [u8; 32], backfill: Option<Box<FollowerStateCheckpointInstall>> },
 }
 
 fn digest(install: &FollowerStateCheckpointInstall) -> Result<[u8; 32]> {
@@ -32,6 +32,12 @@ fn validate(
     part: u32,
     install: &FollowerStateCheckpointInstall,
 ) -> Result<(QueueInternalState, crate::SnapshotMeta)> {
+    if install.event_start_offset > install.event_next_offset
+        || (!install.combined_log && install.event_start_offset != install.event_next_offset)
+        || (install.combined_log && (!cfg!(feature = "combined-queue-log-experiment")
+            || install.message_next_offset != 0 || install.message_epoch != install.event_epoch)) {
+        return Err(StromaError::InvalidArgument("invalid checkpoint layout or physical start".into()));
+    }
     if install.applied_event_offset != install.event_next_offset.saturating_sub(1) {
         return Err(StromaError::InvalidArgument(format!(
             "checkpoint applied event offset {} does not match event continuation {}",
@@ -48,7 +54,9 @@ fn validate(
             meta.last_snapshot_event_offset, install.applied_event_offset,
         )));
     }
-    if install.message_next_offset > state.lowest_not_settled_offset() {
+    let payload_start = if install.combined_log { install.event_start_offset } else { install.message_next_offset };
+    if payload_start > state.lowest_not_settled_offset()
+        || (install.combined_log && state.required_message_next() > install.event_next_offset) {
         return Err(StromaError::InvalidArgument(format!(
             "checkpoint message continuation {} skips state-referenced messages from {}",
             install.message_next_offset,
@@ -196,7 +204,7 @@ impl Stroma {
                 .await?;
             Ok(FollowerStateCheckpointInstallOutcome {
                 message_next_offset: install.message_next_offset,
-                event_next_offset: install.event_next_offset,
+                event_next_offset: install.event_start_offset,
                 applied_event_offset: install.applied_event_offset,
                 snapshot_meta: meta,
             })
@@ -230,7 +238,7 @@ impl Stroma {
             .await?;
             Ok(FollowerStateCheckpointInstallOutcome {
                 message_next_offset: install.message_next_offset,
-                event_next_offset: install.event_next_offset,
+                event_next_offset: install.event_start_offset,
                 applied_event_offset: install.applied_event_offset,
                 snapshot_meta: meta,
             })
@@ -247,8 +255,11 @@ impl Stroma {
         install: &FollowerStateCheckpointInstall,
         learner: Option<&PreparedStorageHistory>,
     ) -> Result<()> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        if install.combined_log != self.queue_payloads_in_event_log() {
+            return Err(StromaError::InvalidArgument("checkpoint layout differs from local queue format".into()));
+        }
+        if install.combined_log && learner.is_none() {
+            return Err(StromaError::InvalidArgument("combined checkpoint reset requires excluded learner authorization".into()));
         }
 
         loop {
@@ -278,7 +289,7 @@ impl Stroma {
             h.work_queue()?;
             Self::checkpoint_epochs(&h, install)?;
             let hash = digest(install)?;
-            if matches!(self.checkpoint_journal(topic, part, group)?.map(|j| j.phase), Some(Phase::Complete { digest }) if digest == hash)
+            if matches!(self.checkpoint_journal(topic, part, group)?.map(|j| j.phase), Some(Phase::Complete { digest, .. }) if digest == hash)
             {
                 // Already committed. In particular, do not wipe later backfill.
                 return Ok(());
@@ -340,14 +351,15 @@ impl Stroma {
         h: &QueueHandleInner,
         install: &FollowerStateCheckpointInstall,
     ) -> Result<()> {
-        if (h.msg_log()?.current_epoch(), h.event_log().current_epoch())
+        if install.combined_log != h.optional_message_log().is_none()
+            || (h.message_lane_epoch(), h.event_log().current_epoch())
             != (install.message_epoch, install.event_epoch)
         {
             return Err(StromaError::InvalidArgument(format!(
                 "checkpoint epochs ({}, {}) do not match local epochs ({}, {})",
                 install.message_epoch,
                 install.event_epoch,
-                h.msg_log()?.current_epoch(),
+                h.message_lane_epoch(),
                 h.event_log().current_epoch(),
             )));
         }
@@ -408,17 +420,14 @@ impl Stroma {
                 let (state, meta) = validate(topic, part, install)?;
                 Self::checkpoint_epochs(h, install)?;
                 for log in h.physical_logs() { log.become_follower(); }
-                h.msg_log()?
-                    .destructive_reset_to_checkpoint_at_epoch(
-                        install.message_next_offset,
-                        install.message_epoch,
-                    )
-                    .await
-                    .map_err(io_err)?;
+                if !install.combined_log {
+                    h.msg_log()?.destructive_reset_to_checkpoint_at_epoch(install.message_next_offset, install.message_epoch)
+                        .await.map_err(io_err)?;
+                }
                 self.checkpoint_boundary("messages")?;
                 h.event_log()
                     .destructive_reset_to_checkpoint_at_epoch(
-                        install.event_next_offset,
+                        install.event_start_offset,
                         install.event_epoch,
                     )
                     .await
@@ -472,6 +481,24 @@ impl Stroma {
         Ok(())
     }
 
+    pub(super) fn permits_combined_checkpoint_backfill(
+        &self, topic: &str, part: u32, group: Option<&str>, next: u64, snapshot: &[u8], log: &Keratin,
+    ) -> Result<bool> {
+        if !self.queue_payloads_in_event_log()
+            || !self.snap_dir(topic, part, group).join("storage.learner").try_exists().map_err(io_err)? {
+            return Ok(false);
+        }
+        let Some(journal) = self.checkpoint_journal(topic, part, group)? else { return Ok(false); };
+        let Phase::Complete { digest: expected, backfill: Some(install) } = journal.phase else { return Ok(false); };
+        validate(topic, part, &install)?;
+        Ok(install.combined_log && digest(&install)? == expected
+            && journal.history.is_some() && journal.history == self.storage_history_binding(topic, part, group)?
+            && install.event_epoch == log.current_epoch()
+            && install.event_next_offset == next && install.state_snapshot == snapshot
+            && install.event_start_offset == log.head_offset()
+            && log.next_offset() >= install.event_start_offset && log.next_offset() < next)
+    }
+
     fn publish_checkpoint_snapshot_and_receipt(&self, mut journal: Journal) -> Result<()> {
         let Phase::Pending(install) = &journal.phase else {
             return Ok(());
@@ -492,7 +519,8 @@ impl Stroma {
         recovery_seal::sync_directories(&self.root.join("tmp"))?;
         self.checkpoint_boundary("snapshot")?;
         let hash = digest(install)?;
-        journal.phase = Phase::Complete { digest: hash };
+        let backfill = install.combined_log.then(|| Box::new(install.clone()));
+        journal.phase = Phase::Complete { digest: hash, backfill };
         persist_journal(
             &self.checkpoint_journal_path(
                 &journal.topic,
@@ -569,26 +597,16 @@ impl Stroma {
                     message_epoch = install.message_epoch, event_epoch = install.event_epoch,
                     message_next = install.message_next_offset, event_next = install.event_next_offset,
                     "resuming interrupted checkpoint before ordinary log recovery");
-                Keratin::rebuild_for_checkpoint_recovery(vec![
-                    (
-                        self.msg_tp_part_dir(
-                            &journal.topic,
-                            journal.partition,
-                            journal.group.as_deref(),
-                        ),
-                        install.message_next_offset,
-                        install.message_epoch,
-                    ),
-                    (
-                        self.tp_part_dir(
-                            &journal.topic,
-                            journal.partition,
-                            journal.group.as_deref(),
-                        ),
-                        install.event_next_offset,
-                        install.event_epoch,
-                    ),
-                ])
+                if install.combined_log != self.queue_payloads_in_event_log() {
+                    return Err(StromaError::Corruption("checkpoint journal layout mismatch".into()));
+                }
+                let mut logs = vec![(self.tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
+                    install.event_start_offset, install.event_epoch)];
+                if !install.combined_log {
+                    logs.push((self.msg_tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
+                        install.message_next_offset, install.message_epoch));
+                }
+                Keratin::rebuild_for_checkpoint_recovery(logs)
                 .await
                 .map_err(io_err)?;
                 self.checkpoint_boundary("cold_logs")?;
@@ -640,6 +658,8 @@ mod tests {
             state.enqueue(offset, 0, None);
         }
         FollowerStateCheckpointInstall {
+            combined_log: false,
+            event_start_offset: count,
             message_epoch: 7,
             event_epoch: 7,
             message_next_offset: 0,

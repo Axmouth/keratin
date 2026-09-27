@@ -566,22 +566,19 @@ impl Stroma {
                         true,
                     )
                     .await?;
-                let messages = open_preparation_log(
-                    &stroma,
-                    stroma.msg_tp_part_dir(&topic, part, group.as_deref()),
-                    stroma.keratin_cfg_msg,
-                )
-                .await?;
+                let messages = if stroma.queue_payloads_in_event_log() { None } else {
+                    Some(open_preparation_log(&stroma, stroma.msg_tp_part_dir(&topic, part, group.as_deref()), stroma.keratin_cfg_msg).await?)
+                };
                 let events = match open_preparation_log(
                     &stroma,
                     stroma.tp_part_dir(&topic, part, group.as_deref()),
-                    stroma.keratin_cfg_event,
+                    if stroma.queue_payloads_in_event_log() { stroma.keratin_cfg_msg } else { stroma.keratin_cfg_event },
                 )
                 .await
                 {
                     Ok(events) => events,
                     Err(e) => {
-                        let _ = messages.shutdown().await;
+                        if let Some(log) = &messages { let _ = log.shutdown().await; }
                         return Err(e);
                     }
                 };
@@ -599,7 +596,7 @@ impl Stroma {
                     fs::rename(&next, &path).map_err(io_err)?;
                     recovery_seal::sync_directories(path.parent().unwrap())
                 })();
-                let (m, e) = tokio::join!(messages.shutdown(), events.shutdown());
+                let (m, e) = tokio::join!(async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } }, events.shutdown());
                 result?;
                 m.map_err(io_err)?;
                 e.map_err(io_err)?;
@@ -2238,6 +2235,8 @@ mod tests {
             .unwrap();
         let state = crate::state::QueueInternalState::new("q".into(), 0);
         let install = FollowerStateCheckpointInstall {
+            combined_log: false,
+            event_start_offset: 0,
             message_epoch: 7,
             event_epoch: 7,
             message_next_offset: 0,

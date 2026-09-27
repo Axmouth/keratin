@@ -1502,7 +1502,15 @@ impl QueueHandleInner {
     }
 
     pub fn mark_recovery_complete(&self) {
-        if let Some(order) = &self.ordered_apply { order.reset(self.event_log.next_offset()); }
+        if let Some(order) = &self.ordered_apply {
+            let physical_next = self.event_log.next_offset();
+            // Only combined learner recovery can have an authorized snapshot
+            // ahead of its payload backfill. Separate-log repair may lower a tail.
+            let next = if self.msg_log.is_none() {
+                order.applied_next().unwrap_or(physical_next).max(physical_next)
+            } else { physical_next };
+            order.reset(next);
+        }
         self.recovery_complete.store(true, Ordering::Release);
         self.recovery_notify.notify_waiters();
     }

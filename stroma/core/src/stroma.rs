@@ -3626,6 +3626,8 @@ impl Stroma {
         // load snapshot...
 
         let mut cur = 0u64;
+        #[cfg(feature = "combined-queue-log-experiment")]
+        let mut pending_combined_backfill = false;
 
         // Legacy snapshots encode an inclusive applied offset, so zero also
         // represents an empty checkpoint. If event zero is still retained,
@@ -3635,11 +3637,19 @@ impl Stroma {
             .read_queue_snapshot(&self.snap_file(tp, part, group))?
             .filter(|(applied, _)| !applied.ambiguous_zero() || event_log.head_offset() != 0)
         {
+            let learner_backfill = applied_upto.event_next() > event_log.next_offset()
+                && self.permits_combined_checkpoint_backfill(tp, part, group, applied_upto.event_next(), &blob, &event_log)?;
             if matches!(applied_upto, checkpoint_capture::SnapshotBoundary::ExactNext(_))
                 && (applied_upto.event_next() < event_log.head_offset()
-                    || applied_upto.event_next() > event_log.next_offset())
-            {
+                    || (applied_upto.event_next() > event_log.next_offset() && !learner_backfill)) {
                 return Err(StromaError::Corruption("exact checkpoint does not cover retained event prefix".into()));
+            }
+            #[cfg(feature = "combined-queue-log-experiment")]
+            { pending_combined_backfill = learner_backfill; }
+            if learner_backfill {
+                h.become_follower();
+                for log in h.physical_logs() { log.become_follower(); }
+                h.reset_ordered_apply_after_recovery(applied_upto.event_next());
             }
             h.load_snapshot(blob).await.map_err(|err| {
                 StromaError::Io(format!(
@@ -3821,26 +3831,7 @@ impl Stroma {
 
         #[cfg(feature = "combined-queue-log-experiment")]
         if self.combined_queue_log {
-            let captured = h.capture_exact_checkpoint(false).await?;
-            let ranges = captured.state.recovery_live_ranges();
-            let log = h.event_log();
-            tokio::task::spawn_blocking(move || {
-                let reader = log.reader();
-                for range in ranges.iter() {
-                    let mut off = range.start;
-                    while off < range.end {
-                        let records = reader.scan_from_disk(off, (range.end-off).min(1024) as usize).map_err(io_err)?;
-                        if records.is_empty() { return Err(StromaError::Corruption("live combined payload was not retained".into())); }
-                        for record in records {
-                            if record.offset != off || !matches!(StromaEvent::decode(&record.payload).map_err(decode_err)?, StromaEvent::PayloadEnqueue{..}) {
-                                return Err(StromaError::Corruption("live state does not identify a retained payload enqueue".into()));
-                            }
-                            off += 1;
-                        }
-                    }
-                }
-                Ok::<_,StromaError>(())
-            }).await.map_err(io_err)??;
+            self.verify_combined_payload_coverage(&h, pending_combined_backfill).await?;
         }
 
         // Re-issue any DLQ copies that were pending at the crash. Streams have no
@@ -7129,6 +7120,8 @@ mod tests {
                     0,
                     None,
                     FollowerStateCheckpointInstall {
+                        combined_log: false,
+                        event_start_offset: 1,
                         message_epoch,
                         event_epoch,
                         message_next_offset: 0,
@@ -7190,6 +7183,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: false,
+                    event_start_offset: 1,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 0,
@@ -7237,6 +7232,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: false,
+                    event_start_offset: 2,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 1,
@@ -7279,6 +7276,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: false,
+                    event_start_offset: 2,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 2,
@@ -7329,6 +7328,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: false,
+                    event_start_offset: 2,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 0,
@@ -7672,6 +7673,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: checkpoint.combined_log,
+                    event_start_offset: checkpoint.event_start_offset,
                     message_epoch: checkpoint.message_epoch,
                     event_epoch: checkpoint.event_epoch,
                     message_next_offset: checkpoint.message_checkpoint_offset,
@@ -7949,6 +7952,8 @@ mod tests {
                 0,
                 None,
                 FollowerStateCheckpointInstall {
+                    combined_log: false,
+                    event_start_offset: 0,
                     message_epoch: 0,
                     event_epoch: 0,
                     message_next_offset: 0,
