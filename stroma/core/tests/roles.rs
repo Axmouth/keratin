@@ -800,3 +800,78 @@ async fn independent_declaration_prefix_is_rejected_by_replication() {
     );
     st.shutdown().await.unwrap();
 }
+
+fn open_frame(offset: u64) -> stroma_core::Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)> {
+    Ok((Some(ReplicatedMessageBatch {
+        epoch: 0, first_offset: offset, records: vec![Message { flags: 0, headers: vec![], payload: vec![42; 1024] }],
+        durability: Some(KDurability::AfterFsync),
+    }), Some(ReplicatedEventBatch {
+        epoch: 0, first_offset: offset, events: vec![StromaEvent::Enqueue { off: offset, retries: 0, expire_at: None }],
+        durability: Some(KDurability::AfterFsync),
+    })))
+}
+
+#[tokio::test]
+async fn open_follower_batch_stages_before_close_and_applies_after_both_syncs() {
+    use futures::{StreamExt, FutureExt};
+    let (st, _dir) = open_test_stroma("open_follower_batch_cutoff").await;
+    st.become_queue_follower("q", 0, None).await.unwrap();
+    let qh = st.queue_handle("q", 0, None).await.unwrap();
+    let h = qh.resolve().unwrap();
+    let (tx, rx) = tokio::sync::mpsc::channel(8);
+    let frames = futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) }).boxed();
+    let apply = st.apply_open_replicated_queue_batch("q", 0, None, frames);
+    tokio::pin!(apply);
+    for offset in 0..2 {
+        tx.send(open_frame(offset)).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while h.msg_log().next_offset() != offset + 1 || h.event_log().next_offset() != offset + 1 {
+                assert!(apply.as_mut().now_or_never().is_none());
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        assert!(!h.work_queue().unwrap().is_ready(offset).await);
+        assert!(h.msg_log().retained_durable_cursor(0, 0, offset + 1, 1_000_000).is_err());
+        assert!(h.event_log().retained_durable_cursor(0, 0, offset + 1, 1_000_000).is_err());
+    }
+    drop(tx);
+    let outcomes = timeout(Duration::from_secs(2), apply).await.unwrap().unwrap();
+    assert_eq!(outcomes.len(), 2);
+    for offset in 0..2 { assert!(h.work_queue().unwrap().is_ready(offset).await); }
+    assert!(h.msg_log().retained_durable_cursor(0, 0, 2, 1_000_000).is_ok());
+    assert!(h.event_log().retained_durable_cursor(0, 0, 2, 1_000_000).is_ok());
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fenced() {
+    use futures::{StreamExt, FutureExt};
+    for cancel in [false, true] {
+        let (st, _dir) = open_test_stroma("open_follower_batch_dirty").await;
+        st.become_queue_follower("q", 0, None).await.unwrap();
+        let qh = st.queue_handle("q", 0, None).await.unwrap();
+        let h = qh.resolve().unwrap();
+        let (tx, rx) = tokio::sync::mpsc::channel(8);
+        let frames = futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) }).boxed();
+        let mut apply = Box::pin(st.apply_open_replicated_queue_batch("q", 0, None, frames));
+        tx.send(open_frame(0)).await.unwrap();
+        timeout(Duration::from_secs(2), async {
+            while h.msg_log().next_offset() != 1 || h.event_log().next_offset() != 1 {
+                assert!(apply.as_mut().now_or_never().is_none());
+                tokio::task::yield_now().await;
+            }
+        }).await.unwrap();
+        if !cancel {
+            tx.send(Err(StromaError::Io("injected later input failure".into()))).await.unwrap();
+            assert!(apply.as_mut().await.is_err());
+        }
+        drop(apply);
+        drop(tx);
+        assert!(!h.work_queue().unwrap().is_ready(0).await);
+        let (m, e) = open_frame(0).unwrap();
+        let err = st.apply_replicated_queue_batch("q", 0, None, m, e).await.unwrap_err();
+        assert!(err.to_string().contains("incomplete follower apply"), "{err}");
+        assert!(st.promote_queue_follower_if_caught_up("q", 0, None, 1, 1).await.is_err());
+        st.shutdown().await.unwrap();
+    }
+}

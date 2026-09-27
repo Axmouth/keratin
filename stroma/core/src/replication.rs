@@ -983,36 +983,16 @@ impl Stroma {
             .await
     }
 
-    /// Shared two-log follower apply for queues and streams. `advance_stream_tail`
-    /// is the only difference: streams advance the keratin stream actor's tail
-    /// after the record append; queues have no stream actor and pass `false`.
-    async fn apply_replicated_two_log_batch(
+    async fn append_follower_frame(
         &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
+        qh: &crate::state::QueueHandleInner,
+        apply_state: &mut bool,
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
-        advance_stream_tail: bool,
-    ) -> Result<ReplicatedQueueApplyOutcome> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
-        let mut apply_state = qh.follower_apply_state().await;
-        if *apply_state {
-            return Err(crate::StromaError::Io(
-                "incomplete follower apply; recover or install a checkpoint before retry".into(),
-            ));
-        }
-        let role = qh.role();
-        if role != QueueRole::Follower {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Follower,
-                actual: role,
-            });
-        }
-        qh.msg_log().become_follower();
-        qh.event_log().become_follower();
-
+    ) -> Result<(ReplicatedQueueApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
+        let topic = qh.topic();
+        let part = qh.partition();
+        let group = qh.group();
         // Encode before either append so an encoding failure cannot leave one
         // side queued. Reject obvious epoch/gap cases through the serial path;
         // ordinary contiguous traffic overlaps the two independent writers.
@@ -1118,6 +1098,131 @@ impl Stroma {
             };
             (message, event)
         };
+        Ok((ReplicatedQueueApplyOutcome { message_log, event_log }, events, message_next, parallel))
+    }
+
+    async fn apply_follower_events(
+        &self,
+        qh: &crate::state::QueueHandleInner,
+        batch: ReplicatedEventBatch,
+    ) -> Result<()> {
+                // A verified overlap may contain already-applied NACKs, whose
+                // retry increment must not run a second time. The exclusive
+                // frontier also distinguishes an unapplied event zero.
+                let applied_next = qh.ordered_applied_next()?;
+                let skip = match applied_next {
+                    Some(next) if batch.first_offset > next => {
+                        return Err(StromaError::Io("follower event application gap".into()));
+                    }
+                    Some(next) => next.saturating_sub(batch.first_offset)
+                        .min(batch.events.len() as u64) as usize,
+                    None => 0,
+                };
+                let count = batch.events.len() - skip;
+                if count > 0 {
+                    let scope = qh.ordered_apply_scope();
+                    let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
+                    for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
+                        self.apply_event_inmem(event, qh).await?;
+                        qh.applied_upto()
+                            .fetch_max(batch.first_offset + idx as u64, Ordering::Release);
+                    }
+                    crate::ordered_apply::finish(turn, scope)?;
+                }
+        Ok(())
+    }
+
+    /// Experimental open durability group. Input is polled only after the
+    /// previous frame has staged. The caller owns its deadline and byte budget.
+    /// The recovery guard spans staging, both sync completions and actor apply.
+    /// Dropping this future after mutation leaves the existing dirty fence set.
+    pub async fn apply_open_replicated_queue_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        mut frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
+    ) -> Result<Vec<ReplicatedQueueApplyOutcome>> {
+        use futures::StreamExt;
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        let mut apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(StromaError::Io("incomplete follower apply; recover or install a checkpoint before retry".into()));
+        }
+        if qh.role() != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole { expected: QueueRole::Follower, actual: qh.role() });
+        }
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+        let mut pending_events = Vec::new();
+        let mut sync_messages = false;
+        let mut sync_events = false;
+        let mut outcomes = Vec::new();
+        while let Some(frame) = frames.next().await {
+            let (mut messages, mut events) = frame?;
+            sync_messages |= messages.is_some();
+            sync_events |= events.is_some();
+            if let Some(batch) = &mut messages { batch.durability = Some(KDurability::AfterWrite); }
+            if let Some(batch) = &mut events { batch.durability = Some(KDurability::AfterWrite); }
+            let (outcome, events, _, _) = self.append_follower_frame(&qh, &mut apply_state, messages, events).await?;
+            if !outcome.message_log.as_ref().is_none_or(replicated_append_outcome_allows_state_apply)
+                || !outcome.event_log.as_ref().is_none_or(replicated_append_outcome_allows_state_apply) {
+                return Err(StromaError::Io("open follower batch rejected a frame; resync required".into()));
+            }
+            if let Some(events) = events { pending_events.push(events); }
+            outcomes.push(outcome);
+        }
+        if !outcomes.is_empty() {
+            // Drain both operations even when one fails. Neither staging nor a
+            // completed single-log sync is a two-log durable acknowledgment.
+            let messages = qh.msg_log();
+            let events = qh.event_log();
+            let (m, e) = tokio::join!(
+                async { if sync_messages { messages.sync().await } else { Ok(()) } },
+                async { if sync_events { events.sync().await } else { Ok(()) } },
+            );
+            m.map_err(io_err)?;
+            e.map_err(io_err)?;
+            for batch in pending_events { self.apply_follower_events(&qh, batch).await?; }
+            *apply_state = false;
+        }
+        Ok(outcomes)
+    }
+
+    /// Shared two-log follower apply for queues and streams. `advance_stream_tail`
+    /// is the only difference: streams advance the keratin stream actor's tail
+    /// after the record append; queues have no stream actor and pass `false`.
+    async fn apply_replicated_two_log_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        messages: Option<ReplicatedMessageBatch>,
+        events: Option<ReplicatedEventBatch>,
+        advance_stream_tail: bool,
+    ) -> Result<ReplicatedQueueApplyOutcome> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        let mut apply_state = qh.follower_apply_state().await;
+        if *apply_state {
+            return Err(crate::StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before retry".into(),
+            ));
+        }
+        let role = qh.role();
+        if role != QueueRole::Follower {
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: role,
+            });
+        }
+        qh.msg_log().become_follower();
+        qh.event_log().become_follower();
+
+        let (outcome, events, message_next, parallel) = self
+            .append_follower_frame(&qh, &mut apply_state, messages, events).await?;
+        let ReplicatedQueueApplyOutcome { message_log, event_log } = outcome;
         let messages_allowed = message_log
             .as_ref()
             .is_none_or(replicated_append_outcome_allows_state_apply);
@@ -1136,29 +1241,7 @@ impl Stroma {
                 rx.await.map_err(|_| StromaError::QueueActorGone)?;
             }
             if let Some(batch) = events {
-                // A verified overlap may contain already-applied NACKs, whose
-                // retry increment must not run a second time. The exclusive
-                // frontier also distinguishes an unapplied event zero.
-                let applied_next = qh.ordered_applied_next()?;
-                let skip = match applied_next {
-                    Some(next) if batch.first_offset > next => {
-                        return Err(StromaError::Io("follower event application gap".into()));
-                    }
-                    Some(next) => next.saturating_sub(batch.first_offset)
-                        .min(batch.events.len() as u64) as usize,
-                    None => 0,
-                };
-                let count = batch.events.len() - skip;
-                if count > 0 {
-                    let scope = qh.ordered_apply_scope();
-                    let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
-                    for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
-                        self.apply_event_inmem(event, &qh).await?;
-                        qh.applied_upto()
-                            .fetch_max(batch.first_offset + idx as u64, Ordering::Release);
-                    }
-                    crate::ordered_apply::finish(turn, scope)?;
-                }
+                self.apply_follower_events(&qh, batch).await?;
             }
             *apply_state = false;
         } else if !parallel {

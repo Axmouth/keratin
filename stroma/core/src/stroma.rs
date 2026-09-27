@@ -9521,3 +9521,50 @@ mod retention_tests {
         );
     }
 }
+
+
+#[cfg(all(test, feature = "io-fault-injection"))]
+mod open_batch_fault_tests {
+    use super::*;
+    use futures::StreamExt;
+    use keratin_log::io_fault_injection::{arm, Fault};
+
+    #[tokio::test]
+    async fn open_batch_sync_failures_drain_both_logs_without_actor_apply() {
+        for message_fails in [false, true] {
+            for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
+                let dir = keratin_log::test_dir!("open_batch_sync_failure");
+                let st = Stroma::open(
+                    &dir.root,
+                    crate::StromaKeratinConfig::from_message_log(keratin_log::KeratinConfig::test_default()),
+                    crate::SnapshotConfig::default(),
+                ).await.unwrap();
+                st.become_queue_follower("q", 0, None).await.unwrap();
+                let qh = st.queue_handle("q", 0, None).await.unwrap();
+                let h = qh.resolve().unwrap();
+                let path = if message_fails { st.msg_tp_part_dir("q", 0, None) } else { st.tp_part_dir("q", 0, None) }
+                    .join("segments").join("00000000000000000000.log");
+                let armed = arm(&path, fault).unwrap();
+                let frame = (Some(ReplicatedMessageBatch {
+                    epoch: 0, first_offset: 0,
+                    records: vec![Message { flags: 0, headers: vec![], payload: vec![42; 1024] }],
+                    durability: Some(KDurability::AfterFsync),
+                }), Some(ReplicatedEventBatch {
+                    epoch: 0, first_offset: 0,
+                    events: vec![StromaEvent::Enqueue { off: 0, retries: 0, expire_at: None }],
+                    durability: Some(KDurability::AfterFsync),
+                }));
+                let result = st.apply_open_replicated_queue_batch("q", 0, None, futures::stream::iter([Ok(frame)]).boxed()).await;
+                assert!(result.is_err());
+                assert_eq!(armed.hits(), 1);
+                assert!(!h.work_queue().unwrap().is_ready(0).await);
+                let healthy = if message_fails { h.event_log() } else { h.msg_log() };
+                assert!(healthy.retained_durable_cursor(0, 0, 1, 1_000_000).is_ok(), "healthy sync must complete before returning failure");
+                assert!(*h.follower_apply_state().await);
+                drop(armed);
+                // A log whose sync failed may report its sticky error on shutdown.
+                let _ = st.shutdown().await;
+            }
+        }
+    }
+}
