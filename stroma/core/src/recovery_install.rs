@@ -80,6 +80,10 @@ impl Stroma {
         receipt: PreparedStorageHistory,
         intent: [u8; 32],
     ) -> Result<Self> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         if !cfg!(unix) || intent == [0; 32] || receipt.stream {
             return Err(invalid(
                 "queue reseed requires an exact intent and durable directories",
@@ -453,6 +457,10 @@ impl Stroma {
         binding: StorageHistoryBinding,
         intent: [u8; 32],
     ) -> Result<PreparedStorageHistory> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         if !cfg!(unix) || intent == [0; 32] {
             return Err(invalid(
                 "learner generation requires durable directories and an exact intent",
@@ -613,6 +621,10 @@ impl Stroma {
         seal: RecoverySealRequest,
         stage: &QueueRecoveryStage,
     ) -> Result<PreparedQueueRecovery> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         if seal.fence_epoch != spec.fence_epoch {
             return Err(invalid("installation fence differs from stage"));
         }

@@ -261,6 +261,8 @@ impl QueueReplay {
         // Same state operations used by the actor, without delivery, clocks,
         // external DLQ copies, priority scheduling or snapshot mutations.
         match ev {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => return Err("combined queue recovery reconciliation is not implemented".into()),
             StromaEvent::ActivateDelayed { now, max } => {
                 self.state.activate_delayed(now, max as usize);
             }

@@ -20,6 +20,8 @@ pub enum EventType {
     EnqueueDelayedMany = 3,
     CancelEnqueueMany = 4,
     ActivateDelayed = 5,
+    #[cfg(feature = "combined-queue-log-experiment")]
+    PayloadEnqueue = 6,
     MarkInflight = 10,
     MarkInflightMany = 11,
     Ack = 20,
@@ -217,6 +219,14 @@ pub enum DLQDiscardPolicyWire {
 // TODO: Add events for setting DLQ target and policy, timeouts, retry limits, etc.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum StromaEvent {
+    /// Experimental original publish. Identity comes from the containing record.
+    #[cfg(feature = "combined-queue-log-experiment")]
+    PayloadEnqueue {
+        not_before: Option<UnixMillis>,
+        expire_at: Option<UnixMillis>,
+        headers: Vec<u8>,
+        payload: Vec<u8>,
+    },
     Enqueue {
         off: Offset,
         retries: u32,
@@ -413,6 +423,15 @@ fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
 }
 
 impl StromaEvent {
+    #[cfg(feature = "combined-queue-log-experiment")]
+    pub(crate) fn into_record_state(self, off: Offset) -> Self {
+        match self {
+            Self::PayloadEnqueue { not_before: Some(not_before), .. } => Self::EnqueueDelayed { off, not_before },
+            Self::PayloadEnqueue { not_before: None, expire_at, .. } => Self::Enqueue { off, retries: 0, expire_at },
+            other => other,
+        }
+    }
+
     /// The highest message-log offset this event references, if any.
     ///
     /// Used by recovery to verify the event log does not reference messages the
@@ -422,6 +441,8 @@ impl StromaEvent {
     /// (Declare / ResetQueue / Snapshot).
     pub fn max_referenced_msg_offset(&self) -> Option<Offset> {
         match self {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => None,
             StromaEvent::Enqueue { off, .. }
             | StromaEvent::EnqueueDelayed { off, .. }
             | StromaEvent::MarkInflight { off, .. }
@@ -463,6 +484,8 @@ impl StromaEvent {
     /// never feeds them through this.
     pub fn referenced_msg_offsets(&self) -> Vec<Offset> {
         match self {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => Vec::new(),
             StromaEvent::Enqueue { off, .. }
             | StromaEvent::EnqueueDelayed { off, .. }
             | StromaEvent::MarkInflight { off, .. }
@@ -497,6 +520,17 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { not_before, expire_at, headers, payload } => {
+                put_u16(&mut out, EventType::PayloadEnqueue as u16);
+                put_opt_u64(&mut out, *not_before);
+                put_opt_u64(&mut out, *expire_at);
+                for bytes in [headers, payload] {
+                    let len = u32::try_from(bytes.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "combined enqueue field too large"))?;
+                    put_u32(&mut out, len);
+                    out.extend_from_slice(bytes);
+                }
+            }
             StromaEvent::ActivateDelayed { now, max } => {
                 if *max == 0 || *max > MAX_DELAYED_ACTIVATION {
                     return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid delayed activation limit"));
@@ -733,6 +767,21 @@ impl StromaEvent {
         // a field spliced into the fixed-stride entries.
         let ty = rd_u16(bytes, &mut i)?;
         match ty {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            x if x == EventType::PayloadEnqueue as u16 => {
+                let not_before = rd_opt_u64(bytes, &mut i)?;
+                let expire_at = rd_opt_u64(bytes, &mut i)?;
+                let mut field = || -> io::Result<Vec<u8>> {
+                    let len = rd_u32(bytes, &mut i)? as usize;
+                    let end = i.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "combined enqueue length overflow"))?;
+                    let data = bytes.get(i..end).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "combined enqueue truncated"))?;
+                    i = end;
+                    Ok(data.to_vec())
+                };
+                let headers = field()?;
+                let payload = field()?;
+                Ok(Self::PayloadEnqueue { not_before, expire_at, headers, payload })
+            }
             x if x == EventType::Enqueue as u16 => {
                 let off = rd_u64(bytes, &mut i)?;
                 let retries = rd_u32(bytes, &mut i)?;

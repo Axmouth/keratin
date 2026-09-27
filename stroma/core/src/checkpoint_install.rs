@@ -247,6 +247,10 @@ impl Stroma {
         install: &FollowerStateCheckpointInstall,
         learner: Option<&PreparedStorageHistory>,
     ) -> Result<()> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         loop {
             self.queue_handle(topic, part, group).await?;
             let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;

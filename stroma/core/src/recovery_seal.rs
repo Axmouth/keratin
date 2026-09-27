@@ -216,6 +216,10 @@ impl Stroma {
         expected_kind: PartitionKind,
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
                 "durable recovery seals require directory-sync support on this platform".into(),

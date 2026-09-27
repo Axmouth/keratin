@@ -216,7 +216,7 @@ impl Stroma {
             && let Some(wq) = qh.as_work_queue()
         {
             let required = wq.required_message_next().await.map_err(io_err)?;
-            if qh.msg_log().next_offset() < required {
+            if self.payload_log_for(&qh).next_offset() < required {
                 return Err(crate::StromaError::InvalidArgument(format!(
                     "queue payload backfill incomplete: message next {} requires {required}",
                     qh.msg_log().next_offset()
@@ -439,7 +439,7 @@ impl Stroma {
             ));
         }
         if let Some(wq) = qh.as_work_queue() {
-            if message_next < wq.required_message_next().await.map_err(io_err)? {
+            if self.payload_log_for(&qh).next_offset() < wq.required_message_next().await.map_err(io_err)? {
                 return Err(StromaError::InvalidArgument(
                     "learner payload backfill is incomplete".into(),
                 ));
@@ -532,7 +532,7 @@ impl Stroma {
 
         if let Some(wq) = qh.as_work_queue() {
             let required = wq.required_message_next().await.map_err(io_err)?;
-            if message_next_offset < required {
+            if self.payload_log_for(&qh).next_offset() < required {
                 return Ok(QueuePromotionOutcome::MessageLogBehind {
                     local_next_offset: message_next_offset,
                     expected_next_offset: required,
@@ -604,7 +604,7 @@ impl Stroma {
 
         if let Some(wq) = qh.as_work_queue() {
             let required = wq.required_message_next().await.map_err(io_err)?;
-            if message_next_offset < required {
+            if self.payload_log_for(&qh).next_offset() < required {
                 return Ok(QueuePromotionOutcome::MessageLogBehind {
                     local_next_offset: message_next_offset,
                     expected_next_offset: required,
@@ -902,6 +902,10 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<OwnerStateCheckpoint> {
+        if self.queue_payloads_in_event_log() {
+            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
+        }
+
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         let _apply = qh.follower_apply_state().await;
@@ -990,6 +994,15 @@ impl Stroma {
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
     ) -> Result<(ReplicatedQueueApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        {
+            if self.combined_queue_log && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
+                return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
+            }
+            if !self.combined_queue_log && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
+                return Err(StromaError::InvalidArgument("combined queue event received by a two-log queue".into()));
+            }
+        }
         let topic = qh.topic();
         let part = qh.partition();
         let group = qh.group();
@@ -1122,6 +1135,13 @@ impl Stroma {
                 if count > 0 {
                     let scope = qh.ordered_apply_scope();
                     let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
+                    #[cfg(feature = "combined-queue-log-experiment")]
+                    if self.combined_queue_log {
+                        self.apply_combined_records(batch.events.into_iter().skip(skip).collect(),batch.first_offset+skip as u64,qh).await?;
+                        qh.applied_upto().fetch_max(batch.first_offset+skip as u64+count as u64-1,Ordering::Release);
+                        crate::ordered_apply::finish(turn,scope)?;
+                        return Ok(());
+                    }
                     for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
                         self.apply_event_inmem(event, qh).await?;
                         qh.applied_upto()

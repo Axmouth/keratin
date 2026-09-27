@@ -91,6 +91,8 @@ pub struct RecoveryReferenceGap {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RecoverySemanticGap {
     UnknownOrMalformedEncoding,
+    #[cfg(feature = "combined-queue-log-experiment")]
+    CombinedQueueFormatUnsupported,
     EventEntryLimit,
     StateReplayRequired,
     CheckpointRequired,
@@ -713,6 +715,8 @@ impl RecoveryReferenceInspection {
             }
         };
         match event {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => { self.gap(record.offset, RecoverySemanticGap::CombinedQueueFormatUnsupported); return; }
             StromaEvent::Enqueue { off, .. } | StromaEvent::EnqueueDelayed { off, .. } => {
                 reference(off)
             }

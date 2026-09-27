@@ -79,6 +79,9 @@ pub use recovery_stage::{
 mod agreed_checkpoint;
 #[path = "stroma/checkpoint_capture.rs"]
 mod checkpoint_capture;
+#[cfg(feature = "combined-queue-log-experiment")]
+#[path = "stroma/combined.rs"]
+mod combined;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "replication_retention.rs"]
@@ -195,6 +198,8 @@ pub const DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS: u64 = 60_000;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct StromaOptions {
+    #[cfg(feature = "combined-queue-log-experiment")]
+    pub combined_queue_log: bool,
     /// How often the background worker sweeps already-materialized stream
     /// partitions to enforce their retention policy. `None` (or zero) disables the
     /// sweep, for example when an external scheduler drives retention instead. The
@@ -206,6 +211,8 @@ impl Default for StromaOptions {
     fn default() -> Self {
         Self {
             stream_retention_sweep_interval_ms: Some(DEFAULT_STREAM_RETENTION_SWEEP_INTERVAL_MS),
+            #[cfg(feature = "combined-queue-log-experiment")]
+            combined_queue_log: std::env::var("STROMA_COMBINED_QUEUE_LOG").as_deref() == Ok("1"),
         }
     }
 }
@@ -362,7 +369,7 @@ impl AppendCompletion<IoError> for ApplyThenComplete {
                         let result = async {
                             let h = qh.resolve()?;
                             let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
-                            stroma.apply_event_inmem(ev, &h).await?;
+                            stroma.apply_record_inmem(ev, ar.base_offset, &h).await?;
                             h.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
                             crate::ordered_apply::finish(turn, ordered_scope)?;
                             Ok::<_, StromaError>(ar)
@@ -793,6 +800,8 @@ struct RecoveryScanOutcome {
 
 #[derive(Debug, Clone)]
 pub struct Stroma {
+    #[cfg(feature = "combined-queue-log-experiment")]
+    pub(crate) combined_queue_log: bool,
     pub(crate) start_time: Instant,
     pub(crate) root: PathBuf,
     pub(crate) keratin_cfg_msg: KeratinConfig,
@@ -920,6 +929,12 @@ impl Stroma {
     ) -> Result<Self> {
         let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
+        #[cfg(feature = "combined-queue-log-experiment")]
+        combined::prepare_root(&root, options.combined_queue_log)?;
+        #[cfg(not(feature = "combined-queue-log-experiment"))]
+        if root.join("combined-queue-log.v1").exists() {
+            return Err(StromaError::InvalidArgument("combined queue log requires the experimental build".into()));
+        }
         fs::create_dir_all(root.join("events")).map_err(io_err)?;
         fs::create_dir_all(root.join("messages")).map_err(io_err)?;
         fs::create_dir_all(root.join("snapshots")).map_err(io_err)?;
@@ -930,6 +945,8 @@ impl Stroma {
         let keratin_cfg_event = keratin_cfg.event_log;
 
         let st = Self {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            combined_queue_log: options.combined_queue_log,
             start_time,
             root,
             keratin_cfg_msg,
@@ -2069,6 +2086,8 @@ impl Stroma {
             return Ok(());
         }
         match ev {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => return Err(io::Error::new(io::ErrorKind::InvalidData, "payload enqueue needs record offset")),
             StromaEvent::Enqueue {
                 off,
                 retries,
@@ -2250,6 +2269,26 @@ impl Stroma {
         Ok(())
     }
 
+    pub fn queue_payloads_in_event_log(&self) -> bool {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        { return self.combined_queue_log; }
+        #[cfg(not(feature = "combined-queue-log-experiment"))]
+        { false }
+    }
+
+    pub(crate) fn payload_log_for(&self, qh: &QueueHandleInner) -> Arc<Keratin> {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log { return qh.event_log(); }
+        qh.msg_log()
+    }
+
+    pub(crate) async fn apply_record_inmem(&self, ev: StromaEvent, off: u64, qh: &QueueHandleInner) -> Result<()> {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log { return self.apply_combined_records(vec![ev], off, qh).await; }
+        let _ = off;
+        self.apply_event_inmem(ev, qh).await
+    }
+
     pub(crate) async fn apply_event_inmem(
         &self,
         ev: StromaEvent,
@@ -2260,6 +2299,8 @@ impl Stroma {
             return Ok(());
         }
         match ev {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            StromaEvent::PayloadEnqueue { .. } => return Err(StromaError::InvalidArgument("payload enqueue needs record offset".into())),
             StromaEvent::Enqueue {
                 off,
                 retries,
@@ -2564,8 +2605,8 @@ impl Stroma {
 
         // Apply in memory after durable accept.
         let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
-        for ev in evs.into_iter() {
-            self.apply_event_inmem(ev, &qh).await?;
+        for (i, ev) in evs.into_iter().enumerate() {
+            self.apply_record_inmem(ev, ar.base_offset + i as u64, &qh).await?;
         }
         if ordered_scope.is_some() {
             qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
@@ -2635,8 +2676,8 @@ impl Stroma {
         qh.set_dirty_snapshot(true);
 
         let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
-        for ev in evs.into_iter() {
-            self.apply_event_inmem(ev, &qh).await?;
+        for (i, ev) in evs.into_iter().enumerate() {
+            self.apply_record_inmem(ev, ar.base_offset + i as u64, &qh).await?;
         }
         if ordered_scope.is_some() {
             qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
@@ -3598,7 +3639,8 @@ impl Stroma {
             // the state for follower catch-up, but never reopen it as an owner.
             if let Some(wq) = h.as_work_queue() {
                 let required = wq.required_message_next().await.map_err(io_err)?;
-                if h.msg_log().next_offset() < required {
+                let payload_next = self.payload_log_for(&h).next_offset();
+                if payload_next < required {
                     tracing::warn!(
                         tp,
                         part,
@@ -3635,11 +3677,15 @@ impl Stroma {
             }
         }
 
+        #[cfg(feature = "combined-queue-log-experiment")]
+        let combined_mode = self.combined_queue_log;
         let RecoveryScanOutcome {
             events,
             events_count,
             mismatch,
         } = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            if combined_mode { return combined::recover_events(event_log,cur,tail,applied_upto); }
             Self::recover_events_from_log(event_log, cur, tail, applied_upto, msg_tail)
         })
         .await
@@ -3761,6 +3807,30 @@ impl Stroma {
 
         for ev in events {
             self.apply_event_inmem(ev, &h).await?;
+        }
+
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            let captured = h.capture_exact_checkpoint(false).await?;
+            let ranges = captured.state.recovery_live_ranges();
+            let log = h.event_log();
+            tokio::task::spawn_blocking(move || {
+                let reader = log.reader();
+                for range in ranges.iter() {
+                    let mut off = range.start;
+                    while off < range.end {
+                        let records = reader.scan_from_disk(off, (range.end-off).min(1024) as usize).map_err(io_err)?;
+                        if records.is_empty() { return Err(StromaError::Corruption("live combined payload was not retained".into())); }
+                        for record in records {
+                            if record.offset != off || !matches!(StromaEvent::decode(&record.payload).map_err(decode_err)?, StromaEvent::PayloadEnqueue{..}) {
+                                return Err(StromaError::Corruption("live state does not identify a retained payload enqueue".into()));
+                            }
+                            off += 1;
+                        }
+                    }
+                }
+                Ok::<_,StromaError>(())
+            }).await.map_err(io_err)??;
         }
 
         // Re-issue any DLQ copies that were pending at the crash. Streams have no
@@ -4238,6 +4308,10 @@ impl Stroma {
             return Ok(());
         }
 
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            return self.append_combined(qh, messages, completion_items, observer, owner_operation).await;
+        }
         let durability = self.keratin_cfg_msg.default_durability;
 
         // Parallel durable append (immediate AND delayed publishes): get the
@@ -4514,6 +4588,13 @@ impl Stroma {
             headers: headers.encode()?,
             payload,
         };
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            return self.append_combined(qh, vec![message], vec![CompletionItem {
+                meta: ItemMeta { not_before: None, expire_at },
+                completion: event_completion,
+            }], None, owner_operation).await;
+        }
         msg_log
             .append_enqueue(message, None, msg_completion)
             .map_err(io_err)?;
@@ -4593,6 +4674,8 @@ impl Stroma {
                 "{tp}/{part} is already declared as a queue, cannot declare it as a plexus stream - use a different topic name, or destroy the queue first if it is no longer needed"
             )));
         }
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log { return Err(StromaError::InvalidArgument("combined experiment currently supports work queues only".into())); }
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
         drop(lifecycle);
         let qh = self.queue_handle(tp, part, None).await?;
@@ -5146,7 +5229,7 @@ impl Stroma {
             if ordered_scope.is_some() {
                 // Apply the recorded marker as replay does, even though Nack
                 // normally already put the offset in pending-DLQ state.
-                self.apply_event_inmem(ev, &h).await?;
+                self.apply_record_inmem(ev, dlq_ar.base_offset, &h).await?;
                 h.applied_upto().fetch_max(dlq_ar.base_offset + dlq_ar.count as u64 - 1, Ordering::Release);
             }
             crate::ordered_apply::finish(turn, ordered_scope)?;
@@ -5447,7 +5530,7 @@ impl Stroma {
             .await
             .map_err(io_err)?;
         let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
-        self.apply_event_inmem(StromaEvent::DeadLetterCommit { offs }, qh)
+        self.apply_record_inmem(StromaEvent::DeadLetterCommit { offs }, ar.base_offset, qh)
             .await?;
         if ordered_scope.is_some() {
             qh.applied_upto().fetch_max(ar.base_offset + ar.count as u64 - 1, Ordering::Release);
@@ -5461,6 +5544,10 @@ impl Stroma {
         qh: &QueueHandleInner,
         off: Offset,
     ) -> Result<Option<Message>> {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            return combined::fetch_payload(qh, off);
+        }
         let log = qh.msg_log();
         let reader = log.reader();
         let rec = reader.fetch(off).map_err(io_err)?.map(|r| r.to_message());
@@ -5497,6 +5584,8 @@ impl Stroma {
 
         let stroma = self.clone();
         let closure = move || {
+            #[cfg(feature = "combined-queue-log-experiment")]
+            if stroma.combined_queue_log { let h = qh.resolve()?; return combined::read_selected(&h, &offs); }
             let res: Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> = {
                 let mut out: Vec<(u64, MessageHeaders, Vec<u8>, u32)> =
                     Vec::with_capacity(offs.len());
@@ -5567,6 +5656,8 @@ impl Stroma {
         from: Offset,
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log { return combined::scan_payloads(qh, from, max); }
         let log = qh.msg_log();
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
@@ -5637,18 +5728,10 @@ impl Stroma {
         })
     }
 
-    pub async fn current_next_offset(
-        &self,
-        tp: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> Result<Offset> {
-        let msg_log = self
-            .queue_handle(tp, part, group)
-            .await?
-            .resolve()?
-            .msg_log();
-        Ok(msg_log.next_offset())
+    pub async fn current_next_offset(&self,tp:&str,part:u32,group:Option<&str>) -> Result<Offset> {
+        let q = self.queue_handle(tp,part,group).await?;
+        let h = q.resolve()?;
+        Ok(self.payload_log_for(&h).next_offset())
     }
 
     /// Optional (used by cleanup_topic): truncate message log.
@@ -5663,6 +5746,13 @@ impl Stroma {
         let qh = ticket.resolve()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
+            let live = qh.work_queue()?.lowest_not_settled_offset().await;
+            let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
+            return qh.event_log().truncate_before(before.min(snapshot).min(live)).await.map_err(io_err);
+        }
         let (before, _) = self.checkpoint_retention_limits(&qh, before, u64::MAX).await?;
         qh.msg_log().truncate_before(before).await.map_err(io_err)
     }
@@ -5904,6 +5994,13 @@ impl Stroma {
         let tp = qh.topic();
         let part = qh.partition();
         let group = qh.group();
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
+            let live = qh.work_queue()?.lowest_not_settled_offset().await;
+            let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
+            return qh.event_log().truncate_before(before_event.min(snapshot).min(live)).await.map_err(io_err);
+        }
         let (tp_msg_floor, before_event) = self.checkpoint_retention_limits(&qh, u64::MAX, before_event).await?;
         let event_log = qh.event_log();
         let event_head = event_log
