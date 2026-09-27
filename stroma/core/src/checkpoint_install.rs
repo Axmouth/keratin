@@ -1,4 +1,4 @@
-//! Recoverable two-log checkpoint replacement. A pending record owns the reset;
+//! Recoverable queue checkpoint replacement. A pending record owns the reset.
 //! a durable completion receipt prevents retries from erasing later backfill.
 
 use super::*;

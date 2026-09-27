@@ -113,7 +113,7 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     })
 }
 
-/// The exact two-log dependency of one successfully applied queue batch.
+/// The exact physical-log dependency of one successfully applied queue batch.
 /// Frontiers are exclusive; epochs identify the log histories that contain it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuePublishCommit {

@@ -985,8 +985,8 @@ impl Stroma {
     }
 
     /// Apply a replicated two-log batch to a STREAM partition: records to the
-    /// message log, cursor-commit events to the event log. Identical to the queue
-    /// apply except the stream tail is advanced after the record append, so the
+    /// message log, cursor-commit events to the event log. The stream tail advances
+    /// after the record append, so the
     /// follower's head/tail (and a promoted owner's fan-out + cursor clamping)
     /// reflect the applied records, mirroring the owner append path. Streams have
     /// no group.
@@ -1013,7 +1013,7 @@ impl Stroma {
                 return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
             }
             if !qh.has_combined_log() && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
-                return Err(StromaError::InvalidArgument("combined queue event received by a two-log queue".into()));
+                return Err(StromaError::InvalidArgument("queue payload event received by a stream".into()));
             }
         }
         // Validate the entire incoming frame before enqueueing any writes or
@@ -1262,9 +1262,9 @@ impl Stroma {
         Ok(outcomes)
     }
 
-    /// Shared two-log follower apply for queues and streams. `advance_stream_tail`
-    /// is the only difference: streams advance the keratin stream actor's tail
-    /// after the record append; queues have no stream actor and pass `false`.
+    /// Shared follower apply for single-log queues and two-log streams.
+    /// Streams advance their record tail after accepted writes. Queues apply
+    /// payload-bearing events in order and reject a separate message lane.
     async fn apply_replicated_two_log_batch(
         &self,
         topic: &str,
