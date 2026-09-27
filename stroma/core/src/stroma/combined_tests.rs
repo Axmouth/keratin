@@ -930,6 +930,22 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
     st.shutdown().await.unwrap();
 }
 
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_learner_checkpoint_crash_child() {
+    let Some(root) = std::env::var_os("STROMA_COMBINED_LEARNER_CRASH_ROOT") else { return };
+    let root = Path::new(&root);
+    let install = rmp_serde::from_slice(&fs::read(root.join("checkpoint-fixture")).unwrap()).unwrap();
+    let st = open(root).await;
+    let binding = crate::StorageHistoryBinding {
+        resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
+    };
+    let receipt = st.prepare_queue_learner_storage("q", 0, None, binding, [4; 32]).await.unwrap();
+    st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+    st.install_queue_learner_checkpoint(receipt, install).await.unwrap();
+    panic!("child did not stop at the requested installation boundary");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reapplying_nack() {
     use crate::{FollowerStateCheckpointInstall, OwnerReplicationRead, StorageHistoryBinding};
@@ -947,59 +963,93 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
     let OwnerReplicationRead::Batch(batch) = owner.read_owner_event_records("q", 0, None, 0, 100).await.unwrap() else { panic!("retained source") };
     let events: Vec<_> = batch.records.into_iter().map(|(_, e)| e).collect();
     assert_eq!(events.len(), 3);
-    for boundary in ["intent", "messages", "events", "state", "snapshot", "complete"] {
-        let root = dir.root.join(boundary);
-        let mut st = open(&root).await;
-        let receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [4; 32]).await.unwrap();
-        st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-        let install = FollowerStateCheckpointInstall {
-            combined_log: cut.combined_log, event_start_offset: cut.event_start_offset,
-            message_epoch: cut.message_epoch, event_epoch: cut.event_epoch,
-            message_next_offset: cut.message_checkpoint_offset, event_next_offset: cut.event_next_offset,
-            applied_event_offset: cut.applied_event_offset, state_snapshot: cut.state_snapshot.clone(),
-        };
-        let mut wrong = install.clone();
-        wrong.event_start_offset = 1;
-        assert!(st.install_queue_learner_checkpoint(receipt.clone(), wrong).await.is_err());
-        *st.checkpoint_fault.lock().unwrap() = Some(boundary);
-        let err = st.install_queue_learner_checkpoint(receipt, install.clone()).await.unwrap_err();
-        assert!(err.to_string().contains(boundary), "{err}");
-        st.shutdown().await.unwrap();
-        drop(st);
-        st = open(&root).await;
-        assert!(st.queue_handle("q", 0, None).await.is_err());
-        let mut receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [5; 32]).await.unwrap();
-        for (offset, event) in events.iter().enumerate() {
-            assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.is_err());
-            assert!(st.become_queue_owner("q", 0, None).await.is_err());
-            for _ in 0..2 {
-                let batch = ReplicatedEventBatch { epoch: 7, first_offset: offset as u64, events: vec![event.clone()], durability: Some(KDurability::AfterFsync) };
-                st.apply_replicated_queue_batch("q", 0, None, None, Some(batch)).await.unwrap();
-            }
-            if offset == 0 {
+    for hard_kill in [false, true].into_iter().filter(|hard_kill| !hard_kill || cfg!(unix)) {
+        for boundary in ["intent", "messages", "events", "state", "snapshot", "complete"] {
+            let root = dir.root.join(format!("{boundary}-{hard_kill}"));
+            let mut st = open(&root).await;
+            let receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [4; 32]).await.unwrap();
+            st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+            let install = FollowerStateCheckpointInstall {
+                combined_log: cut.combined_log, event_start_offset: cut.event_start_offset,
+                message_epoch: cut.message_epoch, event_epoch: cut.event_epoch,
+                message_next_offset: cut.message_checkpoint_offset, event_next_offset: cut.event_next_offset,
+                applied_event_offset: cut.applied_event_offset, state_snapshot: cut.state_snapshot.clone(),
+            };
+            let mut wrong = install.clone();
+            wrong.event_start_offset = 1;
+            assert!(st.install_queue_learner_checkpoint(receipt.clone(), wrong).await.is_err());
+            if hard_kill {
                 st.shutdown().await.unwrap();
                 drop(st);
-                st = open(&root).await;
-                receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [6; 32]).await.unwrap();
-                assert_eq!(st.queue_replication_next_offsets("q", 0, None).await.unwrap(), (0, 1));
-                assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+                fs::write(root.join("checkpoint-fixture"), rmp_serde::to_vec_named(&install).unwrap()).unwrap();
+                #[cfg(unix)]
+                {
+                    struct KillOnDrop(std::process::Child);
+                    impl Drop for KillOnDrop {
+                        fn drop(&mut self) {
+                            let _ = self.0.kill();
+                            let _ = self.0.wait();
+                        }
+                    }
+                    let ready = root.join("child-ready");
+                    let mut child = KillOnDrop(std::process::Command::new(std::env::current_exe().unwrap())
+                        .args(["--exact", "stroma::combined::tests::combined_learner_checkpoint_crash_child", "--nocapture"])
+                        .env("STROMA_COMBINED_LEARNER_CRASH_ROOT", &root)
+                        .env("STROMA_CHECKPOINT_CRASH_READY", &ready)
+                        .env("STROMA_CHECKPOINT_CRASH_BOUNDARY", boundary)
+                        .stdout(std::process::Stdio::null()).spawn().unwrap());
+                    tokio::time::timeout(std::time::Duration::from_secs(10), async {
+                        while !ready.exists() {
+                            assert!(child.0.try_wait().unwrap().is_none(), "child exited before {boundary}");
+                            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+                        }
+                    }).await.unwrap();
+                    child.0.kill().unwrap();
+                    use std::os::unix::process::ExitStatusExt;
+                    assert_eq!(child.0.wait().unwrap().signal(), Some(9));
+                }
+            } else {
+                *st.checkpoint_fault.lock().unwrap() = Some(boundary);
+                let err = st.install_queue_learner_checkpoint(receipt, install.clone()).await.unwrap_err();
+                assert!(err.to_string().contains(boundary), "{err}");
+                st.shutdown().await.unwrap();
+                drop(st);
             }
+            st = open(&root).await;
+            assert!(st.queue_handle("q", 0, None).await.is_err());
+            let mut receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [5; 32]).await.unwrap();
+            for (offset, event) in events.iter().enumerate() {
+                assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.is_err());
+                assert!(st.become_queue_owner("q", 0, None).await.is_err());
+                for _ in 0..2 {
+                    let batch = ReplicatedEventBatch { epoch: 7, first_offset: offset as u64, events: vec![event.clone()], durability: Some(KDurability::AfterFsync) };
+                    st.apply_replicated_queue_batch("q", 0, None, None, Some(batch)).await.unwrap();
+                }
+                if offset == 0 {
+                    st.shutdown().await.unwrap();
+                    drop(st);
+                    st = open(&root).await;
+                    receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [6; 32]).await.unwrap();
+                    assert_eq!(st.queue_replication_next_offsets("q", 0, None).await.unwrap(), (0, 1));
+                    assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+                }
+            }
+            st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.unwrap();
+            let ticket = st.queue_handle("q", 0, None).await.unwrap();
+            let h = ticket.resolve().unwrap();
+            assert_eq!(h.work_queue().unwrap().retries(1).await, 1);
+            assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+            assert_eq!(fetch_payload(&h, 1).unwrap().unwrap().payload, vec![42; 2048]);
+            let mut state = crate::QueueInternalState::new("q".into(), 0);
+            state.load_snapshot(&h.force_encode_snapshot(2).await.unwrap()).unwrap();
+            let mut expected = crate::QueueInternalState::new("q".into(), 0);
+            expected.load_snapshot(&cut.state_snapshot).unwrap();
+            assert_eq!(state.recovery_state_digest(), expected.recovery_state_digest());
+            st.install_queue_learner_checkpoint(receipt, install).await.unwrap();
+            assert_eq!(h.event_log().next_offset(), 3);
+            drop(h);
+            st.shutdown().await.unwrap();
         }
-        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.unwrap();
-        let ticket = st.queue_handle("q", 0, None).await.unwrap();
-        let h = ticket.resolve().unwrap();
-        assert_eq!(h.work_queue().unwrap().retries(1).await, 1);
-        assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
-        assert_eq!(fetch_payload(&h, 1).unwrap().unwrap().payload, vec![42; 2048]);
-        let mut state = crate::QueueInternalState::new("q".into(), 0);
-        state.load_snapshot(&h.force_encode_snapshot(2).await.unwrap()).unwrap();
-        let mut expected = crate::QueueInternalState::new("q".into(), 0);
-        expected.load_snapshot(&cut.state_snapshot).unwrap();
-        assert_eq!(state.recovery_state_digest(), expected.recovery_state_digest());
-        st.install_queue_learner_checkpoint(receipt, install).await.unwrap();
-        assert_eq!(h.event_log().next_offset(), 3);
-        drop(h);
-        st.shutdown().await.unwrap();
     }
     owner.shutdown().await.unwrap();
 }
@@ -1038,6 +1088,61 @@ async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_recor
         let error = match st.queue_handle("q", 0, None).await { Ok(_) => panic!("invalid learner became readable"), Err(e) => e };
         let expected = if missing_receipt { "exact checkpoint does not cover" } else { "retained payload enqueue" };
         assert!(error.to_string().contains(expected), "{error}");
+        st.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_reseed_preserves_original_and_only_switches_complete_unsealed_history() {
+    use crate::{OwnerReplicationRead, PreparedStorageHistory, StorageHistoryBinding};
+    for seal_during_copy in [false, true] {
+        let dir = keratin_log::test_dir!("combined_reseed_switch");
+        let st = open(&dir.root).await;
+        let binding = StorageHistoryBinding {
+            resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
+        };
+        st.initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, binding.clone()).await.unwrap();
+        st.ensure_queue_owner_epoch("q", 0, None, Some(7)).await.unwrap();
+        assert_eq!(publish(&st, false).await, 0);
+        let OwnerReplicationRead::Batch(batch) = st.read_owner_event_records("q", 0, None, 0, 100).await.unwrap() else { panic!("retained original") };
+        let events = batch.records.into_iter().map(|(_, event)| event).collect();
+        st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+        let receipt = PreparedStorageHistory {
+            topic: "q".into(), partition: 0, group: None, stream: false,
+            binding: binding.clone(), storage_instance: st.storage_session,
+        };
+        let view = st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.unwrap();
+        view.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+        assert!(st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0).await.is_err());
+        assert_eq!(st.queue_replication_next_offsets("q", 0, None).await.unwrap(), (0, 1));
+        let original_root = st.partition_root("q", 0, None);
+        if seal_during_copy {
+            let seal = st.seal_replica_for_recovery("q", 0, None,
+                RecoverySealRequest { transition: [45; 32], fence_epoch: 8 }).await.unwrap();
+            assert_eq!((seal.message_next, seal.event_next), (0, 1));
+        }
+        view.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
+            epoch: 7, first_offset: 0, events, durability: Some(KDurability::AfterFsync),
+        })).await.unwrap();
+        let installed = st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1).await;
+        if seal_during_copy {
+            assert!(installed.is_err());
+            assert_eq!(st.partition_root("q", 0, None), original_root);
+        } else {
+            installed.unwrap();
+            assert_ne!(st.partition_root("q", 0, None), original_root);
+            assert!(view.verify_admitted_storage_history(&receipt).is_err());
+            assert!(view.resume_unaccepted_storage_history("q", 0, None, binding).await.is_err());
+            st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+            st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1).await.unwrap();
+            assert_eq!(st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(), Some((7, 0, 1)));
+            assert!(st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.is_err());
+            st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1).await.unwrap();
+            let ticket = st.queue_handle("q", 0, None).await.unwrap();
+            let h = ticket.resolve().unwrap();
+            assert!(h.optional_message_log().is_none());
+            assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+        }
         st.shutdown().await.unwrap();
     }
 }
