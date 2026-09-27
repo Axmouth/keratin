@@ -1092,57 +1092,115 @@ async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_recor
     }
 }
 
+async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
+    use crate::{OwnerReplicationRead, PreparedStorageHistory, StorageHistoryBinding};
+    let st = open(root).await;
+    let binding = StorageHistoryBinding {
+        resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
+    };
+    st.initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, binding.clone()).await.unwrap();
+    st.ensure_queue_owner_epoch("q", 0, None, Some(7)).await.unwrap();
+    assert_eq!(publish(&st, false).await, 0);
+    let OwnerReplicationRead::Batch(batch) = st.read_owner_event_records("q", 0, None, 0, 100).await.unwrap() else { panic!("retained original") };
+    let events = batch.records.into_iter().map(|(_, event)| event).collect();
+    st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+    let receipt = PreparedStorageHistory {
+        topic: "q".into(), partition: 0, group: None, stream: false,
+        binding: binding.clone(), storage_instance: st.storage_session,
+    };
+    let view = st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.unwrap();
+    view.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+    assert!(st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0).await.is_err());
+    assert_eq!(st.queue_replication_next_offsets("q", 0, None).await.unwrap(), (0, 1));
+    let original_root = st.partition_root("q", 0, None);
+    if seal_during_copy {
+        let seal = st.seal_replica_for_recovery("q", 0, None,
+            RecoverySealRequest { transition: [45; 32], fence_epoch: 8 }).await.unwrap();
+        assert_eq!((seal.message_next, seal.event_next), (0, 1));
+    }
+    view.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
+        epoch: 7, first_offset: 0, events, durability: Some(KDurability::AfterFsync),
+    })).await.unwrap();
+    let installed = st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1).await;
+    if seal_during_copy {
+        assert!(installed.is_err());
+        assert_eq!(st.partition_root("q", 0, None), original_root);
+    } else {
+        installed.unwrap();
+        assert_ne!(st.partition_root("q", 0, None), original_root);
+        assert!(view.verify_admitted_storage_history(&receipt).is_err());
+        assert!(view.resume_unaccepted_storage_history("q", 0, None, binding).await.is_err());
+        st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
+        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1).await.unwrap();
+        assert_eq!(st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(), Some((7, 0, 1)));
+        assert!(st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.is_err());
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1).await.unwrap();
+        let ticket = st.queue_handle("q", 0, None).await.unwrap();
+        let h = ticket.resolve().unwrap();
+        assert!(h.optional_message_log().is_none());
+        assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+    }
+    st.shutdown().await.unwrap();
+
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_reseed_preserves_original_and_only_switches_complete_unsealed_history() {
-    use crate::{OwnerReplicationRead, PreparedStorageHistory, StorageHistoryBinding};
     for seal_during_copy in [false, true] {
         let dir = keratin_log::test_dir!("combined_reseed_switch");
+        combined_reseed_case(&dir.root, seal_during_copy).await;
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_reseed_crash_child() {
+    let Some(root) = std::env::var_os("STROMA_COMBINED_RESEED_CRASH_ROOT") else { return };
+    combined_reseed_case(Path::new(&root), false).await;
+    panic!("child did not stop at the requested reseed boundary");
+}
+
+#[cfg(unix)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_reseed_sigkill_preserves_recoverable_payloads_on_either_route() {
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    for boundary in ["reseed_before_switch", "reseed_retired", "reseed_switched"] {
+        let dir = keratin_log::test_dir!("combined_reseed_sigkill");
+        let ready = dir.root.join("child-ready");
+        let mut child = KillOnDrop(std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "stroma::combined::tests::combined_reseed_crash_child", "--nocapture"])
+            .env("STROMA_COMBINED_RESEED_CRASH_ROOT", &dir.root)
+            .env("STROMA_INSTALL_CRASH_READY", &ready)
+            .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
+            .stdout(std::process::Stdio::null()).spawn().unwrap());
+        tokio::time::timeout(std::time::Duration::from_secs(20), async {
+            while !ready.exists() {
+                assert!(child.0.try_wait().unwrap().is_none(), "child exited before {boundary}");
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+        }).await.unwrap();
+        child.0.kill().unwrap();
+        use std::os::unix::process::ExitStatusExt;
+        assert_eq!(child.0.wait().unwrap().signal(), Some(9));
         let st = open(&dir.root).await;
-        let binding = StorageHistoryBinding {
-            resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
+        let request = RecoverySealRequest { transition: [49; 32], fence_epoch: 8 };
+        let seal = st.seal_replica_for_recovery("q", 0, None, request.clone()).await.unwrap();
+        assert_eq!((seal.message_next, seal.event_next), (0, 1), "{boundary}");
+        let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, RecoveryReadRequest {
+            seal: request, history_id: seal.history.id, source: RecoveryReadSource::Events,
+            from: 0, max_records: 8, max_bytes: 65536,
+        }).await.unwrap();
+        assert_eq!(page.records.len(), 1);
+        let StromaEvent::PayloadEnqueue { payload, .. } = StromaEvent::decode(&page.records[0].payload).unwrap() else {
+            panic!("retained event is not a payload enqueue at {boundary}");
         };
-        st.initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, binding.clone()).await.unwrap();
-        st.ensure_queue_owner_epoch("q", 0, None, Some(7)).await.unwrap();
-        assert_eq!(publish(&st, false).await, 0);
-        let OwnerReplicationRead::Batch(batch) = st.read_owner_event_records("q", 0, None, 0, 100).await.unwrap() else { panic!("retained original") };
-        let events = batch.records.into_iter().map(|(_, event)| event).collect();
-        st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-        let receipt = PreparedStorageHistory {
-            topic: "q".into(), partition: 0, group: None, stream: false,
-            binding: binding.clone(), storage_instance: st.storage_session,
-        };
-        let view = st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.unwrap();
-        view.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-        assert!(st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0).await.is_err());
-        assert_eq!(st.queue_replication_next_offsets("q", 0, None).await.unwrap(), (0, 1));
-        let original_root = st.partition_root("q", 0, None);
-        if seal_during_copy {
-            let seal = st.seal_replica_for_recovery("q", 0, None,
-                RecoverySealRequest { transition: [45; 32], fence_epoch: 8 }).await.unwrap();
-            assert_eq!((seal.message_next, seal.event_next), (0, 1));
-        }
-        view.apply_replicated_queue_batch("q", 0, None, None, Some(ReplicatedEventBatch {
-            epoch: 7, first_offset: 0, events, durability: Some(KDurability::AfterFsync),
-        })).await.unwrap();
-        let installed = st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1).await;
-        if seal_during_copy {
-            assert!(installed.is_err());
-            assert_eq!(st.partition_root("q", 0, None), original_root);
-        } else {
-            installed.unwrap();
-            assert_ne!(st.partition_root("q", 0, None), original_root);
-            assert!(view.verify_admitted_storage_history(&receipt).is_err());
-            assert!(view.resume_unaccepted_storage_history("q", 0, None, binding).await.is_err());
-            st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-            st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1).await.unwrap();
-            assert_eq!(st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(), Some((7, 0, 1)));
-            assert!(st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.is_err());
-            st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1).await.unwrap();
-            let ticket = st.queue_handle("q", 0, None).await.unwrap();
-            let h = ticket.resolve().unwrap();
-            assert!(h.optional_message_log().is_none());
-            assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
-        }
+        assert_eq!(payload, vec![42; 2048], "{boundary}");
         st.shutdown().await.unwrap();
     }
 }
