@@ -646,8 +646,28 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
                     assert_eq!(h.msg_log().next_offset(), prefix + 1);
                     drop(armed);
                 }
+                let shutdown = owner.shutdown().await;
+                if let Err(error) = shutdown {
+                    // Immediate staging fences the writer on a buffer-write error.
+                    // Shutdown reports that failure and still drains the other log.
+                    assert_eq!(
+                        std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref(),
+                        Ok("1"),
+                        "unexpected shutdown error: {error:?} ({label})"
+                    );
+                    assert!(
+                        matches!(error, crate::StromaError::Io(ref message) if message == "writer gone" || message == "writer dropped"),
+                        "unexpected shutdown error: {error:?} ({label})"
+                    );
+                }
+                for log in [h.event_log(), h.msg_log()] {
+                    let error = tokio::time::timeout(Duration::from_secs(5), log.sync())
+                        .await
+                        .expect("shutdown must finish both writers")
+                        .expect_err("shutdown must close both writers");
+                    assert_eq!(error.kind(), std::io::ErrorKind::BrokenPipe, "{label}");
+                }
                 drop(h);
-                owner.shutdown().await.unwrap();
                 drop(qh);
                 drop(owner);
                 let reopened = Stroma::open(

@@ -3956,9 +3956,11 @@ impl Stroma {
                     if let Some(wq) = q.as_work_queue() {
                         wq.shutdown().await;
                     }
-                    q.event_log().shutdown().await.map_err(io_err)?;
-                    q.msg_log().shutdown().await.map_err(io_err)?;
-                    Ok::<_, StromaError>(())
+                    // A failed writer must not prevent its sibling from draining.
+                    // Preserve the first error after both shutdown attempts.
+                    let events = q.event_log().shutdown().await.map_err(io_err);
+                    let messages = q.msg_log().shutdown().await.map_err(io_err);
+                    events.and(messages)
                 });
             }
         }
