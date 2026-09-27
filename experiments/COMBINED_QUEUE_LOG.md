@@ -44,13 +44,25 @@ writer. The injected gate is test-only and absent from the benchmark release.
 
 ## Remaining gates
 
-Streams and complete recovery checkpoint transfer/reconciliation are unsupported.
-Agreed checkpoint creation and acceptance reject combined mode before mutation.
-Future-offset settlement compatibility remains undecided. Full broker failover,
-restart/fault acceptance across every boundary, and queue/stream coexistence must
-be completed before adoption. Existing acceptance in this worktree covers local
-replay, retention, delayed activation, cancellation, follower overlap and injected
-writer failures. It does not establish complete clustered recovery.
+Combined queues support sealed-history inspection, transfer, staged installation,
+agreed checkpoints and excluded-replica learner backfill. Recovery preserves live
+payloads older than a snapshot's replay boundary. Owner and follower paths reject
+forward payload references before append. Interrupted installation, learner
+restart, reseeding and broker recovery have focused acceptance coverage.
+
+Queues and streams can share one storage instance. Streams retain separate
+payload and cursor logs, their metadata-sized event configuration and independent
+replication frontiers. Mixed-root tests cover payload reads, queue compaction,
+stream retention, cursor replication, cold reopen and stream recovery seals.
+Broker tests cover stream catch-up, promotion and confirmations with both queue
+layouts, including stream assignments that have not materialized local storage.
+
+Remaining adoption gates include matched release-mode performance and failover
+timing, larger retained histories and live backlogs, clustered repair after early
+replication leaves an unconfirmed suffix, and removal of the old two-log queue
+runtime. Keep the old layout in a pinned benchmark control. Adoption changes the
+queue storage format without migration support, while preserving stream storage.
+Early replication remains opt-in and outside the dashboard.
 
 The event codec still decodes and re-encodes payloads in replication and copies
 the nested body during delivery. Those are separate optimization candidates.
@@ -65,5 +77,6 @@ the omitted serialization default, preserving existing separate-history identity
 bytes. Combined evidence names its layout, requires a bound queue history and a
 canonical empty compatibility lane, and is rejected by builds without combined
 format support. Pair inspection rejects mixed layouts before fetching pages.
-This schema groundwork does not enable combined recovery. The operational guards
-remain until replay, transfer, installation and failover acceptance are complete.
+Recovery reads and installation use the selected physical payload log. Combined
+checkpoints require exact authorized learner installation when backfilling old
+payloads, and promotion remains fenced until those dependencies are verified.

@@ -883,7 +883,7 @@ impl Stroma {
             let mut combined_bytes = 0usize;
             for record in raw {
                 #[cfg(feature = "combined-queue-log-experiment")]
-                if self.combined_queue_log {
+                if qh.has_combined_log() {
                     // The reader includes one lookahead record. Payload-bearing
                     // events now need the same cap the message lane had. Always
                     // allow one oversized record so the cursor can advance.
@@ -960,11 +960,11 @@ impl Stroma {
             };
 
             Ok(OwnerStateCheckpoint {
-                combined_log: self.queue_payloads_in_event_log(),
-                event_start_offset: if self.queue_payloads_in_event_log() { state_checkpoint.message_checkpoint_offset.min(event_next_offset) } else { event_next_offset },
+                combined_log: qh.has_combined_log(),
+                event_start_offset: if qh.has_combined_log() { state_checkpoint.message_checkpoint_offset.min(event_next_offset) } else { event_next_offset },
                 message_epoch: qh.message_lane_epoch(),
                 event_epoch: qh.event_log().current_epoch(),
-                message_checkpoint_offset: if self.queue_payloads_in_event_log() { 0 } else { state_checkpoint.message_checkpoint_offset },
+                message_checkpoint_offset: if qh.has_combined_log() { 0 } else { state_checkpoint.message_checkpoint_offset },
                 message_next_offset,
                 event_next_offset,
                 applied_event_offset,
@@ -1012,10 +1012,10 @@ impl Stroma {
     ) -> Result<(ReplicatedQueueApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
         #[cfg(feature = "combined-queue-log-experiment")]
         {
-            if self.combined_queue_log && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
+            if qh.has_combined_log() && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
                 return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
             }
-            if !self.combined_queue_log && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
+            if !qh.has_combined_log() && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
                 return Err(StromaError::InvalidArgument("combined queue event received by a two-log queue".into()));
             }
         }
@@ -1059,7 +1059,7 @@ impl Stroma {
         #[cfg(feature = "combined-queue-log-experiment")]
         let events = {
             let mut events = events;
-            if self.combined_queue_log {
+            if qh.has_combined_log() {
                 if let Some(batch) = &mut events {
                     for event in &mut batch.events {
                         if let StromaEvent::PayloadEnqueue { headers, payload, .. } = event {
@@ -1186,7 +1186,7 @@ impl Stroma {
                 // Snapshot backfill may skip old state events, but its physical
                 // payload dependencies must be checked before that cut is ready.
                 #[cfg(feature = "combined-queue-log-experiment")]
-                if self.combined_queue_log && skip > 0
+                if qh.has_combined_log() && skip > 0
                     && applied_next.is_some_and(|next| batch.first_offset.saturating_add(batch.events.len() as u64) >= next) {
                     self.verify_combined_payload_coverage(qh, false).await?;
                 }
@@ -1195,7 +1195,7 @@ impl Stroma {
                     let scope = qh.ordered_apply_scope();
                     let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
                     #[cfg(feature = "combined-queue-log-experiment")]
-                    if self.combined_queue_log {
+                    if qh.has_combined_log() {
                         self.apply_combined_records(batch.events.into_iter().skip(skip).collect(),batch.first_offset+skip as u64,qh).await?;
                         qh.applied_upto().fetch_max(batch.first_offset+skip as u64+count as u64-1,Ordering::Release);
                         crate::ordered_apply::finish(turn,scope)?;

@@ -282,8 +282,8 @@ impl Stroma {
             Some(handle) => Some(handle.follower_apply_state().await),
             None => None,
         };
-        let combined = self.queue_payloads_in_event_log();
-        if combined && (actual != PartitionKind::Queue || self.durable_storage_history_receipt(topic, part, group)?.is_none()) {
+        let combined = actual == PartitionKind::Queue && self.queue_payloads_in_event_log();
+        if combined && self.durable_storage_history_receipt(topic, part, group)?.is_none() {
             return Err(StromaError::InvalidArgument("combined recovery requires an admitted queue history".into()));
         }
         let (messages, events) = match &handle {

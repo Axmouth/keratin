@@ -2972,6 +2972,11 @@ impl QueueHandleInner {
         ))
     }
 
+    /// The physical layout belongs to this partition, even in mixed roots.
+    pub(crate) fn has_combined_log(&self) -> bool {
+        self.msg_log.is_none()
+    }
+
     pub fn optional_message_log(&self) -> Option<Arc<Keratin>> {
         self.msg_log.clone()
     }

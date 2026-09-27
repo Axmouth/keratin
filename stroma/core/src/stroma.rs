@@ -1322,6 +1322,13 @@ impl Stroma {
         self.keratin_cfg_event
     }
 
+    fn partition_event_log_config(&self, kind: PartitionKind) -> KeratinConfig {
+        match kind {
+            PartitionKind::Queue => self.queue_event_log_config(),
+            PartitionKind::Stream => self.keratin_cfg_event,
+        }
+    }
+
     async fn event_log_init(
         &self,
         tp: &str,
@@ -1335,7 +1342,7 @@ impl Stroma {
         let k = self
             .open_keratin(
                 dir,
-                self.queue_event_log_config(),
+                self.partition_event_log_config(self.read_partition_kind(tp, part, group)),
                 self.storage_history_binding(tp, part, group)?.is_some(),
             )
             .await
@@ -1613,7 +1620,12 @@ impl Stroma {
                 .handle
                 .get_or_try_init(|| async {
                     self.ensure_partition_not_sealed(tp, part, group)?;
-                    let msg_log = if self.queue_payloads_in_event_log() { None } else { Some(self.msg_log_init(tp, part, group).await?) };
+                    let kind = self.read_partition_kind(tp, part, group);
+                    let msg_log = if kind == PartitionKind::Queue && self.queue_payloads_in_event_log() {
+                        None
+                    } else {
+                        Some(self.msg_log_init(tp, part, group).await?)
+                    };
                     let event_log = self.event_log_init(tp, part, group).await?;
 
                     let bundle = QueueSharedBundle {
@@ -1625,7 +1637,6 @@ impl Stroma {
                         deadline_waker: self.deadline_waker.clone(),
                     };
 
-                    let kind = self.read_partition_kind(tp, part, group);
                     let inner = QueueHandleInner::init(
                         tp.into(),
                         part,
@@ -2289,13 +2300,25 @@ impl Stroma {
         { false }
     }
 
+    /// Resolve this partition's payload lane. Live handles avoid filesystem reads
+    /// on replication progress reports. Cold partitions use their durable kind.
+    pub fn partition_payloads_in_event_log(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
+        if !self.queue_payloads_in_event_log() { return false; }
+        let group = normalize_group(group);
+        let current = self.queue_handles.load();
+        if let Some(h) = slot_lookup_no_alloc(&current, tp, part, group).and_then(|s| s.handle.get()) {
+            return h.has_combined_log();
+        }
+        self.read_partition_kind(tp, part, group) == PartitionKind::Queue
+    }
+
     pub(crate) fn payload_log_for(&self, qh: &QueueHandleInner) -> Arc<Keratin> {
         qh.payload_log()
     }
 
     pub(crate) async fn apply_record_inmem(&self, ev: StromaEvent, off: u64, qh: &QueueHandleInner) -> Result<()> {
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log { return self.apply_combined_records(vec![ev], off, qh).await; }
+        if qh.has_combined_log() { return self.apply_combined_records(vec![ev], off, qh).await; }
         let _ = off;
         self.apply_event_inmem(ev, qh).await
     }
@@ -3719,7 +3742,7 @@ impl Stroma {
         }
 
         #[cfg(feature = "combined-queue-log-experiment")]
-        let combined_mode = self.combined_queue_log;
+        let combined_mode = h.has_combined_log();
         let RecoveryScanOutcome {
             events,
             events_count,
@@ -3851,7 +3874,7 @@ impl Stroma {
         }
 
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
+        if h.has_combined_log() {
             self.verify_combined_payload_coverage(&h, pending_combined_backfill).await?;
         }
 
@@ -4700,8 +4723,6 @@ impl Stroma {
                 "{tp}/{part} is already declared as a queue, cannot declare it as a plexus stream - use a different topic name, or destroy the queue first if it is no longer needed"
             )));
         }
-        #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log { return Err(StromaError::InvalidArgument("combined experiment currently supports work queues only".into())); }
         self.write_partition_kind(tp, part, None, PartitionKind::Stream)?;
         drop(lifecycle);
         let qh = self.queue_handle(tp, part, None).await?;
@@ -5572,7 +5593,7 @@ impl Stroma {
         off: Offset,
     ) -> Result<Option<Message>> {
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
+        if qh.has_combined_log() {
             return combined::fetch_payload(qh, off);
         }
         let log = qh.msg_log()?;
@@ -5684,7 +5705,7 @@ impl Stroma {
         max: usize,
     ) -> Result<Vec<(Offset, Vec<u8>, MessageHeaders)>> {
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log { return combined::scan_payloads(qh, from, max); }
+        if qh.has_combined_log() { return combined::scan_payloads(qh, from, max); }
         let log = qh.msg_log()?;
         let reader = log.reader();
         let got = reader.scan_from(from, max).map_err(io_err)?;
@@ -5774,7 +5795,7 @@ impl Stroma {
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
+        if qh.has_combined_log() {
             let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
             let live = qh.work_queue()?.lowest_not_settled_offset().await;
             let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
@@ -6022,7 +6043,7 @@ impl Stroma {
         let part = qh.partition();
         let group = qh.group();
         #[cfg(feature = "combined-queue-log-experiment")]
-        if self.combined_queue_log {
+        if qh.has_combined_log() {
             let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
             let live = qh.work_queue()?.lowest_not_settled_offset().await;
             let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;

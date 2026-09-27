@@ -1364,3 +1364,266 @@ async fn combined_open_group_keeps_dirty_fence_when_later_frame_is_invalid() {
     assert!(st.apply_replicated_queue_batch("q", 0, None, None, Some(invalid())).await.unwrap_err().to_string().contains("incomplete follower apply"));
     st.shutdown().await.unwrap();
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
+    use crate::OwnerReplicationRead;
+    let dir = keratin_log::test_dir!("combined_mixed_stream");
+    let owner = open(&dir.root.join("owner")).await;
+    let follower = open(&dir.root.join("follower")).await;
+    owner
+        .create_stream(
+            "s",
+            0,
+            Some(RetentionConfig {
+                max_records: Some(3),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap();
+    follower.create_stream("s", 0, None).await.unwrap();
+    let delayed = publish(&owner, true).await;
+    for i in 0..12u8 {
+        let ready = publish(&owner, false).await;
+        ack(&owner, ready).await;
+        assert_eq!(
+            owner
+                .append_stream_record("s", 0, &headers(), vec![i; 2048])
+                .await
+                .unwrap(),
+            i as u64
+        );
+    }
+    owner
+        .commit_stream_cursor("s", 0, "reader", 1)
+        .await
+        .unwrap();
+    let OwnerReplicationRead::Batch(messages) = owner
+        .read_owner_message_records("s", 0, None, 0, 100)
+        .await
+        .unwrap()
+    else {
+        panic!("stream messages retained")
+    };
+    let OwnerReplicationRead::Batch(events) = owner
+        .read_owner_event_records("s", 0, None, 0, 100)
+        .await
+        .unwrap()
+    else {
+        panic!("stream events retained")
+    };
+    assert_eq!(messages.records.len(), 12);
+    assert_eq!(events.records.len(), 1);
+    follower
+        .become_stream_follower_with_epoch("s", 0, events.epoch)
+        .await
+        .unwrap();
+    follower
+        .apply_replicated_stream_batch(
+            "s",
+            0,
+            Some(ReplicatedMessageBatch {
+                epoch: messages.epoch,
+                first_offset: 0,
+                records: messages
+                    .records
+                    .into_iter()
+                    .map(|(_, message)| message)
+                    .collect(),
+                durability: Some(KDurability::AfterFsync),
+            }),
+            Some(ReplicatedEventBatch {
+                epoch: events.epoch,
+                first_offset: 0,
+                events: events.records.into_iter().map(|(_, event)| event).collect(),
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap();
+
+    let OwnerReplicationRead::Batch(events) = owner
+        .read_owner_event_records("q", 0, None, 0, 100)
+        .await
+        .unwrap()
+    else {
+        panic!("queue events retained")
+    };
+    follower
+        .become_queue_follower_with_epoch("q", 0, None, events.epoch)
+        .await
+        .unwrap();
+    follower
+        .apply_replicated_queue_batch(
+            "q",
+            0,
+            None,
+            None,
+            Some(ReplicatedEventBatch {
+                epoch: events.epoch,
+                first_offset: 0,
+                events: events.records.into_iter().map(|(_, event)| event).collect(),
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap();
+
+    // Queue compaction cannot discard its old delayed payload. Stream retention
+    // advances independently and replicates its head and cursor clamp.
+    let q = owner.queue_handle("q", 0, None).await.unwrap();
+    owner.write_exact_queue_checkpoint(q, true).await.unwrap();
+    assert_eq!(
+        owner
+            .truncate_messages_before("q", 0, None, u64::MAX)
+            .await
+            .unwrap(),
+        0
+    );
+    let head = owner
+        .enforce_stream_retention("s", 0)
+        .await
+        .unwrap()
+        .unwrap();
+    assert!(head > 0 && head <= 9);
+    let OwnerReplicationRead::Batch(events) = owner
+        .read_owner_event_records("s", 0, None, 1, 100)
+        .await
+        .unwrap()
+    else {
+        panic!("retention event retained")
+    };
+    follower
+        .apply_replicated_stream_batch(
+            "s",
+            0,
+            None,
+            Some(ReplicatedEventBatch {
+                epoch: events.epoch,
+                first_offset: 1,
+                events: events.records.into_iter().map(|(_, event)| event).collect(),
+                durability: Some(KDurability::AfterFsync),
+            }),
+        )
+        .await
+        .unwrap();
+    for st in [&owner, &follower] {
+        let q = st.queue_handle("q", 0, None).await.unwrap();
+        let h = q.resolve().unwrap();
+        assert!(h.has_combined_log());
+        assert_eq!(h.physical_logs().count(), 1);
+        assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+        assert_eq!(
+            st.fetch_message_by_offset(&h, delayed)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![42; 2048]
+        );
+        assert_eq!(
+            h.work_queue().unwrap().lowest_not_settled_offset().await,
+            delayed
+        );
+        let s = st.queue_handle("s", 0, None).await.unwrap();
+        let h = s.resolve().unwrap();
+        assert!(!h.has_combined_log());
+        assert_eq!(h.physical_logs().count(), 2);
+        // Follower append batches may have different segment boundaries.
+        assert!(h.msg_log().unwrap().head_offset() <= head);
+        assert_eq!(st.stream_head_tail("s", 0).await.unwrap(), (head, 12));
+        assert_eq!(
+            st.stream_cursor("s", 0, "reader").await.unwrap(),
+            Some(head)
+        );
+        assert_eq!(
+            st.fetch_message_by_offset(&h, 11)
+                .await
+                .unwrap()
+                .unwrap()
+                .payload,
+            vec![11; 2048]
+        );
+        st.snapshot_partition("s", 0, None).await.unwrap();
+        st.truncate_partition_log(s, 1).await.unwrap();
+    }
+    owner.shutdown().await.unwrap();
+    follower.shutdown().await.unwrap();
+    drop(owner);
+    drop(follower);
+    for node in ["owner", "follower"] {
+        let st = open(&dir.root.join(node)).await;
+        assert!(st.partition_payloads_in_event_log("q", 0, None));
+        assert!(!st.partition_payloads_in_event_log("s", 0, None));
+        let q = st.queue_handle("q", 0, None).await.unwrap();
+        let h = q.resolve().unwrap();
+        assert!(h.has_combined_log());
+        assert_eq!(
+            h.work_queue().unwrap().lowest_not_settled_offset().await,
+            delayed
+        );
+        assert!(
+            st.fetch_message_by_offset(&h, delayed)
+                .await
+                .unwrap()
+                .is_some()
+        );
+        assert_eq!(st.stream_head_tail("s", 0).await.unwrap(), (head, 12));
+        assert_eq!(
+            st.stream_cursor("s", 0, "reader").await.unwrap(),
+            Some(head)
+        );
+        let records = st.read_stream_records("s", 0, head, 100).await.unwrap();
+        assert_eq!(records.len() as u64, 12 - head);
+        for (off, payload, _) in records {
+            assert_eq!(payload, vec![off as u8; 2048]);
+        }
+        st.commit_stream_cursor("s", 0, "reader", 12).await.unwrap();
+        assert_eq!(st.stream_cursor("s", 0, "reader").await.unwrap(), Some(12));
+        st.shutdown().await.unwrap();
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_root_preserves_stream_preparation_and_seal_layout() {
+    use crate::{QueueLogLayout, RecoverySealRequest, StorageHistoryBinding};
+    let dir = keratin_log::test_dir!("combined_stream_preparation");
+    let st = open(&dir.root).await;
+    st.initialize_empty_storage_history(
+        "s",
+        0,
+        None,
+        PartitionKind::Stream,
+        StorageHistoryBinding {
+            resource_incarnation: [1; 16],
+            accepted_history: [2; 16],
+            writer_session: [3; 16],
+        },
+    )
+    .await
+    .unwrap();
+    st.append_stream_record("s", 0, &headers(), b"stream payload".to_vec())
+        .await
+        .unwrap();
+    st.commit_stream_cursor("s", 0, "reader", 1).await.unwrap();
+    // Exercise the cold physical-log open used for sealing an evicted stream.
+    st.unmaterialize("s", 0, None).await.unwrap();
+    let sealed = st
+        .seal_replica_for_recovery(
+            "s",
+            0,
+            None,
+            RecoverySealRequest {
+                transition: [9; 32],
+                fence_epoch: 8,
+            },
+        )
+        .await
+        .unwrap();
+    assert_eq!(sealed.history.log_layout, QueueLogLayout::Separate);
+    assert!(sealed.history.storage_history.as_ref().unwrap().stream);
+    assert_eq!(sealed.message_next, 1);
+    assert_eq!(sealed.event_next, 1);
+    st.shutdown().await.unwrap();
+}

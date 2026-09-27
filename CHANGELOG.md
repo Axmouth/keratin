@@ -101,6 +101,9 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Single-log queues can share storage with streams. Stream reads, cursor replay,
+  retention, follower application and recovery seals retain their separate logs.
+
 - The single-log queue experiment rejects forward payload references before
   owner or follower append, including cancellation directives. Rejected frames
   leave the apply fence clean unless an earlier frame already mutated an open

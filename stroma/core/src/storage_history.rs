@@ -572,7 +572,7 @@ impl Stroma {
                 let events = match open_preparation_log(
                     &stroma,
                     stroma.tp_part_dir(&topic, part, group.as_deref()),
-                    if stroma.queue_payloads_in_event_log() { stroma.keratin_cfg_msg } else { stroma.keratin_cfg_event },
+                    stroma.queue_event_log_config(),
                 )
                 .await
                 {
@@ -771,7 +771,7 @@ impl Stroma {
             }
             // Take the physical log locks before persisting. Another storage instance
             // cannot write these logs concurrently with initial binding.
-            let messages = if self.queue_payloads_in_event_log() {
+            let messages = if kind == PartitionKind::Queue && self.queue_payloads_in_event_log() {
                 if self.msg_tp_part_dir(topic, part, group).try_exists().map_err(io_err)? {
                     return Err(StromaError::InvalidArgument("combined preparation found an unexpected separate message log".into()));
                 }
@@ -782,7 +782,7 @@ impl Stroma {
             let events = match open_preparation_log(
                 self,
                 self.tp_part_dir(topic, part, group),
-                self.queue_event_log_config(),
+                self.partition_event_log_config(kind),
             )
             .await
             {
