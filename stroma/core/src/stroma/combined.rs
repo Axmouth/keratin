@@ -85,6 +85,24 @@ pub(super) fn read_selected(
     qh: &QueueHandleInner,
     offsets: &[(u64, u32)],
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
+    // Experimental process-wide knob, sampled once rather than per record.
+    // Preserve the existing 1 MiB default and the independent 4096-record cap.
+    static SCAN_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+    let scan_bytes = *SCAN_BYTES.get_or_init(|| {
+        std::env::var("STROMA_COMBINED_DELIVERY_SCAN_BYTES")
+            .ok()
+            .and_then(|v| v.parse::<usize>().ok())
+            .filter(|v| (1..=8 * 1024 * 1024).contains(v))
+            .unwrap_or(1024 * 1024)
+    });
+    read_selected_with_budget(qh, offsets, scan_bytes)
+}
+
+fn read_selected_with_budget(
+    qh: &QueueHandleInner,
+    offsets: &[(u64, u32)],
+    scan_bytes: usize,
+) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
     if offsets.is_empty() {
         return Ok(Vec::new());
     }
@@ -105,7 +123,7 @@ pub(super) fn read_selected(
     let mut out = Vec::with_capacity(offsets.len());
     while next < stop {
         let records = reader
-            .scan_from_with_byte_budget(next, (stop - next).min(4096) as usize, 1024 * 1024)
+            .scan_from_with_byte_budget(next, (stop - next).min(4096) as usize, scan_bytes)
             .map_err(io_err)?;
         if records.is_empty() {
             return Err(StromaError::Corruption(
