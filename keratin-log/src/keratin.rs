@@ -23,7 +23,7 @@ pub struct Keratin {
     log_state: Arc<LogState>,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
     tail_cache: Arc<TailCache>,
-    _lock: Option<File>,
+    _lock: Option<Arc<File>>,
     shutdown_started: AtomicBool,
     role: AtomicU8,
 }
@@ -247,6 +247,7 @@ impl Keratin {
             )
         })?;
         tracing::debug!("acquired Keratin lock at {}", lock_path.display());
+        let lock_file = Arc::new(lock_file);
 
         let now = crate::util::unix_millis();
 
@@ -283,6 +284,7 @@ impl Keratin {
             log.current_epoch(),
             log.next_offset(),
         );
+        log.retain_directory_lock(lock_file.clone());
         let tail_cache = log.tail_cache();
         let WriterHandle { tx } =
             crate::writer::spawn_writer(log, cfg, log_state.clone(), writer_channel_capacity);

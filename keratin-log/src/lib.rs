@@ -10,6 +10,7 @@ mod frozen_reader;
 mod keratin;
 mod log;
 mod manifest;
+mod manifest_worker;
 mod reader;
 mod record;
 mod recovery;

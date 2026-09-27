@@ -175,6 +175,9 @@ pub struct Log {
     // stats
     pub stats: IoStats,
     last_stats_dump: Instant,
+    manifest_worker: crate::manifest_worker::ManifestWorker,
+    // Drop order keeps the directory locked until the worker has drained.
+    _directory_lock: Option<Arc<File>>,
     manifest_flush_interval: Duration,
     last_manifest_flush: Instant,
 
@@ -287,6 +290,13 @@ impl Log {
             .into_iter()
             .chain(self.idx_buf.maintenance_deadline())
             .min()
+    }
+
+    /// Retain ownership until outstanding periodic checkpoints have drained.
+    pub(crate) fn retain_directory_lock(&mut self, lock: Arc<File>) {
+        if self.manifest_worker.enabled {
+            self._directory_lock = Some(lock);
+        }
     }
 
     /// Complete a reset authorized by an external durable installation journal,
@@ -452,6 +462,8 @@ impl Log {
                     stats: IoStats::new(),
                     log_state,
                     last_stats_dump: Instant::now(),
+                    manifest_worker: Default::default(),
+                    _directory_lock: None,
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     staged_end_offset: initial,
@@ -517,6 +529,8 @@ impl Log {
                     log_state,
                     stats: IoStats::new(),
                     last_stats_dump: Instant::now(),
+                    manifest_worker: Default::default(),
+                    _directory_lock: None,
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     staged_end_offset: initial,
@@ -616,6 +630,8 @@ impl Log {
                 log_state,
                 stats: IoStats::new(),
                 last_stats_dump: Instant::now(),
+                manifest_worker: Default::default(),
+                _directory_lock: None,
                 manifest_flush_interval: Duration::from_millis(500),
                 last_manifest_flush: Instant::now(),
                 staged_end_offset: initial,
@@ -1207,6 +1223,7 @@ impl Log {
         elapsed: Duration,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
+        self.poll_manifest()?;
         self.stats.fsync += elapsed;
         self.durable_end = self.durable_end.max(durable_end);
         self.manifest.next_offset = self.manifest.next_offset.max(durable_end);
@@ -1215,12 +1232,12 @@ impl Log {
         // manifest is a hint; persist it on interval
         if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
             #[cfg(not(feature = "writer-stage-trace"))]
-            self.store_manifest()?;
+            self.store_periodic_manifest()?;
             #[cfg(feature = "writer-stage-trace")]
             if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_manifest())?;
+                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_periodic_manifest())?;
             } else {
-                self.store_manifest()?;
+                self.store_periodic_manifest()?;
             }
         }
 
@@ -1244,6 +1261,7 @@ impl Log {
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
+        self.poll_manifest()?;
         #[cfg(not(feature = "writer-stage-trace"))]
         self.fsync_files_and_update_manifest()?;
         #[cfg(feature = "writer-stage-trace")]
@@ -1258,12 +1276,12 @@ impl Log {
         // manifest is a hint; persist it on interval
         if self.last_manifest_flush.elapsed() >= self.manifest_flush_interval {
             #[cfg(not(feature = "writer-stage-trace"))]
-            self.store_manifest()?;
+            self.store_periodic_manifest()?;
             #[cfg(feature = "writer-stage-trace")]
             if let Some((tracer, work_id)) = tracer {
-                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_manifest())?;
+                tracer.trace(work_id, "manifest_write", 0, 0, || self.store_periodic_manifest())?;
             } else {
-                self.store_manifest()?;
+                self.store_periodic_manifest()?;
             }
         }
 
@@ -1287,7 +1305,32 @@ impl Log {
         Ok(())
     }
 
+    fn poll_manifest(&mut self) -> io::Result<()> {
+        if let Some(elapsed) = self.manifest_worker.poll()? {
+            self.stats.manifest += elapsed;
+        }
+        Ok(())
+    }
+
+    fn drain_manifest(&mut self) -> io::Result<()> {
+        if let Some(elapsed) = self.manifest_worker.drain()? {
+            self.stats.manifest += elapsed;
+        }
+        Ok(())
+    }
+
+    fn store_periodic_manifest(&mut self) -> io::Result<()> {
+        if !self.manifest_worker.enabled {
+            return self.store_manifest();
+        }
+        if self.manifest_worker.submit(&self.root, &self.manifest)? {
+            self.last_manifest_flush = Instant::now();
+        }
+        Ok(())
+    }
+
     fn store_manifest(&mut self) -> io::Result<()> {
+        self.drain_manifest()?;
         let t = Instant::now();
         self.manifest.store_atomic(&self.root)?;
         self.stats.manifest += t.elapsed();
@@ -1330,6 +1373,7 @@ impl Log {
         self.flush_buffers()?;
         self.flush()?;
         self.fsync()?;
+        self.drain_manifest()?;
 
         // Publish the in-memory fence only after persistence succeeds. Otherwise
         // a failed store makes a same-epoch retry return early without writing.
@@ -1393,6 +1437,7 @@ impl Log {
 
         // 2) fsync to seal it durably (conservative)
         self.fsync()?;
+        self.drain_manifest()?;
 
         // The outgoing segment is sealed: reclaim any preallocated padding so it
         // is not left on disk for the segment's lifetime.
@@ -1444,6 +1489,7 @@ impl Log {
         }
         self.flush_buffers()?;
         self.fsync()?;
+        self.drain_manifest()?;
         if self.active.base_offset != next {
             self.roll(crate::util::unix_millis())?;
         }
@@ -1515,6 +1561,7 @@ impl Log {
         }
         self.flush_buffers()?;
         self.fsync()?;
+        self.drain_manifest()?;
         self.manifest.next_offset = self.next_offset;
         // Publish the durable logical floor before any physical removal. Reopen
         // must never resurrect a discarded prefix after interrupted reclamation.
@@ -1539,6 +1586,7 @@ impl Log {
         // We force durability before deleting anything.
         self.flush_buffers()?;
         self.fsync()?;
+        self.drain_manifest()?;
 
         let mut bases = self
             .segment_mapping
@@ -1647,6 +1695,7 @@ impl Log {
         self.flush_buffers()?;
         self.flush()?;
         self.fsync()?;
+        self.drain_manifest()?;
         self.manifest.next_offset = self.next_offset;
         self.manifest.store_atomic(&self.root)?;
         crate::suffix_repair::prepare(&self.root, &self.manifest, next_offset)?;
@@ -1686,6 +1735,7 @@ impl Log {
         self.flush_buffers()?;
         self.flush()?;
         self.fsync()?;
+        self.drain_manifest()?;
 
         let seg_dir = self.root.join("segments");
         for ent in fs::read_dir(&seg_dir)? {
@@ -1812,6 +1862,7 @@ impl Log {
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
+        self.drain_manifest()?;
         self.flush_buffers()?;
         self.flush()?;
         self.fsync_files_and_update_manifest()?;
@@ -2109,4 +2160,327 @@ fn open_or_create_segment_pair(
     };
 
     Ok((seg, idx, log_path))
+}
+
+#[cfg(test)]
+mod background_manifest_tests {
+    use super::*;
+    use crossbeam_channel::{Receiver, Sender, bounded};
+
+    fn open(root: &Path) -> Log {
+        let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+        let (mut log, _) = Log::open(
+            root,
+            0,
+            1024 * 1024,
+            64 * 1024,
+            4096,
+            0,
+            0,
+            false,
+            false,
+            state,
+            None,
+        )
+        .unwrap();
+        log.manifest_worker.enabled = true;
+        log
+    }
+
+    // Deterministic stalled snapshot: reproduce an old periodic write that
+    // would overwrite newer metadata unless the control operation waits.
+    fn stall_snapshot(log: &mut Log) -> (Sender<()>, Receiver<()>) {
+        assert!(log.manifest_worker.pending.is_none());
+        let (release, gate) = bounded(1);
+        let (done, observed) = bounded(1);
+        let (result, rx) = bounded(1);
+        let snapshot = log.manifest.clone();
+        let root = log.root.clone();
+        log.manifest_worker.pending = Some(rx);
+        std::thread::spawn(move || {
+            gate.recv().unwrap();
+            let outcome = snapshot.store_atomic(&root).map(|()| Duration::ZERO);
+            result.send(outcome).unwrap();
+            done.send(()).unwrap();
+        });
+        (release, observed)
+    }
+
+    #[test]
+    fn durable_fsync_completion_does_not_wait_for_periodic_manifest() {
+        let dir = crate::test_dir!("manifest_completion");
+        let mut log = open(&dir.root);
+        log.stage_append(
+            &Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![7],
+            },
+            1,
+        )
+        .unwrap();
+        log.flush_buffers().unwrap();
+        log.fsync_files_and_update_manifest().unwrap();
+        let (release, observed) = stall_snapshot(&mut log);
+        log.last_manifest_flush = Instant::now() - Duration::from_secs(1);
+        // If completion waited, this test would deadlock before release.
+        let (tx, rx) = bounded(1);
+        let thread = std::thread::spawn(move || {
+            log.finish_fsync_job(1, Duration::ZERO).unwrap();
+            tx.send(log)
+                .unwrap_or_else(|_| panic!("test receiver lost"));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        let mut log = result.expect("durable completion waited on a metadata hint");
+        assert!(log.durable_end_exclusive().covers(0));
+        observed.recv().unwrap();
+        log.shutdown().unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn follower_fsync_does_not_wait_for_periodic_manifest() {
+        let dir = crate::test_dir!("manifest_follower_completion");
+        let mut log = open(&dir.root);
+        let (release, observed) = stall_snapshot(&mut log);
+        log.stage_append(
+            &Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![7],
+            },
+            1,
+        )
+        .unwrap();
+        log.flush_buffers().unwrap();
+        log.last_manifest_flush = Instant::now() - Duration::from_secs(1);
+        let (tx, rx) = bounded(1);
+        let thread = std::thread::spawn(move || {
+            log.fsync().unwrap();
+            tx.send(log)
+                .unwrap_or_else(|_| panic!("test receiver lost"));
+        });
+        let result = rx.recv_timeout(Duration::from_secs(2));
+        release.send(()).unwrap();
+        let mut log = result.expect("follower persistence waited on a periodic hint");
+        assert!(log.durable_end_exclusive().covers(0));
+        observed.recv().unwrap();
+        log.shutdown().unwrap();
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn critical_metadata_and_drop_wait_for_old_snapshot() {
+        for action in [
+            "epoch", "reset", "roll", "truncate", "head", "repair", "fork", "shutdown", "drop",
+        ] {
+            let dir = crate::test_dir!(action);
+            let mut log = open(&dir.root);
+            log.stage_append(
+                &Message {
+                    flags: 0,
+                    headers: vec![],
+                    payload: vec![9],
+                },
+                1,
+            )
+            .unwrap();
+            log.flush_buffers().unwrap();
+            log.fsync_files_and_update_manifest().unwrap();
+            if action == "truncate" {
+                log.roll(2).unwrap();
+            }
+            let (release, observed) = stall_snapshot(&mut log);
+            let (tx, rx) = bounded(1);
+            let thread = std::thread::spawn(move || {
+                match action {
+                    "epoch" => {
+                        log.advance_epoch(3).unwrap();
+                    }
+                    "reset" => log.reset_to_checkpoint(0, 2).unwrap(),
+                    "roll" => log.roll(2).unwrap(),
+                    "truncate" => {
+                        log.truncate_before(1).unwrap();
+                    }
+                    "head" => {
+                        log.advance_retained_head(1, 0).unwrap();
+                    }
+                    "repair" => log.repair_suffix(0).unwrap(),
+                    "fork" => {
+                        let destination = log.root.join("frozen-copy");
+                        log.fork_frozen(&destination, 0, 0, 1).unwrap();
+                    }
+                    "shutdown" => log.shutdown().unwrap(),
+                    "drop" => (),
+                    _ => unreachable!(),
+                }
+                drop(log);
+                tx.send(()).unwrap();
+            });
+            let premature = rx.recv_timeout(Duration::from_millis(30));
+            release.send(()).unwrap();
+            assert!(
+                premature.is_err(),
+                "{action} passed an unfinished old snapshot"
+            );
+            rx.recv_timeout(Duration::from_secs(2)).unwrap();
+            observed.recv().unwrap();
+            thread.join().unwrap();
+            let m = Manifest::load_or_create(&dir.root, 0, 1024 * 1024, 64 * 1024).unwrap();
+            match action {
+                "epoch" => assert_eq!(m.epoch, 3),
+                "reset" | "repair" => assert_eq!(m.next_offset, 0),
+                "roll" => assert_eq!(m.active_base_offset, 1),
+                "truncate" | "head" => assert_eq!(m.head_offset, 1),
+                "shutdown" => assert!(m.clean_shutdown),
+                _ => assert!(!m.clean_shutdown),
+            }
+            let reopened = open(&dir.root);
+            assert_eq!(
+                reopened.next_offset,
+                if action == "reset" || action == "repair" {
+                    0
+                } else {
+                    1
+                }
+            );
+        }
+    }
+
+    #[test]
+    fn abrupt_exit_recovers_confirmed_data_with_stale_periodic_hint() {
+        const CHILD_ROOT: &str = "KERATIN_MANIFEST_CRASH_TEST_ROOT";
+        if let Some(root) = std::env::var_os(CHILD_ROOT) {
+            let mut log = open(Path::new(&root));
+            log.advance_epoch(7).unwrap();
+            let preallocate = std::env::var("KERATIN_MANIFEST_CRASH_PREALLOC")
+                .unwrap()
+                .parse()
+                .unwrap();
+            log.active.enable_prealloc(preallocate);
+            let (_release, _observed) = stall_snapshot(&mut log);
+            log.stage_append(
+                &Message {
+                    flags: 3,
+                    headers: vec![8],
+                    payload: vec![4; 1024],
+                },
+                1,
+            )
+            .unwrap();
+            log.flush_buffers().unwrap();
+            let job = log.prepare_fsync_job().unwrap();
+            let elapsed = job.sync().unwrap();
+            log.finish_fsync_job(job.durable_end(), elapsed).unwrap();
+            assert!(log.durable_end_exclusive().covers(0));
+            // No destructors or clean-shutdown store; the manifest still says next=0.
+            std::process::exit(0);
+        }
+        for preallocate in [0u64, 1024 * 1024] {
+            let dir = crate::test_dir!("manifest_abrupt_exit");
+            let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "log::background_manifest_tests::abrupt_exit_recovers_confirmed_data_with_stale_periodic_hint", "--nocapture"])
+            .env(CHILD_ROOT, &dir.root).env("KERATIN_MANIFEST_CRASH_PREALLOC",preallocate.to_string()).status().unwrap();
+            assert!(status.success());
+            let m = Manifest::load_or_create(&dir.root, 0, 1, 1).unwrap();
+            assert!(!m.clean_shutdown);
+            assert_eq!(m.next_offset, 0);
+            let mut log = open(&dir.root);
+            assert_eq!(log.current_epoch(), 7);
+            assert_eq!(log.next_offset, 1);
+            let (result, _) = log
+                .stage_append(
+                    &Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: vec![5],
+                    },
+                    2,
+                )
+                .unwrap();
+            assert_eq!(result.base_offset, 1);
+            log.shutdown().unwrap();
+        }
+    }
+
+    #[test]
+    fn failed_old_snapshot_does_not_advance_epoch() {
+        let dir = crate::test_dir!("manifest_error_epoch");
+        let mut log = open(&dir.root);
+        let (result_tx, result_rx) = bounded(1);
+        log.manifest_worker.pending = Some(result_rx);
+        let (done_tx, done_rx) = bounded(1);
+        let thread = std::thread::spawn(move || {
+            let outcome = log.advance_epoch(3);
+            done_tx
+                .send((outcome, log))
+                .unwrap_or_else(|_| panic!("test receiver lost"));
+        });
+        assert!(done_rx.recv_timeout(Duration::from_millis(30)).is_err());
+        result_tx
+            .send(Err(io::Error::other("injected old checkpoint failure")))
+            .unwrap();
+        let (outcome, mut log) = done_rx.recv_timeout(Duration::from_secs(2)).unwrap();
+        assert!(outcome.is_err());
+        assert_eq!(log.current_epoch(), 0);
+        assert_eq!(log.advance_epoch(3).unwrap(), 3);
+        assert_eq!(
+            Manifest::load_or_create(&dir.root, 0, 1, 1).unwrap().epoch,
+            3
+        );
+        thread.join().unwrap();
+    }
+
+    #[test]
+    fn directory_lock_outlives_pending_manifest_on_drop() {
+        use fs2::FileExt;
+        let dir = crate::test_dir!("manifest_lock_lifetime");
+        let mut log = open(&dir.root);
+        let path = dir.root.join(".keratin.lock");
+        let lock = Arc::new(
+            OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&path)
+                .unwrap(),
+        );
+        lock.try_lock_exclusive().unwrap();
+        log.retain_directory_lock(lock.clone());
+        let other = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&path)
+            .unwrap();
+        let (tx, rx) = bounded(1);
+        log.manifest_worker.pending = Some(rx);
+        drop(lock);
+        let thread = std::thread::spawn(move || drop(log));
+        assert!(other.try_lock_exclusive().is_err());
+        tx.send(Ok(Duration::ZERO)).unwrap();
+        thread.join().unwrap();
+        other.try_lock_exclusive().unwrap();
+    }
+
+    #[test]
+    fn real_worker_failure_is_observed_and_checkpoint_can_retry() {
+        let dir = crate::test_dir!("manifest_failure");
+        let mut log = open(&dir.root);
+        // A directory at the temporary-file path deterministically rejects writes.
+        fs::create_dir(Manifest::tmp_path(&dir.root)).unwrap();
+        log.store_periodic_manifest().unwrap();
+        assert!(log.drain_manifest().is_err());
+        assert!(log.manifest_worker.pending.is_none());
+        fs::remove_dir(Manifest::tmp_path(&dir.root)).unwrap();
+        log.manifest.epoch = 7;
+        log.store_periodic_manifest().unwrap();
+        log.drain_manifest().unwrap();
+        assert_eq!(
+            Manifest::load_or_create(&dir.root, 0, 1, 1).unwrap().epoch,
+            7
+        );
+        log.shutdown().unwrap();
+    }
 }
