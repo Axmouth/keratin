@@ -247,6 +247,7 @@ impl PendingAcks {
         input_empty: bool,
         inflight: usize,
         pipeline: bool,
+        startup_deadline: Option<Instant>,
     ) -> crate::commit_policy::Decision {
         crate::commit_policy::Input {
             now,
@@ -262,6 +263,7 @@ impl PendingAcks {
             inflight,
             hard_cap: cfg.max_inflight_fsyncs,
             pipeline,
+            startup_deadline,
         }
         .decide()
     }
@@ -563,6 +565,11 @@ fn writer_loop(
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
     let stage_then_commit = std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() == Ok("1");
+    let startup_delay = std::env::var("KERATIN_IDLE_COMMIT_WINDOW_US")
+        .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(5_000);
+    let mut startup = crate::commit_policy::StartupWindow::new(
+        Duration::from_micros(startup_delay), Duration::from_millis(20),
+    );
     let mut deferred_command = None;
     let flush_on_drain = std::env::var("KERATIN_FLUSH_ON_DRAIN").as_deref() == Ok("1");
     crate::drain_diagnostics::init();
@@ -644,6 +651,7 @@ fn writer_loop(
             deferred_command.is_none() && writes_rx.is_empty(),
             inflight_fsyncs,
             should_pipeline(log, cfg.pipeline_commit_records),
+            startup.deadline(),
         );
         if !stage_then_commit || decision.trigger.is_some() {
             if stage_then_commit {
@@ -687,6 +695,7 @@ fn writer_loop(
                     deferred_command.is_none() && writes_rx.is_empty(),
                     inflight_fsyncs,
                     should_pipeline(log, cfg.pipeline_commit_records),
+                    startup.deadline(),
                 )
                 .wait
             {
@@ -716,6 +725,13 @@ fn writer_loop(
             Deadline::DueNow => wait = Duration::ZERO,
             Deadline::None => {}
         }
+
+        // Observe idle only immediately before receiving. Do not treat a brief
+        // drain while pending or syncing as a new idle-to-busy transition.
+        startup.observe(
+            now, !pending.is_empty(), inflight_fsyncs,
+            deferred_command.is_none() && writes_rx.is_empty(),
+        );
 
         // (D) Fetch next event (bounded).
         let event = if let Some(command) = deferred_command.take() {
@@ -792,10 +808,13 @@ fn writer_loop(
             }
         };
 
+        // Explicit barriers and history controls bypass the startup window.
+        if !matches!(&cmd, WriterCmd::Append(_)) { startup.reset(); }
         // (E) Process command.
         match cmd {
             WriterCmd::Append(r) => {
                 if stage_then_commit {
+                    startup.append(Instant::now());
                     // No wait for additional arrivals. Bound collection by requests,
                     // records, bytes and time. One oversized request remains intact.
                     let reqs = collect_staging_chunk(r, &writes_rx, &mut deferred_command, &cfg);
@@ -815,7 +834,9 @@ fn writer_loop(
                     );
                     // Preserve bounded buffer flushing while durability capacity is
                     // occupied, including explicit-sync AfterWrite callers.
-                    if log.should_flush() {
+                    // Keep early replication's write/tail-cache visibility
+                    // immediate even while the first durability cutoff waits.
+                    if startup.deadline().is_some() || log.should_flush() {
                         #[cfg(feature = "writer-stage-trace")]
                         let flushed = log.flush_buffers_traced(&tracer, work_id);
                         #[cfg(not(feature = "writer-stage-trace"))]
@@ -2373,7 +2394,7 @@ mod stage_commit_tests {
         assert_eq!((pending.bytes, pending.records), (0, 0));
         assert!(
             pending
-                .decision(&KeratinConfig::default(), now, now, true, 1, true)
+                .decision(&KeratinConfig::default(), now, now, true, 1, true, None)
                 .wait
                 .is_none()
         );

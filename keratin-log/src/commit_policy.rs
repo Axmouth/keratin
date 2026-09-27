@@ -26,6 +26,7 @@ pub(crate) struct Input {
     pub inflight: usize,
     pub hard_cap: usize,
     pub pipeline: bool,
+    pub startup_deadline: Option<Instant>,
 }
 impl Input {
     pub fn decide(&self) -> Decision {
@@ -49,6 +50,14 @@ impl Input {
         let size = self.bytes >= self.max_bytes || self.records >= self.max_records;
         let early = self.inflight < soft_cap && (self.input_empty || size);
         let wake = if early { floor } else { deadline.max(floor) };
+        // Only the first commit after a real idle period gets this window.
+        // Size and the oldest-ack deadline still bound it. The caller keeps
+        // staging and flushing writes while this durability cutoff waits.
+        let wake = if size {
+            wake
+        } else {
+            wake.max(self.startup_deadline.unwrap_or(self.now).min(deadline))
+        };
         if self.now < wake {
             return Decision {
                 trigger: None,
@@ -68,6 +77,52 @@ impl Input {
         }
     }
 }
+/// Per-writer startup state. A brief empty channel during active work does
+/// not arm this window. Both outstanding durability and queued input must be
+/// absent for the idle threshold. New arrivals never renew an armed deadline.
+pub(crate) struct StartupWindow {
+    delay: Duration,
+    idle_threshold: Duration,
+    idle_since: Option<Instant>,
+    deadline: Option<Instant>,
+}
+impl StartupWindow {
+    pub fn new(delay: Duration, idle_threshold: Duration) -> Self {
+        Self {
+            delay,
+            idle_threshold,
+            idle_since: None,
+            deadline: None,
+        }
+    }
+    pub fn observe(&mut self, now: Instant, pending: bool, inflight: usize, input_empty: bool) {
+        if !pending {
+            self.deadline = None;
+        }
+        if !pending && inflight == 0 && input_empty {
+            self.idle_since.get_or_insert(now);
+        } else {
+            self.idle_since = None;
+        }
+    }
+    pub fn append(&mut self, now: Instant) {
+        if let Some(idle_since) = self.idle_since.take() {
+            if !self.delay.is_zero()
+                && now.saturating_duration_since(idle_since) >= self.idle_threshold
+            {
+                self.deadline = now.checked_add(self.delay);
+            }
+        }
+    }
+    pub fn reset(&mut self) {
+        self.idle_since = None;
+        self.deadline = None;
+    }
+    pub fn deadline(&self) -> Option<Instant> {
+        self.deadline
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -86,6 +141,7 @@ mod tests {
             inflight: 0,
             hard_cap: 8,
             pipeline: true,
+            startup_deadline: None,
         }
     }
     #[test]
@@ -161,5 +217,88 @@ mod tests {
                 wait: None
             }
         );
+    }
+    #[test]
+    fn startup_requires_full_idle_and_does_not_renew() {
+        let now = Instant::now();
+        let mut window = StartupWindow::new(Duration::from_millis(2), Duration::from_millis(20));
+        window.observe(now, false, 0, true);
+        window.append(now + Duration::from_millis(10));
+        assert_eq!(window.deadline(), None);
+        window.observe(now + Duration::from_millis(11), false, 0, true);
+        window.append(now + Duration::from_millis(32));
+        assert_eq!(window.deadline(), Some(now + Duration::from_millis(34)));
+        window.observe(now + Duration::from_millis(33), true, 0, true);
+        window.append(now + Duration::from_millis(33));
+        assert_eq!(window.deadline(), Some(now + Duration::from_millis(34)));
+        window.observe(now + Duration::from_millis(35), false, 1, true);
+        assert_eq!(window.deadline(), None);
+        window.append(now + Duration::from_millis(90));
+        assert_eq!(
+            window.deadline(),
+            None,
+            "inflight sync never qualifies as idle"
+        );
+    }
+
+    #[test]
+    fn pending_or_queued_work_cannot_arm_startup() {
+        let now = Instant::now();
+        for (pending, inflight, empty) in [(true, 0, true), (false, 1, true), (false, 0, false)] {
+            let mut window =
+                StartupWindow::new(Duration::from_millis(2), Duration::from_millis(20));
+            window.observe(now, false, 0, true);
+            window.observe(now + Duration::from_millis(21), pending, inflight, empty);
+            window.append(now + Duration::from_millis(22));
+            assert_eq!(window.deadline(), None);
+        }
+    }
+
+    #[test]
+    fn startup_delays_only_first_early_commit_and_respects_bounds() {
+        let now = Instant::now();
+        let mut x = input(now);
+        x.input_empty = true;
+        x.startup_deadline = Some(now + Duration::from_millis(2));
+        assert_eq!(x.decide().wait, Some(Duration::from_millis(2)));
+        assert_eq!(x.decide().trigger, None);
+        x.now += Duration::from_millis(1);
+        assert_eq!(x.decide().wait, Some(Duration::from_millis(1)));
+        x.now += Duration::from_millis(1);
+        assert_eq!(x.decide().trigger, Some(Trigger::Drain));
+        x.now = now;
+        x.records = x.max_records;
+        assert_eq!(x.decide().trigger, Some(Trigger::Size));
+        x.records = 1;
+        x.bytes = x.max_bytes;
+        assert_eq!(x.decide().trigger, Some(Trigger::Size));
+        x.bytes = 1;
+        x.startup_deadline = Some(now + Duration::from_secs(1));
+        x.now = now + Duration::from_millis(5);
+        assert_eq!(x.decide().trigger, Some(Trigger::Deadline));
+        x.inflight = x.hard_cap;
+        assert_eq!(x.decide().wait, None);
+        assert_eq!(x.decide().trigger, None);
+    }
+
+    #[test]
+    fn startup_reset_and_disabled_delay_preserve_original_policy() {
+        let now = Instant::now();
+        let mut window = StartupWindow::new(Duration::ZERO, Duration::from_millis(20));
+        window.observe(now, false, 0, true);
+        window.append(now + Duration::from_secs(1));
+        assert_eq!(window.deadline(), None);
+        let mut window = StartupWindow::new(Duration::from_millis(2), Duration::from_millis(20));
+        window.observe(now, false, 0, true);
+        window.append(now + Duration::from_secs(1));
+        assert!(window.deadline().is_some());
+        window.reset();
+        assert_eq!(
+            window.deadline(),
+            None,
+            "explicit barriers bypass the startup wait"
+        );
+        window.append(now + Duration::from_secs(2));
+        assert_eq!(window.deadline(), None);
     }
 }
