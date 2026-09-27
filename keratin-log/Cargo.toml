@@ -5,9 +5,11 @@ edition = "2024"
 
 [features]
 default = []
-writer-stage-trace = []
+writer-stage-trace = ["dep:serde", "dep:serde_json"]
 
 [dependencies]
+serde = { version = "1", features = ["derive"], optional = true }
+serde_json = { version = "1", optional = true }
 byteorder = "1.5"
 crc32c = "0.6"
 crossbeam-channel = "0.5"
