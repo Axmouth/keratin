@@ -3,6 +3,7 @@
 use super::*;
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::QueueInternalState;
+use crate::recovery_replay::RecoveryPayloadLog;
 use keratin_log::{KeratinReplicaExt, ReplicatedAppendOutcome, lock_existing_log};
 use std::io::{Read, Write};
 
@@ -24,6 +25,7 @@ pub struct QueueRecoveryStageSpec {
     pub binding: StorageHistoryBinding,
     pub fence_epoch: u64,
     pub source_history: [u8; 32],
+    pub payload_log: RecoveryPayloadLog,
     pub message_head: u64,
     pub message_next: u64,
     pub event_next: u64,
@@ -146,6 +148,7 @@ pub(super) fn persist_exact(path: &Path, content: &[u8]) -> Result<()> {
 
 fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInternalState> {
     let s = &intent.spec;
+    s.validate_payload_log()?;
     if s.plan == [0; 32]
         || s.source_history == [0; 32]
         || s.topic.is_empty()
@@ -158,7 +161,7 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
             s.binding.writer_session,
         ]
         .contains(&[0; 16])
-        || s.message_head > s.message_next
+        || s.payload_log.head > s.payload_log.next
         || limits.max_bytes == 0
         || intent.snapshot.is_empty()
     {
@@ -166,8 +169,8 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
             "invalid recovery staging identity, snapshot or budget",
         ));
     }
-    if s.message_next - s.message_head > limits.max_records {
-        return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.message_next - s.message_head)));
+    if s.payload_log.next - s.payload_log.head > limits.max_records {
+        return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.payload_log.next - s.payload_log.head)));
     }
     if intent.snapshot.len() > MAX_SNAPSHOT {
         return Err(invalid(Limit::message(Budget::SnapshotBytes, MAX_SNAPSHOT as u64, 0, intent.snapshot.len() as u64)));
@@ -180,11 +183,11 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
     if meta.last_snapshot_event_offset != s.event_next.saturating_sub(1)
         || state.recovery_state_digest() != s.state_digest
         || state.recovery_lease_normalized_digest() != s.state_digest
-        || state.required_message_next() > s.message_next
+        || state.required_message_next() > s.payload_log.next
         || state
             .recovery_live_ranges()
             .iter()
-            .any(|r| r.start < s.message_head || r.end > s.message_next)
+            .any(|r| r.start < s.payload_log.head || r.end > s.payload_log.next)
     {
         return Err(invalid(
             "recovery snapshot does not match the exact staged baseline",
@@ -217,10 +220,10 @@ pub(super) fn scan_parts(
 ) -> Result<u64> {
     let s = &intent.spec;
     let end = messages.next_offset();
-    if messages.head_offset() != s.message_head
-        || end > s.message_next
+    if messages.head_offset() != s.payload_log.head
+        || end > s.payload_log.next
         || messages.current_epoch() != s.fence_epoch
-        || require_complete && end != s.message_next
+        || require_complete && end != s.payload_log.next
     {
         return Err(corrupt("staged log does not cover the expected boundaries"));
     }
@@ -228,8 +231,8 @@ pub(super) fn scan_parts(
     let live = state.recovery_live_ranges();
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
-    hash.update(&s.message_head.to_be_bytes());
-    hash.update(&s.message_next.to_be_bytes());
+    hash.update(&s.payload_log.head.to_be_bytes());
+    hash.update(&s.payload_log.next.to_be_bytes());
     let mut live_hash = blake3::Hasher::new();
     live_hash.update(b"fibril-recovery-live-payloads-v1\0");
     let mut used = 0u64;
@@ -268,13 +271,21 @@ pub(super) fn scan_parts(
             };
             hash_record(&mut hash);
             if live.contains(&record.offset) {
+                #[cfg(feature = "combined-queue-log-experiment")]
+                if s.payload_log.source == RecoveryReadSource::Events {
+                    let record = RecoveryRecord { offset: record.offset, flags: record.flags,
+                        headers: record.headers.to_vec(), payload: record.payload.to_vec() };
+                    if !matches!(crate::recovery_inspection::decode_evidence_event(&record), Ok(StromaEvent::PayloadEnqueue { .. })) {
+                        return Err(io::Error::other("staged live payload points to non-payload event"));
+                    }
+                }
                 hash_record(&mut live_hash);
             }
             Ok(())
         })
         .map_err(io_err)?;
     if require_complete
-        && (*hash.finalize().as_bytes() != s.message_digest
+        && (*hash.finalize().as_bytes() != s.payload_log.digest
             || *live_hash.finalize().as_bytes() != s.live_payload_digest)
     {
         return Err(corrupt(
@@ -284,7 +295,40 @@ pub(super) fn scan_parts(
     Ok(used)
 }
 
+impl QueueRecoveryStageSpec {
+    pub(super) fn validate_payload_log(&self) -> Result<()> {
+        let p = &self.payload_log;
+        let valid = p.head <= p.next && match p.source {
+            RecoveryReadSource::Messages => p.head == self.message_head
+                && p.next == self.message_next && p.digest == self.message_digest,
+            RecoveryReadSource::Events => cfg!(feature = "combined-queue-log-experiment")
+                && self.message_head == 0 && self.message_next == 0
+                && self.message_digest == recovery_history::empty_log_digest()
+                && p.next == self.event_next,
+            RecoveryReadSource::Snapshot => false,
+        };
+        if !valid { return Err(invalid("recovery payload source differs from exact selected baseline")); }
+        Ok(())
+    }
+}
+
 impl Stroma {
+    pub(super) fn validate_recovery_payload_layout(&self, spec: &QueueRecoveryStageSpec) -> Result<()> {
+        spec.validate_payload_log()?;
+        if (spec.payload_log.source == RecoveryReadSource::Events) != self.queue_payloads_in_event_log() {
+            return Err(invalid("recovery staging layout differs from local queue format"));
+        }
+        Ok(())
+    }
+
+    pub(super) fn recovery_payload_path(&self, spec: &QueueRecoveryStageSpec) -> PathBuf {
+        if spec.payload_log.source == RecoveryReadSource::Events {
+            self.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref())
+        } else {
+            self.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref())
+        }
+    }
+
     /// Open/resume non-serving staging after the caller freshly authorizes its
     /// persisted plan. One stage is open per storage instance. Caller cancellation
     /// does not interrupt admitted initialization. No active files are replaced.
@@ -364,10 +408,10 @@ impl Stroma {
             None => None,
         };
         let messages = match &handle {
-            Some(handle) => handle.msg_log()?,
+            Some(handle) => handle.payload_log(),
             None => Arc::new(
                 self.open_keratin(
-                    self.msg_tp_part_dir(&s.topic, s.partition, s.group.as_deref()),
+                    self.recovery_payload_path(s),
                     self.keratin_cfg_msg,
                     true,
                 )
@@ -383,8 +427,8 @@ impl Stroma {
                 return Err(invalid("sealed reuse source still has a writer role"));
             }
             if messages.current_epoch() != s.fence_epoch
-                || messages.head_offset() != s.message_head
-                || messages.next_offset() != s.message_next
+                || messages.head_offset() != s.payload_log.head
+                || messages.next_offset() != s.payload_log.next
             {
                 return Ok(false);
             }
@@ -400,7 +444,7 @@ impl Stroma {
                 return Ok(false);
             }
             let stats = messages
-                .fork_frozen(destination, s.fence_epoch, s.message_head, s.message_next)
+                .fork_frozen(destination, s.fence_epoch, s.payload_log.head, s.payload_log.next)
                 .await
                 .map_err(io_err)?;
             tracing::info!(
@@ -433,6 +477,7 @@ impl Stroma {
                 "recovery staging requires durable Unix metadata".into(),
             ));
         }
+        self.validate_recovery_payload_layout(&spec)?;
         let resume_only = snapshot.is_none();
         let permit = self
             .recovery_stage_slots
@@ -550,7 +595,7 @@ impl Stroma {
                     .map_err(io_err)?;
                 messages
                     .destructive_reset_to_checkpoint_at_epoch(
-                        intent.spec.message_head,
+                        intent.spec.payload_log.head,
                         intent.spec.fence_epoch,
                     )
                     .await
@@ -628,8 +673,8 @@ impl QueueRecoveryStage {
             .map_err(|_| invalid("stage is busy"))?;
         if !guard.complete
             || guard.needs_reopen
-            || from < guard.intent.spec.message_head
-            || from > guard.intent.spec.message_next
+            || from < guard.intent.spec.payload_log.head
+            || from > guard.intent.spec.payload_log.next
         {
             return Err(invalid("invalid completed stage read"));
         }
@@ -638,10 +683,10 @@ impl QueueRecoveryStage {
             let s = &guard.intent.spec;
             let mut page = RecoveryReadPage {
                 history_id: s.source_history,
-                source: RecoveryReadSource::Messages,
+                source: s.payload_log.source,
                 from,
                 next: from,
-                end: s.message_next,
+                end: s.payload_log.next,
                 records: vec![],
                 snapshot_bytes: vec![],
             };
@@ -712,10 +757,10 @@ impl QueueRecoveryStage {
         }
         let next = guard.messages.next_offset();
         let duplicate = page.next <= next;
-        if page.source != RecoveryReadSource::Messages
+        if page.source != s.payload_log.source
             || page.history_id != s.source_history
-            || page.end != s.message_next
-            || page.from < s.message_head
+            || page.end != s.payload_log.next
+            || page.from < s.payload_log.head
             || page.next > page.end
             || page.from.checked_add(page.records.len() as u64) != Some(page.next)
             || page.records.is_empty()

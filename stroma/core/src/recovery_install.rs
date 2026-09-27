@@ -621,9 +621,7 @@ impl Stroma {
         seal: RecoverySealRequest,
         stage: &QueueRecoveryStage,
     ) -> Result<PreparedQueueRecovery> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue prototype does not support checkpoint transfer or recovery reconciliation".into()));
-        }
+        self.validate_recovery_payload_layout(&spec)?;
 
         if seal.fence_epoch != spec.fence_epoch {
             return Err(invalid("installation fence differs from stage"));
@@ -777,8 +775,7 @@ impl Stroma {
             if let Some(wq) = h.as_work_queue() {
                 wq.shutdown().await;
             }
-            h.msg_log()?.shutdown().await.map_err(io_err)?;
-            h.event_log().shutdown().await.map_err(io_err)?;
+            for log in h.physical_logs() { log.shutdown().await.map_err(io_err)?; }
         }
         st.remove_queue(&spec.topic, spec.partition, spec.group.as_deref());
         st.admitted_histories
@@ -812,7 +809,7 @@ impl Stroma {
             if root.exists() {
                 fs::remove_dir_all(&root).map_err(io_err)?;
             }
-            let target = view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref());
+            let target = view.recovery_payload_path(&spec);
             let (guard, target) = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan(&guard, true)?;
                 if let Some(parent) = target.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
@@ -820,7 +817,7 @@ impl Stroma {
             })
             .await
             .map_err(io_err)??;
-            let stats = guard.messages.fork_frozen(target, spec.fence_epoch, spec.message_head, spec.message_next)
+            let stats = guard.messages.fork_frozen(target, spec.fence_epoch, spec.payload_log.head, spec.payload_log.next)
                 .await.map_err(io_err)?;
             tracing::info!(topic = spec.topic, partition = spec.partition,
                 shared_bytes = stats.shared_bytes, copied_bytes = stats.copied_bytes,
@@ -828,7 +825,7 @@ impl Stroma {
             boundary("messages");
             let messages = view
                 .open_keratin(
-                    view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                    view.recovery_payload_path(&spec),
                     st.keratin_cfg_msg,
                     true,
                 )
@@ -843,26 +840,28 @@ impl Stroma {
             .map_err(io_err)??;
             messages.shutdown().await.map_err(io_err)?;
             drop(messages);
-            let events = view
-                .open_keratin(
-                    view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-                    st.keratin_cfg_event,
-                    false,
-                )
-                .await
-                .map_err(io_err)?;
-            events.become_follower();
-            events
-                .advance_epoch(spec.fence_epoch)
-                .await
-                .map_err(io_err)?;
-            events
-                .destructive_reset_to_checkpoint_at_epoch(spec.event_next, spec.fence_epoch)
-                .await
-                .map_err(io_err)?;
-            events.sync().await.map_err(io_err)?;
-            events.shutdown().await.map_err(io_err)?;
-            drop(events);
+            if spec.payload_log.source == RecoveryReadSource::Messages {
+                let events = view
+                    .open_keratin(
+                        view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                        st.keratin_cfg_event,
+                        false,
+                    )
+                    .await
+                    .map_err(io_err)?;
+                events.become_follower();
+                events
+                    .advance_epoch(spec.fence_epoch)
+                    .await
+                    .map_err(io_err)?;
+                events
+                    .destructive_reset_to_checkpoint_at_epoch(spec.event_next, spec.fence_epoch)
+                    .await
+                    .map_err(io_err)?;
+                events.sync().await.map_err(io_err)?;
+                events.shutdown().await.map_err(io_err)?;
+                drop(events);
+            }
             let writer = view.clone();
             let saved = prepared.clone();
             tokio::task::spawn_blocking(move || {
@@ -892,11 +891,11 @@ impl Stroma {
                         storage_session: saved.storage.storage_instance,
                     },
                 )?;
-                recovery_seal::sync_directories(&writer.msg_tp_part_dir(
-                    &s.topic,
-                    s.partition,
-                    s.group.as_deref(),
-                ))?;
+                if s.payload_log.source == RecoveryReadSource::Messages {
+                    recovery_seal::sync_directories(&writer.msg_tp_part_dir(
+                        &s.topic, s.partition, s.group.as_deref(),
+                    ))?;
+                }
                 recovery_seal::sync_directories(&writer.tp_part_dir(
                     &s.topic,
                     s.partition,
@@ -913,27 +912,24 @@ impl Stroma {
         // generation whose receipt survived an interrupted route switch.
         let messages = view
             .open_keratin(
-                view.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
+                view.recovery_payload_path(&spec),
                 st.keratin_cfg_msg,
                 true,
             )
             .await
             .map_err(io_err)?;
         messages.freeze();
-        let events = view
-            .open_keratin(
+        let events = if spec.payload_log.source == RecoveryReadSource::Messages {
+            let events = view.open_keratin(
                 view.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
-                st.keratin_cfg_event,
-                true,
-            )
-            .await
-            .map_err(io_err)?;
-        if events.head_offset() != spec.event_next
-            || events.next_offset() != spec.event_next
-            || events.current_epoch() != spec.fence_epoch
-        {
-            return Err(invalid("installed event baseline differs from plan"));
-        }
+                st.keratin_cfg_event, true,
+            ).await.map_err(io_err)?;
+            if events.head_offset() != spec.event_next || events.next_offset() != spec.event_next
+                || events.current_epoch() != spec.fence_epoch {
+                return Err(invalid("installed event baseline differs from plan"));
+            }
+            Some(events)
+        } else { None };
         let reader = view.clone();
         let messages = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan_parts(&messages, &verification_intent, verification_limits, true)?;
@@ -944,7 +940,7 @@ impl Stroma {
                 Ok::<_, StromaError>(messages)
             }).await.map_err(io_err)??;
         messages.shutdown().await.map_err(io_err)?;
-        events.shutdown().await.map_err(io_err)?;
+        if let Some(events) = &events { events.shutdown().await.map_err(io_err)?; }
         drop(messages);
         drop(events);
         // fsync the complete generation before atomically publishing its route.
@@ -1001,6 +997,7 @@ impl Stroma {
 
     pub fn verify_prepared_queue_recovery(&self, prepared: &PreparedQueueRecovery) -> Result<()> {
         let s = &prepared.spec;
+        self.validate_recovery_payload_layout(s)?;
         self.verify_prepared_storage_history(&prepared.storage)?;
         if prepared.storage.topic != s.topic
             || prepared.storage.partition != s.partition

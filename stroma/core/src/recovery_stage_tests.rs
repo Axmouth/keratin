@@ -50,6 +50,7 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
             },
             fence_epoch: 8,
             source_history: [5; 32],
+            payload_log: RecoveryPayloadLog { source: RecoveryReadSource::Messages, head, next, digest: *messages.finalize().as_bytes() },
             message_head: head,
             message_next: next,
             event_next: next,
@@ -65,10 +66,10 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
 fn page(spec: &QueueRecoveryStageSpec, records: &[RecoveryRecord]) -> RecoveryReadPage {
     RecoveryReadPage {
         history_id: spec.source_history,
-        source: RecoveryReadSource::Messages,
+        source: spec.payload_log.source,
         from: records[0].offset,
         next: records.last().unwrap().offset + 1,
-        end: spec.message_next,
+        end: spec.payload_log.next,
         records: records.to_vec(),
         snapshot_bytes: vec![],
     }
@@ -586,13 +587,55 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
     st.shutdown().await.unwrap();
 }
 
+async fn open_install_fixture(root: &Path, combined: bool) -> Stroma {
+    #[cfg(feature = "combined-queue-log-experiment")]
+    if combined {
+        return Stroma::open_with_options(root,
+            StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+            SnapshotConfig::default(), StromaOptions { combined_queue_log: true, ..Default::default() },
+        ).await.unwrap();
+    }
+    assert!(!combined);
+    open(root).await
+}
+
+fn install_fixture(combined: bool) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<RecoveryRecord>) {
+    let baseline = fixture(0, 3);
+    #[cfg(feature = "combined-queue-log-experiment")]
+    if combined {
+        let (mut spec, snapshot, mut records) = baseline;
+        let mut hash = blake3::Hasher::new();
+        hash.update(b"fibril-retained-log-v1\0");
+        hash.update(&0u64.to_be_bytes());
+        hash.update(&3u64.to_be_bytes());
+        let mut live = blake3::Hasher::new();
+        live.update(b"fibril-recovery-live-payloads-v1\0");
+        for r in &mut records {
+            r.payload = StromaEvent::PayloadEnqueue { not_before: None, expire_at: Some(1000),
+                headers: vec![], payload: r.payload.clone() }.encode().unwrap();
+            hash_record(&mut hash, r);
+            hash_record(&mut live, r);
+        }
+        spec.payload_log.source = RecoveryReadSource::Events;
+        spec.payload_log.digest = *hash.finalize().as_bytes();
+        spec.message_head = 0;
+        spec.message_next = 0;
+        spec.message_digest = recovery_history::empty_log_digest();
+        spec.live_payload_digest = *live.finalize().as_bytes();
+        return (spec, snapshot, records);
+    }
+    assert!(!combined);
+    baseline
+}
+
 #[tokio::test]
 async fn install_crash_child() {
     let Some(root) = std::env::var_os("STROMA_INSTALL_CRASH_ROOT") else {
         return;
     };
-    let st = open(Path::new(&root)).await;
-    let (spec, snapshot, records) = fixture(0, 3);
+    let combined = std::env::var("STROMA_INSTALL_COMBINED").as_deref() == Ok("true");
+    let st = open_install_fixture(Path::new(&root), combined).await;
+    let (spec, snapshot, records) = install_fixture(combined);
     let stage = st
         .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
         .await
@@ -615,63 +658,70 @@ async fn install_crash_child() {
 
 #[tokio::test]
 async fn installation_sigkill_resumes_each_publication_boundary_without_old_source() {
-    for boundary in ["retired", "messages", "prepared", "switched"] {
-        let dir = keratin_log::test_dir!("install_sigkill");
-        let ready = dir.root.join("ready");
-        let mut child = std::process::Command::new(std::env::current_exe().unwrap())
-            .args([
-                "--exact",
-                "stroma::recovery_stage::tests::install_crash_child",
-                "--nocapture",
-            ])
-            .env("STROMA_INSTALL_CRASH_ROOT", &dir.root)
-            .env("STROMA_INSTALL_CRASH_READY", &ready)
-            .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
-            .stdout(std::process::Stdio::null())
-            .spawn()
-            .unwrap();
-        let reached = tokio::time::timeout(Duration::from_secs(20), async {
-            loop {
-                if ready.exists() {
-                    return true;
+    for combined in [false, true].into_iter().filter(|c| !c || cfg!(feature = "combined-queue-log-experiment")) {
+        for boundary in ["retired", "messages", "prepared", "switched"] {
+            let dir = keratin_log::test_dir!("install_sigkill");
+            let ready = dir.root.join("ready");
+            let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+                .args([
+                    "--exact",
+                    "stroma::recovery_stage::tests::install_crash_child",
+                    "--nocapture",
+                ])
+                .env("STROMA_INSTALL_COMBINED", combined.to_string())
+                .env("STROMA_INSTALL_CRASH_ROOT", &dir.root)
+                .env("STROMA_INSTALL_CRASH_READY", &ready)
+                .env("STROMA_INSTALL_CRASH_BOUNDARY", boundary)
+                .stdout(std::process::Stdio::null())
+                .spawn()
+                .unwrap();
+            let reached = tokio::time::timeout(Duration::from_secs(20), async {
+                loop {
+                    if ready.exists() {
+                        return true;
+                    }
+                    if child.try_wait().unwrap().is_some() {
+                        return false;
+                    }
+                    tokio::time::sleep(Duration::from_millis(10)).await;
                 }
-                if child.try_wait().unwrap().is_some() {
-                    return false;
-                }
-                tokio::time::sleep(Duration::from_millis(10)).await;
+            })
+            .await;
+            let _ = child.kill();
+            child.wait().unwrap();
+            assert!(matches!(reached, Ok(true)), "boundary {boundary}");
+            let st = open_install_fixture(&dir.root, combined).await;
+            assert!(st.queue_handle("q", 0, None).await.is_err(), "{boundary}");
+            let (spec, _, _) = install_fixture(combined);
+            let stage = st
+                .resume_queue_recovery_stage(spec.clone(), Default::default())
+                .await
+                .unwrap();
+            let installed = st
+                .install_queue_recovery_stage(
+                    spec,
+                    RecoverySealRequest {
+                        transition: [9; 32],
+                        fence_epoch: 8,
+                    },
+                    &stage,
+                )
+                .await
+                .unwrap();
+            assert!(st.queue_handle("q", 0, None).await.is_err());
+            st.admit_prepared_queue_recovery(installed).await.unwrap();
+            let ticket = st.queue_handle("q", 0, None).await.unwrap();
+            let h = ticket.resolve().unwrap();
+            assert_eq!(
+                (h.message_lane_next(), h.event_log().next_offset()),
+                (if combined { 0 } else { 3 }, 3)
+            );
+            if combined {
+                assert_eq!(h.event_log().head_offset(), 0);
+                assert!(!st.msg_tp_part_dir("q", 0, None).exists());
             }
-        })
-        .await;
-        let _ = child.kill();
-        child.wait().unwrap();
-        assert!(matches!(reached, Ok(true)), "boundary {boundary}");
-        let st = open(&dir.root).await;
-        assert!(st.queue_handle("q", 0, None).await.is_err(), "{boundary}");
-        let (spec, _, _) = fixture(0, 3);
-        let stage = st
-            .resume_queue_recovery_stage(spec.clone(), Default::default())
-            .await
-            .unwrap();
-        let installed = st
-            .install_queue_recovery_stage(
-                spec,
-                RecoverySealRequest {
-                    transition: [9; 32],
-                    fence_epoch: 8,
-                },
-                &stage,
-            )
-            .await
-            .unwrap();
-        assert!(st.queue_handle("q", 0, None).await.is_err());
-        st.admit_prepared_queue_recovery(installed).await.unwrap();
-        let ticket = st.queue_handle("q", 0, None).await.unwrap();
-        let h = ticket.resolve().unwrap();
-        assert_eq!(
-            (h.msg_log().unwrap().next_offset(), h.event_log().next_offset()),
-            (3, 3)
-        );
-        st.shutdown().await.unwrap();
+            st.shutdown().await.unwrap();
+        }
     }
 }
 
@@ -861,5 +911,35 @@ async fn reuse_resumes_after_kill_before_and_after_initialized_marker() {
         stage.finish().await.unwrap();
         assert!(st.queue_handle("q", 0, None).await.is_err());
         st.shutdown().await.unwrap();
+    }
+}
+
+#[test]
+fn stage_descriptor_binds_source_bounds_digest_and_complete_target() {
+    let (spec, _, _) = fixture(1, 3);
+    spec.validate_payload_log().unwrap();
+    for change in 0..5 {
+        let mut bad = spec.clone();
+        match change {
+            0 => bad.payload_log.source = RecoveryReadSource::Snapshot,
+            1 => bad.payload_log.head = 0,
+            2 => bad.payload_log.next = 4,
+            3 => bad.payload_log.digest[0] ^= 1,
+            _ => bad.payload_log.source = RecoveryReadSource::Events,
+        }
+        assert!(bad.validate_payload_log().is_err(), "accepted mutation {change}");
+    }
+    #[cfg(feature = "combined-queue-log-experiment")]
+    {
+        let mut combined = spec;
+        combined.payload_log.source = RecoveryReadSource::Events;
+        combined.message_head = 0;
+        combined.message_next = 0;
+        combined.message_digest = recovery_history::empty_log_digest();
+        combined.validate_payload_log().unwrap();
+        combined.event_next = 2;
+        assert!(combined.validate_payload_log().is_err());
+        combined.event_next = 4;
+        assert!(combined.validate_payload_log().is_err());
     }
 }

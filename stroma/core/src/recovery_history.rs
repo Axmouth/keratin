@@ -82,7 +82,7 @@ impl RetainedHistoryIdentity {
     }
 }
 
-fn empty_log_digest() -> [u8; 32] {
+pub(super) fn empty_log_digest() -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
     hash.update(&0u64.to_be_bytes());

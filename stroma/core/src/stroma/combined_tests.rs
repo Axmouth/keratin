@@ -750,3 +750,109 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
         st.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress() {
+    use crate::recovery_inspection::{RecoveryInspectionLimits, RecoveryPairInspector};
+    use crate::{QueueRecoveryStageSpec, RecoveryReadRequest, RecoveryReadSource, RecoverySealRequest, StorageHistoryBinding};
+    for reuse in [false, true] {
+        let dir = keratin_log::test_dir!("combined_recovery_install");
+        let source = open(&dir.root.join("source")).await;
+        source.initialize_empty_storage_history("q", 0, None, PartitionKind::Queue, StorageHistoryBinding {
+            resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
+        }).await.unwrap();
+        assert_eq!(publish(&source, false).await, 0);
+        assert_eq!(publish(&source, true).await, 1);
+        ack(&source, 0).await;
+        source.snapshot_partition("q", 0, None).await.unwrap();
+        assert_eq!(publish(&source, false).await, 3);
+        let seal = RecoverySealRequest { transition: [9; 32], fence_epoch: 8 };
+        let sealed = source.seal_replica_for_recovery("q", 0, None, seal.clone()).await.unwrap();
+        let mut check = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed.clone(),
+            RecoveryInspectionLimits { page_records: 2, page_bytes: 4096, ..Default::default() }).unwrap()
+            .with_queue_checkpoint_replay(4, Default::default(), 4096).unwrap();
+        while let Some((side, request)) = check.next_read().unwrap() {
+            let page = source.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();
+            check.accept_page(side, page).unwrap();
+        }
+        let (_, [artifact, _]) = check.finish_with_queue_artifacts(4096).unwrap();
+        let spec = QueueRecoveryStageSpec {
+            plan: [8; 32], topic: "q".into(), partition: 0, group: None,
+            binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [4; 16], writer_session: [5; 16] },
+            fence_epoch: 8, source_history: sealed.history.id,
+            payload_log: sealed.history.payload_log(), message_head: 0, message_next: 0, event_next: 4,
+            message_digest: sealed.history.message_digest, snapshot_digest: artifact.snapshot_digest(),
+            state_digest: artifact.evidence().lease_normalized_state_digest,
+            live_payload_digest: artifact.evidence().live_payload_digest.unwrap(),
+        };
+        let target = if reuse { source.clone() } else { open(&dir.root.join("target")).await };
+        // A snapshot behind the copied suffix must never authorize installation.
+        let mut wrong = spec.clone();
+        wrong.event_next -= 1;
+        assert!(target.open_queue_recovery_stage(wrong, artifact.state_snapshot().to_vec(), Default::default()).await.is_err());
+        let mut stage = if reuse {
+            target.open_queue_recovery_stage_reusing(spec.clone(), artifact.state_snapshot().to_vec(), Default::default(), seal.clone()).await.unwrap()
+        } else {
+            target.open_queue_recovery_stage(spec.clone(), artifact.state_snapshot().to_vec(), Default::default()).await.unwrap()
+        };
+        assert_eq!(stage.next_offset().await, if reuse { 4 } else { 0 });
+        if !reuse {
+            let mut from = 0;
+            while from < spec.payload_log.next {
+                let page = source.read_sealed_replica("q", 0, None, PartitionKind::Queue, RecoveryReadRequest {
+                    seal: seal.clone(), history_id: sealed.history.id, source: RecoveryReadSource::Events,
+                    from, max_records: 2, max_bytes: 4096,
+                }).await.unwrap();
+                let next = page.next;
+                assert!(next > from);
+                assert_eq!(stage.append(page.clone()).await.unwrap(), next);
+                assert_eq!(stage.append(page).await.unwrap(), next);
+                if from == 0 {
+                    drop(stage);
+                    stage = target.resume_queue_recovery_stage(spec.clone(), Default::default()).await.unwrap();
+                    assert_eq!(stage.next_offset().await, next);
+                }
+                from = next;
+            }
+        }
+        let receipt = stage.finish().await.unwrap();
+        assert_eq!((receipt.message_next, receipt.event_next), (0, 4));
+        let page = stage.read_completed_messages(0, 10, 16384).await.unwrap();
+        assert_eq!((page.source, page.end, page.records.len()), (RecoveryReadSource::Events, 4, 4));
+        let installed = target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap();
+        assert!(target.queue_handle("q", 0, None).await.is_err());
+        assert!(!target.msg_tp_part_dir("q", 0, None).exists());
+        target.recovery_routes.clear();
+        assert_eq!(target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap(), installed);
+        target.admit_prepared_queue_recovery(installed.clone()).await.unwrap();
+        target.ensure_queue_owner_epoch("q", 0, None, Some(8)).await.unwrap();
+        let q = target.queue_handle("q", 0, None).await.unwrap();
+        let h = q.resolve().unwrap();
+        assert_eq!((h.event_log().head_offset(), h.event_log().next_offset()), (0, 4));
+        assert_eq!(fetch_payload(&h, 1).unwrap().unwrap().payload, vec![42; 2048]);
+        assert_eq!(fetch_payload(&h, 3).unwrap().unwrap().payload, vec![42; 2048]);
+        assert!(fetch_payload(&h, 2).unwrap().is_none());
+        let mut state = crate::QueueInternalState::new("q".into(), 0);
+        state.load_snapshot(&h.force_encode_snapshot(3).await.unwrap()).unwrap();
+        assert_eq!(state.recovery_state_digest(), spec.state_digest);
+        assert_eq!(publish(&target, false).await, 4);
+        assert_eq!(target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap(), installed);
+        assert_eq!(h.event_log().next_offset(), 5);
+        drop(stage);
+        drop(h);
+        drop(q);
+        target.shutdown().await.unwrap();
+        source.shutdown().await.unwrap();
+        let root = if reuse { dir.root.join("source") } else { dir.root.join("target") };
+        drop(target);
+        drop(source);
+        let reopened = open(&root).await;
+        assert!(reopened.admit_prepared_queue_recovery(installed).await.is_err());
+        let sealed = reopened.seal_replica_for_recovery("q", 0, None,
+            RecoverySealRequest { transition: [10; 32], fence_epoch: 9 }).await.unwrap();
+        assert_eq!((sealed.message_next, sealed.event_next), (0, 5));
+        assert_eq!(sealed.history.storage_history.unwrap().binding, spec.binding);
+        assert!(!reopened.msg_tp_part_dir("q", 0, None).exists());
+        reopened.shutdown().await.unwrap();
+    }
+}
