@@ -210,9 +210,8 @@ impl Stroma {
         let path = self.snap_dir(topic, part, group).join("recovery.history");
         let stream = self.read_partition_kind(topic, part, group) == PartitionKind::Stream;
         let storage_history = self.durable_storage_history_receipt(topic, part, group)?;
-        let agreed = match (stream, messages) {
-            (false, Some(messages)) => self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages, events)?,
-            _ => None,
+        let agreed = if stream { None } else {
+            self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), messages.unwrap_or(events), events)?
         };
         let checkpoint_snapshot = agreed.is_some();
         let snapshot = if let Some(bytes) = agreed {

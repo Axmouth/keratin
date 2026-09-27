@@ -21,16 +21,14 @@ pub struct QueueCheckpointActivity {
 }
 impl Stroma {
     pub fn queue_checkpoint_activity(&self, topic: &str, part: u32, group: Option<&str>) -> Option<QueueCheckpointActivity> {
-        // Agreed checkpoint transfer is not implemented for the combined format.
-        if self.queue_payloads_in_event_log() { return None; }
         let current = self.queue_handles.load();
         let h = slot_lookup_no_alloc(current.as_ref(), topic, part, group)?.handle.get()?;
         Some(QueueCheckpointActivity {
             event_head: h.event_log().head_offset(),
             event_next: h.event_log().next_offset(),
-            message_head: h.msg_log().ok()?.head_offset(),
-            message_next: h.msg_log().ok()?.next_offset(),
-            local_append_bytes: h.msg_log().ok()?.local_append_bytes().saturating_add(h.event_log().local_append_bytes()),
+            message_head: h.payload_log().head_offset(),
+            message_next: h.payload_log().next_offset(),
+            local_append_bytes: h.physical_logs().map(|log| log.local_append_bytes()).fold(0u64, u64::saturating_add),
             event_epoch: h.event_log().current_epoch(),
         })
     }
@@ -45,13 +43,15 @@ const MAX_PINS: usize = 2; // Last accepted checkpoint and one candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointPin {
+    pub log_layout: QueueLogLayout,
     pub attempt: [u8; 32],
     pub storage: PreparedStorageHistory,
     pub event_epoch: u64,
     pub message_epoch: u64,
     /// Fully applied, exclusive event boundary, including the empty cut at zero.
     pub event_next: u64,
-    /// Conservative payload retention, including not-yet-applied enqueues.
+    /// Payload-carrying log bounds, including not-yet-applied enqueues.
+    /// Combined queues use event offsets here, unlike the empty wire message lane.
     pub message_head: u64,
     pub message_next: u64,
     pub required_message_next: u64,
@@ -190,7 +190,11 @@ fn reclaim_unpinned(root: &Path, index: &Retention) -> Result<()> {
 
 fn validate_pin(pin: &QueueCheckpointPin) -> Result<()> {
     let s = &pin.storage;
-    if pin.attempt == [0; 32]
+    if (pin.log_layout == QueueLogLayout::Combined && (!cfg!(feature = "combined-queue-log-experiment")
+            || pin.required_message_next > pin.event_next || pin.event_next > pin.message_next
+            || pin.message_head > pin.event_next
+            || pin.event_epoch != pin.message_epoch))
+        || pin.attempt == [0; 32]
         || s.stream
         || s.topic.is_empty()
         || s.group.as_deref() != normalize_group(s.group.as_deref())
@@ -229,7 +233,7 @@ fn load_index(root: &Path, topic: &str, part: u32, group: Option<&str>) -> Resul
         accepted.contents.validate().map_err(corrupt)?;
         if accepted.certificate == [0; 32]
             || accepted.capsule == [0; 32]
-            || !index.pins.contains_key(&name(accepted.attempt))
+            || index.pins.get(&name(accepted.attempt)).is_none_or(|pin| pin.log_layout != accepted.contents.log_layout)
         {
             return Err(corrupt("accepted checkpoint has no retained identity"));
         }
@@ -267,6 +271,17 @@ fn load_base(root: &Path, pin: &QueueCheckpointPin) -> Result<QueueCheckpointBas
 }
 
 impl Stroma {
+    fn checkpoint_layout(&self) -> QueueLogLayout {
+        if self.queue_payloads_in_event_log() { QueueLogLayout::Combined } else { QueueLogLayout::Separate }
+    }
+
+    fn require_checkpoint_layout(&self, pin: &QueueCheckpointPin) -> Result<()> {
+        if pin.log_layout != self.checkpoint_layout() {
+            return Err(invalid("checkpoint layout differs from local queue format"));
+        }
+        validate_pin(pin)
+    }
+
     fn checkpoint_pin_root(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.snap_dir(topic, part, group).join("agreed-checkpoints")
     }
@@ -279,9 +294,6 @@ impl Stroma {
         storage: PreparedStorageHistory,
         attempt: [u8; 32],
     ) -> Result<QueueCheckpointBase> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue checkpoint agreement is not implemented".into()));
-        }
         if !cfg!(unix) {
             return Err(StromaError::Unsupported(
                 "checkpoint retention requires Unix durable metadata".into(),
@@ -353,11 +365,12 @@ impl Stroma {
                 .await
                 .map_err(io_err)??;
                 if let Some(base) = existing {
-                    if base.pin.storage != storage
+                    if base.pin.log_layout != stroma.checkpoint_layout()
+                        || base.pin.storage != storage
                         || base.pin.event_epoch != h.event_log().current_epoch()
-                        || base.pin.message_epoch != h.msg_log()?.current_epoch()
+                        || base.pin.message_epoch != h.payload_log().current_epoch()
                         || base.pin.event_next < h.event_log().head_offset()
-                        || base.pin.message_head < h.msg_log()?.head_offset()
+                        || base.pin.message_head < h.payload_log().head_offset()
                     {
                         return Err(invalid("checkpoint pin no longer matches local history"));
                     }
@@ -378,18 +391,20 @@ impl Stroma {
                 }
                 // Drain queued mutations whose callers may have been cancelled
                 // after sending a truncate but before observing its completion.
-                let messages = h.msg_log()?;
+                let messages = h.payload_log();
                 let events = h.event_log();
-                tokio::try_join!(messages.sync(), events.sync()).map_err(io_err)?;
+                if stroma.queue_payloads_in_event_log() { events.sync().await.map_err(io_err)?; }
+                else { tokio::try_join!(messages.sync(), events.sync()).map_err(io_err)?; }
                 let captured = h.capture_exact_checkpoint(false).await?;
                 let pin = QueueCheckpointPin {
+                    log_layout: stroma.checkpoint_layout(),
                     attempt,
                     storage: storage.clone(),
                     event_epoch: h.event_log().current_epoch(),
-                    message_epoch: h.msg_log()?.current_epoch(),
+                    message_epoch: h.payload_log().current_epoch(),
                     event_next: captured.event_next,
-                    message_head: h.msg_log()?.head_offset(),
-                    message_next: h.msg_log()?.next_offset(),
+                    message_head: h.payload_log().head_offset(),
+                    message_next: h.payload_log().next_offset(),
                     required_message_next: captured.state.required_message_next(),
                     snapshot_digest: [0; 32],
                     state_digest: [0; 32],
@@ -431,6 +446,7 @@ impl Stroma {
         &self,
         pin: QueueCheckpointPin,
     ) -> Result<QueueCheckpointBase> {
+        self.require_checkpoint_layout(&pin)?;
         let stroma = self.clone();
         tokio::spawn(async move {
             let s = &pin.storage;
@@ -547,7 +563,7 @@ impl Stroma {
             } else {
                 (u64::MAX, u64::MAX)
             };
-            let message = message.min(replica_message);
+            let message = if storage.queue_payloads_in_event_log() { message } else { message.min(replica_message) };
             let event = event.min(replica_event);
             let index = load_index(&root, &topic, part, group.as_deref())?;
             Ok(index.pins.values().fold((message, event), |(m, e), pin| {
@@ -568,10 +584,12 @@ impl Stroma {
 mod tests;
 
 /// The common cut chosen after all replicas have pinned replay bases. No field
-/// is a serving/confirmation authorization; offsets use independent log spaces.
+/// is a serving/confirmation authorization. Message bounds name the payload log,
+/// which is the event log in the combined layout.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointTarget {
+    pub log_layout: QueueLogLayout,
     pub event_next: u64,
     pub message_head: u64,
     pub message_next: u64,
@@ -580,6 +598,7 @@ pub struct QueueCheckpointTarget {
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointContents {
+    pub log_layout: QueueLogLayout,
     pub event_next: u64,
     pub message_head: u64,
     pub message_next: u64,
@@ -591,13 +610,16 @@ pub struct QueueCheckpointContents {
 }
 impl QueueCheckpointContents {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if self.message_head > self.message_next || self.required_message_next > self.message_next {
+        if (self.log_layout == QueueLogLayout::Combined && (!cfg!(feature = "combined-queue-log-experiment")
+            || self.message_next != self.event_next))
+            || self.message_head > self.message_next || self.required_message_next > self.message_next {
             return Err("checkpoint payload bounds do not cover state dependencies".into());
         }
         Ok(())
     }
     pub fn target(&self) -> QueueCheckpointTarget {
         QueueCheckpointTarget {
+            log_layout: self.log_layout,
             event_next: self.event_next,
             message_head: self.message_head,
             message_next: self.message_next,
@@ -627,6 +649,7 @@ impl QueueCheckpointCapsule {
         let c = &self.contents;
         c.validate().map_err(invalid)?;
         if self.version != 1
+            || c.log_layout != self.pin.log_layout
             || c.event_next < self.pin.event_next
             || c.message_head < self.pin.message_head
             || c.message_next < self.pin.message_next
@@ -687,9 +710,6 @@ impl Stroma {
         minimum_message_head: u64,
         minimum_message_next: u64,
     ) -> Result<QueueCheckpointTarget> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue checkpoint agreement is not implemented".into()));
-        }
         let stroma = self.clone();
         tokio::spawn(async move {
             stroma.verify_admitted_storage_history(&storage)?;
@@ -729,7 +749,7 @@ impl Stroma {
             h.ensure_owner()?;
             let _paused = h.pause_owner_operations_and_wait().await?;
             let captured = h.capture_exact_checkpoint(false).await?;
-            let message_next = h.msg_log()?.next_offset();
+            let message_next = h.payload_log().next_offset();
             if captured.event_next < minimum_event_next
                 || message_next < minimum_message_next
                 || captured.event_next != h.event_log().next_offset()
@@ -738,11 +758,12 @@ impl Stroma {
             }
             let message_head = minimum_message_head
                 .max(captured.message_floor)
-                .max(h.msg_log()?.head_offset());
+                .max(h.payload_log().head_offset());
             if message_head > message_next {
                 return Err(invalid("checkpoint payload floor exceeds owner tail"));
             }
             Ok(QueueCheckpointTarget {
+                log_layout: stroma.checkpoint_layout(),
                 event_next: captured.event_next,
                 message_head,
                 message_next,
@@ -761,8 +782,10 @@ impl Stroma {
         target: QueueCheckpointTarget,
         limits: QueueCheckpointBuildLimits,
     ) -> Result<QueueCheckpointCapsule> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue checkpoint agreement is not implemented".into()));
+        self.require_checkpoint_layout(&pin)?;
+        if target.log_layout != pin.log_layout
+            || (target.log_layout == QueueLogLayout::Combined && target.message_next != target.event_next) {
+            return Err(invalid("checkpoint target layout or combined boundary mismatch"));
         }
         if limits.records == 0
             || limits.records > 1_000_000
@@ -804,7 +827,7 @@ impl Stroma {
                     "replica has not fully applied the checkpoint target",
                 ));
             }
-            let messages = h.msg_log()?;
+            let messages = h.payload_log();
             let events = h.event_log();
             if pin.event_epoch != events.current_epoch()
                 || pin.message_epoch != messages.current_epoch()
@@ -851,7 +874,7 @@ impl Stroma {
             stroma.verify_admitted_storage_history(&pin.storage)?;
             if *apply
                 || h.event_log().current_epoch() != pin.event_epoch
-                || h.msg_log()?.current_epoch() != pin.message_epoch
+                || h.payload_log().current_epoch() != pin.message_epoch
             {
                 return Err(invalid("checkpoint history changed during verification"));
             }
@@ -885,17 +908,18 @@ fn build_capsule(
     let envelope = Stroma::queue_snapshot_envelope(2, base.pin.event_next, &base.snapshot)?;
     // This private replay input is not a sealed-recovery receipt. Its output is
     // used only to construct a checkpoint capsule after both physical scans.
+    let combined = base.pin.log_layout == QueueLogLayout::Combined;
     let history = RetainedHistoryIdentity {
-        log_layout: Default::default(),
+        log_layout: base.pin.log_layout,
         version: 2,
         storage_history: Some(base.pin.storage.clone()),
         id: base.pin.attempt,
-        message_digest: [0; 32],
+        message_digest: if combined { recovery_history::empty_log_digest() } else { [0; 32] },
         event_digest: [0; 32],
         snapshot_digest: Some(*blake3::hash(&envelope).as_bytes()),
-        message_head: target.message_head,
-        message_next: target.message_next,
-        event_head: base.pin.event_next,
+        message_head: if combined { 0 } else { target.message_head },
+        message_next: if combined { 0 } else { target.message_next },
+        event_head: if combined { base.pin.event_next.min(target.message_head) } else { base.pin.event_next },
         event_next: target.event_next,
     };
     let mut replay = QueueReplay::from_checkpoint(
@@ -970,6 +994,7 @@ fn build_capsule(
         version: 1,
         pin: base.pin,
         contents: QueueCheckpointContents {
+            log_layout: target.log_layout,
             event_next: target.event_next,
             message_head: target.message_head,
             message_next: target.message_next,
@@ -1005,9 +1030,7 @@ impl Stroma {
         capsule_digest: [u8; 32],
         previous: Option<[u8; 32]>,
     ) -> Result<()> {
-        if self.queue_payloads_in_event_log() {
-            return Err(StromaError::Unsupported("combined queue checkpoint agreement is not implemented".into()));
-        }
+        self.require_checkpoint_layout(&pin)?;
         if certificate == [0; 32] || capsule_digest == [0; 32] {
             return Err(invalid(
                 "checkpoint acceptance requires certificate and capsule identities",
@@ -1038,7 +1061,7 @@ impl Stroma {
             stroma.verify_prepared_storage_history(s)?;
             if *apply
                 || h.event_log().current_epoch() != pin.event_epoch
-                || h.msg_log()?.current_epoch() != pin.message_epoch
+                || h.payload_log().current_epoch() != pin.message_epoch
             {
                 return Err(invalid("checkpoint acceptance history changed"));
             }
@@ -1137,15 +1160,15 @@ impl Stroma {
             let (message, event) = stroma
                 .checkpoint_retention_limits(&h, target.message_head, target.event_next)
                 .await?;
+            let event = if pin.log_layout == QueueLogLayout::Combined { event.min(message) } else { event };
             h.event_log()
                 .advance_retained_head(event, pin.event_epoch)
                 .await
                 .map_err(io_err)?;
             stroma.checkpoint_boundary("agreement_event_floor")?;
-            h.msg_log()?
-                .advance_retained_head(message, pin.message_epoch)
-                .await
-                .map_err(io_err)?;
+            if pin.log_layout == QueueLogLayout::Separate {
+                h.payload_log().advance_retained_head(message, pin.message_epoch).await.map_err(io_err)?;
+            }
             stroma.checkpoint_boundary("agreement_message_floor")?;
             Ok(())
         })
@@ -1276,6 +1299,7 @@ impl Stroma {
             return Ok(None);
         };
         capsule.validate()?;
+        self.require_checkpoint_layout(pin)?;
         if capsule.pin != *pin
             || capsule.contents != accepted.contents
             || capsule.digest()? != accepted.capsule

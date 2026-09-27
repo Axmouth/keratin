@@ -14,13 +14,18 @@ impl QueueReplicationRetention for NoLaggingReplicas {
     }
 }
 
-async fn open(root: &Path) -> Stroma {
+async fn open(root: &Path) -> Stroma { open_layout(root, false).await }
+async fn open_layout(root: &Path, combined: bool) -> Stroma {
+    #[cfg(feature = "combined-queue-log-experiment")]
+    let options = StromaOptions { combined_queue_log: combined, ..Default::default() };
+    #[cfg(not(feature = "combined-queue-log-experiment"))]
+    let options = { assert!(!combined); StromaOptions::default() };
     let mut config = KeratinConfig::test_default();
     config.segment_max_bytes = 1024;
-    let st = Stroma::open(
+    let st = Stroma::open_with_options(
         root,
         StromaKeratinConfig::from_message_log(config),
-        SnapshotConfig::default(),
+        SnapshotConfig::default(), options,
     )
     .await
     .unwrap();
@@ -588,7 +593,8 @@ async fn agreement_crash_child() {
     let Some(root) = std::env::var_os("STROMA_AGREEMENT_CRASH_ROOT") else {
         return;
     };
-    let st = open(Path::new(&root)).await;
+    let combined = std::env::var("STROMA_AGREEMENT_COMBINED").as_deref() == Ok("true");
+    let st = open_layout(Path::new(&root), combined).await;
     let storage = admitted(&st).await;
     publish(&st, 12).await;
     st.ack_batch("q".into(), 0, None, &(0..8).collect::<Vec<_>>())
@@ -630,74 +636,88 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
             let _ = self.0.wait();
         }
     }
-    for boundary in [
-        "agreement_base",
-        "agreement_pin",
-        "agreement_capsule",
-        "agreement_restart_snapshot",
-        "agreement_acceptance",
-        "agreement_event_floor",
-        "agreement_message_floor",
-    ] {
-        let dir = keratin_log::test_dir!("agreement_sigkill");
-        let ready = dir.root.join("ready");
-        let mut child = KillOnDrop(
-            std::process::Command::new(std::env::current_exe().unwrap())
-                .args([
-                    "--exact",
-                    "stroma::agreed_checkpoint::tests::agreement_crash_child",
-                    "--nocapture",
-                ])
-                .env("STROMA_AGREEMENT_CRASH_ROOT", &dir.root)
-                .env("STROMA_CHECKPOINT_CRASH_READY", &ready)
-                .env("STROMA_CHECKPOINT_CRASH_BOUNDARY", boundary)
-                .stdout(std::process::Stdio::null())
-                .spawn()
-                .unwrap(),
-        );
-        tokio::time::timeout(Duration::from_secs(10), async {
-            while !ready.exists() {
-                assert!(
-                    child.0.try_wait().unwrap().is_none(),
-                    "child exited before {boundary}"
-                );
-                tokio::time::sleep(Duration::from_millis(5)).await;
-            }
-        })
-        .await
-        .unwrap();
-        child.0.kill().unwrap();
-        child.0.wait().unwrap();
-        let st = open(&dir.root).await;
-        assert!(st.queue_handle("q", 0, None).await.is_err());
-        let seal = st
-            .seal_replica_for_recovery(
-                "q",
-                0,
-                None,
-                RecoverySealRequest {
-                    transition: [9; 32],
-                    fence_epoch: 1,
-                },
-            )
+    for combined in [false, true].into_iter().filter(|c| !c || cfg!(feature = "combined-queue-log-experiment")) {
+        for boundary in [
+            "agreement_base",
+            "agreement_pin",
+            "agreement_capsule",
+            "agreement_restart_snapshot",
+            "agreement_acceptance",
+            "agreement_event_floor",
+            "agreement_message_floor",
+        ] {
+            let dir = keratin_log::test_dir!("agreement_sigkill");
+            let ready = dir.root.join("ready");
+            let mut child = KillOnDrop(
+                std::process::Command::new(std::env::current_exe().unwrap())
+                    .args([
+                        "--exact",
+                        "stroma::agreed_checkpoint::tests::agreement_crash_child",
+                        "--nocapture",
+                    ])
+                    .env("STROMA_AGREEMENT_COMBINED", combined.to_string())
+                    .env("STROMA_AGREEMENT_CRASH_ROOT", &dir.root)
+                    .env("STROMA_CHECKPOINT_CRASH_READY", &ready)
+                    .env("STROMA_CHECKPOINT_CRASH_BOUNDARY", boundary)
+                    .stdout(std::process::Stdio::null())
+                    .spawn()
+                    .unwrap(),
+            );
+            tokio::time::timeout(Duration::from_secs(10), async {
+                while !ready.exists() {
+                    assert!(
+                        child.0.try_wait().unwrap().is_none(),
+                        "child exited before {boundary}"
+                    );
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            })
             .await
             .unwrap();
-        assert_eq!(seal.history.message_next, 12, "{boundary}");
-        assert_eq!(seal.history.event_next, 20, "{boundary}");
-        assert!(
-            seal.history.message_head <= 8,
-            "old live payloads must survive {boundary}"
-        );
-        let snapshot = st
-            .read_queue_snapshot(&st.recovery_snapshot_path("q", 0, None).unwrap())
-            .unwrap();
-        if seal.history.event_head > 0 {
-            assert_eq!(
-                snapshot.as_ref().unwrap().0.event_next(),
-                seal.history.event_next
+            child.0.kill().unwrap();
+            child.0.wait().unwrap();
+            let st = open_layout(&dir.root, combined).await;
+            assert!(st.queue_handle("q", 0, None).await.is_err());
+            let seal = st
+                .seal_replica_for_recovery(
+                    "q",
+                    0,
+                    None,
+                    RecoverySealRequest {
+                        transition: [9; 32],
+                        fence_epoch: 1,
+                    },
+                )
+                .await
+                .unwrap();
+            assert_eq!(seal.history.message_next, if combined { 0 } else { 12 }, "{boundary}");
+            assert_eq!(seal.history.event_next, 20, "{boundary}");
+            assert!(
+                seal.history.payload_bounds().0 <= 8,
+                "old live payloads must survive {boundary}"
             );
+            let snapshot = st
+                .read_queue_snapshot(&st.recovery_snapshot_path("q", 0, None).unwrap())
+                .unwrap();
+            if seal.history.event_head > 0 {
+                assert_eq!(
+                    snapshot.as_ref().unwrap().0.event_next(),
+                    seal.history.event_next
+                );
+            }
+            let mut inspector = crate::recovery_inspection::RecoveryPairInspector::new(
+                "q", 0, None, false, seal.clone(), seal, Default::default(),
+            ).unwrap().with_queue_checkpoint_replay(20, Default::default(), 16384).unwrap();
+            while let Some((side, request)) = inspector.next_read().unwrap() {
+                let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();
+                inspector.accept_page(side, page).unwrap();
+            }
+            let (_, [artifact, _]) = inspector.finish_with_queue_artifacts(16384).unwrap();
+            let mut state = QueueInternalState::new("q".into(), 0);
+            state.load_snapshot(artifact.state_snapshot()).unwrap();
+            assert_eq!(state.recovery_live_ranges().iter().cloned().collect::<Vec<_>>(), vec![8..12]);
+            st.shutdown().await.unwrap();
         }
-        st.shutdown().await.unwrap();
     }
 }
 

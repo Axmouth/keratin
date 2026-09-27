@@ -856,3 +856,76 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         reopened.shutdown().await.unwrap();
     }
 }
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
+    use crate::{QueueLogLayout, RecoverySealRequest, StorageHistoryBinding};
+    #[derive(Debug)]
+    struct NoLag;
+    impl QueueReplicationRetention for NoLag {
+        fn retained_from(&self, _: &str, _: u32, _: Option<&str>, _: Option<&StorageHistoryBinding>) -> Result<(u64, u64)> {
+            // The absent message lane stays at zero. Only event progress pins a combined queue.
+            Ok((0, u64::MAX))
+        }
+    }
+    let dir = keratin_log::test_dir!("combined_agreed_checkpoint");
+    let st = open(&dir.root).await;
+    st.set_queue_replication_retention(Arc::new(NoLag));
+    let storage = st.prepare_empty_storage_history("q", 0, None, PartitionKind::Queue,
+        StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] }).await.unwrap();
+    st.admit_prepared_storage_history(storage.clone()).await.unwrap();
+    assert_eq!(publish(&st, true).await, 0);
+    assert_eq!(publish(&st, false).await, 1);
+    ack(&st, 1).await;
+    let a = st.begin_queue_checkpoint_pin(storage.clone(), [1; 32]).await.unwrap();
+    assert_eq!(a.pin.log_layout, QueueLogLayout::Combined);
+    assert_eq!(a.pin.event_next, 3);
+    assert_eq!(publish(&st, false).await, 3);
+    assert_eq!(publish(&st, false).await, 4);
+    ack(&st, 3).await;
+    let b = st.begin_queue_checkpoint_pin(storage.clone(), [2; 32]).await.unwrap();
+    let target = st.queue_checkpoint_target(storage.clone(), b.pin.event_next, b.pin.message_head, b.pin.message_next).await.unwrap();
+    assert_eq!((target.message_head, target.message_next, target.event_next), (0, 6, 6));
+    let ca = st.build_queue_checkpoint_capsule(a.pin.clone(), target.clone(), Default::default()).await.unwrap();
+    let cb = st.build_queue_checkpoint_capsule(b.pin.clone(), target, Default::default()).await.unwrap();
+    assert_eq!(ca.contents, cb.contents);
+    assert_eq!(ca.snapshot, cb.snapshot);
+    let mut bad = ca.contents.target();
+    bad.log_layout = QueueLogLayout::Separate;
+    assert!(st.build_queue_checkpoint_capsule(a.pin.clone(), bad, Default::default()).await.is_err());
+    st.accept_queue_checkpoint(a.pin.clone(), [11; 32], ca.digest().unwrap(), None).await.unwrap();
+    let ticket = st.queue_handle("q", 0, None).await.unwrap();
+    let h = ticket.resolve().unwrap();
+    assert_eq!(h.event_log().head_offset(), 0);
+    assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+    assert!(h.optional_message_log().is_none());
+    assert_eq!(st.queue_checkpoint_activity("q", 0, None).unwrap().message_next, 6);
+    st.release_queue_checkpoint_pin(b.pin).await.unwrap();
+    ack(&st, 0).await;
+    ack(&st, 4).await;
+    let c = st.begin_queue_checkpoint_pin(storage.clone(), [3; 32]).await.unwrap();
+    let target = st.queue_checkpoint_target(storage, c.pin.event_next, c.pin.message_head, c.pin.message_next).await.unwrap();
+    assert_eq!((target.message_head, target.message_next, target.event_next), (8, 8, 8));
+    let cc = st.build_queue_checkpoint_capsule(c.pin.clone(), target, Default::default()).await.unwrap();
+    st.accept_queue_checkpoint(c.pin, [12; 32], cc.digest().unwrap(), Some([11; 32])).await.unwrap();
+    assert_eq!(h.event_log().head_offset(), 8);
+    drop(h);
+    drop(ticket);
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st = open(&dir.root).await;
+    let seal = st.seal_replica_for_recovery("q", 0, None,
+        RecoverySealRequest { transition: [9; 32], fence_epoch: 9 }).await.unwrap();
+    assert_eq!((seal.event_head, seal.event_next, seal.message_next), (8, 8, 0));
+    assert!(seal.history.snapshot_digest.is_some());
+    let mut check = crate::recovery_inspection::RecoveryPairInspector::new("q", 0, None, false,
+        seal.clone(), seal.clone(), Default::default()).unwrap().with_queue_checkpoint_replay(8, Default::default(), 4096).unwrap();
+    while let Some((side, request)) = check.next_read().unwrap() {
+        let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();
+        check.accept_page(side, page).unwrap();
+    }
+    let (_, [recovered, _]) = check.finish_with_queue_artifacts(4096).unwrap();
+    assert_eq!(recovered.state_snapshot(), cc.snapshot);
+    assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+    st.shutdown().await.unwrap();
+}
