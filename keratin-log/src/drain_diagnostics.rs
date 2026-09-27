@@ -8,6 +8,9 @@ use std::time::Duration;
 #[derive(Default)]
 struct Counters {
     drain_batches: AtomicU64,
+    commit_drain: AtomicU64,
+    commit_size: AtomicU64,
+    commit_deadline: AtomicU64,
     drain_records: AtomicU64,
     staged_batches: AtomicU64,
     staged_records: AtomicU64,
@@ -29,6 +32,9 @@ pub(crate) fn init() {
                 loop {
                     let fields = [
                         ("drain_batches", &c.drain_batches),
+                        ("commit_drain", &c.commit_drain),
+                        ("commit_size", &c.commit_size),
+                        ("commit_deadline", &c.commit_deadline),
                         ("drain_records", &c.drain_records),
                         ("staged_batches", &c.staged_batches),
                         ("staged_records", &c.staged_records),
@@ -69,6 +75,17 @@ pub(crate) fn fsync(direct: bool) {
             &c.direct_fsync_jobs
         } else {
             &c.worker_fsync_jobs
+        };
+        counter.fetch_add(1, Ordering::Relaxed);
+    }
+}
+
+pub(crate) fn commit_trigger(trigger: crate::commit_policy::Trigger) {
+    if let Some(c) = COUNTERS.get() {
+        let counter = match trigger {
+            crate::commit_policy::Trigger::Drain => &c.commit_drain,
+            crate::commit_policy::Trigger::Size => &c.commit_size,
+            crate::commit_policy::Trigger::Deadline => &c.commit_deadline,
         };
         counter.fetch_add(1, Ordering::Relaxed);
     }

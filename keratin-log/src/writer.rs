@@ -210,6 +210,61 @@ struct PendingAck {
     end_offset: u64, // inclusive
     respond_to: AppendCompletionTarget,
     result: AppendResult,
+    staging_started: Instant,
+    bytes: usize,
+}
+
+/// Only acknowledgements not yet handed to an fsync request live here.
+#[derive(Default)]
+struct PendingAcks {
+    entries: VecDeque<PendingAck>,
+    bytes: usize,
+    records: usize,
+}
+impl PendingAcks {
+    fn is_empty(&self) -> bool {
+        self.entries.is_empty()
+    }
+    fn front(&self) -> Option<&PendingAck> {
+        self.entries.front()
+    }
+    fn push_back(&mut self, ack: PendingAck) {
+        self.bytes = self.bytes.saturating_add(ack.bytes);
+        self.records = self.records.saturating_add(ack.result.count as usize);
+        self.entries.push_back(ack);
+    }
+    fn pop_front(&mut self) -> Option<PendingAck> {
+        let ack = self.entries.pop_front()?;
+        self.bytes = self.bytes.saturating_sub(ack.bytes);
+        self.records = self.records.saturating_sub(ack.result.count as usize);
+        Some(ack)
+    }
+    fn decision(
+        &self,
+        cfg: &KeratinConfig,
+        now: Instant,
+        last_submit: Instant,
+        input_empty: bool,
+        inflight: usize,
+        pipeline: bool,
+    ) -> crate::commit_policy::Decision {
+        crate::commit_policy::Input {
+            now,
+            oldest: self.front().map(|p| p.staging_started),
+            last_submit,
+            max_delay: Duration::from_millis(cfg.fsync_interval_ms.max(1)),
+            min_interval: Duration::from_millis(cfg.min_fsync_interval_ms),
+            input_empty,
+            bytes: self.bytes,
+            records: self.records,
+            max_bytes: cfg.max_batch_bytes,
+            max_records: cfg.max_batch_records,
+            inflight,
+            hard_cap: cfg.max_inflight_fsyncs,
+            pipeline,
+        }
+        .decide()
+    }
 }
 
 /// Whether recent commits are small enough (fsync-count-bound) to pipeline fsyncs
@@ -237,7 +292,7 @@ fn commit_when_idle(
     inflight_fsyncs < max_inflight && last_fsync.elapsed() >= min_fsync_interval
 }
 
-fn pending_needs_fsync(pending: &VecDeque<PendingAck>) -> bool {
+fn pending_needs_fsync(pending: &PendingAcks) -> bool {
     !pending.is_empty()
 }
 
@@ -541,13 +596,15 @@ fn writer_loop_inner(
     fsync_done_rx: Receiver<FsyncDone>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
+    let stage_then_commit = std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() == Ok("1");
+    let mut deferred_command = None;
     let flush_on_drain = std::env::var("KERATIN_FLUSH_ON_DRAIN").as_deref() == Ok("1");
     crate::drain_diagnostics::init();
     let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
     let mut last_fsync = Instant::now();
 
-    let mut pending: VecDeque<PendingAck> = VecDeque::new();
+    let mut pending = PendingAcks::default();
     let mut inflight_fsyncs = 0usize;
 
     // Adaptive linger
@@ -614,6 +671,13 @@ fn writer_loop_inner(
 
         // (B) Never block past fsync deadline if we owe durability acks.
         // Commit due work first (and fail pending if commit is repeatedly broken).
+        let decision = pending.decision(&cfg, Instant::now(), last_fsync,
+            deferred_command.is_none() && writes_rx.is_empty(), inflight_fsyncs,
+            should_pipeline(log, cfg.pipeline_commit_records));
+        if !stage_then_commit || decision.trigger.is_some() {
+            if stage_then_commit {
+                crate::drain_diagnostics::commit_trigger(decision.trigger.unwrap());
+            }
         maybe_commit_due(
             log,
             &state,
@@ -630,6 +694,7 @@ fn writer_loop_inner(
             #[cfg(feature = "writer-stage-trace")]
             &tracer,
         );
+        }
 
         // (C) Compute how long we may wait for the next cmd.
         let now = Instant::now();
@@ -642,7 +707,13 @@ fn writer_loop_inner(
         // Cap by the commit deadline when durability acks are pending. With no
         // fsync in flight the wait only runs to the idle-commit floor, so the
         // writer self-clocks on fsync completions instead of the interval.
-        if pending_needs_fsync(&pending) {
+        if stage_then_commit {
+            if let Some(delay) = pending.decision(&cfg, now, last_fsync,
+                deferred_command.is_none() && writes_rx.is_empty(), inflight_fsyncs,
+                should_pipeline(log, cfg.pipeline_commit_records)).wait {
+                wait = wait.min(delay);
+            }
+        } else if pending_needs_fsync(&pending) {
             let horizon = if inflight_fsyncs == 0 {
                 min_fsync_interval
             } else {
@@ -668,7 +739,11 @@ fn writer_loop_inner(
         }
 
         // (D) Fetch next event (bounded).
-        let event = recv_writer_event(&writes_rx, &fsync_done_rx, wait);
+        let event = if let Some(command) = deferred_command.take() {
+            WriterEvent::Command(command)
+        } else {
+            recv_writer_event(&writes_rx, &fsync_done_rx, wait)
+        };
 
         let cmd = match event {
             WriterEvent::Command(cmd) => cmd,
@@ -741,6 +816,35 @@ fn writer_loop_inner(
         // (E) Process command.
         match cmd {
             WriterCmd::Append(r) => {
+                if stage_then_commit {
+                    // No wait for additional arrivals. Bound collection by requests,
+                    // records, bytes and time. One oversized request remains intact.
+                    let reqs = collect_staging_chunk(r, &writes_rx, &mut deferred_command, &cfg);
+                    #[cfg(feature = "writer-stage-trace")]
+                    let work_id = tracer.next_work_id();
+                    stage_reqs(log, &cfg, &state, &mut pending, reqs, &notify_tx,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                        #[cfg(feature = "writer-stage-trace")]
+                        work_id,
+                    );
+                    // Preserve bounded buffer flushing while durability capacity is
+                    // occupied, including explicit-sync AfterWrite callers.
+                    if log.should_flush() {
+                        if let Err(error) = log.flush_buffers() {
+                            fail_all_pending(&mut pending, format!("flushing staged data: {error}"), &notify_tx, true);
+                            wait_for_inflight_fsyncs(log, &state, &notify_tx, &fsync_done_rx,
+                                &mut inflight_fsyncs,
+                                #[cfg(feature = "writer-stage-trace")]
+                                &tracer,
+                            );
+                            return;
+                        }
+                    }
+                    // Re-enter at the completion drain, then decide commit eligibility
+                    // from the post-staging channel state.
+                    continue;
+                }
                 let now = Instant::now();
                 match batcher.push(now, r) {
                     PushResult::None => {
@@ -1172,15 +1276,20 @@ fn writer_loop_inner(
                 let job = log.prepare_fsync_job();
                 match job {
                     Ok(job) => {
+                        let ready = if stage_then_commit {
+                            last_fsync = Instant::now();
+                            take_covered_acks(&mut pending, job.durable_end())
+                        } else { Vec::new() };
                         let req = FsyncReq {
                             job,
-                            ready: Vec::new(),
+                            ready,
                             sync_acks: vec![respond_to],
                             #[cfg(feature = "writer-stage-trace")]
                             work_id,
                         };
                         if let Err(err) = fsync_tx.send(req) {
-                            let FsyncReq { sync_acks, .. } = err.into_inner();
+                            let FsyncReq { sync_acks, ready, .. } = err.into_inner();
+                            send_notify_items(&notify_tx, fail_notify_items(ready, "fsync worker disconnected"));
                             answer_sync_acks(
                                 sync_acks,
                                 Err(io::Error::other("fsync worker disconnected")),
@@ -1316,6 +1425,37 @@ fn stage_replicated_req(
     Ok(outcome)
 }
 
+fn collect_staging_chunk(
+    first: AppendReq,
+    input: &Receiver<WriterCmd>,
+    deferred: &mut Option<WriterCmd>,
+    cfg: &KeratinConfig,
+) -> Vec<AppendReq> {
+    let started = Instant::now();
+    let mut bytes = first.records.bytes_len();
+    let mut records = first.records.len();
+    let mut requests = vec![first];
+    while requests.len() < 64
+        && records < cfg.max_batch_records
+        && bytes < cfg.max_batch_bytes
+        && started.elapsed() < Duration::from_micros(250)
+    {
+        match input.try_recv() {
+            Ok(WriterCmd::Append(next)) => {
+                bytes = bytes.saturating_add(next.records.bytes_len());
+                records = records.saturating_add(next.records.len());
+                requests.push(next);
+            }
+            Ok(command) => {
+                *deferred = Some(command);
+                break;
+            }
+            Err(_) => break,
+        }
+    }
+    requests
+}
+
 /// Check the deadline first so drain counts capture only avoided linger waits.
 fn take_ready_batch<T, W: FnMut(&T) -> (usize, usize)>(
     batcher: &mut BatcherCore<T, W>,
@@ -1338,7 +1478,7 @@ fn stage_reqs(
     log: &mut Log,
     cfg: &KeratinConfig,
     state: &Arc<LogState>,
-    pending: &mut VecDeque<PendingAck>,
+    pending: &mut PendingAcks,
     reqs: Vec<AppendReq>,
     notify_tx: &Sender<NotifyMsg>,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
@@ -1348,6 +1488,7 @@ fn stage_reqs(
         reqs.iter().map(|r| r.records.len() as u64).sum(),
         reqs.iter().map(|r| r.records.bytes_len() as u64).sum(),
     );
+    let staging_started = Instant::now();
     let now_ms = crate::util::unix_millis();
 
     let mut total_bytes: usize = 0;
@@ -1401,6 +1542,8 @@ fn stage_reqs(
                         end_offset,
                         respond_to: completion,
                         result: ar,
+                        staging_started,
+                        bytes: request_bytes,
                     });
                 }
             }
@@ -1424,7 +1567,7 @@ fn stage_reqs(
 fn maybe_commit_due(
     log: &mut Log,
     state: &Arc<LogState>,
-    pending: &mut VecDeque<PendingAck>,
+    pending: &mut PendingAcks,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     min_fsync_interval: Duration,
@@ -1504,7 +1647,7 @@ fn post_stage_commit_and_tune(
     log: &mut Log,
     cfg: &KeratinConfig,
     state: &Arc<LogState>,
-    pending: &mut VecDeque<PendingAck>,
+    pending: &mut PendingAcks,
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
@@ -1799,7 +1942,7 @@ fn fail_notify_items(items: Vec<NotifyItem>, err_msg: impl AsRef<str>) -> Vec<No
 fn commit(
     log: &mut Log,
     state: &Arc<LogState>,
-    pending: &mut VecDeque<PendingAck>,
+    pending: &mut PendingAcks,
     last_fsync: &mut Instant,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
@@ -1828,7 +1971,6 @@ fn commit(
     let job = log.prepare_fsync_job()?;
     *last_fsync = Instant::now();
 
-    let mut ready = Vec::new();
     let durable_end = job.durable_end();
 
     // Track the per-commit record count (EWMA) to gate fsync pipelining. Driven by
@@ -1838,19 +1980,7 @@ fn commit(
     log.last_commit_through = durable_end;
     log.recent_commit_records = (log.recent_commit_records * 3 + commit_records) / 4;
 
-    while let Some(front) = pending.front() {
-        if front.end_offset < durable_end {
-            let p = pending
-                .pop_front()
-                .expect("front() returned Some on the previous line");
-            ready.push(NotifyItem {
-                completion: p.respond_to,
-                result: Ok(p.result),
-            });
-        } else {
-            break;
-        }
-    }
+    let ready = take_covered_acks(pending, durable_end);
 
     if ready.is_empty() {
         return Ok(());
@@ -1882,8 +2012,26 @@ fn commit(
     Ok(())
 }
 
+fn take_covered_acks(pending: &mut PendingAcks, durable_end: u64) -> Vec<NotifyItem> {
+    let mut ready = Vec::new();
+    while let Some(front) = pending.front() {
+        if front.end_offset < durable_end {
+            let p = pending
+                .pop_front()
+                .expect("front() returned Some on the previous line");
+            ready.push(NotifyItem {
+                completion: p.respond_to,
+                result: Ok(p.result),
+            });
+        } else {
+            break;
+        }
+    }
+    ready
+}
+
 fn fail_all_pending(
-    pending: &mut VecDeque<PendingAck>,
+    pending: &mut PendingAcks,
     err_msg: impl AsRef<str>,
     notify_tx: &Sender<NotifyMsg>,
     error: bool,
@@ -1969,5 +2117,231 @@ mod drain_batch_tests {
         assert!(!commit_when_idle(8, &now, Duration::ZERO, true, 8));
         assert!(!commit_when_idle(1, &now, Duration::ZERO, false, 8));
         assert!(commit_when_idle(0, &now, Duration::ZERO, true, 8));
+    }
+}
+
+#[cfg(test)]
+mod stage_commit_tests {
+    use super::*;
+    fn append(id: u8, size: usize) -> AppendReq {
+        let (tx, _) = tokio::sync::oneshot::channel();
+        AppendReq {
+            records: AppendPayload::One(Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![id; size],
+            }),
+            durability: Some(KDurability::AfterFsync),
+            completion: AppendCompletionTarget::Oneshot(tx),
+            staged_offset_tx: None,
+        }
+    }
+    fn ack(offset: u64, now: Instant, bytes: usize) -> PendingAck {
+        let (tx, _) = tokio::sync::oneshot::channel();
+        PendingAck {
+            end_offset: offset,
+            respond_to: AppendCompletionTarget::Oneshot(tx),
+            result: AppendResult {
+                base_offset: offset,
+                count: 1,
+            },
+            staging_started: now,
+            bytes,
+        }
+    }
+    #[test]
+    fn staging_keeps_control_command_ahead_of_later_append() {
+        let (tx, rx) = crossbeam_channel::bounded(4);
+        tx.send(WriterCmd::Append(append(2, 10))).unwrap();
+        let (reply, _) = tokio::sync::oneshot::channel();
+        tx.send(WriterCmd::Sync { respond_to: reply }).unwrap();
+        tx.send(WriterCmd::Append(append(3, 10))).unwrap();
+        let mut deferred = None;
+        let batch =
+            collect_staging_chunk(append(1, 10), &rx, &mut deferred, &KeratinConfig::default());
+        assert_eq!(batch.len(), 2);
+        assert!(matches!(deferred, Some(WriterCmd::Sync { .. })));
+        assert!(matches!(rx.try_recv(), Ok(WriterCmd::Append(_))));
+    }
+    #[test]
+    fn staging_bounds_work_and_accepts_an_oversized_request() {
+        let (tx, rx) = crossbeam_channel::bounded(100);
+        for _ in 0..90 {
+            tx.send(WriterCmd::Append(append(2, 10))).unwrap();
+        }
+        let mut deferred = None;
+        let batch =
+            collect_staging_chunk(append(1, 10), &rx, &mut deferred, &KeratinConfig::default());
+        assert!(!batch.is_empty() && batch.len() <= 64);
+        assert!(!rx.is_empty());
+        let cfg = KeratinConfig {
+            max_batch_bytes: 16,
+            ..KeratinConfig::default()
+        };
+        let before = rx.len();
+        assert_eq!(
+            collect_staging_chunk(append(1, 1024), &rx, &mut deferred, &cfg).len(),
+            1
+        );
+        assert_eq!(rx.len(), before);
+    }
+    #[test]
+    fn empty_input_returns_current_chunk_without_linger() {
+        let (_tx, rx) = crossbeam_channel::bounded(1);
+        let mut deferred = None;
+        assert_eq!(
+            collect_staging_chunk(append(1, 1), &rx, &mut deferred, &KeratinConfig::default())
+                .len(),
+            1
+        );
+    }
+    #[test]
+    fn submission_removes_covered_budget_and_preserves_next_deadline() {
+        let now = Instant::now();
+        let mut pending = PendingAcks::default();
+        pending.push_back(ack(0, now, 10));
+        pending.push_back(ack(1, now + Duration::from_millis(1), 20));
+        assert_eq!(take_covered_acks(&mut pending, 1).len(), 1);
+        assert_eq!((pending.bytes, pending.records), (20, 1));
+        assert_eq!(
+            pending.front().unwrap().staging_started,
+            now + Duration::from_millis(1)
+        );
+        assert_eq!(take_covered_acks(&mut pending, 2).len(), 1);
+        assert!(take_covered_acks(&mut pending, 2).is_empty());
+        assert_eq!((pending.bytes, pending.records), (0, 0));
+        assert!(
+            pending
+                .decision(&KeratinConfig::default(), now, now, true, 1, true)
+                .wait
+                .is_none()
+        );
+    }
+    #[test]
+    fn failure_clears_deadline_and_size_budget() {
+        let now = Instant::now();
+        let mut pending = PendingAcks::default();
+        pending.push_back(ack(0, now, 10));
+        let (tx, _rx) = crossbeam_channel::bounded(1);
+        fail_all_pending(&mut pending, "injected failure", &tx, false);
+        assert_eq!((pending.bytes, pending.records), (0, 0));
+        assert!(pending.front().is_none());
+    }
+}
+
+
+#[cfg(all(test, not(feature = "writer-stage-trace")))]
+mod held_pipeline_test {
+    use super::*;
+    use crate::DurableFrontier;
+
+    #[test]
+    fn stage_commit_stages_behind_held_fsync_then_submits_once() {
+        // The full suite runs both modes. This deliberately held worker exercises
+        // the new policy when its explicit process-level switch is enabled.
+        if std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() != Ok("1") {
+            return;
+        }
+        let dir = crate::test_dir!("held_stage_commit_pipeline");
+        let cfg = KeratinConfig {
+            max_inflight_fsyncs: 1,
+            fsync_interval_ms: 1,
+            tail_cache_bytes: 0,
+            ..KeratinConfig::test_default()
+        };
+        let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+        let (mut log, _) = Log::open(
+            &dir.root,
+            crate::util::unix_millis(),
+            cfg.segment_max_bytes,
+            cfg.index_stride_bytes,
+            cfg.flush_target_bytes,
+            0,
+            0,
+            false,
+            false,
+            state.clone(),
+            None,
+        )
+        .unwrap();
+        let (writes, input) = crossbeam_channel::bounded(8);
+        let (notifications, notified) = crossbeam_channel::unbounded();
+        let (jobs, requests) = crossbeam_channel::bounded::<FsyncReq>(1);
+        let (done, completed) = crossbeam_channel::bounded(1);
+        let writer_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            writer_loop(
+                &mut log,
+                cfg,
+                input,
+                writer_state,
+                notifications,
+                jobs,
+                completed,
+            );
+        });
+        let append = |id| {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            writes
+                .send(WriterCmd::Append(AppendReq {
+                    records: AppendPayload::One(Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: vec![id],
+                    }),
+                    durability: Some(KDurability::AfterFsync),
+                    completion: AppendCompletionTarget::Oneshot(reply),
+                    staged_offset_tx: None,
+                }))
+                .unwrap();
+        };
+        let complete = |request: FsyncReq| {
+            let elapsed = request.job.sync().unwrap();
+            done.send(FsyncDone {
+                durable_end: request.job.durable_end(),
+                elapsed,
+                ready: request.ready,
+                sync_acks: request.sync_acks,
+                error: None,
+            })
+            .unwrap();
+        };
+        append(1);
+        let first = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(first.job.durable_end(), 1);
+        append(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.tail.load(Ordering::Acquire) != 2 {
+            assert!(
+                Instant::now() < deadline,
+                "second append must stage while the first fsync is held"
+            );
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        assert!(!state.durable.load().covers(0));
+        assert!(
+            requests.try_recv().is_err(),
+            "hard capacity must be respected"
+        );
+        complete(first);
+        let second = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(second.job.durable_end(), 2);
+        assert!(state.durable.load().covers(0));
+        assert!(!state.durable.load().covers(1));
+        complete(second);
+        for _ in 0..2 {
+            notified.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        assert!(state.durable.load().covers(1));
+        assert!(
+            requests.try_recv().is_err(),
+            "already submitted work must not create another sync"
+        );
+        let (reply, finished) = tokio::sync::oneshot::channel();
+        writes
+            .send(WriterCmd::Shutdown { notify_tx: reply })
+            .unwrap();
+        finished.blocking_recv().unwrap();
+        worker.join().unwrap();
     }
 }
