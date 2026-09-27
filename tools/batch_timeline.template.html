@@ -1,0 +1,180 @@
+<div id="batch-overlap">
+  <h3>Replication batches on one clock</h3>
+  <div class="viz-controls">
+    <label class="form-label">Capture
+      <select class="form-select" data-choice="run" aria-label="Scheduling policy"></select>
+    </label>
+    <label class="form-label">Offset window
+      <select class="form-select" data-choice="burst" aria-label="Offset window"></select>
+    </label>
+    <label class="form-label">Log
+      <select class="form-select" data-choice="log" aria-label="Storage log">
+        <option value="messages">Payloads</option>
+        <option value="events">Queue events</option>
+      </select>
+    </label>
+  </div>
+  <div class="text-small" data-scope></div>
+  <div data-plot></div>
+  <div class="text-small tabular-nums" data-detail aria-live="polite"></div>
+  <div class="tooltip" role="tooltip" data-hover hidden></div>
+</div>
+<style>
+  #batch-overlap { position: relative; }
+  #batch-overlap [data-plot] { width: 100%; margin-block: 12px; }
+  #batch-overlap .trace-chart { display: block; width: 100%; overflow: visible; }
+  #batch-overlap .trace-chart text { fill: var(--foreground); font-size: 12px; font-weight: 400; }
+  #batch-overlap .trace-chart .node-label { font-weight: 500; }
+  #batch-overlap .trace-chart .domain,
+  #batch-overlap .trace-chart .tick line { stroke: var(--border); }
+  #batch-overlap [data-hover] { position: absolute; pointer-events: none; z-index: 2; max-width: min(340px, 90%); background: var(--popover); color: var(--popover-foreground); white-space: pre-line; }
+</style>
+<script type="application/json" id="batch-overlap-data">__TRACE_DATA__</script>
+<script src="https://cdn.jsdelivr.net/npm/d3@7.9.0/dist/d3.min.js"></script>
+<script>
+(() => {
+  const root = document.getElementById('batch-overlap');
+  const data = JSON.parse(document.getElementById('batch-overlap-data').textContent);
+  const run = root.querySelector('[data-choice="run"]');
+  const burst = root.querySelector('[data-choice="burst"]');
+  const log = root.querySelector('[data-choice="log"]');
+  const plot = root.querySelector('[data-plot]');
+  const scope = root.querySelector('[data-scope]');
+  const detail = root.querySelector('[data-detail]');
+  const tip = root.querySelector('[data-hover]');
+  const phases = ['Stage', 'Write', 'Queued', 'Fsync', 'Durable'];
+
+  const color = i => `var(--viz-series-${i % 6 + 1})`;
+  const number = v => v.toFixed(v < 1 ? 3 : 2);
+  const ms = v => `${number(v)} ms`;
+  const widthOf = v => v.end - v.start;
+  data.forEach(c => run.add(new Option(c.name, String(c.policy))));
+
+  let state = {run: String(data.at(-1).policy), burst: '0', log: 'messages'};
+  const saved = window.openai?.widgetState?.privateContent;
+  if (saved && typeof saved === 'object') state = {...state, ...saved};
+  function validState() {
+    if (!data.some(c => String(c.policy) === state.run)) state.run = String(data.at(-1).policy);
+    const selected=data.find(c=>String(c.policy)===state.run);
+    burst.replaceChildren();
+    selected.bursts.forEach((b,i)=>burst.add(new Option(`${i+1} · ${b.count} messages · offset ${b.first}`,String(i))));
+    if (!(Number(state.burst) >= 0 && Number(state.burst) < selected.bursts.length)) state.burst = '0';
+    if (!['messages', 'events'].includes(state.log)) state.log = 'messages';
+    run.value = state.run; burst.value = state.burst; log.value = state.log;
+  }
+  const svg = d3.select(plot).append('svg').attr('class', 'trace-chart').attr('role', 'img');
+  svg.append('title').text('Measured staging, writes, queueing, fsync and durable completion across the captured brokers');
+  const desc = svg.append('desc');
+  const frame = svg.append('rect').attr('data-chart-frame', '').attr('fill', 'none').attr('stroke', 'var(--border)');
+  const grid = svg.append('g');
+  const clip = svg.append('defs').append('clipPath').attr('id','batch-overlap-clip').append('rect');
+  const marks = svg.append('g').attr('clip-path','url(#batch-overlap-clip)');
+  const labels = svg.append('g');
+  const axes = svg.append('g');
+  const guide = svg.append('line').attr('data-chart-hover-guide', '').attr('stroke', 'var(--foreground)').attr('opacity', 0);
+  const dots = svg.append('g');
+  const hit = svg.append('rect').attr('data-chart-hit', '').attr('data-chart-hover-overlay', 'cross-series').attr('fill', 'transparent');
+  let initial = true;
+  let priorWidth = 0;
+  function draw() {
+    validState();
+    tip.hidden = true;
+    const c = data.find(c => String(c.policy) === state.run);
+    const names = c.nodes;
+    const b = c.bursts[Number(state.burst)];
+    const d = b.logs[state.log];
+    const w = Math.max(280, plot.getBoundingClientRect().width);
+    const left = w < 440 ? 102 : 124;
+    const right = 12, top = 28, row = 23, heading = 24;
+    const y = m => top + m.node * (heading + phases.length * row) + heading + phases.indexOf(m.phase) * row + row / 2;
+    const bottom = top + names.length * (heading + phases.length * row);
+    const height = bottom + 62;
+    const domain = d3.extent(d.marks.flatMap(m => [m.start, m.end]));
+    const span = Math.max(1, domain[1] - domain[0]);
+    const x = d3.scaleLinear().domain([Math.min(0, domain[0]) - span * .015, domain[1] + span * .035]).range([left + 3, w - right - 3]);
+    svg.attr('viewBox', `0 0 ${w} ${height}`).attr('height', height).attr('aria-label', `${c.name}, ${state.log}, burst ${Number(state.burst)+1}`);
+    desc.text(`Payload offsets ${b.first} through ${b.first+b.count-1}. Each node has five operation lanes. Batches have node-local IDs and half-open offset ranges. Bars are measured spans. Dots mark durable publication. No transport or actor spans are inferred.`);
+    scope.textContent = `${state.log === 'messages' ? 'Payload-log offsets' : 'Payload window'} ${b.first}–${b.first+b.count-1} · ${b.count} messages${c.payloadBytes ? ' · '+c.payloadBytes+' B each' : ''}${c.openCapture ? ' · no final close marker' : ''}`;
+    detail.textContent = `Node-local batch IDs · offset ranges are [first, next) · durable dots report log progress`;
+    frame.attr('x', left).attr('y', top).attr('width', w-left-right).attr('height', bottom-top);
+    const ticks = x.ticks(w < 440 ? 3 : 7);
+    grid.selectAll('line').data(ticks).join('line').attr('x1', t => x(t)).attr('x2', t => x(t)).attr('y1', top).attr('y2', bottom).attr('stroke', 'var(--border)').attr('opacity', .5);
+    labels.selectAll('*').remove();
+    names.forEach((name, node) => {
+      const yy = top + node * (heading + phases.length * row);
+      labels.append('text').attr('class', 'node-label').attr('x', 0).attr('y', yy+16).text(w < 440 ? (node===0 ? 'Owner' : 'Follower '+node) : name);
+      if (node) labels.append('line').attr('x1', left).attr('x2', w-right).attr('y1', yy).attr('y2', yy).attr('stroke', 'var(--border)');
+      phases.forEach(phase => labels.append('text').attr('x', left-10).attr('y', y({node, phase})+4).attr('text-anchor', 'end').text(phase));
+    });
+    axes.selectAll('*').remove();
+    axes.append('g').attr('transform', `translate(0,${bottom})`).call(d3.axisBottom(x).tickValues(ticks).tickFormat(d3.format('.1f')).tickSize(4));
+    axes.append('text').attr('class', 'axis-title').attr('data-axis', 'x').attr('x', (left+w-right)/2).attr('y', bottom+44).attr('text-anchor', 'middle').text(w < 440 ? 'Time from owner stage (ms)' : 'Milliseconds from first owner stage');
+    axes.append('text').attr('class', 'axis-title').attr('data-axis', 'y').attr('x', 0).attr('y', 13).text('Node / operation');
+    const duration = initial || priorWidth !== w || matchMedia('(prefers-reduced-motion: reduce)').matches ? 0 : 180;
+    priorWidth = w;
+    clip.attr('x',left).attr('y',top).attr('width',w-left-right).attr('height',bottom-top);
+    const rows = marks.selectAll('g.trace-mark').data(d.marks, (m,i) => `${m.node}:${m.phase}:${m.batch}:${i}`).join(
+      enter => { const g=enter.append('g').attr('class','trace-mark'); g.append('rect').attr('x',m=>x(m.start)).attr('y',m=>y(m)-7).attr('width',m=>Math.max(.8,x(m.end)-x(m.start))); g.append('circle').attr('cx',m=>x(m.start)).attr('cy',m=>y(m)); g.append('text').attr('x',m=>(x(m.start)+x(m.end))/2).attr('y',m=>y(m)+4); return g; },
+      update => update,
+      exit => exit.remove()
+    );
+    rows.select('rect').attr('fill', m => color(m.index)).attr('opacity', m => m.phase === 'Queued' ? .35 : .72).attr('display', m => m.phase==='Durable' ? 'none' : null)
+      .transition().duration(duration).attr('x',m=>x(m.start)).attr('y',m=>y(m)-7).attr('width',m=>Math.max(.8,x(m.end)-x(m.start))).attr('height',14);
+    rows.select('circle').attr('fill',m=>color(m.index)).attr('display',m=>m.phase==='Durable'?null:'none').transition().duration(duration).attr('cx',m=>x(m.start)).attr('cy',m=>y(m)).attr('r',3.5);
+    rows.select('text').attr('text-anchor','middle').text(m => m.phase==='Fsync' && x(m.end)-x(m.start)>34 ? m.batch : '').transition().duration(duration).attr('x',m=>(x(m.start)+x(m.end))/2).attr('y',m=>y(m)+4);
+    hit.attr('x',left).attr('y',top).attr('width',w-left-right).attr('height',bottom-top);
+    guide.attr('y1',top).attr('y2',bottom).attr('opacity',0);
+    dots.selectAll('*').remove();
+    function hover(event, pinned=false) {
+      const [px,py] = d3.pointer(event, svg.node());
+      const t = x.invert(Math.max(left,Math.min(w-right,px)));
+      const active = d.marks.filter(m => m.phase==='Durable' ? Math.abs(x(m.start)-px)<4 : m.start<=t && m.end>=t);
+      const nearest = d.marks.reduce((best,m) => {
+        const dx = px < x(m.start) ? x(m.start)-px : px > x(m.end) ? px-x(m.end) : 0;
+        const score = dx + Math.abs(y(m)-py)*2;
+        return !best || score<best.score ? {m,score} : best;
+      },null);
+      guide.attr('x1',x(t)).attr('x2',x(t)).attr('opacity',.45);
+      dots.selectAll('circle').data(active).join('circle').attr('data-chart-hover-marker','').attr('cx',x(t)).attr('cy',m=>y(m)).attr('r',3).attr('fill',m=>color(m.index));
+      let lines = [`${ms(t)} from first owner stage`];
+      active.forEach(m => lines.push(`${m.batch} · ${m.phase} · [${m.first}, ${m.next})`));
+      if (nearest && nearest.score < 32) {
+        const m = nearest.m;
+        lines.push(`${m.batch} ${m.phase}: ${ms(m.start)} → ${ms(m.end)} (${ms(widthOf(m))})`);
+        if (m.detail) lines.push(m.detail);
+        if (pinned) detail.textContent = `${m.batch} · ${m.phase} · offsets [${m.first}, ${m.next}) · ${ms(m.start)}–${ms(m.end)} · duration ${ms(widthOf(m))}`;
+      }
+      tip.textContent = lines.join('\n');
+      tip.hidden = false;
+      const rootRect=root.getBoundingClientRect(), svgRect=svg.node().getBoundingClientRect();
+      const localX=svgRect.left-rootRect.left+px, localY=svgRect.top-rootRect.top+py;
+      tip.style.left=Math.max(0,Math.min(root.clientWidth-tip.offsetWidth,localX+12))+'px';
+      tip.style.top=Math.max(0,localY-tip.offsetHeight-12)+'px';
+    }
+    hit.on('pointermove',event=>hover(event)).on('click',event=>hover(event,true)).on('pointerleave',()=>{tip.hidden=true;guide.attr('opacity',0);dots.selectAll('*').remove();});
+    initial=false;
+    requestAnimationFrame(() => {
+      const tickLabels=[...axes.node().querySelectorAll('.tick text')];
+      let previous=null;
+      tickLabels.forEach(label=>{
+        const box=label.getBoundingClientRect();
+        if(previous && box.left<previous.right+4) label.style.visibility='hidden';
+        else previous=box;
+      });
+    });
+  }
+  function changed() {
+    state={run:run.value,burst:burst.value,log:log.value};
+    draw();
+    const c=data.find(c=>String(c.policy)===state.run), b=c.bursts[Number(state.burst)];
+    window.openai?.setWidgetState?.({modelContent:{policy:c.name,payloadFirst:b.first,payloadCount:b.count,log:state.log},privateContent:state}).catch(()=>{});
+  }
+  [run,burst,log].forEach(el=>el.addEventListener('change',changed));
+  window.addEventListener('openai:set_globals',event=>{
+    const v=event.detail?.globals?.widgetState?.privateContent;
+    if(v){state={...state,...v};draw();}
+  });
+  new ResizeObserver(draw).observe(plot);
+  draw();
+})();
+</script>

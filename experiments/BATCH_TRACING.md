@@ -128,3 +128,12 @@ Broker captures terminated by SIGTERM lack a final closed summary. Preserve that
 incomplete status, verify periodic drop counters and completed operation links,
 and restrict conclusions to observed work. Cross-process wall-clock anchors can
 illustrate approximate overlap on one host, but do not establish RPC causality.
+
+## Broker batch overlap view
+
+For normal-operation captures from the same-host broker harness, use the
+[batch timeline renderer](../tools/BATCH_TIMELINE.md). A case manifest selects
+trace files, node labels and payload offset windows. One command generates an
+interactive lane view plus a capture audit, with separate controls for runs,
+windows and payload/event logs. The raw Perfetto converter remains useful for
+arbitrary logs, failure traces and detailed event inspection.
