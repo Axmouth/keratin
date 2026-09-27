@@ -4,6 +4,7 @@ version = "0.1.0"
 edition = "2024"
 
 [features]
+writer-stage-trace = ["keratin-log/writer-stage-trace"]
 io-fault-injection = ["keratin-log/io-fault-injection"]
 early-replication-experiment = ["keratin-log/early-replication-experiment"]
 # Keep the opt-out for controlled comparisons; ordinary queue writes apply in

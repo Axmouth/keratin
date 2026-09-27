@@ -21,9 +21,10 @@ def convert(rows):
     complete = bool(summaries and summaries[-1].get('closed') and summaries[-1]['dropped'] == 0)
     if not complete:
         print('WARNING: incomplete capture (missing close marker or dropped events)', file=sys.stderr)
+    physical_groups = {(r['writer'], r['id']) for r in rows if r.get('stage') == 'fsync_begin'}
     def lane(r):
         stage = r['stage']
-        role = 'fsync' if stage.startswith('fsync') else ('notifier' if stage == 'notify' else 'writer')
+        role = 'fsync' if (r['writer'], r['id']) in physical_groups and stage in ('fsync', 'fsync_begin', 'fsync_success', 'fsync_error', 'log_fsync', 'index_fsync') or stage == 'fsync_member' else ('notifier' if stage == 'notify' else 'writer')
         return r['writer'] * 3 + {'writer': 0, 'fsync': 1, 'notifier': 2}[role]
     for ident, writer in writers.items():
         for role in ('writer', 'fsync', 'notifier'):

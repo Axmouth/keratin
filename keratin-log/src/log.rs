@@ -111,13 +111,31 @@ impl FsyncJob {
     }
 
     pub(crate) fn sync(&self) -> io::Result<Duration> {
+        self.sync_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    #[cfg(feature = "writer-stage-trace")]
+    pub(crate) fn sync_traced(&self, tracer: &WriterStageTracer, id: u64) -> io::Result<Duration> {
+        self.sync_inner(Some((tracer, id)))
+    }
+
+    fn sync_inner(
+        &self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<Duration> {
         crate::drain_diagnostics::fsync(false);
         let started = Instant::now();
-        #[cfg(feature = "io-fault-injection")]
-        crate::io_fault_injection::sync_data(&self.active)?;
-        #[cfg(not(feature = "io-fault-injection"))]
-        self.active.sync_data()?;
-        self.index.sync_data()?;
+        observe_stage!(tracer, "log_fsync", (0, 0), {
+            #[cfg(feature = "io-fault-injection")]
+            let result = crate::io_fault_injection::sync_data(&self.active);
+            #[cfg(not(feature = "io-fault-injection"))]
+            let result = self.active.sync_data();
+            result
+        })?;
+        observe_stage!(tracer, "index_fsync", (0, 0), { self.index.sync_data() })?;
         Ok(started.elapsed())
     }
 }
@@ -1222,7 +1240,10 @@ impl Log {
         crate::drain_diagnostics::fsync(true);
         self.poll_manifest()?;
         observe_stage!(tracer, "fsync", (0, 0), {
-            self.fsync_files_and_update_manifest()
+            self.fsync_files_and_update_manifest_inner(
+                #[cfg(feature = "writer-stage-trace")]
+                tracer,
+            )
         })?;
 
         // manifest is a hint; persist it on interval
@@ -1236,10 +1257,20 @@ impl Log {
     }
 
     fn fsync_files_and_update_manifest(&mut self) -> io::Result<()> {
+        self.fsync_files_and_update_manifest_inner(
+            #[cfg(feature = "writer-stage-trace")]
+            None,
+        )
+    }
+
+    fn fsync_files_and_update_manifest_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
         let t = Instant::now();
 
-        self.active.fsync()?;
-        self.index.fsync()?;
+        observe_stage!(tracer, "log_fsync", (0, 0), { self.active.fsync() })?;
+        observe_stage!(tracer, "index_fsync", (0, 0), { self.index.fsync() })?;
 
         self.stats.fsync += t.elapsed();
 

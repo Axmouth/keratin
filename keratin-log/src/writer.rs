@@ -424,10 +424,21 @@ fn fsync_loop(
     done_tx: Sender<FsyncDone>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
+    #[cfg(feature = "writer-stage-trace")]
+    let job_tracer = tracer.clone();
     fsync_loop_with(
         rx,
         done_tx,
-        FsyncJob::sync,
+        |job, _id| {
+            #[cfg(feature = "writer-stage-trace")]
+            {
+                job.sync_traced(&job_tracer, _id)
+            }
+            #[cfg(not(feature = "writer-stage-trace"))]
+            {
+                job.sync()
+            }
+        },
         #[cfg(feature = "writer-stage-trace")]
         tracer,
     );
@@ -436,7 +447,7 @@ fn fsync_loop(
 fn fsync_loop_with(
     rx: Receiver<FsyncReq>,
     done_tx: Sender<FsyncDone>,
-    mut sync: impl FnMut(&FsyncJob) -> io::Result<Duration>,
+    mut sync: impl FnMut(&FsyncJob, u64) -> io::Result<Duration>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) {
     // Reused across wakeups so the coalescing buffer is not reallocated per fsync.
@@ -457,6 +468,8 @@ fn fsync_loop_with(
         // One sync covers every drained request; fan the single result out.
         #[cfg(feature = "writer-stage-trace")]
         let group_id = tracer.next_work_id();
+        #[cfg(not(feature = "writer-stage-trace"))]
+        let group_id = 0;
         #[cfg(feature = "writer-stage-trace")]
         for req in &reqs {
             tracer.event(
@@ -480,7 +493,7 @@ fn fsync_loop_with(
             Some((0, reqs.last().unwrap().job.durable_end())),
         );
         let result = trace_writer_stage!(tracer, group_id, "fsync", (reqs.len(), 0), {
-            sync(&reqs.last().expect("at least one request").job)
+            sync(&reqs.last().expect("at least one request").job, group_id)
         });
         #[cfg(feature = "writer-stage-trace")]
         tracer.event(
@@ -975,6 +988,10 @@ fn writer_loop(
                             &records,
                             mode,
                             durability.unwrap_or(cfg.default_durability),
+                            #[cfg(feature = "writer-stage-trace")]
+                            &tracer,
+                            #[cfg(feature = "writer-stage-trace")]
+                            work_id,
                         )
                     }
                 );
@@ -1453,10 +1470,14 @@ fn stage_replicated_req(
     records: &[Message],
     mode: ReplicatedAppendMode,
     durability: KDurability,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> Result<ReplicatedAppendOutcome, IoError> {
     let now_ms = crate::util::unix_millis();
     let (outcome, end_offset) =
-        log.stage_replicated_append_batch(epoch, first_offset, records, mode, now_ms)?;
+        trace_writer_stage!(tracer, work_id, "replicated_stage", (records.len(), 0), {
+            log.stage_replicated_append_batch(epoch, first_offset, records, mode, now_ms)
+        })?;
     state.epoch.store(log.current_epoch(), Ordering::Release);
 
     if let Some(end_offset) = end_offset {
@@ -1464,18 +1485,40 @@ fn stage_replicated_req(
 
         match durability {
             KDurability::AfterWrite => {
+                #[cfg(feature = "writer-stage-trace")]
+                log.flush_buffers_traced(tracer, work_id)?;
+                #[cfg(not(feature = "writer-stage-trace"))]
                 log.flush_buffers()?;
-                log.flush()?;
+                trace_writer_stage!(tracer, work_id, "replicated_flush", (0, 0), { log.flush() })?;
             }
             KDurability::AfterFsync => {
+                #[cfg(feature = "writer-stage-trace")]
+                log.flush_buffers_traced(tracer, work_id)?;
+                #[cfg(not(feature = "writer-stage-trace"))]
                 log.flush_buffers()?;
-                log.flush()?;
+                trace_writer_stage!(tracer, work_id, "replicated_flush", (0, 0), { log.flush() })?;
+                #[cfg(feature = "writer-stage-trace")]
+                log.fsync_traced(tracer, work_id)?;
+                #[cfg(not(feature = "writer-stage-trace"))]
                 log.fsync()?;
                 state.durable.advance(log.durable_end_exclusive());
             }
         }
     }
 
+    #[cfg(feature = "writer-stage-trace")]
+    tracer.event(
+        work_id,
+        "replicated_done",
+        None,
+        records.len(),
+        0,
+        None,
+        Some((
+            first_offset,
+            first_offset.saturating_add(records.len() as u64),
+        )),
+    );
     Ok(outcome)
 }
 
@@ -2535,7 +2578,7 @@ mod batch_trace_tests {
         fsync_loop_with(
             rx,
             done_tx,
-            |job| {
+            |job, _| {
                 calls += 1;
                 assert_eq!(job.durable_end(), 3);
                 if fail {

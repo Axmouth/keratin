@@ -113,3 +113,18 @@ cannot simply be subtracted from observed latency.
 
 The output is versioned JSON Lines. It replaces the earlier per-writer CSV trace.
 Earlier CSV consumers need updating to the new schema.
+
+## Combined-candidate substeps
+
+The immediate-staging path also traces its bounded buffer flushes. Physical
+worker jobs and direct follower fsyncs expose `log_fsync` and `index_fsync` under
+the encompassing operation ID. Follower application exposes `replicated_stage`,
+`replicated_flush`, buffer writes, direct fsync and `replicated_done` with the
+requested offset range. All observations wrap the existing operation bodies.
+`manifest_write` measures the periodic manifest handoff when background manifests
+are enabled. It does not measure the separate manifest worker's disk I/O.
+
+Broker captures terminated by SIGTERM lack a final closed summary. Preserve that
+incomplete status, verify periodic drop counters and completed operation links,
+and restrict conclusions to observed work. Cross-process wall-clock anchors can
+illustrate approximate overlap on one host, but do not establish RPC causality.
