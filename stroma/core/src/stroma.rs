@@ -1306,6 +1306,22 @@ impl Stroma {
 
     // ---------------- Core accessors ----------------
 
+    /// Combined queues inherit the payload writer's capacities and cadence.
+    /// Keep the small event configuration for metadata/global-store logs.
+    fn queue_event_log_config(&self) -> KeratinConfig {
+        #[cfg(feature = "combined-queue-log-experiment")]
+        if self.combined_queue_log {
+            return KeratinConfig {
+                default_durability: if self.keratin_cfg_msg.default_durability == KDurability::AfterFsync
+                    || self.keratin_cfg_event.default_durability == KDurability::AfterFsync {
+                    KDurability::AfterFsync
+                } else { KDurability::AfterWrite },
+                ..self.keratin_cfg_msg
+            };
+        }
+        self.keratin_cfg_event
+    }
+
     async fn event_log_init(
         &self,
         tp: &str,
@@ -1319,7 +1335,7 @@ impl Stroma {
         let k = self
             .open_keratin(
                 dir,
-                self.keratin_cfg_event,
+                self.queue_event_log_config(),
                 self.storage_history_binding(tp, part, group)?.is_some(),
             )
             .await

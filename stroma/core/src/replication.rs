@@ -872,7 +872,18 @@ impl Stroma {
             .map_err(io_err)?;
             let mut expected = from;
             let mut records = Vec::with_capacity(raw.len());
+            #[cfg(feature = "combined-queue-log-experiment")]
+            let mut combined_bytes = 0usize;
             for record in raw {
+                #[cfg(feature = "combined-queue-log-experiment")]
+                if self.combined_queue_log {
+                    // The reader includes one lookahead record. Payload-bearing
+                    // events now need the same cap the message lane had. Always
+                    // allow one oversized record so the cursor can advance.
+                    let bytes = record.headers.len().saturating_add(record.payload.len()).saturating_add(32);
+                    if !records.is_empty() && combined_bytes.saturating_add(bytes) > max_bytes { break; }
+                    combined_bytes = combined_bytes.saturating_add(bytes);
+                }
                 if record.offset != expected {
                     return owner_replication_gap("event", &log, from, expected, record.offset);
                 }

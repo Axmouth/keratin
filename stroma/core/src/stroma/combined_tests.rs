@@ -352,3 +352,62 @@ async fn failed_combined_fsync_never_confirms_or_applies_payload() {
         let _ = st.shutdown().await;
     }
 }
+
+#[tokio::test]
+async fn combined_writer_uses_payload_budgets_and_read_cap_allows_one_oversized_record() {
+    let dir = keratin_log::test_dir!("combined_payload_budgets");
+    let mut message = KeratinConfig::test_default();
+    message.tail_cache_bytes = 8 * 1024 * 1024;
+    message.segment_max_bytes = 32 * 1024 * 1024;
+    let mut config = StromaKeratinConfig::from_message_log(message);
+    config.event_log.tail_cache_bytes = 0;
+    config.event_log.default_durability = KDurability::AfterFsync;
+    config.message_log.default_durability = KDurability::AfterWrite;
+    let st = Stroma::open_with_options(
+        &dir.root,
+        config,
+        SnapshotConfig::default(),
+        StromaOptions {
+            combined_queue_log: true,
+            ..Default::default()
+        },
+    )
+    .await
+    .unwrap();
+    let effective = st.queue_event_log_config();
+    assert_eq!(effective.segment_max_bytes, message.segment_max_bytes);
+    assert_eq!(effective.max_batch_bytes, message.max_batch_bytes);
+    assert_eq!(effective.flush_target_bytes, message.flush_target_bytes);
+    assert_eq!(effective.index_stride_bytes, message.index_stride_bytes);
+    assert_eq!(effective.tail_cache_bytes, message.tail_cache_bytes);
+    assert_eq!(effective.max_batch_records, message.max_batch_records);
+    assert_eq!(effective.default_durability, KDurability::AfterFsync);
+    // The small metadata profile is still retained independently.
+    assert_eq!(st.keratin_cfg_event.tail_cache_bytes, 0);
+    assert_eq!(
+        st.keratin_cfg_event.max_batch_bytes,
+        message.max_batch_bytes / 8
+    );
+    publish(&st, false).await;
+    publish(&st, false).await;
+    let read = st
+        .read_owner_event_records_with_byte_budget("q", 0, None, 0, 10, 1024)
+        .await
+        .unwrap();
+    let crate::OwnerReplicationRead::Batch(batch) = read else {
+        panic!("unexpected checkpoint")
+    };
+    assert_eq!(batch.records.len(), 1);
+    assert_eq!(batch.next_offset, 1);
+    let read = st
+        .read_owner_event_records_with_byte_budget("q", 0, None, 1, 10, 1024)
+        .await
+        .unwrap();
+    let crate::OwnerReplicationRead::Batch(batch) = read else {
+        panic!("unexpected checkpoint")
+    };
+    assert_eq!(batch.records.len(), 1);
+    assert_eq!(batch.records[0].0, 1);
+    assert_eq!(batch.next_offset, 2);
+    st.shutdown().await.unwrap();
+}

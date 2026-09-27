@@ -285,8 +285,10 @@ impl Stroma {
         let bytes: usize = records.iter().map(Message::bytes_len).sum();
         let message_epoch = h.msg_log().current_epoch();
         let event_epoch = event_log.current_epoch();
-        let receiver = event_log
-            .append_batch_enqueue_receiver(records, Some(self.keratin_cfg_msg.default_durability));
+        let receiver = event_log.append_batch_enqueue_receiver(
+            records,
+            Some(self.queue_event_log_config().default_durability),
+        );
         let stroma = self.clone();
         self.task_group
             .spawn("combined publish completion", async move {
