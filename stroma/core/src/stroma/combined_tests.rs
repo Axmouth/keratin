@@ -537,6 +537,22 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
                     .unwrap(),
                 );
             }
+            for st in &stores {
+                st.initialize_empty_storage_history(
+                    "q",
+                    0,
+                    None,
+                    PartitionKind::Queue,
+                    crate::StorageHistoryBinding {
+                        resource_incarnation: [1; 16],
+                        accepted_history: [2; 16],
+                        writer_session: [3; 16],
+                    },
+                )
+                .await
+                .unwrap();
+                assert!(!st.msg_tp_part_dir("q", 0, None).exists());
+            }
             let owner = &stores[0];
             let follower = &stores[1];
             let q = owner.queue_handle("q", 0, None).await.unwrap();

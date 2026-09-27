@@ -772,24 +772,26 @@ impl Stroma {
                 persist(&intent_path, intent.as_ref().unwrap_or(&receipt))?;
                 preparation_boundary("intent");
             }
-            // Take both Keratin locks before persisting. Another storage instance
+            // Take the physical log locks before persisting. Another storage instance
             // cannot write these logs concurrently with initial binding.
-            let messages = open_preparation_log(
-                self,
-                self.msg_tp_part_dir(topic, part, group),
-                self.keratin_cfg_msg,
-            )
-            .await?;
+            let messages = if self.queue_payloads_in_event_log() {
+                if self.msg_tp_part_dir(topic, part, group).try_exists().map_err(io_err)? {
+                    return Err(StromaError::InvalidArgument("combined preparation found an unexpected separate message log".into()));
+                }
+                None
+            } else {
+                Some(open_preparation_log(self, self.msg_tp_part_dir(topic, part, group), self.keratin_cfg_msg).await?)
+            };
             let events = match open_preparation_log(
                 self,
                 self.tp_part_dir(topic, part, group),
-                self.keratin_cfg_event,
+                self.queue_event_log_config(),
             )
             .await
             {
                 Ok(events) => events,
                 Err(error) => {
-                    let _ = messages.shutdown().await;
+                    if let Some(log) = &messages { let _ = log.shutdown().await; }
                     return Err(error);
                 }
             };
@@ -798,11 +800,9 @@ impl Stroma {
                     return Err(StromaError::InvalidArgument("storage receipt changed during preparation".into()));
                 }
                 preparation_boundary("logs");
-                if messages.next_offset() != 0
-                    || messages.head_offset() != 0
+                if messages.as_ref().is_some_and(|log| log.next_offset() != 0 || log.head_offset() != 0 || log.current_epoch() != 0)
                     || events.next_offset() != 0
                     || events.head_offset() != 0
-                    || messages.current_epoch() != 0
                     || events.current_epoch() != 0
                 {
                     return Err(StromaError::InvalidArgument(
@@ -819,7 +819,7 @@ impl Stroma {
                         kind,
                     )?;
                     if resume && existing.as_ref().is_some_and(|old| old != &saved) {
-                        // Both log locks are held. Only the local session changes;
+                        // All physical log locks are held. Only the local session changes;
                         // the history binding and pristine logs remain intact.
                         let next = path.with_file_name("storage.history.next");
                         if next.try_exists().map_err(io_err)? { fs::remove_file(&next).map_err(io_err)?; }
@@ -835,7 +835,10 @@ impl Stroma {
                 .map_err(io_err)?
             }
             .await;
-            let (message_close, event_close) = tokio::join!(messages.shutdown(), events.shutdown());
+            let (message_close, event_close) = tokio::join!(
+                async { match messages { Some(log) => log.shutdown().await, None => Ok(()) } },
+                events.shutdown(),
+            );
             result?;
             message_close.map_err(io_err)?;
             event_close.map_err(io_err)?;
