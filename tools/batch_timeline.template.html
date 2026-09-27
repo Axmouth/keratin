@@ -9,8 +9,7 @@
     </label>
     <label class="form-label">Log
       <select class="form-select" data-choice="log" aria-label="Storage log">
-        <option value="messages">Payloads</option>
-        <option value="events">Queue events</option>
+
       </select>
     </label>
   </div>
@@ -57,9 +56,12 @@
     if (!data.some(c => String(c.policy) === state.run)) state.run = String(data.at(-1).policy);
     const selected=data.find(c=>String(c.policy)===state.run);
     burst.replaceChildren();
-    selected.bursts.forEach((b,i)=>burst.add(new Option(`${i+1} · ${b.count} messages · offset ${b.first}`,String(i))));
+    selected.bursts.forEach((b,i)=>burst.add(new Option(`${i+1} · ${b.count} ${selected.recordLabel || 'messages'} · offset ${b.first}`,String(i))));
     if (!(Number(state.burst) >= 0 && Number(state.burst) < selected.bursts.length)) state.burst = '0';
-    if (!['messages', 'events'].includes(state.log)) state.log = 'messages';
+    const available = Object.keys(selected.bursts[Number(state.burst)].logs);
+    log.replaceChildren();
+    available.forEach(kind => log.add(new Option(selected.logLabels?.[kind] || kind, kind)));
+    if (!available.includes(state.log)) state.log = available[0];
     run.value = state.run; burst.value = state.burst; log.value = state.log;
   }
   const svg = d3.select(plot).append('svg').attr('class', 'trace-chart').attr('role', 'img');
@@ -93,8 +95,8 @@
     const span = Math.max(1, domain[1] - domain[0]);
     const x = d3.scaleLinear().domain([Math.min(0, domain[0]) - span * .015, domain[1] + span * .035]).range([left + 3, w - right - 3]);
     svg.attr('viewBox', `0 0 ${w} ${height}`).attr('height', height).attr('aria-label', `${c.name}, ${state.log}, burst ${Number(state.burst)+1}`);
-    desc.text(`Payload offsets ${b.first} through ${b.first+b.count-1}. Each node has five operation lanes. Batches have node-local IDs and half-open offset ranges. Bars are measured spans. Dots mark durable publication. No transport or actor spans are inferred.`);
-    scope.textContent = `${state.log === 'messages' ? 'Payload-log offsets' : 'Payload window'} ${b.first}–${b.first+b.count-1} · ${b.count} messages${c.payloadBytes ? ' · '+c.payloadBytes+' B each' : ''}${c.openCapture ? ' · no final close marker' : ''}`;
+    desc.text(`${c.offsetLabel || 'Payload offsets'} ${b.first} through ${b.first+b.count-1}. Each node has five operation lanes. Batches have node-local IDs and half-open offset ranges. Bars are measured spans. Dots mark durable publication. No transport or actor spans are inferred.`);
+    scope.textContent = `${c.offsetLabel || 'Payload offsets'} ${b.first}–${b.first+b.count-1} · ${b.count} ${c.recordLabel || 'messages'}${c.payloadBytes ? ' · '+c.payloadBytes+' B payloads' : ''}${c.openCapture ? ' · no final close marker' : ''}`;
     detail.textContent = `Node-local batch IDs · offset ranges are [first, next) · durable dots report log progress`;
     frame.attr('x', left).attr('y', top).attr('width', w-left-right).attr('height', bottom-top);
     const ticks = x.ticks(w < 440 ? 3 : 7);

@@ -19,6 +19,14 @@ def extract(config, base, allow_open=False):
             "Only same-host captures are supported. Cross-host clock alignment needs separate evidence."
         )
     nodes = config["nodes"]
+    payload_log = config.get("payload_log", "messages")
+    log_kinds = config.get("logs", ["messages", "events"])
+    if not log_kinds or len(set(log_kinds)) != len(log_kinds) or any(
+        kind not in ("messages", "events") for kind in log_kinds
+    ) or payload_log not in log_kinds:
+        raise ValueError("logs must contain unique known lanes including payload_log")
+    combined = payload_log == "events"
+
     if not nodes or not config["windows"] or not config["cases"]:
         raise ValueError("nodes, windows and cases must be nonempty")
     for case in config["cases"]:
@@ -65,7 +73,7 @@ def extract(config, base, allow_open=False):
             ]:
                 node = int(w["path"].split("/node-")[1].split("/")[0])
                 kind = w["path"].split("/data/")[1].split("/")[0]
-                if kind not in ["messages", "events"]:
+                if kind not in log_kinds:
                     continue
                 events = []
                 for r in rows:
@@ -92,7 +100,7 @@ def extract(config, base, allow_open=False):
         first_window = min(window["first"] for window in config["windows"])
         window_start = min(
             e["s"]
-            for e in writers[0, "messages"]
+            for e in writers[0, payload_log]
             if e["stage"] == "stage" and e["first"] >= first_window
         )
         for key, events in writers.items():
@@ -263,7 +271,7 @@ def extract(config, base, allow_open=False):
                 )
             groups_by_writer[node, kind] = groups
             spans_by_writer[node, kind] = spans
-        owner_stages = [e for e in writers[0, "messages"] if e["stage"] == "stage"]
+        owner_stages = [e for e in writers[0, payload_log] if e["stage"] == "stage"]
         bursts = []
         for window in config["windows"]:
             for start, count in [(window["first"], window["count"])]:
@@ -276,7 +284,7 @@ def extract(config, base, allow_open=False):
                 for node in range(len(nodes)):
                     covered = [
                         g
-                        for g in groups_by_writer[node, "messages"]
+                        for g in groups_by_writer[node, payload_log]
                         if g["first"] < stop
                         and g["next"] >= stop
                         and g["done"] >= origin
@@ -288,7 +296,7 @@ def extract(config, base, allow_open=False):
                     done.append(min(g["done"] for g in covered))
                 end = max(done) + 1_000_000
                 logs = {}
-                for kind in ["messages", "events"]:
+                for kind in log_kinds:
                     marks = []
                     group_labels = []
                     for node in range(len(nodes)):
@@ -344,6 +352,13 @@ def extract(config, base, allow_open=False):
                 "source": name,
                 "nodes": nodes,
                 "payloadBytes": config.get("payload_bytes"),
+                "offsetLabel": "Event offsets" if combined else "Payload offsets",
+                "recordLabel": "event records" if combined else "messages",
+                "logLabels": {
+                    kind: ("Combined log" if combined and kind == "events" else
+                           "Payloads" if kind == "messages" else "Queue events")
+                    for kind in log_kinds
+                },
                 "openCapture": any(not c["summary"].get("closed") for c in captures),
                 "bursts": bursts,
             }
@@ -361,7 +376,7 @@ def main():
     parser.add_argument(
         "manifest",
         type=Path,
-        help="Case labels, same-host traces and payload offset windows",
+        help="Case labels, same-host traces and offset windows in payload_log",
     )
     parser.add_argument(
         "output", type=Path, help="Interactive HTML page, opened directly in a browser"

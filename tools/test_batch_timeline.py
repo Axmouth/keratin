@@ -82,6 +82,26 @@ class TimelineTests(unittest.TestCase):
         self.assertEqual(durable["source"], "durable_published")
         self.assertEqual(audit[0]["unmatched"], [])
 
+    def test_combined_log_needs_no_message_writer(self):
+        self.config.update(payload_log="events", logs=["events"])
+        for node, rows in enumerate(self.rows):
+            self.rows[node] = [r for r in rows if r.get("writer") != 1]
+            self.rows[node][-1]["emitted"] = sum(
+                "stage" in r or r.get("type") == "writer" for r in self.rows[node]
+            )
+        cases, audit = self.extract()
+        self.assertEqual(cases[0]["offsetLabel"], "Event offsets")
+        self.assertEqual(cases[0]["recordLabel"], "event records")
+        self.assertEqual(cases[0]["logLabels"], {"events": "Combined log"})
+        marks = cases[0]["bursts"][0]["logs"]["events"]["marks"]
+        self.assertTrue(any(m["node"] == 1 and m["phase"] == "Durable" for m in marks))
+        self.assertEqual(audit[0]["unmatched"], [])
+
+    def test_payload_lane_must_be_present(self):
+        self.config.update(payload_log="events", logs=["messages"])
+        with self.assertRaisesRegex(ValueError, "payload_log"):
+            self.extract()
+
     def test_missing_worker_publication_is_rejected(self):
         self.rows[1] = [
             r for r in self.rows[1] if r.get("stage") != "durable_published"
