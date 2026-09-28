@@ -1686,3 +1686,20 @@ async fn sparse_live_retention_probe() {
         drop(q); drop(st);
     }
 }
+
+#[tokio::test]
+async fn combined_queue_preserves_strongest_flush_policy() {
+    for (message, event, expected) in [
+        (KDurability::AfterWrite, KDurability::AfterFlush, KDurability::AfterFlush),
+        (KDurability::AfterFlush, KDurability::AfterWrite, KDurability::AfterFlush),
+        (KDurability::AfterFlush, KDurability::AfterFsync, KDurability::AfterFsync),
+    ] {
+        let dir = keratin_log::test_dir!("combined_after_flush_policy");
+        let mut config = StromaKeratinConfig::from_message_log(KeratinConfig::test_default());
+        config.message_log.default_durability = message;
+        config.event_log.default_durability = event;
+        let st = Stroma::open(&dir.root, config, SnapshotConfig::default()).await.unwrap();
+        assert_eq!(st.queue_event_log_config().default_durability, expected);
+        st.shutdown().await.unwrap();
+    }
+}

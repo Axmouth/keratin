@@ -3,7 +3,13 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KDurability {
+    /// Legacy completion mode. Local appends may complete while still staged.
+    /// Replicated appends flush their buffers before completing.
     AfterWrite,
+    /// Complete after the batch is written through Keratin's buffers to the OS.
+    /// Does not request fsync, advance durability or enable ordinary readers.
+    AfterFlush,
+    /// Complete after the record crosses the persistence boundary.
     AfterFsync,
 }
 

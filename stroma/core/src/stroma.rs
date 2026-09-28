@@ -1294,10 +1294,8 @@ impl Stroma {
     /// Keep the small event configuration for metadata/global-store logs.
     fn queue_event_log_config(&self) -> KeratinConfig {
         KeratinConfig {
-            default_durability: if self.keratin_cfg_msg.default_durability == KDurability::AfterFsync
-                || self.keratin_cfg_event.default_durability == KDurability::AfterFsync {
-                KDurability::AfterFsync
-            } else { KDurability::AfterWrite },
+            default_durability: self.keratin_cfg_msg.default_durability
+                .max(self.keratin_cfg_event.default_durability),
             ..self.keratin_cfg_msg
         }
     }

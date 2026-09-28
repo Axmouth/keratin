@@ -31,6 +31,36 @@ macro_rules! trace_writer_stage {
     ($tracer:ident, $id:expr, $stage:expr, $weight:expr, $body:block) => {{ $body }};
 }
 
+// A failed flush may have partially written a record. Stop this writer rather
+// than retrying the buffer at an uncertain file position. Previously submitted
+// sync work is drained so its callers still receive their actual outcome.
+macro_rules! staged_or_stop {
+    ($result:expr, $log:expr, $state:expr, $pending:expr, $notify:expr,
+     $done:expr, $inflight:expr, $tracer:ident) => {
+        match $result {
+            Ok(bytes) => bytes,
+            Err(error) => {
+                fail_all_pending(
+                    $pending,
+                    format!("batch flush failed: {error}"),
+                    $notify,
+                    true,
+                );
+                wait_for_inflight_fsyncs(
+                    $log,
+                    $state,
+                    $notify,
+                    $done,
+                    $inflight,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &$tracer,
+                );
+                return Some(error.to_string());
+            }
+        }
+    };
+}
+
 macro_rules! stage_reqs_then_post {
     (
         $tracer:ident,
@@ -53,7 +83,7 @@ macro_rules! stage_reqs_then_post {
         #[cfg(feature = "writer-stage-trace")]
         let work_id = $tracer.next_work_id();
 
-        let total_bytes = stage_reqs(
+        let total_bytes = staged_or_stop!(stage_reqs(
             $log,
             $cfg,
             $state,
@@ -64,7 +94,7 @@ macro_rules! stage_reqs_then_post {
             &$tracer,
             #[cfg(feature = "writer-stage-trace")]
             work_id,
-        );
+        ), $log, $state, $pending, $notify_tx, $fsync_done_rx, $inflight_fsyncs, $tracer);
 
         post_stage_commit_and_tune(
             $log,
@@ -384,21 +414,51 @@ pub fn spawn_writer(
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(channel_capacity);
 
     std::thread::spawn(move || {
-        writer_loop(
+        let failure = writer_loop(
             &mut log,
             cfg,
-            rx,
+            &rx,
             state,
-            notify_tx,
+            notify_tx.clone(),
             fsync_tx,
             fsync_done_rx,
             #[cfg(feature = "writer-stage-trace")]
             tracer,
         );
+        if let Some(error) = failure {
+            reject_failed_writer_requests(&rx, &notify_tx, &error);
+        }
         tracing::info!("Writer loop exited")
     });
 
     WriterHandle { tx }
+}
+
+// Keep receiving only to reject requests. Crossbeam can retain buffered commands
+// while senders still exist, so merely dropping the receiver can strand waiters.
+fn reject_failed_writer_requests(
+    rx: &Receiver<WriterCmd>,
+    notify: &Sender<NotifyMsg>,
+    error: &str,
+) {
+    while let Ok(command) = rx.recv() {
+        match command {
+            WriterCmd::Append(request) => {
+                let _ = notify.send(NotifyMsg::One {
+                    item: NotifyItem {
+                        completion: request.completion,
+                        result: Err(IoError::new(format!(
+                            "writer stopped after flush failure: {error}"
+                        ))),
+                    },
+                });
+            }
+            WriterCmd::Shutdown { .. } => break,
+            // Dropping the response sender reports a closed writer to control
+            // callers. No command may modify storage after the failed flush.
+            _ => {}
+        }
+    }
 }
 
 fn notifier_loop(
@@ -557,13 +617,13 @@ fn fsync_loop_with(
 fn writer_loop(
     log: &mut Log,
     cfg: KeratinConfig,
-    writes_rx: Receiver<WriterCmd>,
+    writes_rx: &Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
     fsync_tx: Sender<FsyncReq>,
     fsync_done_rx: Receiver<FsyncDone>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
-) {
+) -> Option<String> {
     let stage_then_commit = std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() == Ok("1");
     let startup_delay = std::env::var("KERATIN_IDLE_COMMIT_WINDOW_US")
         .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(5_000);
@@ -800,11 +860,11 @@ fn writer_loop(
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
                 );
-                return;
+                return None;
             }
             WriterEvent::FsyncDisconnected => {
                 fail_all_pending(&mut pending, "fsync worker disconnected", &notify_tx, true);
-                return;
+                return None;
             }
         };
 
@@ -820,7 +880,7 @@ fn writer_loop(
                     let reqs = collect_staging_chunk(r, &writes_rx, &mut deferred_command, &cfg);
                     #[cfg(feature = "writer-stage-trace")]
                     let work_id = tracer.next_work_id();
-                    stage_reqs(
+                    staged_or_stop!(stage_reqs(
                         log,
                         &cfg,
                         &state,
@@ -831,7 +891,7 @@ fn writer_loop(
                         &tracer,
                         #[cfg(feature = "writer-stage-trace")]
                         work_id,
-                    );
+                    ), log, &state, &mut pending, &notify_tx, &fsync_done_rx, &mut inflight_fsyncs, tracer);
                     // Preserve bounded buffer flushing while durability capacity is
                     // occupied, including explicit-sync AfterWrite callers.
                     // Keep early replication's write/tail-cache visibility
@@ -857,7 +917,7 @@ fn writer_loop(
                                 #[cfg(feature = "writer-stage-trace")]
                                 &tracer,
                             );
-                            return;
+                            return None;
                         }
                     }
                     // Re-enter at the completion drain, then decide commit eligibility
@@ -899,7 +959,7 @@ fn writer_loop(
                         // Very rare but must be lossless (stale barrier + size flush).
                         #[cfg(feature = "writer-stage-trace")]
                         let work_id1 = tracer.next_work_id();
-                        let b1 = stage_reqs(
+                        let b1 = staged_or_stop!(stage_reqs(
                             log,
                             &cfg,
                             &state,
@@ -910,11 +970,11 @@ fn writer_loop(
                             &tracer,
                             #[cfg(feature = "writer-stage-trace")]
                             work_id1,
-                        );
+                        ), log, &state, &mut pending, &notify_tx, &fsync_done_rx, &mut inflight_fsyncs, tracer);
 
                         #[cfg(feature = "writer-stage-trace")]
                         let work_id2 = tracer.next_work_id();
-                        let b2 = stage_reqs(
+                        let b2 = staged_or_stop!(stage_reqs(
                             log,
                             &cfg,
                             &state,
@@ -925,7 +985,7 @@ fn writer_loop(
                             &tracer,
                             #[cfg(feature = "writer-stage-trace")]
                             work_id2,
-                        );
+                        ), log, &state, &mut pending, &notify_tx, &fsync_done_rx, &mut inflight_fsyncs, tracer);
 
                         // Use combined bytes for tuning.
                         let total_bytes = b1.saturating_add(b2);
@@ -995,6 +1055,7 @@ fn writer_loop(
 
                 #[cfg(feature = "writer-stage-trace")]
                 let work_id = tracer.next_work_id();
+                let mut flush_failed = false;
                 let res = trace_writer_stage!(
                     tracer,
                     work_id,
@@ -1009,6 +1070,7 @@ fn writer_loop(
                             &records,
                             mode,
                             durability.unwrap_or(cfg.default_durability),
+                            &mut flush_failed,
                             #[cfg(feature = "writer-stage-trace")]
                             &tracer,
                             #[cfg(feature = "writer-stage-trace")]
@@ -1016,8 +1078,18 @@ fn writer_loop(
                         )
                     }
                 );
+                let failure = flush_failed.then(|| res.as_ref().unwrap_err().to_string());
                 if let Err(_err) = respond_to.send(res) {
                     tracing::info!("Error sending replicated append response");
+                }
+                if let Some(error) = failure {
+                    fail_all_pending(&mut pending, &error, &notify_tx, true);
+                    wait_for_inflight_fsyncs(log, &state, &notify_tx, &fsync_done_rx,
+                        &mut inflight_fsyncs,
+                        #[cfg(feature = "writer-stage-trace")]
+                        &tracer,
+                    );
+                    return Some(error);
                 }
             }
             WriterCmd::Truncate { before, respond_to } => {
@@ -1075,7 +1147,7 @@ fn writer_loop(
                         next_offset,
                         "suffix repair failed; writer stopped until reopen"
                     );
-                    return;
+                    return None;
                 }
                 last_fsync = Instant::now();
             }
@@ -1469,7 +1541,7 @@ fn writer_loop(
                 if shutdown_tx.send(()).is_err() {
                     tracing::info!("Error sending shutdown notification");
                 }
-                return;
+                return None;
             }
             WriterCmd::SizeEstimate { respond_to } => {
                 let res = log
@@ -1491,6 +1563,7 @@ fn stage_replicated_req(
     records: &[Message],
     mode: ReplicatedAppendMode,
     durability: KDurability,
+    flush_failed: &mut bool,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> Result<ReplicatedAppendOutcome, IoError> {
@@ -1501,16 +1574,26 @@ fn stage_replicated_req(
         })?;
     state.epoch.store(log.current_epoch(), Ordering::Release);
 
+    let end_offset = end_offset.or_else(|| match outcome {
+        ReplicatedAppendOutcome::AlreadyPresent { first_offset, count, .. }
+            if durability == KDurability::AfterFsync && count > 0
+                && first_offset + count as u64 > log.durable_end_exclusive().first_non_durable() =>
+            Some(first_offset + count as u64 - 1),
+        _ => None,
+    });
     if let Some(end_offset) = end_offset {
-        state.tail.store(end_offset + 1, Ordering::Release);
+        state.tail.fetch_max(end_offset + 1, Ordering::Release);
 
         match durability {
-            KDurability::AfterWrite => {
+            KDurability::AfterWrite | KDurability::AfterFlush => {
                 #[cfg(feature = "writer-stage-trace")]
-                log.flush_buffers_traced(tracer, work_id)?;
+                let result = log.flush_buffers_traced(tracer, work_id).and_then(|_| trace_writer_stage!(tracer, work_id, "replicated_flush", (0, 0), { log.flush() }));
                 #[cfg(not(feature = "writer-stage-trace"))]
-                log.flush_buffers()?;
-                trace_writer_stage!(tracer, work_id, "replicated_flush", (0, 0), { log.flush() })?;
+                let result = log.flush_buffers().and_then(|_| trace_writer_stage!(tracer, work_id, "replicated_flush", (0, 0), { log.flush() }));
+                if let Err(error) = result {
+                    *flush_failed = durability == KDurability::AfterFlush;
+                    return Err(error.into());
+                }
             }
             KDurability::AfterFsync => {
                 #[cfg(feature = "writer-stage-trace")]
@@ -1601,7 +1684,7 @@ fn stage_reqs(
     notify_tx: &Sender<NotifyMsg>,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
-) -> usize {
+) -> io::Result<usize> {
     crate::drain_diagnostics::stage(
         reqs.iter().map(|r| r.records.len() as u64).sum(),
         reqs.iter().map(|r| r.records.bytes_len() as u64).sum(),
@@ -1617,6 +1700,7 @@ fn stage_reqs(
 
     let mut total_bytes: usize = 0;
     let mut successful_bytes = 0u64;
+    let mut flush_waiters = Vec::new();
 
     for r in reqs {
         let request_bytes = r.records.bytes_len();
@@ -1661,6 +1745,8 @@ fn stage_reqs(
                             },
                         })
                         .ok();
+                } else if dur == KDurability::AfterFlush {
+                    flush_waiters.push(NotifyItem { completion, result: Ok(ar) });
                 } else {
                     pending.push_back(PendingAck {
                         end_offset,
@@ -1684,6 +1770,21 @@ fn stage_reqs(
         }
     }
 
+    if !flush_waiters.is_empty() {
+        // One flush covers the entire bounded staging group, including any
+        // fsync waiters that share it. Their persistence wait remains separate.
+        #[cfg(feature = "writer-stage-trace")]
+        let flushed = log.flush_buffers_traced(tracer, work_id).and_then(|_| log.flush());
+        #[cfg(not(feature = "writer-stage-trace"))]
+        let flushed = log.flush_buffers().and_then(|_| log.flush());
+        if let Err(error) = flushed {
+            let message = error.to_string();
+            let _ = notify_tx.send(NotifyMsg::Batch(fail_notify_items(flush_waiters, &message)));
+            return Err(error);
+        }
+        let _ = notify_tx.send(NotifyMsg::Batch(flush_waiters));
+    }
+
     state
         .local_append_bytes
         .fetch_add(successful_bytes, Ordering::Relaxed);
@@ -1697,7 +1798,7 @@ fn stage_reqs(
         None,
         Some((first_offset, log.next_offset())),
     );
-    total_bytes
+    Ok(total_bytes)
 }
 
 /// Commit if due, retry a few times and fail all pending waiters on repeated errors.

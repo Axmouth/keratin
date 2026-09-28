@@ -1800,7 +1800,19 @@ impl Log {
             self.segment_mapping.clone(),
             self.tail_cache.clone(),
         );
-        let got = reader.scan_from(readable_first_offset, payloads.len())?;
+        let requested_end = readable_first_offset.checked_add(payloads.len() as u64)
+            .ok_or_else(|| io::Error::other("overlap range overflow"))?;
+        let got = if requested_end <= self.durable_end_exclusive().first_non_durable() {
+            reader.scan_from(readable_first_offset, payloads.len())?
+        } else {
+            // AfterFlush retries may overlap a written, unsynced prefix. Verify
+            // exact bytes through raw reads under this writer's exclusive access.
+            // This neither advances durability nor authorizes recovery evidence.
+            (readable_first_offset..requested_end)
+                .map(|offset| reader.fetch(offset)?.ok_or_else(|| io::Error::new(
+                    io::ErrorKind::InvalidData, "replicated written overlap is not fully readable")))
+                .collect::<io::Result<Vec<_>>>()?
+        };
         if got.len() != payloads.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

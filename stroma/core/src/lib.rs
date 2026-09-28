@@ -63,6 +63,7 @@ pub type UnixMillis = u64;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Durability {
     AfterWrite,
+    AfterFlush,
     AfterFsync,
     AfterReplicated, // for later; can map to AfterFsync initially
 }
@@ -71,6 +72,7 @@ impl From<Durability> for KDurability {
     fn from(value: Durability) -> Self {
         match value {
             Durability::AfterWrite => KDurability::AfterWrite,
+            Durability::AfterFlush => KDurability::AfterFlush,
             Durability::AfterFsync => KDurability::AfterFsync,
             Durability::AfterReplicated => KDurability::AfterFsync,
         }

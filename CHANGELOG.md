@@ -27,6 +27,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Add `KDurability::AfterFlush` and the Stroma equivalent for batched completion
+  after writing to the OS without requesting fsync. Durable scans and frontiers
+  retain their persistence boundary. Written follower overlaps verify bytes on
+  retry, and stronger retry completion waits for persistence. Flush failures stop
+  further storage commands on the affected writer.
+
 - Persist completed local recovery inspection and comparison phases with exact
   source/configuration binding and a versioned recipe. Restored artifacts verify
   their snapshot and state digests. Namespace leases and bounded retirement keep

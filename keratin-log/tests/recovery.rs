@@ -390,8 +390,8 @@ async fn sync_makes_after_write_durable() {
     let cfg = KeratinConfig::test_default();
     let k = Keratin::open(&dir.root, cfg).await.unwrap();
 
-    // AfterWrite stages + writes to the OS but does not fsync, so the durable
-    // watermark must not advance yet.
+    // AfterWrite may leave local bytes staged and does not request fsync, so
+    // the durable watermark must not advance yet.
     k.append_batch(
         vec![message("a"), message("b"), message("c")],
         Some(KDurability::AfterWrite),

@@ -22,6 +22,28 @@ At its core, Keratin is:
 
 The goal is to keep the design minimal and predictable, while still being fast enough for practical use.
 
+## Append completion
+
+`KDurability` selects when an append completes:
+
+| Mode | Completion boundary |
+| --- | --- |
+| `AfterWrite` | Legacy mode. Local appends can complete in the staging buffer. Replicated appends flush before completion. |
+| `AfterFlush` | The batch has been written through Keratin's buffers to the operating system. |
+| `AfterFsync` | The append has crossed the persistence boundary. This is the default. |
+
+`AfterFlush` writes once per staging batch and does not request an fsync for its
+completion. Segment rollover or concurrent durable work may still perform syncs.
+A flush does not advance the durable frontier. Ordinary scans remain restricted
+to durable records. Raw `reader().fetch(offset)` supports read-your-writes access,
+and the experimental replication reader can use written records in the tail cache.
+Call `sync()` when persistence is required. Setting `AfterFlush` alone does not
+schedule periodic persistence or change a broker's replication and delivery policy.
+
+Write failures fail flush waiters and stop further storage work on that writer.
+Reopen the log to recover before writing again. Dropping an append's receiver
+does not cancel an accepted append.
+
 ## What it is not
 
 Keratin does not attempt to be:
