@@ -11,6 +11,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Recovery staging stores snapshot bytes in a separate resumable artifact file.
+  Stage specifications bind the snapshot length as well as its digest. Previous
+  private staging intents are incompatible and have no migration support.
+
 - Work queues store payload-bearing enqueues and state events in one ordered
   log. Queue layout and unordered-application switches are removed. Existing
   storage roots without the single-log format marker require fresh storage,

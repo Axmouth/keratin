@@ -68,6 +68,7 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
             event_next: next,
             message_digest: recovery_history::empty_log_digest(),
             snapshot_digest: *blake3::hash(&snapshot).as_bytes(),
+            snapshot_bytes: snapshot.len() as u64,
             state_digest,
             live_payload_digest: *live.finalize().as_bytes(),
         },
@@ -930,6 +931,43 @@ async fn stage_verifies_selected_event_digest_even_when_live_payloads_match() {
     stage.append(page(&spec, &records)).await.unwrap();
     assert!(stage.finish().await.is_err());
     assert!(!stage.inner.lock().await.root.join("complete").exists());
+    drop(stage);
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn snapshot_chunks_resume_before_stage_creation_and_bind_exact_plan() {
+    let dir = keratin_log::test_dir!("staged_snapshot_chunks");
+    let st = open(&dir.root).await;
+    let (spec, snapshot, records) = fixture(3, 9);
+    let seal = RecoverySealRequest { transition: [9; 32], fence_epoch: spec.fence_epoch };
+    assert_eq!(st.transfer_queue_recovery_snapshot(spec.clone(), None).await.unwrap(), 0);
+    st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, snapshot[..30].to_vec()))).await.unwrap();
+    assert!(st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal.clone()).await.is_err());
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st = open(&dir.root).await;
+    assert_eq!(st.transfer_queue_recovery_snapshot(spec.clone(), None).await.unwrap(), 30);
+    assert!(st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, vec![0; 30]))).await.is_err());
+    let mut changed = spec.clone();
+    changed.plan = [7; 32];
+    assert_eq!(st.transfer_queue_recovery_snapshot(changed, None).await.unwrap(), 0);
+    let mut from = 30;
+    while from < snapshot.len() {
+        let next = (from + 37).min(snapshot.len());
+        st.transfer_queue_recovery_snapshot(spec.clone(), Some((from as u64, snapshot[from..next].to_vec()))).await.unwrap();
+        from = next;
+    }
+    let stage = st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal).await.unwrap();
+    assert!(stage.completed_snapshot_chunk(0, 30).await.is_err());
+    assert_eq!(stage.snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
+    stage.append(page(&spec, &records)).await.unwrap();
+    stage.finish().await.unwrap();
+    assert_eq!(stage.completed_snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
+    assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
+    drop(stage);
+    let stage = st.resume_queue_recovery_stage(spec, Default::default()).await.unwrap();
+    assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
     drop(stage);
     st.shutdown().await.unwrap();
 }

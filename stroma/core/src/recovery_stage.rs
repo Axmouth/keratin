@@ -7,10 +7,11 @@ use crate::recovery_replay::RecoveryPayloadLog;
 use keratin_log::{KeratinReplicaExt, ReplicatedAppendOutcome, lock_existing_log};
 use std::io::{Read, Write};
 
-const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
+use crate::recovery_snapshot::{RecoverySnapshotFile, RecoverySnapshotIdentity, SNAPSHOT_CHUNK_BYTES, MAX_RECOVERY_SNAPSHOT_BYTES};
+const MAX_SNAPSHOT: usize = MAX_RECOVERY_SNAPSHOT_BYTES;
 const MAX_PAGE: u64 = 16 * 1024 * 1024;
-// MessagePack Vec<u8> may use two encoded bytes per snapshot byte.
-const MAX_METADATA: usize = 2 * MAX_SNAPSHOT + 65_536;
+// Snapshot bytes live in a separately verified raw artifact file.
+const MAX_METADATA: usize = 65_536;
 const MAGIC: &[u8; 8] = b"RSTAGE\0\x01";
 
 /// Exact baseline authorized by a consensus recovery plan. The caller owns
@@ -31,6 +32,7 @@ pub struct QueueRecoveryStageSpec {
     pub event_next: u64,
     pub message_digest: [u8; 32],
     pub snapshot_digest: [u8; 32],
+    pub snapshot_bytes: u64,
     pub state_digest: [u8; 32],
     pub live_payload_digest: [u8; 32],
 }
@@ -172,6 +174,9 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
     if s.payload_log.next - s.payload_log.head > limits.max_records {
         return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.payload_log.next - s.payload_log.head)));
     }
+    if intent.snapshot.len() as u64 != s.snapshot_bytes {
+        return Err(invalid("recovery staging snapshot length differs from plan"));
+    }
     if intent.snapshot.len() > MAX_SNAPSHOT {
         return Err(invalid(Limit::message(Budget::SnapshotBytes, MAX_SNAPSHOT as u64, 0, intent.snapshot.len() as u64)));
     }
@@ -180,6 +185,9 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
     }
     let mut state = QueueInternalState::new(s.topic.clone(), s.partition);
     let meta = state.load_snapshot(&intent.snapshot).map_err(decode_err)?;
+    if state.recovery_retained_entries() > 1_000_000 {
+        return Err(invalid(Limit::message(Budget::ReplayStateEntries, 1_000_000, 0, state.recovery_retained_entries())));
+    }
     if meta.last_snapshot_event_offset != s.event_next.saturating_sub(1)
         || state.recovery_state_digest() != s.state_digest
         || state.recovery_lease_normalized_digest() != s.state_digest
@@ -295,6 +303,10 @@ pub(super) fn scan_parts(
 }
 
 impl QueueRecoveryStageSpec {
+    pub fn snapshot_identity(&self) -> RecoverySnapshotIdentity {
+        RecoverySnapshotIdentity { plan: self.plan, digest: self.snapshot_digest, bytes: self.snapshot_bytes }
+    }
+
     pub(super) fn validate_payload_log(&self) -> Result<()> {
         let p = &self.payload_log;
         let valid = p.head <= p.next && match p.source {
@@ -309,6 +321,34 @@ impl QueueRecoveryStageSpec {
 }
 
 impl Stroma {
+    fn recovery_stage_root(&self, spec: &QueueRecoveryStageSpec) -> PathBuf {
+        self.root.join("recovery-staging").join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str())
+    }
+
+    /// One bounded artifact step under caller-provided fresh plan authority.
+    /// The owned task retains admission and the file lock after cancellation.
+    pub async fn transfer_queue_recovery_snapshot(
+        &self, spec: QueueRecoveryStageSpec, chunk: Option<(u64, Vec<u8>)>,
+    ) -> Result<u64> {
+        self.validate_recovery_payload_layout(&spec)?;
+        let permit = self.recovery_stage_slots.clone().try_acquire_owned()
+            .map_err(|_| invalid("another recovery stage is open, retry later"))?;
+        let root = self.recovery_stage_root(&spec).join("snapshot");
+        tokio::task::spawn_blocking(move || {
+            let _permit = permit;
+            let mut file = RecoverySnapshotFile::open(&root, spec.snapshot_identity(), Default::default()).map_err(io_err)?;
+            if let Some((from, bytes)) = chunk { file.append(from, &bytes).map_err(io_err)?; }
+            Ok(file.next_offset())
+        }).await.map_err(io_err)?
+    }
+
+    pub async fn open_queue_recovery_stage_from_snapshot(
+        &self, spec: QueueRecoveryStageSpec, limits: RecoveryStageLimits, seal: RecoverySealRequest,
+    ) -> Result<QueueRecoveryStage> {
+        if seal.fence_epoch != spec.fence_epoch { return Err(invalid("reuse fence differs from stage")); }
+        self.open_queue_recovery_stage_inner(spec, SnapshotInput::Transferred, limits, Some(seal)).await
+    }
+
     pub(super) fn validate_recovery_payload_layout(&self, spec: &QueueRecoveryStageSpec) -> Result<()> {
         spec.validate_payload_log()?;
         if spec.payload_log.source != RecoveryReadSource::Events {
@@ -330,7 +370,7 @@ impl Stroma {
         snapshot: Vec<u8>,
         limits: RecoveryStageLimits,
     ) -> Result<QueueRecoveryStage> {
-        self.open_queue_recovery_stage_inner(spec, Some(snapshot), limits, None)
+        self.open_queue_recovery_stage_inner(spec, SnapshotInput::Bytes(snapshot), limits, None)
             .await
     }
 
@@ -346,7 +386,7 @@ impl Stroma {
         if seal.fence_epoch != spec.fence_epoch {
             return Err(invalid("reuse fence differs from stage"));
         }
-        self.open_queue_recovery_stage_inner(spec, Some(snapshot), limits, Some(seal))
+        self.open_queue_recovery_stage_inner(spec, SnapshotInput::Bytes(snapshot), limits, Some(seal))
             .await
     }
 
@@ -357,7 +397,7 @@ impl Stroma {
         spec: QueueRecoveryStageSpec,
         limits: RecoveryStageLimits,
     ) -> Result<QueueRecoveryStage> {
-        self.open_queue_recovery_stage_inner(spec, None, limits, None)
+        self.open_queue_recovery_stage_inner(spec, SnapshotInput::Resume, limits, None)
             .await
     }
 
@@ -460,7 +500,7 @@ impl Stroma {
     async fn open_queue_recovery_stage_inner(
         &self,
         spec: QueueRecoveryStageSpec,
-        snapshot: Option<Vec<u8>>,
+        snapshot: SnapshotInput,
         limits: RecoveryStageLimits,
         reuse_seal: Option<RecoverySealRequest>,
     ) -> Result<QueueRecoveryStage> {
@@ -470,40 +510,46 @@ impl Stroma {
             ));
         }
         self.validate_recovery_payload_layout(&spec)?;
-        let resume_only = snapshot.is_none();
+        let resume_only = matches!(snapshot, SnapshotInput::Resume);
         let permit = self
             .recovery_stage_slots
             .clone()
             .try_acquire_owned()
             .map_err(|_| invalid("another recovery stage is open; retry later"))?;
-        let root = self
-            .root
-            .join("recovery-staging")
-            .join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str());
+        let root = self.recovery_stage_root(&spec);
         let cfg = self.keratin_cfg_msg;
         let runtime = self.log_runtime.clone();
         let st = self.clone();
         tokio::spawn(async move {
             let read_root = root.clone();
             let (intent, encoded) = tokio::task::spawn_blocking(move || {
-                let intent = if let Some(snapshot) = snapshot {
-                    Intent { spec, snapshot }
-                } else {
-                    let bytes = read_bounded(&read_root.join("intent"), MAX_METADATA)?
-                        .ok_or_else(|| invalid("recovery staging intent is absent"))?;
-                    let saved: Intent = rmp_serde::from_slice(&bytes).map_err(decode_err)?;
-                    if saved.spec != spec {
-                        return Err(invalid(
-                            "saved recovery stage differs from the authorized plan",
-                        ));
+                let snapshot = match snapshot {
+                    SnapshotInput::Bytes(snapshot) => snapshot,
+                    SnapshotInput::Transferred | SnapshotInput::Resume => {
+                        if resume_only {
+                            let bytes = read_bounded(&read_root.join("intent"), MAX_METADATA)?
+                                .ok_or_else(|| invalid("recovery staging intent is absent"))?;
+                            let saved: QueueRecoveryStageSpec = rmp_serde::from_slice(&bytes).map_err(decode_err)?;
+                            if saved != spec { return Err(invalid("saved recovery stage differs from the authorized plan")); }
+                        }
+                        RecoverySnapshotFile::open(&read_root.join("snapshot"), spec.snapshot_identity(), Default::default())
+                            .map_err(io_err)?.read_complete().map_err(io_err)?
                     }
-                    saved
                 };
+                let intent = Intent { spec, snapshot };
                 validate(&intent, limits)?;
-                let encoded = rmp_serde::to_vec_named(&intent).map_err(encode_err)?;
+                let encoded = rmp_serde::to_vec_named(&intent.spec).map_err(encode_err)?;
                 if encoded.len() + 12 > MAX_METADATA {
                     return Err(invalid("recovery staging metadata exceeds limit"));
                 }
+                // The raw artifact becomes durable before its small intent.
+                let mut file = RecoverySnapshotFile::open(&read_root.join("snapshot"), intent.spec.snapshot_identity(), Default::default()).map_err(io_err)?;
+                while file.next_offset() < intent.snapshot.len() as u64 {
+                    let from = file.next_offset() as usize;
+                    let end = (from + SNAPSHOT_CHUNK_BYTES).min(intent.snapshot.len());
+                    file.append(from as u64, &intent.snapshot[from..end]).map_err(io_err)?;
+                }
+                file.verify_complete().map_err(io_err)?;
                 Ok((intent, encoded))
             })
             .await
@@ -632,6 +678,8 @@ impl Stroma {
     }
 }
 
+enum SnapshotInput { Bytes(Vec<u8>), Transferred, Resume }
+
 impl QueueRecoveryStage {
     /// Export the immutable snapshot of a completed stage. The receiving target
     /// must independently authorize its plan and verify the snapshot digest.
@@ -641,6 +689,23 @@ impl QueueRecoveryStage {
             return Err(invalid("stage is not complete"));
         }
         Ok(guard.intent.snapshot.clone())
+    }
+
+    pub async fn completed_snapshot_chunk(&self, from: u64, max_bytes: usize) -> Result<Vec<u8>> {
+        if !self.inner.lock().await.complete { return Err(invalid("stage is not complete")); }
+        self.snapshot_chunk(from, max_bytes).await
+    }
+
+    /// The snapshot itself was verified before opening this private stage. This
+    /// does not imply the retained log has completed transfer or verification.
+    pub async fn snapshot_chunk(&self, from: u64, max_bytes: usize) -> Result<Vec<u8>> {
+        let guard = self.inner.lock().await;
+        if guard.needs_reopen || max_bytes == 0 || max_bytes > SNAPSHOT_CHUNK_BYTES
+            || from >= guard.intent.snapshot.len() as u64 {
+            return Err(invalid("completed snapshot chunk is unavailable or outside bounds"));
+        }
+        let from = from as usize;
+        Ok(guard.intent.snapshot[from..(from + max_bytes).min(guard.intent.snapshot.len())].to_vec())
     }
 
     /// Bounded, verified messages from a completed stage, even when the original

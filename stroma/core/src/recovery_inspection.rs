@@ -418,7 +418,7 @@ impl RecoveryPairInspector {
             || self.replay.is_some()
             || self.checkpoint_replay.is_some()
             || max_checkpoint_bytes == 0
-            || max_checkpoint_bytes > 16 * 1024 * 1024
+            || max_checkpoint_bytes as usize > crate::recovery_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES
         {
             return Err("invalid checkpoint replay configuration".into());
         }
@@ -783,7 +783,7 @@ impl RecoveryPairInspector {
     ) -> Result<(RecoveryPairInspection, [RecoveryQueueStateArtifact; 2]), String> {
         if self.replay.is_none()
             || max_bytes_per_replica == 0
-            || max_bytes_per_replica > 16 * 1024 * 1024
+            || max_bytes_per_replica > crate::recovery_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES
         {
             return Err("queue artifacts require replay and a bounded output limit".into());
         }

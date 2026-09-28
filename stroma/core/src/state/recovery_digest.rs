@@ -434,3 +434,61 @@ mod tests {
         assert_ne!(a.recovery_state_digest(), b.recovery_state_digest());
     }
 }
+
+#[cfg(test)]
+#[tokio::test]
+#[ignore = "large snapshot transfer acceptance probe"]
+async fn large_recovery_state_transfers_in_bounded_chunks() {
+    use crate::{QueueRecoveryStageSpec, RecoveryReadSource, StorageHistoryBinding, Stroma, StromaKeratinConfig, SnapshotConfig, KeratinConfig};
+    use crate::recovery_snapshot::SNAPSHOT_CHUNK_BYTES;
+    let dir = keratin_log::test_dir!("large_recovery_snapshot");
+    let count = 100_000u64;
+    let mut state = QueueInternalState::new("q".into(), 0);
+    // Valid bounded topic names repeated across many pending DLQ entries make
+    // the state artifact large without unbounded strings or a million entries.
+    for off in 0..count {
+        state.pending_dlq.insert(off, Some(ResolvedDlqTarget {
+            tp: "d".repeat(180), part: 0, group: Some("workers".into()),
+        }));
+    }
+    let state_digest = state.recovery_state_digest();
+    let snapshot = state.into_recovery_snapshot(count);
+    assert!(snapshot.len() > 16 * 1024 * 1024);
+    let mut digest = blake3::Hasher::new();
+    digest.update(b"fibril-retained-log-v1\0"); digest.update(&0u64.to_be_bytes()); digest.update(&count.to_be_bytes());
+    let mut live = blake3::Hasher::new(); live.update(b"fibril-recovery-live-payloads-v1\0");
+    let record = |offset| crate::RecoveryRecord { offset, flags: 0, headers: vec![], payload: crate::StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![1] }.encode().unwrap() };
+    for off in 0..count {
+        let r = record(off);
+        crate::recovery_inspection::hash_record(&mut digest, &r);
+        crate::recovery_inspection::hash_record(&mut live, &r);
+    }
+    let empty = { let mut h = blake3::Hasher::new(); h.update(b"fibril-retained-log-v1\0"); h.update(&0u64.to_be_bytes()); h.update(&0u64.to_be_bytes()); *h.finalize().as_bytes() };
+    let spec = QueueRecoveryStageSpec {
+        plan: [7; 32], topic: "q".into(), partition: 0, group: None,
+        binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] },
+        fence_epoch: 8, source_history: [4; 32],
+        payload_log: crate::recovery_replay::RecoveryPayloadLog { source: RecoveryReadSource::Events, head: 0, next: count, digest: *digest.finalize().as_bytes() },
+        message_head: 0, message_next: 0, event_next: count, message_digest: empty,
+        snapshot_digest: *blake3::hash(&snapshot).as_bytes(), snapshot_bytes: snapshot.len() as u64,
+        state_digest, live_payload_digest: *live.finalize().as_bytes(),
+    };
+    let st = Stroma::open(&dir.root, StromaKeratinConfig::from_message_log(KeratinConfig::test_default()), SnapshotConfig::default()).await.unwrap();
+    for (i, chunk) in snapshot.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
+        st.transfer_queue_recovery_snapshot(spec.clone(), Some(((i * SNAPSHOT_CHUNK_BYTES) as u64, chunk.to_vec()))).await.unwrap();
+    }
+    let stage = st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), crate::RecoverySealRequest { transition: [5; 32], fence_epoch: 8 }).await.unwrap();
+    for from in (0..count).step_by(4096) {
+        let next = (from + 4096).min(count);
+        stage.append(crate::RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Events, from, next, end: count, records: (from..next).map(record).collect(), snapshot_bytes: vec![] }).await.unwrap();
+    }
+    stage.finish().await.unwrap();
+    assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
+    drop(stage);
+    let stage = st.resume_queue_recovery_stage(spec.clone(), Default::default()).await.unwrap();
+    assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
+    assert_eq!(stage.completed_snapshot_chunk(16 * 1024 * 1024, SNAPSHOT_CHUNK_BYTES).await.unwrap(), snapshot[16 * 1024 * 1024..17 * 1024 * 1024]);
+    println!("large_snapshot_acceptance bytes={} retained_entries={count} staged_records={count}", snapshot.len());
+    drop(stage);
+    st.shutdown().await.unwrap();
+}

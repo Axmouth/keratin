@@ -395,7 +395,7 @@ impl QueueReplay {
         self,
         max_bytes: usize,
     ) -> Result<RecoveryQueueStateArtifact, String> {
-        if !self.verify_live || max_bytes == 0 || max_bytes > 16 * 1024 * 1024 {
+        if !self.verify_live || max_bytes == 0 || max_bytes > crate::recovery_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES {
             return Err(
                 "artifact requires live payload verification and a bounded output limit".into(),
             );

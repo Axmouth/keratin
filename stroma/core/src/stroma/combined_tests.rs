@@ -792,6 +792,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
             fence_epoch: 8, source_history: sealed.history.id,
             payload_log: sealed.history.payload_log(), message_head: 0, message_next: 0, event_next: 4,
             message_digest: sealed.history.message_digest, snapshot_digest: artifact.snapshot_digest(),
+            snapshot_bytes: artifact.state_snapshot().len() as u64,
             state_digest: artifact.evidence().lease_normalized_state_digest,
             live_payload_digest: artifact.evidence().live_payload_digest.unwrap(),
         };
