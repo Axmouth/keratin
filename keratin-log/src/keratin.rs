@@ -93,6 +93,14 @@ pub trait KeratinReplicaExt {
 }
 
 pub enum WriterCmd {
+    ReadSettings {
+        respond_to: oneshot::Sender<crate::WriterSettingsSnapshot>,
+    },
+    ReplaceSettings {
+        expected_revision: u64,
+        settings: crate::WriterSettings,
+        respond_to: oneshot::Sender<io::Result<crate::WriterSettingsSnapshot>>,
+    },
     Append(AppendReq),
     ReplicatedAppend {
         epoch: u64,
@@ -598,6 +606,48 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
+    /// Read the applied per-log writer policy in command order.
+    pub async fn writer_settings(&self) -> io::Result<crate::WriterSettingsSnapshot> {
+        let (respond_to, rx) = oneshot::channel();
+        self.enqueue_settings_command(WriterCmd::ReadSettings { respond_to }).await?;
+        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))
+    }
+
+    /// Replace policy at a FIFO boundary. Earlier appends keep their old default.
+    /// The current batch closes and its log prefix is persisted before adoption.
+    /// Explicit per-append durability still wins. Updates do not survive reopen.
+    /// Concurrent sends are ordered by channel admission, not call start time.
+    /// Cancellation after submission may still admit and apply an update. Query
+    /// and reconcile revisions after a lost response. A read can overtake a sender
+    /// still waiting for mailbox space. This changes one log, not a replicated
+    /// broker's confirmation contract or its snapshot/recovery policy.
+    pub async fn replace_writer_settings(
+        &self,
+        expected_revision: u64,
+        settings: crate::WriterSettings,
+    ) -> io::Result<crate::WriterSettingsSnapshot> {
+        settings.validate()?;
+        let (respond_to, rx) = oneshot::channel();
+        self.enqueue_settings_command(WriterCmd::ReplaceSettings { expected_revision, settings, respond_to }).await?;
+        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    // Configuration is rare. A full writer queue must not park a Tokio worker.
+    // Once the blocking sender starts, caller cancellation may still admit it.
+    async fn enqueue_settings_command(&self, command: WriterCmd) -> io::Result<()> {
+        match self.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) =>
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer gone")),
+            Err(crossbeam_channel::TrySendError::Full(command)) => {
+                let sender = self.tx.clone();
+                tokio::task::spawn_blocking(move || sender.send(command))
+                    .await.map_err(io::Error::other)?
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))
+            }
+        }
+    }
+
     /// Make everything staged so far durable (fsync). Pair with `AfterWrite`
     /// appends to fsync separately (e.g. two logs concurrently).
     pub async fn sync(&self) -> std::io::Result<()> {
@@ -1098,3 +1148,7 @@ async fn checkpoint_reset_drains_prior_fsync_completions() {
     }
     log.shutdown().await.unwrap();
 }
+
+#[cfg(test)]
+#[path = "writer_settings_tests.rs"]
+mod writer_settings_tests;

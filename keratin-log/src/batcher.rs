@@ -35,6 +35,11 @@ impl<T, W> BatcherCore<T, W>
 where
     W: FnMut(&T) -> (usize, usize),
 {
+    pub(crate) fn replace_empty_config(&mut self, cfg: BatcherConfig) {
+        assert!(self.items.is_empty(), "configuration boundary must close the batch");
+        self.cfg = cfg;
+    }
+
     pub fn set_linger(&mut self, linger: Duration) {
         self.cfg.linger = linger;
     }

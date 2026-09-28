@@ -616,7 +616,7 @@ fn fsync_loop_with(
 
 fn writer_loop(
     log: &mut Log,
-    cfg: KeratinConfig,
+    mut cfg: KeratinConfig,
     writes_rx: &Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
@@ -633,8 +633,8 @@ fn writer_loop(
     let mut deferred_command = None;
     let flush_on_drain = std::env::var("KERATIN_FLUSH_ON_DRAIN").as_deref() == Ok("1");
     crate::drain_diagnostics::init();
-    let fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
-    let min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
+    let mut fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
+    let mut min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
     let mut last_fsync = Instant::now();
 
     let mut pending = PendingAcks::default();
@@ -643,7 +643,7 @@ fn writer_loop(
     // Adaptive linger
     // TODO: Consider removing due to overlap with fsync window
     let linger_min = Duration::from_millis(0);
-    let linger_max = Duration::from_millis(cfg.batch_linger_ms.max(1));
+    let mut linger_max = Duration::from_millis(cfg.batch_linger_ms);
     let mut linger = Duration::from_millis(0);
 
     // Batcher: items are AppendReq; weights are total records + total bytes.
@@ -662,6 +662,7 @@ fn writer_loop(
         },
     );
 
+    let mut settings_revision = 0u64;
     loop {
         drain_fsync_done(
             log,
@@ -872,6 +873,61 @@ fn writer_loop(
         if !matches!(&cmd, WriterCmd::Append(_)) { startup.reset(); }
         // (E) Process command.
         match cmd {
+            WriterCmd::ReadSettings { respond_to } => {
+                let _ = respond_to.send(crate::WriterSettingsSnapshot {
+                    revision: settings_revision, settings: cfg.into(),
+                });
+            }
+            WriterCmd::ReplaceSettings { expected_revision, settings, respond_to } => {
+                // Reject stale/invalid edits before touching staging or storage.
+                let checked = settings.validate().and_then(|_| {
+                    if expected_revision != settings_revision {
+                        return Err(io::Error::new(io::ErrorKind::WouldBlock, "stale writer settings revision"));
+                    }
+                    settings_revision.checked_add(1)
+                        .ok_or_else(|| io::Error::other("writer settings revision exhausted"))
+                });
+                let next_revision = match checked {
+                    Ok(revision) => revision,
+                    Err(error) => { let _ = respond_to.send(Err(error)); continue; }
+                };
+                let unstaged = batcher.flush();
+                if !unstaged.is_empty() {
+                    stage_reqs_then_post!(tracer, log, &cfg, &state, &mut pending,
+                        unstaged, &notify_tx, &mut last_fsync, fsync_interval,
+                        &fsync_tx, &fsync_done_rx, &mut inflight_fsyncs,
+                        &mut linger, linger_min, linger_max);
+                }
+                // Close the previous timing epoch rather than extending its
+                // deadline with a new interval. This rare control operation pays
+                // a persistence barrier, keeping the ordinary append path local.
+                if let Err(error) = settings_sync_boundary(log, &state, &mut pending,
+                    &notify_tx, &fsync_tx, &fsync_done_rx, &mut inflight_fsyncs,
+                    #[cfg(feature = "writer-stage-trace")]
+                    &tracer,
+                ) {
+                    let message = error.to_string();
+                    let _ = respond_to.send(Err(error));
+                    fail_all_pending(&mut pending, &message, &notify_tx, true);
+                    return Some(message);
+                }
+                settings.apply(&mut cfg);
+                settings_revision = next_revision;
+                fsync_interval = Duration::from_millis(cfg.fsync_interval_ms);
+                min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
+                linger_max = Duration::from_millis(cfg.batch_linger_ms);
+                linger = linger.min(Duration::from_millis(cfg.batch_linger_ms));
+                batcher.replace_empty_config(BatcherConfig {
+                    max_items: cfg.max_batch_records,
+                    max_records: cfg.max_batch_records,
+                    max_bytes: cfg.max_batch_bytes,
+                    linger,
+                });
+                last_fsync = Instant::now();
+                let _ = respond_to.send(Ok(crate::WriterSettingsSnapshot {
+                    revision: settings_revision, settings,
+                }));
+            }
             WriterCmd::Append(r) => {
                 if stage_then_commit {
                     startup.append(Instant::now());
@@ -2034,6 +2090,46 @@ fn drain_fsync_done(
     }
 }
 
+// Runs only for configuration changes. The private response carries physical
+// sync and completion/manifest errors, so a failed barrier cannot report adoption.
+fn settings_sync_boundary(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    pending: &mut PendingAcks,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    inflight: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) -> io::Result<()> {
+    wait_for_inflight_fsyncs(log, state, notify_tx, fsync_done_rx, inflight,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+    );
+    #[cfg(feature = "writer-stage-trace")]
+    let work_id = tracer.next_work_id();
+    #[cfg(feature = "writer-stage-trace")]
+    let job = log.prepare_fsync_job_traced(tracer, work_id)?;
+    #[cfg(not(feature = "writer-stage-trace"))]
+    let job = log.prepare_fsync_job()?;
+    let ready = take_covered_acks(pending, job.durable_end());
+    let (respond_to, result) = tokio::sync::oneshot::channel();
+    let request = FsyncReq { job, ready, sync_acks: vec![respond_to],
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
+    };
+    if let Err(error) = fsync_tx.send(request) {
+        send_notify_items(notify_tx, fail_notify_items(error.0.ready, "fsync worker disconnected"));
+        return Err(io::Error::new(io::ErrorKind::BrokenPipe, "fsync worker disconnected"));
+    }
+    *inflight += 1;
+    wait_for_inflight_fsyncs(log, state, notify_tx, fsync_done_rx, inflight,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+    );
+    result.blocking_recv().map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "sync result dropped"))?
+}
+
 fn wait_for_inflight_fsyncs(
     log: &mut Log,
     state: &Arc<LogState>,
@@ -2560,7 +2656,7 @@ mod held_pipeline_test {
             writer_loop(
                 &mut log,
                 cfg,
-                input,
+                &input,
                 writer_state,
                 notifications,
                 jobs,
