@@ -849,9 +849,21 @@ impl RecoveryPairInspector {
 
 /// Strict proof decoding. Ordinary replay remains forward-compatible, but an
 /// evidence consumer must understand every encoded field and bound allocation.
-pub(crate) fn decode_evidence_event(
+/// Returns semantic fields only. PayloadEnqueue bodies are deliberately empty:
+/// payload identity is hashed from the original RecoveryRecord, never this event.
+pub(crate) fn decode_evidence_semantics(
     record: &RecoveryRecord,
 ) -> Result<StromaEvent, RecoverySemanticGap> {
+    if record.flags != 0 || !record.headers.is_empty() {
+        return Err(RecoverySemanticGap::UnknownOrMalformedEncoding);
+    }
+    if let Some(view) = crate::event::strict_payload_enqueue(&record.payload)
+        .map_err(|_| RecoverySemanticGap::UnknownOrMalformedEncoding)? {
+        return Ok(StromaEvent::PayloadEnqueue {
+            not_before: view.not_before, expire_at: view.expire_at,
+            headers: Vec::new(), payload: Vec::new(),
+        });
+    }
     let payload = &record.payload;
     if payload.len() >= 16 {
         let tag = u16::from_be_bytes(payload[10..12].try_into().unwrap());
@@ -884,7 +896,7 @@ impl RecoveryReferenceInspection {
         stream: bool,
     ) {
         self.checked_events += 1;
-        let event = match decode_evidence_event(record) {
+        let event = match decode_evidence_semantics(record) {
             Ok(event) => event,
             Err(gap) => {
                 self.gap(record.offset, gap);

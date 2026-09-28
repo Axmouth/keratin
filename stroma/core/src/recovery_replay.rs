@@ -3,7 +3,7 @@
 //! transferred record against the resource-bound receipt. No actor is queried.
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
-use crate::recovery_inspection::{decode_evidence_event, hash_record};
+use crate::recovery_inspection::{decode_evidence_semantics, hash_record};
 use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
 use std::collections::BTreeSet;
 
@@ -228,7 +228,7 @@ impl QueueReplay {
             .get_or_insert_with(|| self.state.recovery_live_ranges());
         if live.contains(&record.offset) {
             if self.history.log_layout == QueueLogLayout::Combined
-                && !matches!(decode_evidence_event(record), Ok(StromaEvent::PayloadEnqueue { .. }))
+                && !matches!(decode_evidence_semantics(record), Ok(StromaEvent::PayloadEnqueue { .. }))
             {
                 return Err("live payload points to a non-payload combined record".into());
             }
@@ -250,7 +250,7 @@ impl QueueReplay {
         if record.offset != self.next {
             return Err("noncontiguous recovery state replay".into());
         }
-        let ev = decode_evidence_event(record)
+        let ev = decode_evidence_semantics(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
         let payload = matches!(ev, StromaEvent::PayloadEnqueue { .. });
         let combined = self.history.log_layout == QueueLogLayout::Combined;

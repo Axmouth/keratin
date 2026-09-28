@@ -274,7 +274,7 @@ pub(super) fn scan_parts(
                 if s.payload_log.source == RecoveryReadSource::Events {
                     let record = RecoveryRecord { offset: record.offset, flags: record.flags,
                         headers: record.headers.to_vec(), payload: record.payload.to_vec() };
-                    if !matches!(crate::recovery_inspection::decode_evidence_event(&record), Ok(StromaEvent::PayloadEnqueue { .. })) {
+                    if !matches!(crate::recovery_inspection::decode_evidence_semantics(&record), Ok(StromaEvent::PayloadEnqueue { .. })) {
                         return Err(io::Error::other("staged live payload points to non-payload event"));
                     }
                 }

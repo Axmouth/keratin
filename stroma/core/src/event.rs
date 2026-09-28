@@ -417,6 +417,54 @@ fn rd_box_str(b: &[u8], i: &mut usize) -> io::Result<Box<str>> {
     Ok(s.into())
 }
 
+/// Borrowed payload fields used by strict recovery validation. Bodies stay in
+/// the input page and are hashed there, never copied into replay state.
+#[derive(Debug)]
+pub(crate) struct PayloadEnqueueView<'a> {
+    pub not_before: Option<u64>,
+    pub expire_at: Option<u64>,
+    pub headers: &'a [u8],
+    pub payload: &'a [u8],
+}
+
+fn payload_enqueue_fields<'a>(bytes: &'a [u8], i: &mut usize, strict: bool) -> io::Result<PayloadEnqueueView<'a>> {
+    let mut optional = || -> io::Result<Option<u64>> {
+        let flag = rd_u8(bytes, i)?;
+        if strict && flag > 1 {
+            return Err(io::Error::new(io::ErrorKind::InvalidData, "noncanonical presence flag"));
+        }
+        (flag != 0).then(|| rd_u64(bytes, i)).transpose()
+    };
+    let not_before = optional()?;
+    let expire_at = optional()?;
+    let mut field = || -> io::Result<&'a [u8]> {
+        let len = rd_u32(bytes, i)? as usize;
+        let end = i.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "combined enqueue length overflow"))?;
+        let data = bytes.get(*i..end).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "combined enqueue truncated"))?;
+        *i = end;
+        Ok(data)
+    };
+    Ok(PayloadEnqueueView { not_before, expire_at, headers: field()?, payload: field()? })
+}
+
+/// Strict payload-only proof decoder. None identifies another event type, whose
+/// complete semantic validation remains the caller's responsibility.
+pub(crate) fn strict_payload_enqueue(bytes: &[u8]) -> io::Result<Option<PayloadEnqueueView<'_>>> {
+    if bytes.len() < 12 || &bytes[..8] != STROMA_MAGIC
+        || u16::from_be_bytes([bytes[8], bytes[9]]) != STROMA_VER {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid stroma event header"));
+    }
+    if u16::from_be_bytes([bytes[10], bytes[11]]) != EventType::PayloadEnqueue as u16 {
+        return Ok(None);
+    }
+    let mut i = 12;
+    let view = payload_enqueue_fields(bytes, &mut i, true)?;
+    if i != bytes.len() {
+        return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing payload enqueue fields"));
+    }
+    Ok(Some(view))
+}
+
 impl StromaEvent {
     pub(crate) fn into_record_state(self, off: Offset) -> Self {
         match self {
@@ -769,18 +817,11 @@ impl StromaEvent {
         let ty = rd_u16(bytes, &mut i)?;
         match ty {
             x if x == EventType::PayloadEnqueue as u16 => {
-                let not_before = rd_opt_u64(bytes, &mut i)?;
-                let expire_at = rd_opt_u64(bytes, &mut i)?;
-                let mut field = || -> io::Result<Vec<u8>> {
-                    let len = rd_u32(bytes, &mut i)? as usize;
-                    let end = i.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "combined enqueue length overflow"))?;
-                    let data = bytes.get(i..end).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "combined enqueue truncated"))?;
-                    i = end;
-                    Ok(data.to_vec())
-                };
-                let headers = field()?;
-                let payload = field()?;
-                Ok(Self::PayloadEnqueue { not_before, expire_at, headers, payload })
+                let view = payload_enqueue_fields(bytes, &mut i, false)?;
+                Ok(Self::PayloadEnqueue {
+                    not_before: view.not_before, expire_at: view.expire_at,
+                    headers: view.headers.to_vec(), payload: view.payload.to_vec(),
+                })
             }
             x if x == EventType::Enqueue as u16 => {
                 let off = rd_u64(bytes, &mut i)?;

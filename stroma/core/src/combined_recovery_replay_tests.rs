@@ -132,3 +132,82 @@ fn combined_recovery_payload_pass_is_budgeted_and_digest_checked() {
     assert!(corrupted);
     assert!(check.finish_with_queue_artifacts(4096).is_err());
 }
+
+
+/// Reproducible CPU-only inspection probe. Excludes fixture construction and
+/// storage/RPC delays. Run alone in release mode with --ignored --nocapture.
+#[test]
+#[ignore]
+fn recovery_inspection_cpu_probe() {
+    use std::{hint::black_box, time::Instant};
+    for size in [128, 1024, 8192] {
+        let count = 10_000;
+        let ev = events((0..count).map(|_| StromaEvent::PayloadEnqueue {
+            not_before: None, expire_at: None,
+            headers: vec![7; 24], payload: vec![23; size],
+        }).collect());
+        let source = combined_seal(0, &ev);
+        for round in 0..5 {
+            let started = Instant::now();
+            for record in &ev { black_box(decode_evidence_semantics(black_box(record)).unwrap()); }
+            let decode_us = started.elapsed().as_micros();
+            let mut hash = blake3::Hasher::new();
+            let started = Instant::now();
+            for record in &ev { hash_record(&mut hash, black_box(record)); }
+            black_box(hash.finalize());
+            let hash_us = started.elapsed().as_micros();
+            let check = inspector(source.clone(), source.clone(), RecoveryInspectionLimits {
+                total_bytes: 512 * 1024 * 1024, ..Default::default()
+            }).with_queue_checkpoint_replay(count as u64, Default::default(), 16*1024*1024).unwrap()
+              .with_single_source().unwrap();
+            let started = Instant::now();
+            let mut check = check;
+            while let Some((side, request)) = check.next_read().unwrap() {
+                // Offset-indexed slicing avoids an artificial quadratic scan in
+                // the small-fixture test helper.
+                let response = page(&request, &ev[request.from as usize..], count as u64);
+                check.accept_page(side, response).unwrap();
+            }
+            let report = check.finish().unwrap();
+            assert_eq!(report.records, 2 * count as u64);
+            black_box(report);
+            println!("inspection_probe bytes={size} records={count} round={round} decode_us={decode_us} hash_us={hash_us} inspection_us={}", started.elapsed().as_micros());
+        }
+    }
+}
+
+#[test]
+fn borrowed_payload_evidence_matches_strict_roundtrip_validation() {
+    // Differential oracle: the pre-optimization strict decoder. Exercise every
+    // byte mutation, truncation and trailing data with all optional-field shapes.
+    let old = |record: &RecoveryRecord| {
+        record.flags == 0 && record.headers.is_empty()
+            && StromaEvent::decode(&record.payload).ok()
+                .and_then(|event| event.encode().ok()) == Some(record.payload.clone())
+    };
+    for not_before in [None, Some(0), Some(u64::MAX)] {
+        for expire_at in [None, Some(0), Some(u64::MAX)] {
+            let original = events(vec![StromaEvent::PayloadEnqueue {
+                not_before, expire_at, headers: vec![0, 1, 255], payload: vec![5; 17],
+            }]).remove(0);
+            let semantic = decode_evidence_semantics(&original).unwrap();
+            assert_eq!(semantic.into_record_state(42), StromaEvent::decode(&original.payload).unwrap().into_record_state(42));
+            for i in 0..original.payload.len() {
+                for value in [0, 1, 2, 6, 255] {
+                    let mut record = original.clone(); record.payload[i] = value;
+                    assert_eq!(decode_evidence_semantics(&record).is_ok(), old(&record), "byte {i}, value {value}");
+                }
+                let mut record = original.clone(); record.payload.truncate(i);
+                assert_eq!(decode_evidence_semantics(&record).is_ok(), old(&record), "truncate {i}");
+            }
+            for suffix in [vec![0], vec![0, 0, 0, 1]] {
+                let mut record = original.clone(); record.payload.extend(suffix);
+                assert!(decode_evidence_semantics(&record).is_err());
+            }
+            let mut record = original.clone(); record.flags = 1;
+            assert!(decode_evidence_semantics(&record).is_err());
+            let mut record = original; record.headers.push(0);
+            assert!(decode_evidence_semantics(&record).is_err());
+        }
+    }
+}
