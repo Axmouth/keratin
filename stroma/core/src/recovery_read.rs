@@ -58,7 +58,7 @@ pub struct RecoverySequentialRead {
     source: Option<RecoveryReadSource>,
     cursor: Option<keratin_log::FrozenLogCursor>,
     pending: Option<RecoveryRecord>,
-    hash: blake3::Hasher,
+    hash: Option<blake3::Hasher>,
     next: u64,
     end: u64,
     _permit: tokio::sync::OwnedSemaphorePermit,
@@ -96,22 +96,25 @@ impl RecoverySequentialRead {
             if self.source.is_some() && self.next != self.end {
                 return Err(invalid("previous sequential log is incomplete"));
             }
-            if request.from != head {
-                return Err(invalid("sequential inspection must start at retained head"));
+            if request.from < head || request.from > end {
+                return Err(invalid("sequential inspection starts outside retained history"));
             }
             self.cursor = Some(
                 FrozenLogReader::open(root, request.seal.fence_epoch, head, end)
                     .map_err(io_err)?
-                    .into_retained_cursor()
+                    .into_suffix_cursor(request.from)
                     .map_err(io_err)?,
             );
             self.source = Some(request.source);
             self.pending = None;
-            self.hash = blake3::Hasher::new();
-            self.hash.update(b"fibril-retained-log-v1\0");
-            self.hash.update(&head.to_be_bytes());
-            self.hash.update(&end.to_be_bytes());
-            self.next = head;
+            self.hash = (request.from == head).then(|| {
+                let mut hash = blake3::Hasher::new();
+                hash.update(b"fibril-retained-log-v1\0");
+                hash.update(&head.to_be_bytes());
+                hash.update(&end.to_be_bytes());
+                hash
+            });
+            self.next = request.from;
             self.end = end;
         }
         if request.from != self.next {
@@ -154,21 +157,16 @@ impl RecoverySequentialRead {
             if record.offset != self.next {
                 return Err(corrupt("noncontiguous sequential history"));
             }
-            self.hash.update(&record.offset.to_be_bytes());
-            self.hash.update(&record.flags.to_be_bytes());
-            self.hash
-                .update(&(record.headers.len() as u64).to_be_bytes());
-            self.hash.update(&record.headers);
-            self.hash
-                .update(&(record.payload.len() as u64).to_be_bytes());
-            self.hash.update(&record.payload);
+            if let Some(hash) = &mut self.hash {
+                crate::recovery_inspection::hash_record(hash, &record);
+            }
             used += size;
             self.next += 1;
             page.next = self.next;
             page.records.push(record);
         }
         if self.next == end {
-            if self.hash.finalize().as_bytes() != &digest {
+            if self.hash.as_ref().is_some_and(|hash| hash.finalize().as_bytes() != &digest) {
                 return Err(corrupt("sequential history does not match sealed digest"));
             }
             self.cursor = None;
@@ -201,8 +199,10 @@ impl Stroma {
             .map(|(page, _)| page)
     }
 
-    /// Read tentative pages in order, validating the selected complete log at
-    /// its final page. Use only with a receiver that verifies all sealed digests
+    /// Read tentative pages in order. A scan starting at the retained head also
+    /// validates the complete log at its final page. A resumed suffix relies on
+    /// receiver verification of its retained prefix plus this suffix.
+    /// Use only with a receiver that verifies all sealed digests
     /// before emitting evidence. Strict diagnostics use `read_sealed_replica`.
     pub async fn read_sealed_replica_sequential(
         &self,
@@ -347,7 +347,7 @@ impl Stroma {
                             source: None,
                             cursor: None,
                             pending: None,
-                            hash: blake3::Hasher::new(),
+                            hash: None,
                             next: 0,
                             end: 0,
                             _permit: session_permit.unwrap(),
@@ -823,10 +823,56 @@ mod tests {
         .unwrap();
         let mut skipped = request.clone();
         skipped.from = first.next;
-        assert!(sequential(&s, skipped, None).await.is_err());
+        let expected = read(&s, skipped.clone()).await.unwrap();
+        let (resumed, resumed_cursor) = sequential(&s, skipped, None).await.unwrap();
+        assert_eq!(resumed, expected);
+        drop(resumed_cursor);
         let (page, cursor) = sequential(&s, request, None).await.unwrap();
         assert_eq!(page, first);
         drop(cursor);
+        s.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn resumed_suffix_remains_tentative_until_receiver_verifies_the_whole_seal() {
+        use crate::recovery_inspection::{RecoveryInspectionLimits, RecoveryPairInspector};
+        let dir = test_dir!("sequential_resumed_digest");
+        let s = populate(&dir.root).await;
+        let request = seal(&s).await;
+        let sealed = s.seal_replica_for_recovery("q", 0, None, request.seal.clone()).await.unwrap();
+        let mut inspector = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed,
+            RecoveryInspectionLimits { page_records: 2, page_bytes: 300, ..Default::default() })
+            .unwrap().with_single_source().unwrap();
+        let (side, request) = inspector.next_read().unwrap().unwrap();
+        let (page, cursor) = sequential(&s, request, None).await.unwrap();
+        inspector.accept_page(side, page).unwrap();
+        drop(cursor); // connection/process restart after retained prefix
+        let mut paths: Vec<_> = fs::read_dir(s.tp_part_dir("q", 0, None).join("segments")).unwrap()
+            .map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "log")).collect();
+        paths.sort();
+        let path = paths.pop().unwrap();
+        let mut bytes = fs::read(&path).unwrap();
+        let start = 68;
+        let headers = u32::from_be_bytes(bytes[start + 8..start + 12].try_into().unwrap()) as usize;
+        let payload = u32::from_be_bytes(bytes[start + 12..start + 16].try_into().unwrap()) as usize;
+        let end = start + 32 + headers + payload;
+        bytes[end - 1] ^= 1;
+        let crc = crc32c::crc32c(&bytes[start + 2..end]);
+        bytes[end..end + 4].copy_from_slice(&crc.to_be_bytes());
+        fs::write(path, bytes).unwrap();
+        let mut cursor = None;
+        loop {
+            let (side, request) = inspector.next_read().unwrap().unwrap();
+            let (page, next_cursor) = sequential(&s, request, cursor.take()).await.unwrap();
+            let complete = page.next == page.end;
+            let result = inspector.accept_page(side, page);
+            if complete {
+                assert!(result.unwrap_err().contains("sealed digest"));
+                break;
+            }
+            result.unwrap(); cursor = next_cursor;
+        }
+        assert!(inspector.finish().is_err());
         s.shutdown().await.unwrap();
     }
 

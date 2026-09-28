@@ -49,6 +49,16 @@ impl Digest {
 }
 
 impl QueueInternalState {
+    /// Retained collection entries, not historical operations or message count.
+    /// Compressed ranges count once. Include stale timer entries because they
+    /// still occupy memory. Each replay event is separately encoding-bounded.
+    pub(crate) fn recovery_retained_entries(&self) -> u64 {
+        [self.settled.len(), self.ready.len(), self.inflight.len(), self.pending_dlq.len(),
+         self.retries.len(), self.ttl_deadlines.len(), self.expiry_heap.len(),
+         self.delayed_enqueue_heap.len(), self.delayed_retry_heap.len()]
+            .into_iter().map(|n| n as u64).sum()
+    }
+
     pub(crate) fn recovery_resource(&self) -> (String, u32) {
         (self.topic.clone(), self.partition)
     }

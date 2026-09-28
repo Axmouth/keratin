@@ -235,6 +235,7 @@ pub struct RecoveryPairInspector {
     bytes: u64,
     failed: bool,
     single_source: bool,
+    incremental_state_entries: Option<u64>,
     resource: (String, u32),
     replay: Option<[QueueReplay; 2]>,
     checkpoint_replay: Option<CheckpointReplayPlan>,
@@ -354,6 +355,7 @@ impl RecoveryPairInspector {
             bytes: 0,
             failed: false,
             single_source: false,
+            incremental_state_entries: None,
             resource: (topic.to_string(), partition),
             replay: None,
             checkpoint_replay: None,
@@ -373,6 +375,7 @@ impl RecoveryPairInspector {
             || self.pages != 0
             || self.failed
             || self.single_source
+            || self.incremental_state_entries.is_some()
             || self.replay.is_some()
             || self.checkpoint_replay.is_some()
         {
@@ -411,6 +414,7 @@ impl RecoveryPairInspector {
             || self.pages != 0
             || self.failed
             || self.single_source
+            || self.incremental_state_entries.is_some()
             || self.replay.is_some()
             || self.checkpoint_replay.is_some()
             || max_checkpoint_bytes == 0
@@ -436,6 +440,27 @@ impl RecoveryPairInspector {
                 .map(|s| s.history.snapshot_digest.is_none()),
         });
         self.initialize_checkpoint_replay()?;
+        Ok(self)
+    }
+
+    /// Opt into page-by-page work with a retained-state bound, independently of
+    /// total historical bytes/records/operations. Only combined queues qualify.
+    /// The caller must provide durable continuation and per-page I/O deadlines.
+    /// Configure replay before opting in. This does not relax page size, entry
+    /// encoding, digest or snapshot bounds.
+    pub fn with_incremental_work(mut self, max_state_entries: u64) -> Result<Self, String> {
+        if max_state_entries == 0 || self.pages != 0 || self.failed || self.stream
+            || self.seals.iter().any(|s| s.history.log_layout != QueueLogLayout::Combined) {
+            return Err("incremental recovery requires an unread combined queue and state admission".into());
+        }
+        self.incremental_state_entries = Some(max_state_entries);
+        self.limits.total_pages = u64::MAX;
+        self.limits.total_records = u64::MAX;
+        self.limits.total_bytes = u64::MAX;
+        if let Some(plan) = &mut self.checkpoint_replay { plan.limits.operations_per_replica = u64::MAX; }
+        if let Some(replay) = &mut self.replay {
+            for state in replay { state.enable_incremental_work(max_state_entries)?; }
+        }
         Ok(self)
     }
 
@@ -486,6 +511,9 @@ impl RecoveryPairInspector {
         };
         self.replay = Some([build(0)?, build(1)?]);
         plan.buffers = Default::default(); // release raw snapshots after decoding
+        if let (Some(limit), Some(replay)) = (self.incremental_state_entries, &mut self.replay) {
+            for state in replay { state.enable_incremental_work(limit)?; }
+        }
         Ok(())
     }
 
@@ -1015,6 +1043,7 @@ mod tests {
     // exactly the same path as retained-history comparisons.
     include!("recovery_checkpoint_tests.rs");
     include!("combined_recovery_replay_tests.rs");
+    include!("recovery_journal_tests.rs");
 
     #[test]
     fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {

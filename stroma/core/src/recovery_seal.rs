@@ -32,7 +32,7 @@ struct SealIntent {
 /// Stable local durable log bounds after sealing both writers. These bounds
 /// include potentially incomplete/unconfirmed work. They are not a promotion
 /// certificate: history, checkpoint and payload/event validation must follow.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SealedReplicaFrontiers {
     pub request: RecoverySealRequest,
     pub history: RetainedHistoryIdentity,

@@ -211,3 +211,71 @@ fn borrowed_payload_evidence_matches_strict_roundtrip_validation() {
         }
     }
 }
+
+#[test]
+fn incremental_inspection_separates_historical_work_from_retained_state() {
+    let records = events((0..200).flat_map(|i| [payload_event(None), StromaEvent::Ack { off: i * 2 }]).collect());
+    let limits = RecoveryInspectionLimits { page_records: 2, total_pages: 1, total_records: 2,
+        total_bytes: 1024, ..Default::default() };
+    let source = combined_seal(0, &records);
+    let make = || inspector(source.clone(), source.clone(), limits)
+        .with_queue_checkpoint_replay(records.len() as u64, RecoveryReplayLimits { operations_per_replica: 2 }, 4096).unwrap();
+    assert!(drive_checkpoints(make().with_single_source().unwrap(), [[&[], &records], [&[], &records]], [&[], &[]]).is_err());
+    let incremental = drive_checkpoints(make().with_incremental_work(4).unwrap().with_single_source().unwrap(),
+        [[&[], &records], [&[], &records]], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
+    let direct = drive_checkpoints(combined_inspector(&records, Default::default()).with_single_source().unwrap(),
+        [[&[], &records], [&[], &records]], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
+    assert_eq!(incremental.1, direct.1);
+    assert_eq!(incremental.0.records, direct.0.records);
+    assert_eq!(incremental.0.bytes, direct.0.bytes);
+    assert!(incremental.0.queue_replay.unwrap()[0].operations > 2);
+
+    let growing = events((0..20).map(|_| payload_event(Some(1000))).collect());
+    let check = combined_inspector(&growing, Default::default()).with_incremental_work(4).unwrap().with_single_source().unwrap();
+    let error = drive_checkpoints(check, [[&[], &growing], [&[], &growing]], [&[], &[]]).err().unwrap();
+    assert_eq!(crate::recovery_budget::RecoveryBudgetExceeded::from_message(&error).unwrap().budget,
+        crate::recovery_budget::RecoveryBudget::ReplayStateEntries);
+}
+
+/// Streaming fixture crosses the old byte, record and replay-operation ceilings
+/// without allocating the whole history. Run explicitly in release mode.
+#[test]
+#[ignore]
+fn incremental_inspection_crosses_legacy_history_budgets() {
+    let count = 1_100_002u64;
+    let record = |offset| RecoveryRecord { offset, flags: 0, headers: vec![], payload: if offset % 2 == 0 {
+        StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![42; 256] }
+    } else { StromaEvent::Ack { off: offset - 1 } }.encode().unwrap() };
+    let mut source = combined_seal(0, &[]);
+    source.event_next = count; source.history.event_next = count;
+    let mut hash = Cursor::new(0, count, [0; 32]).hash;
+    for offset in 0..count { hash_record(&mut hash, &record(offset)); }
+    source.history.event_digest = *hash.finalize().as_bytes();
+    source.history.id = [0; 32];
+    let mut hash = blake3::Hasher::new(); hash.update(b"fibril-retained-history-v1\0");
+    hash.update(&rmp_serde::to_vec_named(&("q", 0u32, None::<&str>, false, &source.history)).unwrap());
+    source.history.id = *hash.finalize().as_bytes();
+    let make = || inspector(source.clone(), source.clone(), RecoveryInspectionLimits {
+        page_records: 4096, page_bytes: 16*1024*1024, ..Default::default()
+    }).with_queue_checkpoint_replay(count, Default::default(), 4096).unwrap();
+    let drive = |mut check: RecoveryPairInspector| -> Result<RecoveryPairInspector, String> {
+        while let Some((side, request)) = check.next_read()? {
+            let next = (request.from + request.max_records as u64).min(count);
+            check.accept_page(side, RecoveryReadPage { history_id: request.history_id,
+                source: request.source, from: request.from, next, end: count,
+                records: (request.from..next).map(&record).collect(), snapshot_bytes: vec![] })?;
+        }
+        Ok(check)
+    };
+    assert!(drive(make().with_single_source().unwrap()).err().unwrap().contains("budget"));
+    let (report, artifacts) = drive(make().with_incremental_work(4).unwrap().with_single_source().unwrap()).unwrap()
+        .finish_with_queue_artifacts(4096).unwrap();
+    assert_eq!(report.records, count * 2);
+    assert!(report.bytes > 256 * 1024 * 1024);
+    assert!(artifacts[0].evidence().operations > 1_000_000);
+    let mut expected = crate::QueueInternalState::new("q".into(), 0);
+    for offset in 0..count { expected.ack(offset); }
+    assert_eq!(artifacts[0].evidence().state_digest, expected.recovery_state_digest());
+    println!("incremental_history records={} bytes={} operations={} artifact_bytes={}",
+        report.records, report.bytes, artifacts[0].evidence().operations, artifacts[0].state_snapshot().len());
+}

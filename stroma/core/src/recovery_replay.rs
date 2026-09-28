@@ -110,6 +110,7 @@ pub(crate) struct QueueReplay {
     live_hash: blake3::Hasher,
     live_seen: u64,
     verify_live: bool,
+    state_entry_limit: Option<u64>,
 }
 impl QueueReplay {
     pub(crate) fn new(
@@ -143,6 +144,7 @@ impl QueueReplay {
             live_hash: live_hasher(),
             live_seen: 0,
             verify_live: false,
+            state_entry_limit: None,
         })
     }
 
@@ -209,7 +211,27 @@ impl QueueReplay {
             live_hash: live_hasher(),
             live_seen: 0,
             verify_live: true,
+            state_entry_limit: None,
         })
+    }
+
+    /// Historical work may span arbitrarily many bounded pages. Admission is
+    /// instead based on the state retained by replay, plus one bounded event.
+    pub(crate) fn enable_incremental_work(&mut self, max_entries: u64) -> Result<(), String> {
+        self.state_entry_limit = Some(max_entries);
+        self.remaining = u64::MAX - self.operations;
+        self.check_retained_state()
+    }
+
+    fn check_retained_state(&self) -> Result<(), String> {
+        if let Some(limit) = self.state_entry_limit {
+            let entries = self.state.recovery_retained_entries()
+                .checked_add(self.missing_enqueues.len() as u64).ok_or("replay state entry overflow")?;
+            if entries > limit {
+                return Err(Limit::message(Budget::ReplayStateEntries, limit, 0, entries));
+            }
+        }
+        Ok(())
     }
 
     pub(crate) fn verify_live_payloads(&mut self) {
@@ -359,6 +381,7 @@ impl QueueReplay {
         if combined && !payload {
             self.state.ack(record.offset);
         }
+        self.check_retained_state()?;
         hash_record(&mut self.prefix_hash, record);
         self.next += 1;
         Ok(())

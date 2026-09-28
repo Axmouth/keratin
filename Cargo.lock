@@ -839,6 +839,7 @@ dependencies = [
  "crossbeam",
  "dashmap",
  "fastrand",
+ "fs2",
  "futures",
  "hashbrown 0.17.0",
  "keratin-log",

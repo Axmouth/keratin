@@ -285,6 +285,17 @@ impl FrozenLogReader {
         FrozenLogCursor::durable_prefix(self.segments, self.head, self.next, u64::MAX)
     }
 
+    /// Read a suffix of an exact frozen range after a receiver retained earlier
+    /// pages. The suffix is tentative. The receiver must verify the complete
+    /// sealed digest using its retained prefix before producing evidence.
+    pub fn into_suffix_cursor(self, from: u64) -> io::Result<FrozenLogCursor> {
+        if from < self.head || from > self.next {
+            return Err(invalid("frozen suffix starts outside retained history"));
+        }
+        if from == self.head { return self.into_retained_cursor(); }
+        FrozenLogCursor::durable_prefix(self.segments, from, self.next, u64::MAX)
+    }
+
     pub fn scan_retained(
         self,
         mut visit: impl FnMut(DecodedRecord<'_>) -> io::Result<()>,
