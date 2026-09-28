@@ -118,6 +118,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Avoid scanning every TTL range on each enqueue. Deadline updates notify the
+  coalescing expiry worker, keeping fragmented TTL publication and recovery replay
+  independent of a growing per-message minimum search. Expiry selection still
+  computes the exact earliest deadline.
+
 - Single-log queues can share storage with streams. Stream reads, cursor replay,
   retention, follower application and recovery seals retain their separate logs.
 

@@ -3709,17 +3709,15 @@ impl QueueInternalState {
         self.recompute_hint_if_needed();
     }
 
-    /// Record a message's drop deadline (message TTL) and wake the deadline
-    /// worker if this is the new earliest deadline.
+    /// Record a message's drop deadline and wake the deadline worker. Notify
+    /// coalesces updates while a batch is applied. Scanning all TTL ranges here
+    /// would make rebuilding fragmented TTL state quadratic in message count.
     fn set_ttl_deadline(&mut self, offset: Offset, deadline: UnixMillis) {
         if self.is_settled(offset) {
             return;
         }
-        let was_earlier_or_empty = self.min_ttl_deadline().is_none_or(|d| deadline < d);
         self.ttl_deadlines.insert(offset..offset + 1, deadline);
-        if was_earlier_or_empty {
-            self.deadline_waker.notify_one();
-        }
+        self.deadline_waker.notify_one();
     }
 
     /// Earliest TTL deadline across all tracked offsets, or `None` if no message
@@ -5996,6 +5994,39 @@ mod tests {
         assert!(s.mark_inflight(0, 5_000));
         // Past its deadline but leased - must not be collected for drop.
         assert_eq!(s.collect_ttl_expired(1_000, 10), Vec::<u64>::new());
+    }
+
+    #[test]
+    #[ignore = "manual TTL enqueue scaling probe"]
+    fn fragmented_ttl_enqueue_scaling_probe() {
+        for count in [5_000u64, 10_000, 20_000, 40_000] {
+            let mut state = QueueInternalState::new("ttl-probe".into(), 0);
+            let start = std::time::Instant::now();
+            for off in 0..count {
+                state.enqueue(off, 0, Some(1_000_000 + off));
+            }
+            eprintln!("distinct TTL enqueue count={count} elapsed_us={}", start.elapsed().as_micros());
+            assert_eq!(state.ttl_deadlines.len(), count as usize);
+            assert_eq!(state.min_ttl_deadline(), Some(1_000_000));
+            assert_eq!(state.collect_ttl_expired(1_000_003, 8), vec![0, 1, 2, 3]);
+        }
+    }
+
+    #[tokio::test]
+    async fn ttl_updates_wake_expiry_after_earliest_entry_is_removed() {
+        let mut state = QueueInternalState::new("ttl-wake".into(), 0);
+        let wake = state.deadline_waker.clone();
+        state.enqueue(0, 0, Some(100));
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        state.enqueue(1, 0, Some(50));
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        assert_eq!(state.next_expiry_hint(), Some(50));
+        state.ack(1);
+        assert_eq!(state.next_expiry_hint(), Some(100));
+        state.enqueue(2, 0, Some(75));
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        assert_eq!(state.next_expiry_hint(), Some(75));
+        assert_eq!(state.collect_ttl_expired(75, 8), vec![2]);
     }
 
     #[test]
