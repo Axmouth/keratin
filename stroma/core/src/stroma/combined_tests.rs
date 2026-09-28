@@ -1703,3 +1703,39 @@ async fn combined_queue_preserves_strongest_flush_policy() {
         st.shutdown().await.unwrap();
     }
 }
+
+#[cfg(feature = "early-replication-experiment")]
+#[tokio::test]
+async fn experimental_written_selection_handles_cache_misses_without_durability() {
+    for cache in [0, 128, 512, 1024 * 1024] {
+        let dir = keratin_log::test_dir!("written_selection");
+        let cfg = KeratinConfig { tail_cache_bytes: cache, segment_max_bytes: 32 * 1024 * 1024,
+            ..KeratinConfig::test_default() };
+        let st = Stroma::open(&dir.root, StromaKeratinConfig::from_message_log(cfg), SnapshotConfig::default()).await.unwrap();
+        let q = st.queue_handle("q", 0, None).await.unwrap();
+        let h = q.resolve().unwrap();
+        for event in [
+            StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: headers().encode().unwrap(), payload: vec![1; 256] },
+            StromaEvent::Ack { off: 0 },
+            StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: headers().encode().unwrap(), payload: vec![2; 4096] },
+        ] {
+            h.event_log().append_batch(vec![event_msg(&event).unwrap()], Some(KDurability::AfterFlush)).await.unwrap();
+        }
+        for budget in [1, 512, 1024 * 1024] {
+            let rows = read_selected_with_visibility(&h, &[(0, 0), (2, 3)], budget, true).unwrap();
+            assert_eq!(rows.len(), 2);
+            assert_eq!(rows[0].0, 0);
+            assert_eq!(rows[0].2, vec![1; 256]);
+            assert_eq!(rows[1].0, 2);
+            assert_eq!(rows[1].2, vec![2; 4096]);
+            assert_eq!(rows[1].3, 3);
+            assert!(read_selected_with_visibility(&h, &[(1, 0)], budget, true).is_err());
+            assert!(read_selected_with_visibility(&h, &[(3, 0)], budget, true).is_err());
+            assert!(read_selected_with_visibility(&h, &[(2, 0), (0, 0)], budget, true).is_err());
+            assert!(read_selected_with_budget(&h, &[(0, 0)], budget).is_err());
+            assert!(h.event_log().reader().scan_from(0, 3).unwrap().is_empty());
+        }
+        drop(h);
+        st.shutdown().await.unwrap();
+    }
+}

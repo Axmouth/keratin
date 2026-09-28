@@ -95,6 +95,14 @@ pub(super) fn read_selected(
             .filter(|v| (1..=8 * 1024 * 1024).contains(v))
             .unwrap_or(1024 * 1024)
     });
+    #[cfg(feature = "early-replication-experiment")]
+    {
+        static WRITTEN_DELIVERY: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+        if *WRITTEN_DELIVERY.get_or_init(||
+            std::env::var("KERATIN_EXPERIMENT_AFTERFLUSH").as_deref() == Ok("1")) {
+            return read_selected_with_visibility(qh, offsets, scan_bytes, true);
+        }
+    }
     read_selected_with_budget(qh, offsets, scan_bytes)
 }
 
@@ -102,6 +110,18 @@ fn read_selected_with_budget(
     qh: &QueueHandleInner,
     offsets: &[(u64, u32)],
     scan_bytes: usize,
+) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
+    read_selected_with_visibility(qh, offsets, scan_bytes, false)
+}
+
+// Disposable weak-queue probe. These offsets come from applied enqueue events
+// whose AfterFlush completion precedes actor visibility. Written reads confer
+// no persistence or recovery authority, and never alter the durable watermark.
+fn read_selected_with_visibility(
+    qh: &QueueHandleInner,
+    offsets: &[(u64, u32)],
+    scan_bytes: usize,
+    written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
     if offsets.is_empty() {
         return Ok(Vec::new());
@@ -122,9 +142,26 @@ fn read_selected_with_budget(
     let mut i = 0;
     let mut out = Vec::with_capacity(offsets.len());
     while next < stop {
-        let records = reader
-            .scan_from_with_byte_budget(next, (stop - next).min(4096) as usize, scan_bytes)
-            .map_err(io_err)?;
+        let max = (stop - next).min(4096) as usize;
+        let records = if written {
+            #[cfg(feature = "early-replication-experiment")]
+            {
+                let cached = reader.scan_for_replication_with_byte_budget(next, max, scan_bytes)
+                    .map_err(io_err)?;
+                if cached.is_empty() {
+                    // Disabled/evicted/oversized cache entries still need a real
+                    // file read. Read exactly the next selected offset, retaining
+                    // CRC/offset/type/header checks and the existing one-record
+                    // oversized allowance. No unbounded scan of an unsynced tail.
+                    vec![reader.fetch(offsets[i].0).map_err(io_err)?.ok_or_else(||
+                        StromaError::Corruption("selected written payload missing".into()))?]
+                } else { cached }
+            }
+            #[cfg(not(feature = "early-replication-experiment"))]
+            { return Err(StromaError::InvalidArgument("written delivery experiment is unavailable".into())); }
+        } else {
+            reader.scan_from_with_byte_budget(next, max, scan_bytes).map_err(io_err)?
+        };
         if records.is_empty() {
             return Err(StromaError::Corruption(
                 "selected payload missing from combined log".into(),
