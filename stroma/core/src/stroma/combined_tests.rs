@@ -1626,3 +1626,62 @@ async fn combined_root_preserves_stream_preparation_and_seal_layout() {
     assert_eq!(sealed.event_next, 1);
     st.shutdown().await.unwrap();
 }
+
+/// Disk amplification probe, independent of failover timing. One delayed oldest
+/// payload pins increasingly long settled histories. All disposable data is
+/// owned by the test directory and removed on return.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore]
+async fn sparse_live_retention_probe() {
+    fn file_bytes(root: &Path) -> u64 {
+        std::fs::read_dir(root).unwrap().map(|entry| {
+            let entry = entry.unwrap();
+            if entry.file_type().unwrap().is_dir() { file_bytes(&entry.path()) }
+            else { entry.metadata().unwrap().len() }
+        }).sum()
+    }
+    for count in [1_000usize, 10_000, 50_000] {
+        let dir = keratin_log::test_dir!("sparse_live_retention_probe");
+        let mut cfg = KeratinConfig::test_default();
+        cfg.segment_max_bytes = 1024 * 1024;
+        cfg.segment_preallocate_bytes = 0;
+        cfg.tail_cache_bytes = 0;
+        let st = Stroma::open_with_options(&dir.root, StromaKeratinConfig::from_message_log(cfg),
+            SnapshotConfig { every_events: u64::MAX }, StromaOptions::default()).await.unwrap();
+        let held = publish(&st, true).await;
+        for start in (0..count).step_by(256) {
+            let mut completions = Vec::new();
+            let mut batch = Vec::new();
+            for _ in start..(start + 256).min(count) {
+                let (completion, rx) = KeratinAppendCompletion::pair();
+                completions.push(rx);
+                batch.push(PublishItem { headers: headers(), payload: vec![17; 1024], completion,
+                    not_before: None, expire_at: None });
+            }
+            st.append_message_batch("q", 0, None, batch).await.unwrap();
+            let mut reqs = Vec::new();
+            for rx in completions { reqs.push(AckEventMeta { off: rx.await.unwrap().unwrap().base_offset }); }
+            let (completion, rx) = KeratinAppendCompletion::pair();
+            st.ack_enqueue_many("q", 0, None, reqs, completion).await.unwrap();
+            rx.await.unwrap().unwrap();
+        }
+        let q = st.queue_handle("q", 0, None).await.unwrap();
+        st.write_exact_queue_checkpoint(q.clone(), true).await.unwrap();
+        let h = q.resolve().unwrap();
+        assert_eq!(h.work_queue().unwrap().lowest_not_settled_offset().await, held);
+        assert_eq!(h.event_log().head_offset(), 0);
+        let retained_records = h.event_log().next_offset();
+        assert_eq!(fetch_payload(&h, held).unwrap().unwrap().payload, vec![42; 2048]);
+        let pinned_bytes = file_bytes(&dir.root);
+        drop(h);
+        ack(&st, held).await;
+        st.write_exact_queue_checkpoint(q.clone(), true).await.unwrap();
+        let head_after = q.resolve().unwrap().event_log().head_offset();
+        assert!(head_after > held);
+        let reclaimed_bytes = file_bytes(&dir.root);
+        println!("retention_probe settled={count} live_payload_bytes=2048 retained_records={retained_records} pinned_file_bytes={pinned_bytes} released_file_bytes={reclaimed_bytes} head_after={head_after}");
+        assert!(reclaimed_bytes < pinned_bytes);
+        st.shutdown().await.unwrap();
+        drop(q); drop(st);
+    }
+}
