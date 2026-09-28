@@ -963,12 +963,15 @@ async fn snapshot_chunks_resume_before_stage_creation_and_bind_exact_plan() {
     assert!(stage.completed_snapshot_chunk(0, 30).await.is_err());
     assert_eq!(stage.snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
     stage.append(page(&spec, &records)).await.unwrap();
-    stage.finish().await.unwrap();
+    assert!(stage.completion_receipt().await.unwrap().is_none());
+    let completed = stage.finish().await.unwrap();
+    assert_eq!(stage.completion_receipt().await.unwrap(), Some(completed.clone()));
     assert_eq!(stage.completed_snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
     drop(stage);
     let stage = st.resume_queue_recovery_stage(spec, Default::default()).await.unwrap();
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
+    assert_eq!(stage.completion_receipt().await.unwrap(), Some(completed));
     drop(stage);
     st.shutdown().await.unwrap();
 }

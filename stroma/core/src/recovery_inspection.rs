@@ -31,7 +31,7 @@ impl RecoverySide {
     }
 }
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
 pub struct RecoveryInspectionLimits {
     pub page_records: u32,
     pub page_bytes: u32,
@@ -52,14 +52,14 @@ impl Default for RecoveryInspectionLimits {
     }
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryRecordDifference {
     pub offset: u64,
     pub left_id: [u8; 32],
     pub right_id: [u8; 32],
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RecoveryOverlap {
     /// Empty/disjoint ranges supply no shared-record evidence.
     NoSharedRecords,
@@ -74,14 +74,14 @@ pub enum RecoveryOverlap {
     },
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryLogInspection {
     pub left_range: (u64, u64),
     pub right_range: (u64, u64),
     pub overlap: RecoveryOverlap,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryReferenceGap {
     pub event_offset: u64,
     pub message_offset: u64,
@@ -90,7 +90,7 @@ pub struct RecoveryReferenceGap {
     pub event_required_message_next: Option<u64>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RecoverySemanticGap {
     UnknownOrMalformedEncoding,
     CombinedQueueFormatUnsupported,
@@ -100,7 +100,7 @@ pub enum RecoverySemanticGap {
     StreamStateRequired,
 }
 
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone, PartialEq, Eq, Default, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryReferenceInspection {
     pub checked_events: u64,
     pub reference_count: u64,
@@ -110,7 +110,7 @@ pub struct RecoveryReferenceInspection {
     pub first_semantic_gap: Option<(u64, RecoverySemanticGap)>,
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RecoveryProofRequirement {
     CommonOriginAndInstalledLineage,
     StateReplayAndDependencies,
@@ -121,7 +121,7 @@ pub enum RecoveryProofRequirement {
 /// All fields describe retained evidence only. There is deliberately no
 /// compatible/eligible/selected/promotable flag. Even all-empty or equal records
 /// require common-origin, state, checkpoint and fresh activation proofs.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryPairInspection {
     pub transition: [u8; 32],
     pub history_ids: [[u8; 32]; 2],
@@ -1044,6 +1044,7 @@ mod tests {
     include!("recovery_checkpoint_tests.rs");
     include!("combined_recovery_replay_tests.rs");
     include!("recovery_journal_tests.rs");
+    include!("recovery_phase_tests.rs");
 
     #[test]
     fn replay_proves_exact_zero_and_nonzero_boundaries_without_trusting_labels() {

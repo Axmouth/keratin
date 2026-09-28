@@ -27,6 +27,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Persist completed local recovery inspection and comparison phases with exact
+  source/configuration binding and a versioned recipe. Restored artifacts verify
+  their snapshot and state digests. Namespace leases and bounded retirement keep
+  inspection-cache cleanup separate from active or installed storage.
+- Expose immutable completed queue-seal and stage receipts for lost-response
+  retries. These receipts preserve the original evidence. Strict inspection and
+  installation still validate the selected retained records.
+
 - Optional batch timelines share one bounded collector and clock across log writers,
   with commit-to-fsync links, offset bounds, drop counters and emission timing.
   Instrumented and ordinary builds now use the same fsync coalescing loop.

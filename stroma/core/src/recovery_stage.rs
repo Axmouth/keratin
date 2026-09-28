@@ -914,6 +914,19 @@ impl QueueRecoveryStage {
         .map_err(io_err)?
     }
 
+    /// Reuse a completed verification on this immutable, non-serving handle.
+    /// Reopen validates the whole staged log before setting `complete`. The
+    /// installer separately validates the frozen input and installed output.
+    pub async fn completion_receipt(&self) -> Result<Option<QueueRecoveryStageReceipt>> {
+        let guard = self.inner.clone().try_lock_owned().map_err(|_| invalid("recovery stage is busy"))?;
+        if guard.needs_reopen { return Err(invalid("recovery stage must reopen after an append error")); }
+        Ok(guard.complete.then(|| {
+            let s = &guard.intent.spec;
+            QueueRecoveryStageReceipt { plan: s.plan, source_history: s.source_history,
+                snapshot_digest: s.snapshot_digest, message_next: s.message_next, event_next: s.event_next }
+        }))
+    }
+
     /// Verify the complete selected payload range and its live-state subset, then
     /// fsync a completion receipt. The staged log remains unavailable to actors.
     pub async fn finish(&self) -> Result<QueueRecoveryStageReceipt> {

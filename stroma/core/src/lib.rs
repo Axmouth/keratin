@@ -8,6 +8,8 @@ mod replication_diagnostics;
 pub mod recovery_inspection;
 pub mod recovery_journal;
 pub mod recovery_snapshot;
+pub mod recovery_phase;
+pub mod recovery_cache;
 pub mod recovery_budget;
 pub mod recovery_replay;
 mod state;

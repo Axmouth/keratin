@@ -1,13 +1,14 @@
 //! Deterministic, clock-free reconstruction of fully retained queue histories.
-//! Only the sealed inspector can finish this evidence: it first verifies every
-//! transferred record against the resource-bound receipt. No actor is queried.
+//! The sealed inspector finishes this evidence after verifying every
+//! transferred record against the resource-bound receipt. A completed local phase
+//! can restore the result without repeating replay. No actor is queried.
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_semantics, hash_record};
 use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
 use std::collections::BTreeSet;
 
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryReplayLimits {
     /// Bound semantic operations, including every entry in batched events.
     /// State, temporary sorting space and unresolved dependencies are O(this).
@@ -48,7 +49,7 @@ impl RetainedHistoryIdentity {
 /// Evidence at an exclusive event frontier, reconstructed from event zero.
 /// Equal `state_digest` values alone neither establish ancestry nor preserve
 /// payload identity. Compare input history and establish lineage separately.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryQueueReplayEvidence {
     pub log_layout: QueueLogLayout,
     pub payload_log: RecoveryPayloadLog,
@@ -76,12 +77,33 @@ pub struct RecoveryQueueReplayEvidence {
 /// Construction requires completed sealed log and live-payload verification.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryQueueStateArtifact {
+    pub(crate) evidence: RecoveryQueueReplayEvidence,
+    pub(crate) message_head: u64,
+    pub(crate) state_snapshot: Vec<u8>,
+    pub(crate) snapshot_digest: [u8; 32],
+}
+/// Payload-free result of a verified artifact. Source selection can retain
+/// summaries for every witness while snapshot bytes stay in the local phase store.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoveryQueueStateSummary {
     evidence: RecoveryQueueReplayEvidence,
     message_head: u64,
-    state_snapshot: Vec<u8>,
     snapshot_digest: [u8; 32],
+    snapshot_bytes: u64,
 }
+impl RecoveryQueueStateSummary {
+    pub fn evidence(&self) -> &RecoveryQueueReplayEvidence { &self.evidence }
+    pub fn message_head(&self) -> u64 { self.message_head }
+    pub fn snapshot_digest(&self) -> [u8; 32] { self.snapshot_digest }
+    pub fn snapshot_bytes(&self) -> u64 { self.snapshot_bytes }
+}
+
 impl RecoveryQueueStateArtifact {
+    pub fn summary(&self) -> RecoveryQueueStateSummary {
+        RecoveryQueueStateSummary { evidence: self.evidence.clone(), message_head: self.message_head,
+            snapshot_digest: self.snapshot_digest, snapshot_bytes: self.state_snapshot.len() as u64 }
+    }
+
     pub fn evidence(&self) -> &RecoveryQueueReplayEvidence {
         &self.evidence
     }

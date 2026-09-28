@@ -40,6 +40,7 @@ impl Default for RecoveryJournalLimits {
 }
 
 pub struct RecoveryInspectionJournal {
+    _namespace: crate::recovery_cache::RecoveryCacheLease,
     root: PathBuf,
     identity: RecoveryJournalIdentity,
     limits: RecoveryJournalLimits,
@@ -85,6 +86,7 @@ impl RecoveryInspectionJournal {
             Default::default(),
         )
         .map_err(io::Error::other)?;
+        let namespace = crate::recovery_cache::RecoveryCacheLease::acquire(parent)?;
         fs::create_dir_all(parent)?;
         let encoded = encode(&identity)?;
         if encoded.len() > 65536 {
@@ -106,6 +108,7 @@ impl RecoveryInspectionJournal {
             root,
             identity,
             limits,
+            _namespace: namespace,
             _lock: lock,
         };
         // Exact identity is also stored for diagnostics and collision/corruption
