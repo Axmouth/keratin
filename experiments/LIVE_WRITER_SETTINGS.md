@@ -4,6 +4,22 @@ The experimental handle API applies writer policy through the same FIFO as local
 and replicated appends. It adds no shared configuration lookup to the append hot
 path. The writer owns an ordinary local configuration snapshot.
 
+The closure helper is the convenient form:
+
+```rust
+let applied = log.update_writer_settings(|next| {
+    next.max_batch_bytes = 512 * 1024;
+    next.max_batch_records = 2048;
+}).await?;
+```
+
+It edits a copy on the caller, outside writer/configuration locks. The closure
+is `FnOnce` and runs at most once. A concurrent edit returns `WouldBlock` without
+replaying the closure or overwriting the winner. Validation and adoption use the
+same replacement API. A closure's own side effects are not rolled back on error.
+
+Explicit read/replace remains available when the caller already holds a revision:
+
 ```rust
 let current = log.writer_settings().await?;
 let mut next = current.settings;

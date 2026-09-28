@@ -261,3 +261,68 @@ async fn live_settings_full_mailbox_does_not_block_async_runtime() {
     assert_eq!(log.writer_settings().await.unwrap().revision, 1);
     log.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn live_settings_closure_edits_copy_and_validates_before_adoption() {
+    let dir = crate::test_dir!("live_settings_closure");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    let original = log.writer_settings().await.unwrap();
+    let applied = log
+        .update_writer_settings(|next| {
+            next.max_batch_bytes = 256 * 1024;
+            next.max_batch_records = 64;
+        })
+        .await
+        .unwrap();
+    assert_eq!(applied.revision, original.revision + 1);
+    assert_eq!(applied.settings.max_batch_bytes, 256 * 1024);
+    assert_eq!(applied.settings.max_batch_records, 64);
+    assert_eq!(
+        applied.settings.default_durability,
+        original.settings.default_durability
+    );
+    assert_eq!(log.writer_settings().await.unwrap(), applied);
+    assert_eq!(
+        log.update_writer_settings(|next| next.max_batch_bytes = 0)
+            .await
+            .unwrap_err()
+            .kind(),
+        io::ErrorKind::InvalidInput
+    );
+    assert_eq!(log.writer_settings().await.unwrap(), applied);
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn live_settings_closure_conflict_does_not_replay_or_overwrite() {
+    let dir = crate::test_dir!("live_settings_closure_conflict");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    let original = log.writer_settings().await.unwrap();
+    let mut calls = 0;
+    let captured = String::from("consumed once");
+    let result = log
+        .update_writer_settings(|next| {
+            drop(captured); // FnOnce closures need not be reusable.
+            calls += 1;
+            let mut competing = *next;
+            competing.max_batch_records = 7;
+            // Another edit enters the FIFO before this helper's replacement.
+            drop(enqueue_update(&log, original.revision, competing));
+            next.max_batch_bytes = 123;
+        })
+        .await;
+    assert_eq!(result.unwrap_err().kind(), io::ErrorKind::WouldBlock);
+    assert_eq!(calls, 1);
+    let winner = log.writer_settings().await.unwrap();
+    assert_eq!(winner.revision, original.revision + 1);
+    assert_eq!(winner.settings.max_batch_records, 7);
+    assert_eq!(
+        winner.settings.max_batch_bytes,
+        original.settings.max_batch_bytes
+    );
+    log.shutdown().await.unwrap();
+}

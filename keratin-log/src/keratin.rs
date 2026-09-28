@@ -613,6 +613,24 @@ impl Keratin {
         rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))
     }
 
+    /// Edit a copy of the applied policy and submit a revision-checked replacement.
+    /// The synchronous closure runs on the caller, outside writer/configuration
+    /// locks, at most once. Concurrent changes return `WouldBlock`. The closure
+    /// is never replayed automatically, so its side effects are not duplicated.
+    /// Adoption and cancellation follow `replace_writer_settings`.
+    pub async fn update_writer_settings<F>(
+        &self,
+        edit: F,
+    ) -> io::Result<crate::WriterSettingsSnapshot>
+    where
+        F: FnOnce(&mut crate::WriterSettings),
+    {
+        let current = self.writer_settings().await?;
+        let mut next = current.settings;
+        edit(&mut next);
+        self.replace_writer_settings(current.revision, next).await
+    }
+
     /// Replace policy at a FIFO boundary. Earlier appends keep their old default.
     /// The current batch closes and its log prefix is persisted before adoption.
     /// Explicit per-append durability still wins. Updates do not survive reopen.
