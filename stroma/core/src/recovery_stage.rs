@@ -43,14 +43,35 @@ pub struct RecoveryStageLimits {
     /// Logical transferred record bytes, including offset/flags/length fields.
     /// Native log framing, indexes and segment preallocation use additional disk.
     pub max_bytes: u64,
+    /// Best-effort free-space admission before additional private storage work.
+    /// Unrelated writes and preallocation can still race this check.
+    pub reserve_free_bytes: u64,
 }
 impl Default for RecoveryStageLimits {
     fn default() -> Self {
         Self {
             max_records: 1_000_000,
             max_bytes: 1024 * 1024 * 1024,
+            reserve_free_bytes: 256 * 1024 * 1024,
         }
     }
+}
+
+impl RecoveryStageLimits {
+    /// Automatic continuation bounds pages, retained state and free disk, rather
+    /// than refusing progress after a fixed accumulated record/byte count.
+    pub fn incremental() -> Self {
+        Self { max_records: u64::MAX, max_bytes: u64::MAX, ..Default::default() }
+    }
+}
+
+fn admit_stage_bytes(root: &Path, limits: RecoveryStageLimits, requested: u64) -> Result<()> {
+    let free = fs2::available_space(root).map_err(io_err)?;
+    if free.saturating_sub(limits.reserve_free_bytes) < requested {
+        return Err(io_err(io::Error::new(io::ErrorKind::StorageFull,
+            format!("recovery stage disk reserve: free={free}, reserve={}, requested={requested}", limits.reserve_free_bytes))));
+    }
+    Ok(())
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -475,6 +496,13 @@ impl Stroma {
                     "local retained payloads cannot be reused; using verified transfer");
                 return Ok(false);
             }
+            let admission_source = messages.clone();
+            let admission_root = intent.spec.clone();
+            let admission_parent = self.recovery_stage_root(&admission_root);
+            tokio::task::spawn_blocking(move || {
+                let private_bytes = admission_source.segment_infos().map_err(io_err)?.last().map_or(0, |s| s.bytes);
+                admit_stage_bytes(&admission_parent, limits, private_bytes.saturating_add(1024 * 1024))
+            }).await.map_err(io_err)??;
             let stats = messages
                 .fork_frozen(destination, s.fence_epoch, s.payload_log.head, s.payload_log.next)
                 .await
@@ -609,6 +637,11 @@ impl Stroma {
                         initialized = true;
                     }
                 }
+            }
+            if !initialized {
+                let admission_root = root.clone();
+                tokio::task::spawn_blocking(move || admit_stage_bytes(&admission_root, limits,
+                    (cfg.segment_preallocate_bytes as u64).saturating_add(1024 * 1024))).await.map_err(io_err)??;
             }
             // Unfinished staging is not accepted history and can repair an
             // interrupted append. Completed data must never silently lose a tail.
@@ -835,6 +868,14 @@ impl QueueRecoveryStage {
             return Err(invalid(Limit::message(Budget::StageBytes, guard.limits.max_bytes, guard.used, bytes)));
         }
         tokio::spawn(async move {
+            if !duplicate {
+                let root = guard.root.clone();
+                let limits = guard.limits;
+                // Include log framing/index slack. This is admission, not an
+                // exclusive reservation against other processes or writers.
+                tokio::task::spawn_blocking(move || admit_stage_bytes(&root, limits,
+                    bytes.saturating_mul(2).saturating_add(1024 * 1024))).await.map_err(io_err)??;
+            }
             let records = page
                 .records
                 .into_iter()
