@@ -1094,7 +1094,12 @@ fn writer_loop(
             }
             WriterCmd::Truncate { before, respond_to } => {
                 tracing::info!("Truncate before {before}..");
-                if let Err(e) = respond_to.send(log.truncate_before(before)).map_err(|_| {
+                #[cfg(feature = "writer-stage-trace")]
+                let work_id = tracer.next_work_id();
+                let result = trace_writer_stage!(tracer, work_id, "retention", (0, 0), {
+                    log.truncate_before(before)
+                });
+                if let Err(e) = respond_to.send(result).map_err(|_| {
                     io::Error::new(io::ErrorKind::BrokenPipe, "could not notify truncate")
                 }) {
                     tracing::info!("Internal Error in processing truncate command: {e}");

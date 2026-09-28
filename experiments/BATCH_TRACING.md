@@ -69,6 +69,7 @@ retained on disk.
 | `durable_published` | The writer publishes the successful durable frontier |
 | `notify` | The notifier processes a batch of completion callbacks |
 | `history_control` | An epoch change, checkpoint reset or suffix repair is being attempted |
+| `retention` | Writer-thread prefix retention, including its synchronous durability barrier and any segment deletion |
 
 Staging IDs can also identify a directly following commit. Other commits get
 fresh IDs, with offset bounds available for inspection. Multiple commits can map

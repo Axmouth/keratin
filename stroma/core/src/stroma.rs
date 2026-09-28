@@ -1653,6 +1653,8 @@ impl Stroma {
                     // parked in wait_recovery_complete on a notify that will never
                     // fire (which would hold the incarnation alive forever).
                     self.periodic_snapshot(self.ticket_for(tp, part, group, &inner));
+                    #[cfg(feature = "early-replication-experiment")]
+                    self.periodic_afterflush_probe(self.ticket_for(tp, part, group, &inner));
 
                     Ok::<_, StromaError>(inner)
                 })
@@ -8651,3 +8653,7 @@ mod open_batch_fault_tests {
         }
     }
 }
+
+#[cfg(feature = "early-replication-experiment")]
+#[path = "stroma/afterflush_sync_probe.rs"]
+mod afterflush_sync_probe;
