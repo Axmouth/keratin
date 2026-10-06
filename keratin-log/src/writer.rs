@@ -701,7 +701,13 @@ fn writer_loop(
             {
                 wait = wait.min(delay);
             }
-        } else if pending_needs_fsync(&pending) {
+        } else if pending_needs_fsync(&pending)
+            // At the hard cap no commit can be submitted until a completion
+            // arrives, and the completion wakes the receive below. An expired
+            // interval deadline here would otherwise turn into a zero-timeout
+            // busy loop for the whole fsync.
+            && inflight_fsyncs < cfg.max_inflight_fsyncs.max(1)
+        {
             let horizon = if inflight_fsyncs == 0 {
                 min_fsync_interval
             } else {
@@ -756,6 +762,8 @@ fn writer_loop(
             }
             WriterEvent::Timeout => {
                 // Either batch deadline or fsync deadline is due; loop will handle.
+                #[cfg(test)]
+                RECEIVE_TIMEOUTS.with(|count| count.set(count.get() + 1));
                 continue;
             }
             WriterEvent::WritesDisconnected => {
@@ -1873,6 +1881,13 @@ fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<Notify
     }
 }
 
+#[cfg(test)]
+thread_local! {
+    /// Timed-out receives on this writer thread. Lets tests detect a busy
+    /// loop without platform CPU counters.
+    static RECEIVE_TIMEOUTS: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
 fn recv_writer_event(
     writes_rx: &Receiver<WriterCmd>,
     fsync_done_rx: &Receiver<FsyncDone>,
@@ -2524,6 +2539,110 @@ mod held_pipeline_test {
             .unwrap();
         finished.blocking_recv().unwrap();
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn writer_waits_without_spinning_at_fsync_cap() {
+        // Holds in both scheduling modes. At the cap only a completion can
+        // unblock a commit, so the writer must block rather than poll.
+        let dir = crate::test_dir!("held_interval_cap");
+        let cfg = KeratinConfig {
+            max_inflight_fsyncs: 1,
+            fsync_interval_ms: 1,
+            min_fsync_interval_ms: 0,
+            tail_cache_bytes: 0,
+            ..KeratinConfig::test_default()
+        };
+        let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+        let (mut log, _) = Log::open(
+            &dir.root,
+            crate::util::unix_millis(),
+            cfg.segment_max_bytes,
+            cfg.index_stride_bytes,
+            cfg.flush_target_bytes,
+            0,
+            0,
+            false,
+            false,
+            state.clone(),
+            None,
+        )
+        .unwrap();
+        let (writes, input) = crossbeam_channel::bounded(8);
+        let (notifications, notified) = crossbeam_channel::unbounded();
+        let (jobs, requests) = crossbeam_channel::bounded::<FsyncReq>(1);
+        let (done, completed) = crossbeam_channel::bounded(1);
+        let writer_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            writer_loop(
+                &mut log,
+                cfg,
+                input,
+                writer_state,
+                notifications,
+                jobs,
+                completed,
+            );
+            super::RECEIVE_TIMEOUTS.with(|count| count.get())
+        });
+        let append = |id| {
+            let (reply, _) = tokio::sync::oneshot::channel();
+            writes
+                .send(WriterCmd::Append(AppendReq {
+                    records: AppendPayload::One(Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: vec![id],
+                    }),
+                    durability: Some(KDurability::AfterFsync),
+                    completion: AppendCompletionTarget::Oneshot(reply),
+                    staged_offset_tx: None,
+                }))
+                .unwrap();
+        };
+        let complete = |request: FsyncReq| {
+            let elapsed = request.job.sync().unwrap();
+            done.send(FsyncDone {
+                durable_end: request.job.durable_end(),
+                elapsed,
+                ready: request.ready,
+                sync_acks: request.sync_acks,
+                error: None,
+            })
+            .unwrap();
+        };
+        append(1);
+        let first = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        append(2);
+        let deadline = Instant::now() + Duration::from_secs(3);
+        while state.tail.load(Ordering::Acquire) != 2 {
+            assert!(Instant::now() < deadline);
+            std::thread::sleep(Duration::from_millis(1));
+        }
+        // Let the interval deadline expire well past its 1 ms horizon while
+        // the only fsync slot is held.
+        std::thread::sleep(Duration::from_millis(200));
+        assert!(requests.try_recv().is_err());
+        complete(first);
+        let second = requests.recv_timeout(Duration::from_secs(3)).unwrap();
+        assert_eq!(second.job.durable_end(), 2);
+        complete(second);
+        for _ in 0..2 {
+            notified.recv_timeout(Duration::from_secs(3)).unwrap();
+        }
+        assert!(state.durable.load().covers(1));
+        let (reply, finished) = tokio::sync::oneshot::channel();
+        writes
+            .send(WriterCmd::Shutdown { notify_tx: reply })
+            .unwrap();
+        finished.blocking_recv().unwrap();
+        let timeouts = worker.join().unwrap();
+        // A spinning writer times out hundreds of thousands of times here.
+        // Batch and staging deadlines legitimately add a handful.
+        assert!(
+            timeouts < 100,
+            "writer timed out {timeouts} times while waiting for a held fsync"
+        );
     }
 }
 
