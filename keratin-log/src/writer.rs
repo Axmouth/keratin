@@ -613,6 +613,23 @@ fn writer_loop(
             &tracer,
         );
 
+        if log.storage_failure().is_some() {
+            serve_after_storage_failure(
+                log,
+                &state,
+                batcher.flush(),
+                &mut pending,
+                deferred_command.take(),
+                &writes_rx,
+                &notify_tx,
+                &fsync_done_rx,
+                &mut inflight_fsyncs,
+                #[cfg(feature = "writer-stage-trace")]
+                &tracer,
+            );
+            return;
+        }
+
         // Keep linger synced with adaptive tuning.
         batcher.set_linger(linger);
 
@@ -1770,6 +1787,11 @@ fn maybe_commit_due(
             notify_tx,
             true,
         );
+        // Retrying cannot succeed once the log has stopped. The loop
+        // switches to failed mode on its next pass.
+        if log.storage_failure().is_some() {
+            break;
+        }
 
         if error_count > 3 {
             fail_all_pending(
@@ -1878,6 +1900,73 @@ fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<Notify
     }
     if !items.is_empty() {
         let _ = notify_tx.send(NotifyMsg::Batch(items));
+    }
+}
+
+/// Answer every request with an error until shutdown. After a storage
+/// failure nothing written since the last good sync can be trusted, so
+/// in-flight fsync completions are failed without publishing a frontier and
+/// the log is never marked clean. Reopening the log runs the recovery scan.
+#[allow(clippy::too_many_arguments)]
+fn serve_after_storage_failure(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    unstaged: Vec<AppendReq>,
+    pending: &mut PendingAcks,
+    mut deferred_command: Option<WriterCmd>,
+    writes_rx: &Receiver<WriterCmd>,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) {
+    let msg = format!(
+        "log stopped after storage failure, reopen required: {}",
+        log.storage_failure().unwrap_or_default()
+    );
+    shutdown_fail_reqs(unstaged, &msg, notify_tx);
+    fail_all_pending(pending, &msg, notify_tx, true);
+    wait_for_inflight_fsyncs(
+        log,
+        state,
+        notify_tx,
+        fsync_done_rx,
+        inflight_fsyncs,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+    );
+    let error = || io::Error::other(msg.clone());
+    while let Some(cmd) = deferred_command.take().or_else(|| writes_rx.recv().ok()) {
+        match cmd {
+            WriterCmd::Append(req) => shutdown_fail_reqs(vec![req], &msg, notify_tx),
+            WriterCmd::ReplicatedAppend { respond_to, .. } => {
+                let _ = respond_to.send(Err(IoError {
+                    msg: msg.clone().into(),
+                    overlap: None,
+                }));
+            }
+            WriterCmd::Truncate { respond_to, .. }
+            | WriterCmd::AdvanceRetainedHead { respond_to, .. }
+            | WriterCmd::AdvanceEpoch { respond_to, .. } => {
+                let _ = respond_to.send(Err(error()));
+            }
+            WriterCmd::ResetToCheckpoint { respond_to, .. }
+            | WriterCmd::RepairSuffix { respond_to, .. }
+            | WriterCmd::Sync { respond_to } => {
+                let _ = respond_to.send(Err(error()));
+            }
+            WriterCmd::ForkFrozen { respond_to, .. } => {
+                let _ = respond_to.send(Err(error()));
+            }
+            // Read-only, and still useful to disk accounting.
+            WriterCmd::SizeEstimate { respond_to } => {
+                let _ = respond_to.send(log.estimate_disk_used());
+            }
+            WriterCmd::Shutdown { notify_tx } => {
+                let _ = notify_tx.send(());
+                return;
+            }
+        }
     }
 }
 
@@ -2031,6 +2120,7 @@ fn handle_fsync_done(
 
     if let Some(error) = done.error {
         tracing::error!("fsync job failed: {error}");
+        log.record_storage_failure(format!("fsync failed: {error}"));
         send_notify_items(notify_tx, done.ready);
         answer_sync_acks(done.sync_acks, Err(io::Error::other(error)));
         return;

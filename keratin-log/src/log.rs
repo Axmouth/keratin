@@ -216,6 +216,12 @@ pub struct Log {
     _directory_lock: Option<Arc<File>>,
     manifest_flush_interval: Duration,
     last_manifest_flush: Instant,
+    /// First flush, sync or manifest failure seen by this handle. After a
+    /// failed fsync the kernel may have dropped dirty pages and a later fsync
+    /// can still return Ok, so nothing written since the last good sync can be
+    /// trusted. Once set, the handle refuses further writes, syncs, frontier
+    /// advances and the clean-shutdown mark. Reopening rescans the files.
+    storage_failure: Option<String>,
 
     pub flush_target_bytes: usize, // e.g. 16MB
 
@@ -507,6 +513,7 @@ impl Log {
                     _directory_lock: None,
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
+                    storage_failure: None,
                     staged_end_offset: initial,
                     durable_end: next_offset,
                     flush_target_bytes,
@@ -574,6 +581,7 @@ impl Log {
                     _directory_lock: None,
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
+                    storage_failure: None,
                     staged_end_offset: initial,
                     durable_end: next_offset,
                     flush_target_bytes,
@@ -675,6 +683,7 @@ impl Log {
                 _directory_lock: None,
                 manifest_flush_interval: Duration::from_millis(500),
                 last_manifest_flush: Instant::now(),
+                storage_failure: None,
                 staged_end_offset: initial,
                 durable_end: next_offset,
                 flush_target_bytes,
@@ -1058,6 +1067,39 @@ impl Log {
         ))
     }
 
+    /// The first storage failure recorded by this handle, if any.
+    pub(crate) fn storage_failure(&self) -> Option<&str> {
+        self.storage_failure.as_deref()
+    }
+
+    pub(crate) fn record_storage_failure(&mut self, error: impl Into<String>) {
+        if self.storage_failure.is_none() {
+            let error = error.into();
+            tracing::error!(
+                root = %self.root.display(),
+                %error,
+                "log stopped after storage failure, reopen required"
+            );
+            self.storage_failure = Some(error);
+        }
+    }
+
+    fn check_storage(&self) -> io::Result<()> {
+        match &self.storage_failure {
+            Some(error) => Err(io::Error::other(format!(
+                "log stopped after storage failure, reopen required: {error}"
+            ))),
+            None => Ok(()),
+        }
+    }
+
+    fn latched<T>(&mut self, result: io::Result<T>) -> io::Result<T> {
+        if let Err(error) = &result {
+            self.record_storage_failure(error.to_string());
+        }
+        result
+    }
+
     pub fn flush_buffers(&mut self) -> io::Result<u64> {
         self.flush_buffers_inner(
             #[cfg(feature = "writer-stage-trace")]
@@ -1075,6 +1117,18 @@ impl Log {
     }
 
     fn flush_buffers_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<u64> {
+        self.check_storage()?;
+        let result = self.flush_buffers_unguarded(
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        );
+        self.latched(result)
+    }
+
+    fn flush_buffers_unguarded(
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<u64> {
@@ -1161,6 +1215,18 @@ impl Log {
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<FsyncJob> {
+        self.check_storage()?;
+        let result = self.prepare_fsync_job_unguarded(
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        );
+        self.latched(result)
+    }
+
+    fn prepare_fsync_job_unguarded(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<FsyncJob> {
         self.flush_buffers_inner(
             #[cfg(feature = "writer-stage-trace")]
             tracer,
@@ -1204,6 +1270,22 @@ impl Log {
         elapsed: Duration,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
+        self.check_storage()?;
+        let result = self.finish_fsync_job_unguarded(
+            durable_end,
+            elapsed,
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        );
+        self.latched(result)
+    }
+
+    fn finish_fsync_job_unguarded(
+        &mut self,
+        durable_end: u64,
+        elapsed: Duration,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
         self.poll_manifest()?;
         self.stats.fsync += elapsed;
         self.durable_end = self.durable_end.max(durable_end);
@@ -1237,6 +1319,18 @@ impl Log {
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
+        self.check_storage()?;
+        let result = self.fsync_unguarded(
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        );
+        self.latched(result)
+    }
+
+    fn fsync_unguarded(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
         crate::drain_diagnostics::fsync(true);
         self.poll_manifest()?;
         observe_stage!(tracer, "fsync", (0, 0), {
@@ -1264,6 +1358,18 @@ impl Log {
     }
 
     fn fsync_files_and_update_manifest_inner(
+        &mut self,
+        #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
+    ) -> io::Result<()> {
+        self.check_storage()?;
+        let result = self.fsync_files_and_update_manifest_unguarded(
+            #[cfg(feature = "writer-stage-trace")]
+            tracer,
+        );
+        self.latched(result)
+    }
+
+    fn fsync_files_and_update_manifest_unguarded(
         &mut self,
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
@@ -1846,6 +1952,9 @@ impl Log {
     }
 
     pub fn shutdown(&mut self) -> io::Result<()> {
+        // A failed handle must not trim, sync or mark the log clean. Leaving
+        // the dirty flag forces the recovery scan on the next open.
+        self.check_storage()?;
         self.drain_manifest()?;
         self.flush_buffers()?;
         self.flush()?;
