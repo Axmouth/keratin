@@ -98,10 +98,28 @@ pub(super) fn read_selected(
     read_selected_with_budget(qh, offsets, scan_bytes)
 }
 
+/// Selected offsets at most this many records apart are read by scanning the
+/// records between them. Wider gaps are skipped with a fresh positioned read.
+/// Scanning a short run is cheaper than a positioned read, but scanning a long
+/// retained range is not, for example when an old redelivered or newly
+/// activated delayed message is polled with fresh ones. 64 had the lowest or
+/// near-lowest total cost in a sweep over 64 B and 1 KiB records, from the tail
+/// cache and from the file, with selections spaced 1 to 1024 records apart.
+const SELECTED_SCAN_GAP: u64 = 64;
+
 fn read_selected_with_budget(
     qh: &QueueHandleInner,
     offsets: &[(u64, u32)],
     scan_bytes: usize,
+) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
+    read_selected_with_limits(qh, offsets, scan_bytes, SELECTED_SCAN_GAP)
+}
+
+fn read_selected_with_limits(
+    qh: &QueueHandleInner,
+    offsets: &[(u64, u32)],
+    scan_bytes: usize,
+    scan_gap: u64,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
     if offsets.is_empty() {
         return Ok(Vec::new());
@@ -111,19 +129,32 @@ fn read_selected_with_budget(
             "selected offsets must increase".into(),
         ));
     }
-    let reader = qh.event_log().reader();
-    let mut next = offsets[0].0;
-    let stop = offsets
+    offsets
         .last()
         .unwrap()
         .0
         .checked_add(1)
         .ok_or_else(|| io_err("offset exhausted"))?;
+    let reader = qh.event_log().reader();
+    let mut next = offsets[0].0;
     let mut i = 0;
     let mut out = Vec::with_capacity(offsets.len());
-    while next < stop {
+    while i < offsets.len() {
+        let target = offsets[i].0;
+        // A skip lands on the selected offset itself, so a missing or
+        // misplaced record still fails the identity checks below.
+        if target - next > scan_gap {
+            next = target;
+        }
+        let mut run_end = target;
+        for &(offset, _) in &offsets[i + 1..] {
+            if offset - run_end - 1 > scan_gap {
+                break;
+            }
+            run_end = offset;
+        }
         let records = reader
-            .scan_from_with_byte_budget(next, (stop - next).min(4096) as usize, scan_bytes)
+            .scan_from_with_byte_budget(next, (run_end + 1 - next).min(4096) as usize, scan_bytes)
             .map_err(io_err)?;
         if records.is_empty() {
             return Err(StromaError::Corruption(

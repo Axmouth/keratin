@@ -23,7 +23,7 @@ use parking_lot::RwLock;
 
 use crate::durability::{DurableFrontier, DurableWatermark};
 use crate::reader::{OwnedRecord, ScanByteBudget, to_owned};
-use crate::record::decode_record_prefix;
+use crate::record::{decode_record_prefix, peek_record_prefix};
 
 /// One flush worth of encoded records, covering `[base_offset, next_offset)`.
 #[derive(Debug)]
@@ -223,21 +223,27 @@ impl TailCache {
             while pos < buf.len() {
                 // A damaged cache must miss, even after a valid prefix. The file
                 // path performs its normal validation of the durable records.
-                let (rec, used) = decode_record_prefix(&buf[pos..]).ok()?;
-                if rec.offset != decoded_next || rec.offset >= *next {
+                // Records before `from` are stepped over by length. A full
+                // decode of each would make a read near the end of a large
+                // flush batch cost a CRC pass over the whole batch.
+                let (offset, used) = peek_record_prefix(&buf[pos..]).ok()?;
+                if offset != decoded_next || offset >= *next {
                     return None;
                 }
                 decoded_next += 1;
-                if rec.offset >= from {
-                    if rec.offset != expected {
-                        return None;
-                    }
-                    budget.observe(&rec);
-                    out.push(to_owned(rec));
-                    expected += 1;
-                    if expected == upper || budget.finished {
-                        return Some(out);
-                    }
+                if offset < from {
+                    pos += used;
+                    continue;
+                }
+                let (rec, _) = decode_record_prefix(&buf[pos..]).ok()?;
+                if rec.offset != expected {
+                    return None;
+                }
+                budget.observe(&rec);
+                out.push(to_owned(rec));
+                expected += 1;
+                if expected == upper || budget.finished {
+                    return Some(out);
                 }
                 pos += used;
             }
@@ -276,6 +282,35 @@ mod tests {
             DurableWatermark::new(DurableFrontier::from_exclusive(durable_excl)),
             budget,
         )
+    }
+
+    #[test]
+    fn records_before_from_are_stepped_over_by_length() {
+        let (b, n, bytes) = encode_batch(0, 10, 32);
+        let mut record_starts = vec![0usize];
+        while record_starts.len() < 10 {
+            let (_, used) =
+                crate::record::decode_record_prefix(&bytes[*record_starts.last().unwrap()..])
+                    .unwrap();
+            record_starts.push(record_starts.last().unwrap() + used);
+        }
+        // A damaged payload is only detected when that record is returned.
+        let mut payload_damage = bytes.to_vec();
+        payload_damage[record_starts[2] + 40] ^= 0xff;
+        let c = cache(1 << 20, 10);
+        c.push_batch(b, n, payload_damage.into());
+        let records = c.read_from(5, 5).unwrap();
+        assert_eq!(
+            records.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            [5, 6, 7, 8, 9]
+        );
+        assert!(c.read_from(2, 1).is_none());
+        // A damaged length misaligns every later frame, so the read misses.
+        let mut length_damage = bytes.to_vec();
+        length_damage[record_starts[2] + 12] ^= 0x01;
+        let c = cache(1 << 20, 10);
+        c.push_batch(b, n, length_damage.into());
+        assert!(c.read_from(5, 5).is_none());
     }
 
     #[test]

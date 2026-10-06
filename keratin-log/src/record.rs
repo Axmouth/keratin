@@ -75,14 +75,21 @@ pub fn encode_record(dst: &mut Vec<u8>, r: &Record<'_>) -> Result<usize, RecordE
     Ok(dst.len() - start_len)
 }
 
-/// Attempt to decode a record from `buf` beginning at offset 0.
-/// On success, returns (record_meta, total_bytes_consumed, crc_ok).
-///
-/// This is designed for sequential scanning in recovery.
-pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usize), RecordError> {
-    // Fixed header without CRC (32 bytes)
-    // Need at least fixed header: magic(2)+ver(2)+flags(2)+res(2)+hlen(4)+plen(4)+ts(8)+off(8), crc (4) comes later
-    const FIXED: usize = 2 + 2 + 2 + 2 + 4 + 4 + 8 + 8;
+/// Fixed part of an encoded record, validated for magic, version and length.
+struct RecordFrame {
+    flags: u16,
+    header_len: usize,
+    payload_len: usize,
+    timestamp_ms: u64,
+    offset: u64,
+    total_len: usize,
+}
+
+// Fixed header without CRC: magic(2)+ver(2)+flags(2)+res(2)+hlen(4)+plen(4)+ts(8)+off(8).
+// The CRC (4) follows the payload.
+const FIXED: usize = 2 + 2 + 2 + 2 + 4 + 4 + 8 + 8;
+
+fn decode_frame(buf: &[u8]) -> Result<RecordFrame, RecordError> {
     if buf.len() < FIXED {
         return Err(RecordError::Truncated);
     }
@@ -118,6 +125,40 @@ pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usi
     if buf.len() < total_len {
         return Err(RecordError::Truncated);
     }
+
+    Ok(RecordFrame {
+        flags,
+        header_len,
+        payload_len,
+        timestamp_ms,
+        offset,
+        total_len,
+    })
+}
+
+/// Offset and encoded length of the record at the start of `buf`, without a
+/// CRC check. Readers use it to step over records before the requested start.
+/// Every record a reader returns still goes through `decode_record_prefix`.
+/// A damaged length misaligns the next frame, which then fails its magic,
+/// offset or CRC check.
+pub fn peek_record_prefix(buf: &[u8]) -> Result<(u64, usize), RecordError> {
+    let frame = decode_frame(buf)?;
+    Ok((frame.offset, frame.total_len))
+}
+
+/// Attempt to decode a record from `buf` beginning at offset 0.
+/// On success, returns (record_meta, total_bytes_consumed, crc_ok).
+///
+/// This is designed for sequential scanning in recovery.
+pub fn decode_record_prefix<'a>(buf: &'a [u8]) -> Result<(DecodedRecord<'a>, usize), RecordError> {
+    let RecordFrame {
+        flags,
+        header_len,
+        payload_len,
+        timestamp_ms,
+        offset,
+        total_len,
+    } = decode_frame(buf)?;
 
     let headers_start = FIXED;
     let headers_end = headers_start + header_len;

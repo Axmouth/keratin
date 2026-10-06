@@ -96,13 +96,21 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
         assert_eq!(h.work_queue().unwrap().settled_until().await, 1);
         for budget in [1, 1024, 1024 * 1024, 8 * 1024 * 1024] {
             // Cross chunk and segment boundaries, skip a delayed payload and
-            // metadata, and preserve exact selection and retry identity.
-            let selected = read_selected_with_budget(&h, &[(0, 0), (3, 1)], budget).unwrap();
-            assert_eq!(selected.iter().map(|m| m.0).collect::<Vec<_>>(), [0, 3]);
-            assert_eq!(selected[1].2, vec![42; 2048]);
-            assert_eq!(selected[1].3, 1);
-            assert!(read_selected_with_budget(&h, &[(2, 0)], budget).is_err());
-            assert!(read_selected_with_budget(&h, &[(5, 0)], budget).is_err());
+            // metadata, and preserve exact selection and retry identity. Gap 0
+            // skips every unselected record and u64::MAX scans all of them.
+            for gap in [0, 1, SELECTED_SCAN_GAP, u64::MAX] {
+                let read =
+                    |offsets: &[(u64, u32)]| read_selected_with_limits(&h, offsets, budget, gap);
+                let selected = read(&[(0, 0), (3, 1)]).unwrap();
+                assert_eq!(selected.iter().map(|m| m.0).collect::<Vec<_>>(), [0, 3]);
+                assert_eq!(selected[1].2, vec![42; 2048]);
+                assert_eq!(selected[1].3, 1);
+                assert_eq!(read(&[(1, 0), (4, 0)]).unwrap().len(), 2);
+                assert!(read(&[(2, 0)]).is_err());
+                assert!(read(&[(0, 0), (2, 0)]).is_err());
+                assert!(read(&[(5, 0)]).is_err());
+                assert!(read(&[(0, 0), (5, 0)]).is_err());
+            }
         }
         assert!(read_selected(&h, &[(2, 0)]).is_err());
         assert!(fetch_payload(&h, 2).unwrap().is_none());

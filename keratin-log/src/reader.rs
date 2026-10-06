@@ -8,7 +8,7 @@ use parking_lot::RwLock;
 
 use crate::Message;
 use crate::durability::DurableFrontier;
-use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix};
+use crate::record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix, peek_record_prefix};
 use crate::tail_cache::TailCache;
 
 #[derive(Debug, Clone)]
@@ -313,6 +313,15 @@ impl LogReader {
                 continue;
             }
 
+            // Step over records before the cursor by length, as in the tail
+            // cache. Anything unusual falls through to the full decode below.
+            if let Ok((offset, used)) = peek_record_prefix(&window[consumed..])
+                && offset < *cur
+            {
+                consumed += used;
+                continue;
+            }
+
             match decode_record_prefix(&window[consumed..]) {
                 Ok((rec, used)) => {
                     let rec_start = file_pos + consumed as u64;
@@ -392,6 +401,14 @@ impl LogReader {
                 let slice = &window[consumed..];
                 if slice.is_empty() {
                     break;
+                }
+
+                if let Some(want) = want
+                    && let Ok((offset, used)) = peek_record_prefix(slice)
+                    && offset < want
+                {
+                    consumed += used;
+                    continue;
                 }
 
                 match decode_record_prefix(slice) {
