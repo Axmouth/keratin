@@ -786,3 +786,22 @@ async fn retained_durable_cursor_missing_index_falls_back_with_same_integrity_bu
     assert!(limited.next_record(1024).is_err());
     log.shutdown().await.unwrap();
 }
+
+#[tokio::test]
+async fn open_refuses_segments_without_a_manifest() {
+    let dir = test_dir!("recovery_missing_manifest");
+    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    log.append(message(vec![1; 16]), Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+    log.shutdown().await.unwrap();
+    drop(log);
+    std::fs::remove_file(dir.root.join("manifest.bin")).unwrap();
+    let error = match Keratin::open(&dir.root, KeratinConfig::test_default()).await {
+        Ok(_) => panic!("lost metadata must not open as an empty log"),
+        Err(error) => error,
+    };
+    assert_eq!(error.kind(), std::io::ErrorKind::InvalidData);
+}

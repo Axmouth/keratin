@@ -413,6 +413,18 @@ impl Log {
             ));
         }
         crate::suffix_repair::resume(&root)?;
+        // The manifest is created before the first segment, so segments without
+        // one mean lost metadata, not a new log. Opening them as an empty log
+        // would silently drop their history.
+        if !Manifest::path(&root).try_exists()?
+            && root.join("segments").try_exists()?
+            && !list_segment_bases(&root.join("segments"))?.is_empty()
+        {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "log has segments but no manifest",
+            ));
+        }
         fs::create_dir_all(root.join("segments"))?;
         fs::create_dir_all(root.join("tmp"))?;
 
@@ -1529,6 +1541,10 @@ impl Log {
 
         let new_base = self.next_offset;
         let (mut seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
+        // Records in the new files are acknowledged once their file sync lands,
+        // so the directory entries must already be durable by then.
+        let synced = fsync_dir(&self.root.join("segments"));
+        self.latched(synced)?;
         let policy = self.prepare_segment_policy(&mut seg);
         self.active = seg;
         self.index = idx;
@@ -1672,12 +1688,6 @@ impl Log {
             return Ok(cur_head);
         }
 
-        // Must not delete data that might still be needed for durability semantics.
-        // We force durability before deleting anything.
-        self.flush_buffers()?;
-        self.fsync()?;
-        self.drain_manifest()?;
-
         let mut bases = self
             .segment_mapping
             .read()
@@ -1693,82 +1703,47 @@ impl Log {
             return Ok(before);
         }
 
-        // Active segment is the last base (by construction: you always roll to new_base=next_offset).
-        let (active_base, _) = *bases.last().expect("Already checked if empty");
-
-        // Identify deletable sealed bases (everything except active), using the property:
-        // sealed segment [base_i, base_{i+1}) => last_offset = base_{i+1}-1
-        let mut deletable: Vec<u64> = Vec::new();
-        for w in bases.windows(2) {
-            let (base, _) = w[0];
-            let (next_base, _) = w[1];
-            let last_offset = next_base.saturating_sub(1);
-
-            if last_offset < before {
-                deletable.push(base);
-            } else {
-                // since bases sorted and last_offset grows, we can stop early
-                break;
-            }
-        }
-
-        // Never delete the active segment in v0 (no mid-segment trim).
-        deletable.retain(|&b| b != active_base);
-
-        // If nothing deletable, we can still advance head only up to the first base >= before? No.
-        // In v0 we keep head truthful to "first readable". That is:
-        // if we didn't delete any segment, head doesn't change.
+        // Only sealed segments whose last offset is below `before` can go. The
+        // active segment is the last base and is never trimmed.
+        // A sealed segment [base_i, base_{i+1}) ends at base_{i+1} - 1.
+        let deletable = bases
+            .windows(2)
+            .take_while(|w| w[1].0.saturating_sub(1) < before)
+            .map(|w| w[0].0)
+            .collect::<Vec<u64>>();
+        // Without a deletion the first readable offset does not change.
         if deletable.is_empty() {
             return Ok(cur_head);
         }
 
-        // Delete files (best-effort: delete idx + log; ignore NotFound for idempotence)
+        // Make everything written so far durable before removing history.
+        self.flush_buffers()?;
+        self.fsync()?;
+        self.drain_manifest()?;
+
+        // Persist the new floor before unlinking, so a crash part way through
+        // never reopens with a head that points at a missing segment.
+        let new_head = bases[deletable.len()].0.max(cur_head);
+        self.manifest.head_offset = new_head;
+        self.manifest.store_atomic(&self.root)?;
+        self.log_state.head.store(new_head, Ordering::Release);
+
+        // Delete files (ignore NotFound so an interrupted truncate can finish)
         for base in &deletable {
             let lp = seg_log_path(&self.root, *base);
             let ip = seg_idx_path(&self.root, *base);
             self.segment_mapping.write().remove(base);
-
-            match fs::remove_file(&ip) {
-                Ok(_) => {
-                    tracing::info!("{} removed", ip.display())
+            for path in [&ip, &lp] {
+                match fs::remove_file(path) {
+                    Ok(()) => tracing::info!("{} removed", path.display()),
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        tracing::warn!("{} not found during truncating", path.display());
+                    }
+                    Err(e) => return Err(e),
                 }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    tracing::warn!("{} not found during truncating", ip.display());
-                }
-                Err(e) => return Err(e),
-            }
-            match fs::remove_file(&lp) {
-                Ok(_) => {
-                    tracing::info!("{} removed", lp.display())
-                }
-                Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                    tracing::warn!("{} not found during truncating", lp.display());
-                }
-                Err(e) => return Err(e),
             }
         }
-
-        // Compute new head = smallest remaining base (after deletions)
-        // let mut remaining = list_segment_bases(&seg_dir)?;
-        let mut remaining = self
-            .segment_mapping
-            .read()
-            .iter()
-            .map(|(k, v)| (*k, v.clone()))
-            .collect::<Vec<(u64, PathBuf)>>();
-        remaining.sort_unstable();
-
-        let new_head = remaining
-            .first()
-            .map(|(v, _)| v)
-            .copied()
-            .unwrap_or(self.next_offset)
-            .max(cur_head);
-
-        // Persist + publish head
-        self.manifest.head_offset = new_head;
-        self.manifest.store_atomic(&self.root)?;
-        self.log_state.head.store(new_head, Ordering::Release);
+        fsync_dir(&self.root.join("segments"))?;
 
         self.log_state.diagnostics.lock().record(
             LogControlKind::Truncated,
