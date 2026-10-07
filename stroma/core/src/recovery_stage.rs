@@ -534,11 +534,6 @@ impl Stroma {
         limits: RecoveryStageLimits,
         reuse_seal: Option<RecoverySealRequest>,
     ) -> Result<QueueRecoveryStage> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "recovery staging requires durable Unix metadata".into(),
-            ));
-        }
         self.validate_recovery_payload_layout(&spec)?;
         let resume_only = matches!(snapshot, SnapshotInput::Resume);
         let permit = self

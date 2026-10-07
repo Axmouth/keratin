@@ -69,10 +69,8 @@ impl Stroma {
         receipt: PreparedStorageHistory,
         intent: [u8; 32],
     ) -> Result<Self> {
-        if !cfg!(unix) || intent == [0; 32] || receipt.stream {
-            return Err(invalid(
-                "queue reseed requires an exact intent and durable directories",
-            ));
+        if intent == [0; 32] || receipt.stream {
+            return Err(invalid("queue reseed requires an exact queue intent"));
         }
         self.verify_admitted_storage_history(&receipt)?;
         let generation = recovery_generation(intent, self.storage_session);
@@ -368,10 +366,8 @@ impl Stroma {
         binding: StorageHistoryBinding,
         intent: [u8; 32],
     ) -> Result<PreparedStorageHistory> {
-        if !cfg!(unix) || intent == [0; 32] {
-            return Err(invalid(
-                "learner generation requires durable directories and an exact intent",
-            ));
+        if intent == [0; 32] {
+            return Err(invalid("learner generation requires an exact intent"));
         }
         let st = self.clone();
         let topic = topic.to_owned();

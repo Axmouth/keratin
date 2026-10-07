@@ -293,11 +293,6 @@ impl Stroma {
         storage: PreparedStorageHistory,
         attempt: [u8; 32],
     ) -> Result<QueueCheckpointBase> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "checkpoint retention requires Unix durable metadata".into(),
-            ));
-        }
         if storage.stream || attempt == [0; 32] {
             return Err(invalid("queue checkpoint pin requires a nonzero attempt"));
         }

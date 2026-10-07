@@ -1,3 +1,4 @@
+mod dir_sync;
 mod engine;
 mod event;
 mod global;

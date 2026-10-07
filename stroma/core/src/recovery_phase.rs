@@ -1,6 +1,7 @@
 //! Completed local inspection phases. Only this node's durable result directory
 //! may be opened here. These files are never accepted from peers as evidence.
 //! Fresh lineage, witness membership and activation authority remain external.
+use keratin_log::util::fsync_dir;
 use crate::{
     QueueInternalState,
     recovery_inspection::{
@@ -175,19 +176,13 @@ fn publish(root: &Path, name: &str, content: &[u8]) -> io::Result<()> {
     fs::rename(path, root.join(name))?;
     #[cfg(test)]
     phase_crash_gate(root, name, "renamed");
-    File::open(root)?.sync_all()?;
+    fsync_dir(root)?;
     #[cfg(test)]
     phase_crash_gate(root, name, "directory_synced");
     Ok(())
 }
 impl RecoveryPhaseStore {
     pub fn open(parent: &Path, recipe: RecoveryPhaseRecipe) -> io::Result<Self> {
-        if !cfg!(unix) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "phase persistence requires Unix directory sync",
-            ));
-        }
         recipe.inspector().map_err(invalid)?;
         let namespace = crate::recovery_cache::RecoveryCacheLease::acquire(parent)?;
         let identity = encode(&Identity {
@@ -206,9 +201,7 @@ impl RecoveryPhaseStore {
             .write(true)
             .open(root.join("lock"))?;
         lock.try_lock().map_err(io::Error::other)?;
-        for ancestor in fs::canonicalize(&root)?.ancestors() {
-            File::open(ancestor)?.sync_all()?;
-        }
+        crate::dir_sync::sync_dir_chain(&root)?;
         match read(&root.join("identity"))? {
             Some(saved) if saved != identity => return Err(invalid("phase identity mismatch")),
             Some(_) => {}

@@ -1,6 +1,7 @@
 //! Durable tentative inspection pages. A journal is a download cache, never a
 //! witness, verified digest, state artifact, source choice or activation receipt.
 //! Every restored page must pass the ordinary sealed inspector again.
+use keratin_log::util::fsync_dir;
 use crate::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, SealedReplicaFrontiers};
 use serde::{Deserialize, Serialize};
 use std::{
@@ -65,12 +66,6 @@ impl RecoveryInspectionJournal {
         identity: RecoveryJournalIdentity,
         limits: RecoveryJournalLimits,
     ) -> io::Result<Self> {
-        if !cfg!(unix) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "durable inspection journal requires Unix directory sync",
-            ));
-        }
         if identity.replica.is_empty() || identity.topic.is_empty() {
             return Err(invalid("empty inspection journal identity"));
         }
@@ -87,16 +82,13 @@ impl RecoveryInspectionJournal {
         )
         .map_err(io::Error::other)?;
         let namespace = crate::recovery_cache::RecoveryCacheLease::acquire(parent)?;
-        fs::create_dir_all(parent)?;
         let encoded = encode(&identity)?;
         if encoded.len() > 65536 {
             return Err(invalid("inspection journal identity exceeds limit"));
         }
         let root = parent.join(blake3::hash(&encoded).to_hex().as_str());
         fs::create_dir_all(&root)?;
-        for ancestor in fs::canonicalize(&root)?.ancestors() {
-            File::open(ancestor)?.sync_all()?;
-        }
+        crate::dir_sync::sync_dir_chain(&root)?;
         let lock = OpenOptions::new()
             .read(true)
             .write(true)
@@ -128,7 +120,7 @@ impl RecoveryInspectionJournal {
             Err(e) => return Err(e),
         }
         File::open(&path)?.sync_all()?;
-        File::open(&journal.root)?.sync_all()?;
+        fsync_dir(&journal.root)?;
         Ok(journal)
     }
 
@@ -251,7 +243,7 @@ impl RecoveryInspectionJournal {
                 return Err(invalid("conflicting inspection journal page"));
             }
             File::open(path)?.sync_all()?;
-            return File::open(&self.root)?.sync_all();
+            return fsync_dir(&self.root);
         }
         let payload = encode(&(request, page))?;
         if payload.len() as u64 > MAX_ENCODED {
@@ -280,7 +272,7 @@ impl RecoveryInspectionJournal {
                 fs::remove_file(entry.path())?;
             }
         }
-        File::open(&self.root)?.sync_all()?;
+        fsync_dir(&self.root)?;
         Ok(removed)
     }
 
@@ -310,7 +302,7 @@ impl RecoveryInspectionJournal {
         fs::rename(scratch, path)?;
         #[cfg(test)]
         journal_crash_gate(path, "renamed");
-        File::open(&self.root)?.sync_all()?;
+        fsync_dir(&self.root)?;
         #[cfg(test)]
         journal_crash_gate(path, "directory_synced");
         Ok(())

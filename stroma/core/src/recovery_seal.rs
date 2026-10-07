@@ -80,24 +80,10 @@ fn read_intent(path: &Path) -> Result<Option<SealIntent>> {
     Ok(Some(intent))
 }
 
-// Sync the whole ancestor chain: the snapshot path (or storage root itself)
-// may have been created without a durable parent entry. Retrying this also
-// completes a previous rename whose directory sync failed.
-#[cfg(unix)]
+/// Sync `path` and each ancestor up to the Stroma root that owns it. See
+/// `dir_sync::sync_dir_chain`.
 pub(super) fn sync_directories(path: &Path) -> Result<()> {
-    for ancestor in fs::canonicalize(path).map_err(io_err)?.ancestors() {
-        fs::File::open(ancestor)
-            .and_then(|file| file.sync_all())
-            .map_err(io_err)?;
-    }
-    Ok(())
-}
-
-#[cfg(not(unix))]
-pub(super) fn sync_directories(_path: &Path) -> Result<()> {
-    Err(StromaError::Unsupported(
-        "durable recovery seals require directory-sync support on this platform".into(),
-    ))
+    crate::dir_sync::sync_dir_chain(path).map_err(io_err)
 }
 
 fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
@@ -221,11 +207,6 @@ impl Stroma {
         expected_kind: PartitionKind,
         request: RecoverySealRequest,
     ) -> Result<SealedReplicaFrontiers> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "durable recovery seals require directory-sync support on this platform".into(),
-            ));
-        }
         let stroma = self.clone();
         let topic = topic.to_owned();
         let group = normalize_group(group).map(str::to_owned);

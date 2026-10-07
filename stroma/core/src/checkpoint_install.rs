@@ -230,9 +230,9 @@ impl Stroma {
         receipt: PreparedStorageHistory,
         install: FollowerStateCheckpointInstall,
     ) -> Result<FollowerStateCheckpointInstallOutcome> {
-        if !cfg!(unix) || receipt.stream {
+        if receipt.stream {
             return Err(StromaError::Unsupported(
-                "learner checkpoint requires Unix queue storage".into(),
+                "learner checkpoint requires queue storage".into(),
             ));
         }
         let (_, meta) = validate(&receipt.topic, receipt.partition, &install)?;
@@ -591,11 +591,6 @@ impl Stroma {
         let Some(journal) = self.checkpoint_journal(topic, part, group)? else {
             return Ok(lifecycle);
         };
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "checkpoint recovery requires durable directory sync on this platform".into(),
-            ));
-        }
         if excluded_learner {
             // The caller has checked the exact binding under this lifecycle
             // lock. Journal identity is bound to that same history above.

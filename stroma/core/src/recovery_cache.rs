@@ -1,5 +1,6 @@
 //! Bounded reclamation of private inspection caches after a transition retires.
 //! Active logs, recovery stages and installed receipts are outside this tree.
+use keratin_log::util::fsync_dir;
 use std::{
     fs::{self, File, OpenOptions},
     io,
@@ -83,7 +84,7 @@ fn journals(root: &Path, max_files: usize, result: &mut RecoveryCacheCleanup) ->
             }
         }
         if changed {
-            File::open(entry.path())?.sync_all()?;
+            fsync_dir(&entry.path())?;
         }
         if result.removed_files >= max_files {
             result.more = true;
@@ -112,7 +113,7 @@ fn phases(root: &Path, max_files: usize, result: &mut RecoveryCacheCleanup) -> i
         // after interruption sees an incomplete phase and can reconstruct it.
         let changed = remove(&entry.path().join("complete"), max_files, result)?;
         if changed {
-            File::open(entry.path())?.sync_all()?;
+            fsync_dir(&entry.path())?;
         }
         if result.removed_files >= max_files {
             result.more = true;
@@ -134,7 +135,7 @@ fn phases(root: &Path, max_files: usize, result: &mut RecoveryCacheCleanup) -> i
                 // Forget tentative progress durably before reclaiming the data.
                 let changed = remove(&artifact.path().join("progress"), max_files, result)?;
                 if changed {
-                    File::open(artifact.path())?.sync_all()?;
+                    fsync_dir(&artifact.path())?;
                 }
                 if result.removed_files >= max_files {
                     result.more = true;
@@ -146,10 +147,10 @@ fn phases(root: &Path, max_files: usize, result: &mut RecoveryCacheCleanup) -> i
                     return Ok(());
                 }
                 remove(&artifact.path().join("metadata.writing"), max_files, result)?;
-                File::open(artifact.path())?.sync_all()?;
+                fsync_dir(&artifact.path())?;
             }
         }
-        File::open(entry.path())?.sync_all()?;
+        fsync_dir(&entry.path())?;
         if result.removed_files >= max_files {
             result.more = true;
             return Ok(());
@@ -176,6 +177,10 @@ pub fn cleanup_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recov
     Ok(result)
 }
 
+/// Lock file of a cache namespace. Its presence also marks the namespace as
+/// the top of its storage tree for directory syncs.
+pub(crate) const NAMESPACE_LOCK: &str = ".namespace.lock";
+
 /// All resumable inspection work holds shared namespace ownership. Retirement
 /// takes exclusive ownership and leaves a durable marker to reject stale work.
 pub(crate) struct RecoveryCacheLease {
@@ -183,13 +188,13 @@ pub(crate) struct RecoveryCacheLease {
 }
 impl RecoveryCacheLease {
     pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
-        fs::create_dir_all(root)?;
+        crate::dir_sync::create_dir_all_synced(root)?;
         let file = OpenOptions::new()
             .create(true)
             .truncate(false)
             .read(true)
             .write(true)
-            .open(root.join(".namespace.lock"))?;
+            .open(root.join(NAMESPACE_LOCK))?;
         file.try_lock_shared().map_err(io::Error::other)?;
         if root.join("retired").try_exists()? {
             return Err(io::Error::new(
@@ -219,7 +224,7 @@ pub fn retire_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recove
         .truncate(false)
         .read(true)
         .write(true)
-        .open(root.join(".namespace.lock"))?;
+        .open(root.join(NAMESPACE_LOCK))?;
     match file.try_lock() {
         Ok(()) => {}
         Err(std::fs::TryLockError::WouldBlock) => {
@@ -235,16 +240,16 @@ pub fn retire_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recove
         let mut marker = File::create(root.join("retired"))?;
         marker.write_all(b"retired-v1\n")?;
         marker.sync_all()?;
-        File::open(root)?.sync_all()?;
+        fsync_dir(root)?;
     }
     File::open(root.join("retired"))?.sync_all()?;
-    File::open(root)?.sync_all()?;
+    fsync_dir(root)?;
     fn tree(path: &Path, max: usize, result: &mut RecoveryCacheCleanup) -> io::Result<()> {
         for entry in fs::read_dir(path)? {
             let entry = entry?;
             if result.removed_files >= max {
                 result.more = true;
-                File::open(path)?.sync_all()?;
+                fsync_dir(path)?;
                 return Ok(());
             }
             if entry.file_type()?.is_dir() {
@@ -261,7 +266,7 @@ pub fn retire_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recove
                 result.removed_bytes = result.removed_bytes.saturating_add(size);
             }
         }
-        File::open(path)?.sync_all()?;
+        fsync_dir(path)?;
         Ok(())
     }
     let mut result = RecoveryCacheCleanup::default();
@@ -286,7 +291,7 @@ pub fn retire_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recove
         let marker = File::create(root.join("reclaimed"))?;
         marker.sync_all()?;
     }
-    File::open(root)?.sync_all()?;
+    fsync_dir(root)?;
     Ok(result)
 }
 
@@ -354,7 +359,7 @@ impl RecoveryCacheSweep {
                 }
             };
             if !hashed_name(&path)
-                || !path.join(".namespace.lock").is_file()
+                || !path.join(NAMESPACE_LOCK).is_file()
                 || path.join("reclaimed").try_exists()?
                 || is_active(path.file_name().unwrap().to_str().unwrap())?
             {

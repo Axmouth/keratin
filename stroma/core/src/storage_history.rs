@@ -359,11 +359,6 @@ impl Stroma {
         &self,
         prepared: PreparedStorageHistory,
     ) -> Result<()> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "durable storage history requires directory sync".into(),
-            ));
-        }
         self.verify_prepared_storage_history(&prepared)?;
         let stroma = self.clone();
         tokio::spawn(async move {
@@ -405,11 +400,6 @@ impl Stroma {
         kind: PartitionKind,
         binding: StorageHistoryBinding,
     ) -> Result<()> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "durable storage history requires directory sync".into(),
-            ));
-        }
         validate(&binding)?;
         let group = normalize_group(group).map(str::to_owned);
         if kind == PartitionKind::Stream && group.is_some() {
@@ -451,11 +441,6 @@ impl Stroma {
         kind: PartitionKind,
         binding: StorageHistoryBinding,
     ) -> Result<PreparedStorageHistory> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "durable storage history requires directory sync".into(),
-            ));
-        }
         validate(&binding)?;
         let group = normalize_group(group).map(str::to_owned);
         if kind == PartitionKind::Stream && group.is_some() {
@@ -503,11 +488,6 @@ impl Stroma {
         kind: PartitionKind,
         binding: StorageHistoryBinding,
     ) -> Result<PreparedStorageHistory> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "durable storage history requires directory sync".into(),
-            ));
-        }
         validate(&binding)?;
         let group = normalize_group(group).map(str::to_owned);
         if kind == PartitionKind::Stream && group.is_some() {
@@ -553,11 +533,6 @@ impl Stroma {
         group: Option<&str>,
         binding: StorageHistoryBinding,
     ) -> Result<PreparedStorageHistory> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "learner storage requires durable directory sync".into(),
-            ));
-        }
         if self.storage_history_binding(topic, part, group)?.is_none() {
             self.resume_empty_storage_history(
                 topic,

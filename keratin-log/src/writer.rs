@@ -1073,10 +1073,9 @@ fn writer_loop(
                 if expected_epoch != log.current_epoch()
                     || next_offset < log.manifest.head_offset
                     || next_offset > log.next_offset()
-                    || !cfg!(unix)
                 {
                     let _ = respond_to.send(Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        "suffix repair requires the current epoch, a retained cut and Unix durability")));
+                        "suffix repair requires the current epoch and a retained cut")));
                     continue;
                 }
                 shutdown_fail_reqs(batcher.flush(), "writer repairing suffix", &notify_tx);

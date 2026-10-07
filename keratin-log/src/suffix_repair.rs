@@ -83,12 +83,6 @@ fn segment_base(path: &Path) -> io::Result<Option<u64>> {
 }
 
 pub(crate) fn prepare(root: &Path, manifest: &Manifest, next: u64) -> io::Result<()> {
-    if !cfg!(unix) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable suffix repair requires Unix directory sync",
-        ));
-    }
     if root.join(JOURNAL).try_exists()? {
         return Err(invalid("suffix repair already pending"));
     }
@@ -150,12 +144,6 @@ fn resume_with_hook(root: &Path, mut after: impl FnMut(u8) -> io::Result<()>) ->
         Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
         Err(e) => return Err(e),
     };
-    if !cfg!(unix) {
-        return Err(io::Error::new(
-            io::ErrorKind::Unsupported,
-            "durable suffix repair requires Unix directory sync",
-        ));
-    }
     if file.metadata()?.len() != SIZE as u64 {
         return Err(invalid("invalid suffix repair journal size"));
     }

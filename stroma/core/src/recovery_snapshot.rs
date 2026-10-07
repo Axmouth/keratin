@@ -1,5 +1,6 @@
 //! Resumable private snapshot transfer. Durable progress is tentative until the
 //! complete artifact matches the digest and length in the authorized plan.
+use keratin_log::util::fsync_dir;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -64,7 +65,7 @@ fn publish(root: &Path, name: &str, bytes: &[u8]) -> io::Result<()> {
     file.write_all(bytes)?;
     file.sync_all()?;
     fs::rename(scratch, root.join(name))?;
-    File::open(root)?.sync_all()
+    fsync_dir(root)
 }
 impl RecoverySnapshotFile {
     /// The caller supplies fresh authority for this exact identity. This file
@@ -74,12 +75,6 @@ impl RecoverySnapshotFile {
         identity: RecoverySnapshotIdentity,
         limits: RecoverySnapshotLimits,
     ) -> io::Result<Self> {
-        if !cfg!(unix) {
-            return Err(io::Error::new(
-                io::ErrorKind::Unsupported,
-                "snapshot transfer requires durable Unix metadata",
-            ));
-        }
         if identity.plan == [0; 32]
             || identity.bytes == 0
             || identity.bytes > limits.max_bytes
@@ -99,9 +94,7 @@ impl RecoverySnapshotFile {
             .write(true)
             .open(root.join("lock"))?;
         lock.try_lock().map_err(io::Error::other)?;
-        for ancestor in fs::canonicalize(&root)?.ancestors() {
-            File::open(ancestor)?.sync_all()?;
-        }
+        crate::dir_sync::sync_dir_chain(&root)?;
         match bounded_read(&root.join("identity"), 1024) {
             Ok(saved) if saved != encoded => return Err(invalid("snapshot identity changed")),
             Ok(_) => {}
@@ -140,7 +133,7 @@ impl RecoverySnapshotFile {
             data.set_len(next)?;
             data.sync_all()?;
         }
-        File::open(&root)?.sync_all()?;
+        fsync_dir(&root)?;
         Ok(Self {
             root,
             identity,

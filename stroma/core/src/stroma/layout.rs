@@ -21,7 +21,7 @@ use super::*;
 use keratin_log::util::fsync_dir;
 use std::ffi::OsString;
 
-pub(super) const MARKER: &str = "stroma-layout";
+pub(crate) const MARKER: &str = "stroma-layout";
 const MAGIC: &str = "stroma-layout";
 const VERSION: u32 = 2;
 pub(super) const GLOBAL: &str = "global";
@@ -158,12 +158,9 @@ pub(super) fn prepare_root(root: &Path) -> Result<()> {
     let names = match fs::read_dir(root) {
         Ok(_) => entry_names(root)?,
         Err(e) if e.kind() == io::ErrorKind::NotFound => {
-            fs::create_dir_all(root).map_err(io_err)?;
-            // The new root entry must survive a crash. Its parent is synced once
-            // here instead of on every later write.
-            if let Some(parent) = root.parent().filter(|p| !p.as_os_str().is_empty()) {
-                fsync_dir(parent).map_err(io_err)?;
-            }
+            // The new root entry must survive a crash. Its parent is synced
+            // here once instead of on every later write.
+            crate::dir_sync::create_dir_all_synced(root).map_err(io_err)?;
             Vec::new()
         }
         Err(e) => return Err(io_err(e)),

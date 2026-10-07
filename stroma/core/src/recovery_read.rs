@@ -227,11 +227,6 @@ impl Stroma {
         sequential: bool,
         mut cursor: Option<RecoverySequentialRead>,
     ) -> Result<(RecoveryReadPage, Option<RecoverySequentialRead>)> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "sealed recovery reads require Unix log locking".into(),
-            ));
-        }
         if request.max_bytes == 0
             || request.max_bytes > MAX_PAGE_BYTES
             || request.max_records == 0

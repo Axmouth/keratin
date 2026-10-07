@@ -82,7 +82,7 @@ mod checkpoint_capture;
 #[path = "stroma/combined.rs"]
 mod combined;
 #[path = "stroma/layout.rs"]
-mod layout;
+pub(crate) mod layout;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "replication_retention.rs"]
@@ -3320,13 +3320,8 @@ impl Stroma {
 
         fs::rename(&tmp, &final_path).map_err(io_err)?;
         // Publish the directory entry durably before any event-log compaction.
-        #[cfg(unix)]
-        {
-            recovery_seal::sync_directories(final_path.parent().unwrap())?;
-            if tmp.parent() != final_path.parent() {
-                recovery_seal::sync_directories(tmp.parent().unwrap())?;
-            }
-        }
+        recovery_seal::sync_directories(final_path.parent().unwrap())?;
+        keratin_log::util::fsync_dir(tmp.parent().unwrap()).map_err(io_err)?;
         Ok(())
     }
 
