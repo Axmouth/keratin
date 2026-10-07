@@ -264,17 +264,6 @@ async fn event_only_follower_keeps_payloads_and_overlap_does_not_repeat_nack() {
     st.shutdown().await.unwrap();
 }
 
-#[test]
-fn format_marker_requires_known_format_and_fresh_storage() {
-    let dir = keratin_log::test_dir!("combined_marker");
-    prepare_root(&dir.root).unwrap();
-    prepare_root(&dir.root).unwrap();
-    let other = dir.root.join("legacy");
-    std::fs::create_dir(&other).unwrap();
-    std::fs::write(other.join("existing"), b"data").unwrap();
-    assert!(prepare_root(&other).is_err());
-}
-
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn activation_uses_original_payload_and_cancelled_receiver_keeps_admitted_work() {
     let dir = keratin_log::test_dir!("combined_activation_cancel");
@@ -841,7 +830,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         let installed = target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap();
         assert!(target.queue_handle("q", 0, None).await.is_err());
         assert!(!target.msg_tp_part_dir("q", 0, None).exists());
-        target.recovery_routes.clear();
+        target.generations.clear();
         assert_eq!(target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap(), installed);
         target.admit_prepared_queue_recovery(installed.clone()).await.unwrap();
         target.ensure_queue_owner_epoch("q", 0, None, Some(8)).await.unwrap();
@@ -954,7 +943,7 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
 async fn combined_learner_checkpoint_crash_child() {
     let Some(root) = std::env::var_os("STROMA_COMBINED_LEARNER_CRASH_ROOT") else { return };
     let root = Path::new(&root);
-    let install = rmp_serde::from_slice(&fs::read(root.join("checkpoint-fixture")).unwrap()).unwrap();
+    let install = rmp_serde::from_slice(&fs::read(root.with_extension("fixture")).unwrap()).unwrap();
     let st = open(root).await;
     let binding = crate::StorageHistoryBinding {
         resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
@@ -1000,7 +989,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
             if hard_kill {
                 st.shutdown().await.unwrap();
                 drop(st);
-                fs::write(root.join("checkpoint-fixture"), rmp_serde::to_vec_named(&install).unwrap()).unwrap();
+                fs::write(root.with_extension("fixture"), rmp_serde::to_vec_named(&install).unwrap()).unwrap();
                 #[cfg(unix)]
                 {
                     struct KillOnDrop(std::process::Child);
@@ -1010,7 +999,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
                             let _ = self.0.wait();
                         }
                     }
-                    let ready = root.join("child-ready");
+                    let ready = root.with_extension("ready");
                     let mut child = KillOnDrop(std::process::Command::new(std::env::current_exe().unwrap())
                         .args(["--exact", "stroma::combined::tests::combined_learner_checkpoint_crash_child", "--nocapture"])
                         .env("STROMA_COMBINED_LEARNER_CRASH_ROOT", &root)
@@ -1191,7 +1180,7 @@ async fn combined_reseed_sigkill_preserves_recoverable_payloads_on_either_route(
     }
     for boundary in ["reseed_before_switch", "reseed_retired", "reseed_switched"] {
         let dir = keratin_log::test_dir!("combined_reseed_sigkill");
-        let ready = dir.root.join("child-ready");
+        let ready = dir.root.join("tmp/child-ready");
         let mut child = KillOnDrop(std::process::Command::new(std::env::current_exe().unwrap())
             .args(["--exact", "stroma::combined::tests::combined_reseed_crash_child", "--nocapture"])
             .env("STROMA_COMBINED_RESEED_CRASH_ROOT", &dir.root)

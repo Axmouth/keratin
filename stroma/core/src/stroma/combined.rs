@@ -1,36 +1,5 @@
 //! Queue payload identity is the containing event-log offset.
 use super::*;
-use std::io::Write;
-const MARKER: &str = "combined-queue-log.v1";
-const MAGIC: &[u8] = b"combined-queue-log-v1\n";
-
-pub(super) fn prepare_root(root: &Path) -> Result<()> {
-    let marker = root.join(MARKER);
-    if marker.exists() {
-        if fs::read(&marker).map_err(io_err)? != MAGIC {
-            return Err(StromaError::InvalidArgument(
-                "unsupported queue storage format marker".into(),
-            ));
-        }
-    } else {
-        if root.exists() && fs::read_dir(root).map_err(io_err)?.next().is_some() {
-            return Err(StromaError::InvalidArgument(
-                "single-log queue storage requires a fresh root, older layouts are unsupported".into(),
-            ));
-        }
-        fs::create_dir_all(root).map_err(io_err)?;
-        let mut file = fs::OpenOptions::new()
-            .create_new(true)
-            .write(true)
-            .open(marker)
-            .map_err(io_err)?;
-        file.write_all(MAGIC).map_err(io_err)?;
-        file.sync_all().map_err(io_err)?;
-        recovery_seal::sync_directories(root)?;
-    }
-    Ok(())
-}
-
 fn payload(record: keratin_log::OwnedRecord) -> Result<Option<(u64, Message)>> {
     match StromaEvent::decode(&record.payload).map_err(decode_err)? {
         StromaEvent::PayloadEnqueue {

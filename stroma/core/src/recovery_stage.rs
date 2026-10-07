@@ -343,7 +343,9 @@ impl QueueRecoveryStageSpec {
 
 impl Stroma {
     fn recovery_stage_root(&self, spec: &QueueRecoveryStageSpec) -> PathBuf {
-        self.root.join("recovery-staging").join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str())
+        self.partition_dir(&spec.topic, spec.partition, spec.group.as_deref())
+            .join(layout::STAGING)
+            .join(blake3::Hash::from_bytes(spec.plan).to_hex().as_str())
     }
 
     /// One bounded artifact step under caller-provided fresh plan authority.

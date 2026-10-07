@@ -643,7 +643,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
             "agreement_message_floor",
         ] {
             let dir = keratin_log::test_dir!("agreement_sigkill");
-            let ready = dir.root.join("ready");
+            let ready = dir.root.join("tmp/ready");
             let mut child = KillOnDrop(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args([

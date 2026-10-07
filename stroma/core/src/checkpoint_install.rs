@@ -1159,7 +1159,7 @@ mod tests {
             "intent", "messages", "events", "state", "snapshot", "complete",
         ] {
             let dir = test_dir!("checkpoint_sigkill");
-            let ready = dir.root.join("child-ready");
+            let ready = dir.root.join("tmp/child-ready");
             let mut child = KillOnDrop(
                 std::process::Command::new(std::env::current_exe().unwrap())
                     .args([

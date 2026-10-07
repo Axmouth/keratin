@@ -235,7 +235,7 @@ async fn stage_adopts_runtime_policy_on_open_and_resume() {
         .await
         .unwrap();
     assert!(runtime.logs().iter().any(
-        |log| log.root.to_string_lossy().contains("recovery-staging") && log.applied.revision == 1
+        |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 1
     ));
     stage.append(page(&spec, &records)).await.unwrap();
     let receipt = stage.finish().await.unwrap();
@@ -254,7 +254,7 @@ async fn stage_adopts_runtime_policy_on_open_and_resume() {
         .unwrap();
     assert_eq!(stage.finish().await.unwrap(), receipt);
     assert!(runtime.logs().iter().any(
-        |log| log.root.to_string_lossy().contains("recovery-staging") && log.applied.revision == 2
+        |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 2
     ));
     drop(stage);
     st.shutdown().await.unwrap();
@@ -383,7 +383,7 @@ async fn stage_crash_child() {
 async fn stage_resumes_after_sigkill_at_each_durable_boundary() {
     for boundary in ["intent", "initialized", "payloads", "complete"] {
         let dir = keratin_log::test_dir!("recovery_stage_sigkill");
-        let ready = dir.root.join("crash.ready");
+        let ready = dir.root.join("tmp/crash.ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -476,14 +476,14 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         .install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
         .await
         .unwrap();
-    // Accounting observes the routed generation without admitting the queue.
+    // Accounting observes the installed generation without admitting the queue.
     let usage = st.recovery_disk_usage().await.unwrap();
     assert!(usage.active_bytes > 0);
     assert!(usage.retained_bytes > 0);
     assert!(usage.staging_bytes > 0);
     // Simulate a visible pointer whose directory-sync response was lost before
-    // the in-memory route was published. An identical retry repairs admission.
-    st.recovery_routes.clear();
+    // the in-memory generation was published. An identical retry repairs admission.
+    st.generations.clear();
     assert_eq!(
         st.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage)
             .await
@@ -635,7 +635,7 @@ async fn install_crash_child() {
 async fn installation_sigkill_resumes_each_publication_boundary_without_old_source() {
     for boundary in ["retired", "messages", "prepared", "switched"] {
         let dir = keratin_log::test_dir!("install_sigkill");
-        let ready = dir.root.join("ready");
+        let ready = dir.root.join("tmp/ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",
@@ -850,7 +850,7 @@ async fn reuse_crash_child() {
 async fn reuse_resumes_after_kill_before_and_after_initialized_marker() {
     for boundary in ["reused-messages", "initialized"] {
         let dir = keratin_log::test_dir!("reuse_sigkill");
-        let ready = dir.root.join("ready");
+        let ready = dir.root.join("tmp/ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
             .args([
                 "--exact",

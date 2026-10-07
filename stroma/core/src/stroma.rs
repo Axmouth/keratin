@@ -81,6 +81,8 @@ mod agreed_checkpoint;
 mod checkpoint_capture;
 #[path = "stroma/combined.rs"]
 mod combined;
+#[path = "stroma/layout.rs"]
+mod layout;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "replication_retention.rs"]
@@ -818,7 +820,11 @@ pub struct Stroma {
     recovery_read_slots: Arc<Semaphore>,
     recovery_stream_slots: Arc<Semaphore>,
     recovery_stage_slots: Arc<Semaphore>,
-    recovery_routes: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), recovery_install::Route>>,
+    // Current generation of each partition, loaded from `partitions/` at open.
+    generations: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), layout::Generation>>,
+    // Set on a recovery view. It resolves only this one partition, to this
+    // generation, and never creates or resolves any other partition.
+    view_generation: Option<Arc<((Box<str>, u32, Option<Box<str>>), layout::Generation)>>,
     // A new storage instance cannot inherit writer admission from an old process.
     storage_session: [u8; 16],
     reseed_views: Arc<DashMap<[u8; 32], Stroma>>,
@@ -853,9 +859,6 @@ pub struct Stroma {
     /// serving corrupt state; `repair_partition` clears it. Default policy keeps
     /// the rest of the broker running (blast radius = the one queue).
     quarantined: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), QuarantineInfo>>,
-    // Stray dirs found by the partition scan, so each warns once per process
-    // instead of on every catalogue sweep.
-    scan_warned: Arc<DashMap<PathBuf, ()>>,
 
     /// `RecoveryMismatchPolicy` (Quarantine default / Refuse / Ignore), settable
     /// at startup. Shared so a clone observes a runtime change.
@@ -920,11 +923,7 @@ impl Stroma {
     ) -> Result<Self> {
         let start_time = Instant::now();
         let root = root.as_ref().to_path_buf();
-        combined::prepare_root(&root)?;
-        fs::create_dir_all(root.join("events")).map_err(io_err)?;
-        fs::create_dir_all(root.join("messages")).map_err(io_err)?;
-        fs::create_dir_all(root.join("snapshots")).map_err(io_err)?;
-        fs::create_dir_all(root.join("tmp")).map_err(io_err)?;
+        layout::prepare_root(&root)?;
 
         let metrics = Arc::new(StromaMetrics::new(60));
         let keratin_cfg_msg = keratin_cfg.message_log;
@@ -944,7 +943,8 @@ impl Stroma {
             recovery_read_slots: Arc::new(Semaphore::new(1)),
             recovery_stream_slots: Arc::new(Semaphore::new(2)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
-            recovery_routes: Arc::new(DashMap::new()),
+            generations: Arc::new(DashMap::new()),
+            view_generation: None,
             storage_session: *uuid::Uuid::now_v7().as_bytes(),
             reseed_views: Arc::new(DashMap::new()),
             retired_view: Arc::new(AtomicBool::new(false)),
@@ -955,7 +955,6 @@ impl Stroma {
             deadline_waker: Arc::new(Notify::new()),
             initial_recovery_complete: Arc::new(AtomicBool::new(false)),
             quarantined: Arc::new(DashMap::new()),
-            scan_warned: Arc::new(DashMap::new()),
             recovery_mismatch_policy: Arc::new(AtomicU8::new(
                 RecoveryMismatchPolicy::default().as_u8(),
             )),
@@ -971,7 +970,7 @@ impl Stroma {
             publish_apply_pause: Arc::new(std::sync::Mutex::new(None)),
         };
 
-        st.load_recovery_routes()?;
+        st.load_generations()?;
         st.load_global_dlq_setting().await?;
 
         // Discover persisted queues, but do not open logs or replay them yet.
@@ -1018,10 +1017,6 @@ impl Stroma {
         self.root.clone()
     }
 
-    fn events_root(&self) -> PathBuf {
-        self.root.join("events")
-    }
-
     pub fn metrics(&self) -> Arc<StromaMetrics> {
         self.metrics.clone()
     }
@@ -1029,8 +1024,8 @@ impl Stroma {
     pub async fn global_store(&self) -> Result<Arc<GlobalStore>> {
         self.global_store
             .get_or_try_init(|| async {
-                let dir = self.root.join("global");
-                fs::create_dir_all(&dir).map_err(io_err)?;
+                let dir = self.root.join(layout::GLOBAL);
+                layout::create_dir_within(&self.root, &dir)?;
                 let store = GlobalStore::open_with_runtime(
                     dir,
                     self.keratin_cfg_event,
@@ -1127,78 +1122,204 @@ impl Stroma {
         String::from_utf8(out).map_err(|e| StromaError::Decode(e.to_string()))
     }
 
-    fn msg_tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        let group = normalize_group(group);
-        let mut p = self.partition_root(tp, part, group).join("messages");
-        if let Some(g) = group {
-            p = p.join(Self::enc_component(g))
+    fn partition_key(tp: &str, part: u32, group: Option<&str>) -> (Box<str>, u32, Option<Box<str>>) {
+        (tp.into(), part, normalize_group(group).map(Into::into))
+    }
+
+    /// Directory holding every generation and the bookkeeping of one partition.
+    pub(super) fn partition_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        layout::partition_dir(&self.root, tp, part, group)
+    }
+
+    /// The generation this storage resolves for a partition. A recovery view
+    /// resolves only its own partition. Otherwise the cache is filled at open
+    /// and by every switch this storage makes. A miss reads `current` from
+    /// disk, for a partition another storage instance on the same root may
+    /// have created, without caching it, so a racing destroy cannot leave a
+    /// stale entry behind.
+    pub(super) fn partition_generation(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Option<layout::Generation> {
+        let key = Self::partition_key(tp, part, group);
+        if let Some(view) = &self.view_generation {
+            return (view.0 == key).then_some(view.1);
         }
-        p.join(Self::enc_component(tp))
-            .join(format!("{:010}", part))
+        if let Some(generation) = self.generations.get(&key) {
+            return Some(*generation);
+        }
+        match layout::read_current(&self.partition_dir(tp, part, group)) {
+            Ok(generation) => generation,
+            Err(err) => {
+                tracing::warn!("cannot read current generation of {tp}/{part}: {err}");
+                None
+            }
+        }
+    }
+
+    /// Root of the partition's current generation. A partition without one
+    /// resolves to a reserved name that nothing creates.
+    pub(super) fn partition_root(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        let dir = self.partition_dir(tp, part, group);
+        match self.partition_generation(tp, part, group) {
+            Some(generation) => dir.join(generation.name()),
+            None => dir.join(layout::NO_GENERATION),
+        }
+    }
+
+    /// Stream message log. Queues keep payloads in their event log and never
+    /// create this directory.
+    fn msg_tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        self.partition_root(tp, part, group).join(layout::MESSAGES)
     }
 
     fn tp_part_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        let group = normalize_group(group);
-        let mut p = self.partition_root(tp, part, group).join("events");
-        if let Some(g) = group {
-            p = p.join(Self::enc_component(g))
-        }
-        p.join(Self::enc_component(tp))
-            .join(format!("{:010}", part))
+        self.partition_root(tp, part, group).join(layout::LOG)
     }
 
     pub(crate) fn snap_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        let group = normalize_group(group);
-        let mut p = self.partition_root(tp, part, group).join("snapshots");
-        if let Some(g) = group {
-            p = p.join(Self::enc_component(g))
-        }
-        p.join(Self::enc_component(tp))
-            .join(format!("{:010}", part))
+        self.partition_root(tp, part, group).join(layout::STATE)
     }
 
     fn snap_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        self.snap_dir(tp, part, group)
-            .join(format!("{}.snap", Self::enc_component(tp)))
+        self.snap_dir(tp, part, group).join("snapshot")
     }
 
-    /// Per-partition marker recording which engine owns the partition. Lives in
-    /// the partition's snapshot directory so it persists across restarts. Absence
-    /// means a work queue (the default), so existing partitions need no marker and
-    /// no migration.
-    fn kind_marker_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        self.snap_dir(tp, part, group).join("partition.kind")
+    /// Per-partition recovery bookkeeping, shared by all generations.
+    pub(super) fn recovery_dir(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
+        self.partition_dir(tp, part, group).join(layout::RECOVERY)
     }
 
-    /// Read a partition's engine kind from its marker, defaulting to `Queue` when
-    /// the marker is missing or unreadable. Called on the materialization path
-    /// before spawning the control actor, so a stream partition spawns the stream
-    /// engine rather than the work queue.
-    fn read_partition_kind(&self, tp: &str, part: u32, group: Option<&str>) -> PartitionKind {
-        let path = self.kind_marker_file(tp, part, group);
-        match fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => PartitionKind::from_u8(bytes[0]).unwrap_or_default(),
-            _ => PartitionKind::Queue,
+    /// Create `dir`, a directory inside the partition's resolved generation.
+    /// Refused while the partition has no generation, so a write can never
+    /// land outside a generation that `current` or a recovery view names.
+    pub(super) fn create_generation_dir(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        dir: &Path,
+    ) -> Result<()> {
+        let root = self.partition_root(tp, part, group);
+        if self.partition_generation(tp, part, group).is_none() || !dir.starts_with(&root) {
+            return Err(StromaError::InvalidArgument(format!(
+                "partition {tp}/{part} has no storage generation to write into"
+            )));
+        }
+        layout::create_dir_within(&self.root, dir)
+    }
+
+    /// Make sure the partition exists with `kind`, so files can be written
+    /// into its current generation. A new partition gets its kind, an empty
+    /// initial generation and `current`, in that order, so a crash leaves
+    /// either a complete partition or a directory without `current`, which
+    /// is not served. A recovery view only creates its own generation and
+    /// never switches `current`. Callers hold the partition lifecycle lock.
+    pub(super) fn ensure_partition(
+        &self,
+        tp: &str,
+        part: u32,
+        group: Option<&str>,
+        kind: PartitionKind,
+    ) -> Result<()> {
+        let key = Self::partition_key(tp, part, group);
+        let dir = self.partition_dir(tp, part, group);
+        if let Some(view) = &self.view_generation {
+            if view.0 != key {
+                return Err(StromaError::InvalidArgument(
+                    "a recovery view cannot create another partition".into(),
+                ));
+            }
+            self.ensure_partition_kind(&dir, kind)?;
+            return layout::create_dir_within(&self.root, &dir.join(view.1.name()));
+        }
+        if self.partition_generation(tp, part, group).is_some() {
+            return match layout::read_kind(&dir)? {
+                Some(actual) if actual == kind => Ok(()),
+                Some(actual) => Err(StromaError::WrongPartitionKind {
+                    expected: kind,
+                    actual,
+                }),
+                None => Err(StromaError::Corruption(format!(
+                    "partition {tp}/{part} has a current generation but no kind"
+                ))),
+            };
+        }
+        // An interrupted first recovery installation must finish or fail. It
+        // never turns into a fresh empty partition.
+        if self
+            .recovery_dir(tp, part, group)
+            .join("started")
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Err(StromaError::Corruption(
+                "installed recovery lost its current generation".into(),
+            ));
+        }
+        self.ensure_partition_kind(&dir, kind)?;
+        let generation = layout::Generation::new_initial();
+        layout::create_dir_within(&self.root, &dir.join(generation.name()))?;
+        layout::write_current(&dir, &generation)?;
+        self.generations.insert(key, generation);
+        Ok(())
+    }
+
+    fn ensure_partition_kind(&self, dir: &Path, kind: PartitionKind) -> Result<()> {
+        layout::create_dir_within(&self.root, dir)?;
+        match layout::read_kind(dir)? {
+            Some(actual) if actual == kind => Ok(()),
+            Some(actual) => Err(StromaError::WrongPartitionKind {
+                expected: kind,
+                actual,
+            }),
+            None => layout::write_kind(dir, kind),
         }
     }
 
-    /// Read the kind marker WITHOUT defaulting: `None` means no marker exists yet
-    /// (never declared), distinct from a marker that says `Queue`. Used by the
-    /// declare paths to reject re-declaring a topic as the other channel kind.
+    /// Load the current generation of every partition at open.
+    fn load_generations(&self) -> Result<()> {
+        for found in layout::scan_partitions(&self.root)? {
+            if let Some(generation) = found.current {
+                self.generations.insert(
+                    Self::partition_key(&found.topic, found.part, found.group.as_deref()),
+                    generation,
+                );
+            }
+        }
+        Ok(())
+    }
+
+    /// Read a partition's engine kind, defaulting to `Queue` when the
+    /// partition does not exist yet. Called on the materialization path
+    /// before spawning the control actor, so a stream partition spawns the
+    /// stream engine rather than the work queue.
+    fn read_partition_kind(&self, tp: &str, part: u32, group: Option<&str>) -> PartitionKind {
+        self.partition_kind_marker(tp, part, group)
+            .unwrap_or(PartitionKind::Queue)
+    }
+
+    /// Read the kind WITHOUT defaulting: `None` means the partition was never
+    /// declared, distinct from one that says `Queue`. Used by the declare
+    /// paths to reject re-declaring a topic as the other channel kind.
     fn partition_kind_marker(
         &self,
         tp: &str,
         part: u32,
         group: Option<&str>,
     ) -> Option<PartitionKind> {
-        let path = self.kind_marker_file(tp, part, group);
-        match fs::read(&path) {
-            Ok(bytes) if !bytes.is_empty() => PartitionKind::from_u8(bytes[0]),
-            _ => None,
+        match layout::read_kind(&self.partition_dir(tp, part, group)) {
+            Ok(kind) => kind,
+            Err(err) => {
+                tracing::warn!("cannot read kind of {tp}/{part}: {err}");
+                None
+            }
         }
     }
 
-    /// Read a partition's durable engine-kind marker (Queue when absent). Exposed
+    /// Read a partition's durable engine kind (Queue when absent). Exposed
     /// so a caller can route a request to the stream or queue path before the
     /// partition is materialized in memory (e.g. a publish that arrives at a fresh
     /// owner after failover, before the stream channel is opened).
@@ -1206,12 +1327,8 @@ impl Stroma {
         self.read_partition_kind(tp, part, group)
     }
 
-    /// Persist a partition's engine kind. Written before the partition is first
-    /// materialized as a stream (a queue needs no marker). Uses write-temp +
-    /// fsync + rename so a crash mid-write never leaves a torn marker that would
-    /// be misread as the wrong engine. Safe under concurrent identical declares:
-    /// an existing matching marker short-circuits, and the temp name is unique
-    /// per writer so one writer's rename can never consume another's temp file.
+    /// Create the partition as `kind`, or confirm an existing partition has
+    /// that kind. The kind never changes once written.
     fn write_partition_kind(
         &self,
         tp: &str,
@@ -1219,47 +1336,15 @@ impl Stroma {
         group: Option<&str>,
         kind: PartitionKind,
     ) -> Result<()> {
-        if self.partition_kind_marker(tp, part, group) == Some(kind) {
-            return Ok(());
-        }
-        let final_path = self.kind_marker_file(tp, part, group);
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).map_err(io_err)?;
-        }
-        static KIND_TMP_SEQ: AtomicU64 = AtomicU64::new(0);
-        let tmp = final_path.with_extension(format!(
-            "kind.{}.new",
-            KIND_TMP_SEQ.fetch_add(1, Ordering::Relaxed)
-        ));
-        {
-            let mut f = fs::OpenOptions::new()
-                .create(true)
-                .truncate(true)
-                .write(true)
-                .open(&tmp)
-                .map_err(io_err)?;
-            use io::Write;
-            f.write_all(&[kind.as_u8()]).map_err(io_err)?;
-            f.flush().map_err(io_err)?;
-            f.sync_all().map_err(io_err)?;
-        }
-        fs::rename(&tmp, &final_path).map_err(io_err)?;
-        Ok(())
+        self.ensure_partition(tp, part, group, kind)
     }
 
-    fn snap_tmp_file(&self, tp: &str, part: u32, group: Option<&str>) -> PathBuf {
-        let group = normalize_group(group);
-        let p = self.root.join("tmp");
-        if let Some(g) = group {
-            p.join(format!(
-                "{}_{}_{}.snap.new",
-                Self::enc_component(g),
-                Self::enc_component(tp),
-                part,
-            ))
-        } else {
-            p.join(format!("{}_{}.snap.new", Self::enc_component(tp), part,))
-        }
+    // A unique name per write: partitions and recovery views never share a
+    // temporary snapshot. Leftovers are cleared with `tmp/` at open.
+    fn snap_tmp_file(&self) -> PathBuf {
+        self.root
+            .join(layout::TMP)
+            .join(format!("snapshot-{}.tmp", uuid::Uuid::now_v7()))
     }
 
     fn index_existing_queues(&self) -> Result<()> {
@@ -1315,8 +1400,9 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<Arc<Keratin>> {
+        self.ensure_partition(tp, part, group, self.read_partition_kind(tp, part, group))?;
         let dir = self.tp_part_dir(tp, part, group);
-        fs::create_dir_all(&dir).map_err(io_err)?;
+        self.create_generation_dir(tp, part, group, &dir)?;
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
         let k = self
@@ -1333,8 +1419,9 @@ impl Stroma {
     }
 
     async fn msg_log_init(&self, tp: &str, part: u32, group: Option<&str>) -> Result<Arc<Keratin>> {
+        self.ensure_partition(tp, part, group, PartitionKind::Stream)?;
         let dir = self.msg_tp_part_dir(tp, part, group);
-        fs::create_dir_all(&dir).map_err(io_err)?;
+        self.create_generation_dir(tp, part, group, &dir)?;
 
         tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
         let k = self
@@ -1893,51 +1980,46 @@ impl Stroma {
             if let Some(log) = qh.optional_message_log() { log.shutdown().await.map_err(io_err)?; }
         }
 
-        // 3. Rename the dirs aside while the tombstone still blocks reopen, then
-        //    drop the tombstone and wake any parked materializers (they
-        //    revalidate, find no slot, and recreate over a fresh empty dir).
-        let trashed = self.rename_partition_dirs_to_trash(topic, part, group)?;
+        // 3. Move the partition into trash while the tombstone still blocks
+        //    reopen, then drop the tombstone and wake any parked materializers
+        //    (they revalidate, find no slot, and recreate a fresh partition).
+        let trashed = self.move_partition_to_trash(topic, part, group)?;
         self.remove_queue(topic, part, group);
         tombstone.eviction_state.finish_eviction();
 
-        // 4. Delete the renamed trees unhurried; they share no path with any
-        //    live or recreated incarnation.
-        for dir in trashed {
-            if let Err(err) = tokio::fs::remove_dir_all(&dir).await {
-                tracing::warn!("destroy_partition: failed to delete {dir:?}: {err}");
-            }
+        // 4. Delete the moved tree unhurried. It shares no path with any live
+        //    or recreated incarnation, and open sweeps it after a crash.
+        if let Some(dir) = trashed
+            && let Err(err) = tokio::fs::remove_dir_all(&dir).await
+        {
+            tracing::warn!("destroy_partition: failed to delete {dir:?}: {err}");
         }
 
         Ok(DestroyOutcome::Destroyed)
     }
 
-    /// Atomically rename a partition's message, event, and snapshot dirs to
-    /// `<dir>.trash-<uuid>` siblings. Returns the trash paths that were created
-    /// (dirs that did not exist are skipped). The rename targets sit in the same
-    /// parent as the source, so the rename is a same-filesystem O(1) op.
-    fn rename_partition_dirs_to_trash(
+    /// Move the whole partition directory, every generation and its recovery
+    /// bookkeeping, into `trash/<uuid>` with one rename on the same
+    /// filesystem. Returns the trash path, or `None` when nothing existed.
+    fn move_partition_to_trash(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
-    ) -> Result<Vec<PathBuf>> {
-        let suffix = uuid::Uuid::now_v7();
-        let mut trashed = Vec::new();
-        for dir in [
-            self.msg_tp_part_dir(topic, part, group),
-            self.tp_part_dir(topic, part, group),
-            self.snap_dir(topic, part, group),
-        ] {
-            if !dir.exists() {
-                continue;
-            }
-            let mut trash = dir.clone().into_os_string();
-            trash.push(format!(".trash-{suffix}"));
-            let trash = PathBuf::from(trash);
-            fs::rename(&dir, &trash).map_err(io_err)?;
-            trashed.push(trash);
+    ) -> Result<Option<PathBuf>> {
+        let dir = self.partition_dir(topic, part, group);
+        let key = Self::partition_key(topic, part, group);
+        if !dir.try_exists().map_err(io_err)? {
+            self.generations.remove(&key);
+            return Ok(None);
         }
-        Ok(trashed)
+        let trash_dir = self.root.join(layout::TRASH);
+        let trash = trash_dir.join(uuid::Uuid::now_v7().to_string());
+        fs::rename(&dir, &trash).map_err(io_err)?;
+        self.generations.remove(&key);
+        keratin_log::util::fsync_dir(dir.parent().unwrap()).map_err(io_err)?;
+        keratin_log::util::fsync_dir(&trash_dir).map_err(io_err)?;
+        Ok(Some(trash))
     }
 
     /// Freeze an existing follower after its replication worker has stopped.
@@ -3186,7 +3268,7 @@ impl Stroma {
         let recovery_gate = qh.recovery_gate.clone();
         tokio::task::spawn_blocking(move || {
             recovery_gate.write_snapshot(snapshot_generation, &tp, part, group.as_deref(), || {
-                fs::create_dir_all(&dir).map_err(io_err)?;
+                stroma.create_generation_dir(&tp, part, group.as_deref(), &dir)?;
                 stroma.write_queue_snapshot(&tp, part, group.as_deref(), applied_upto, &blob)
             })
         })
@@ -3213,15 +3295,9 @@ impl Stroma {
         &self, tp: &str, part: u32, group: Option<&str>,
         version: u16, boundary: u64, blob: &[u8],
     ) -> Result<()> {
-        let tmp = self.snap_tmp_file(tp, part, group);
+        let tmp = self.snap_tmp_file();
         let final_path = self.snap_file(tp, part, group);
-
-        if let Some(parent) = tmp.parent() {
-            fs::create_dir_all(parent).map_err(io_err)?;
-        }
-        if let Some(parent) = final_path.parent() {
-            fs::create_dir_all(parent).map_err(io_err)?;
-        }
+        self.create_generation_dir(tp, part, group, final_path.parent().unwrap())?;
 
         let out = Self::queue_snapshot_envelope(version, boundary, blob)?;
 
@@ -3739,66 +3815,15 @@ impl Stroma {
         Ok(())
     }
 
+    /// Every partition with a current generation, walking
+    /// `partitions/<group>/<topic>/<part>`.
     pub fn discover_partitions(&self) -> Result<Vec<(Option<String>, String, u32)>> {
-        let root = self.events_root();
-
-        let mut out: Vec<_> = self.recovery_routes.iter().map(|r| (r.group.clone(), r.topic.clone(), r.partition)).collect();
-        if !root.exists() {
-            return Ok(out);
-        }
-
-        for lvl1 in fs::read_dir(&root).map_err(io_err)? {
-            let lvl1 = lvl1.map_err(io_err)?;
-            if !lvl1.file_type().map_err(io_err)?.is_dir() {
-                continue;
-            }
-
-            let lvl1_name_enc = lvl1.file_name().to_string_lossy().to_string();
-            let lvl1_path = lvl1.path();
-
-            // --- detect layout ---
-            let mut has_partition_dirs = false;
-
-            for e in fs::read_dir(&lvl1_path).map_err(io_err)? {
-                let e = e.map_err(io_err)?;
-                if e.file_type().map_err(io_err)?.is_dir()
-                    && e.file_name().to_string_lossy().parse::<u32>().is_ok()
-                {
-                    has_partition_dirs = true;
-                    break;
-                }
-            }
-
-            if has_partition_dirs {
-                // ---- legacy: lvl1 = topic ----
-                let tp = Self::dec_component(&lvl1_name_enc)?;
-                collect_parts_decoded(None, tp, &lvl1_path, &mut out, &self.scan_warned)?;
-            } else {
-                // ---- grouped: lvl1 = group ----
-                let group = Self::dec_component(&lvl1_name_enc)?;
-
-                for tp_ent in fs::read_dir(&lvl1_path).map_err(io_err)? {
-                    let tp_ent = tp_ent.map_err(io_err)?;
-                    if !tp_ent.file_type().map_err(io_err)?.is_dir() {
-                        continue;
-                    }
-
-                    let tp_enc = tp_ent.file_name().to_string_lossy().to_string();
-                    let tp = Self::dec_component(&tp_enc)?;
-
-                    collect_parts_decoded(
-                        Some(group.clone()),
-                        tp,
-                        &tp_ent.path(),
-                        &mut out,
-                        &self.scan_warned,
-                    )?;
-                }
-            }
-        }
-
+        let mut out: Vec<_> = layout::scan_partitions(&self.root)?
+            .into_iter()
+            .filter(|found| found.current.is_some())
+            .map(|found| (found.group, found.topic, found.part))
+            .collect();
         out.sort();
-        out.dedup();
         Ok(out)
     }
 
@@ -5584,54 +5609,6 @@ pub(crate) fn replicated_append_outcome_allows_state_apply(
             | ReplicatedAppendOutcome::AppliedSuffix { .. }
             | ReplicatedAppendOutcome::AlreadyPresent { .. }
     )
-}
-
-fn collect_parts_decoded(
-    group: Option<String>,
-    tp_enc: String,
-    tp_dir: &Path,
-    out: &mut Vec<(Option<String>, String, u32)>,
-    warned: &DashMap<PathBuf, ()>,
-) -> Result<()> {
-    for part_ent in fs::read_dir(tp_dir).map_err(io_err)? {
-        let part_ent = part_ent.map_err(io_err)?;
-        if !part_ent.file_type().map_err(io_err)?.is_dir() {
-            continue;
-        }
-
-        let part_str = part_ent.file_name().to_string_lossy().to_string();
-        let Ok(part) = part_str.parse::<u32>() else {
-            // Not a partition dir. A `<n>.trash-<uuid>` sibling is a destroy
-            // that crashed between its atomic rename-aside and the unhurried
-            // delete - finish the delete now. Anything else is unknown:
-            // leave it in place for a human, but never refuse to open the
-            // whole engine over a stray directory name.
-            if part_str.contains(".trash-") {
-                tracing::info!(
-                    "removing interrupted-destroy leftover {:?}",
-                    part_ent.path()
-                );
-                if let Err(err) = fs::remove_dir_all(part_ent.path()) {
-                    tracing::warn!(
-                        "could not remove destroy leftover {:?}: {err}",
-                        part_ent.path()
-                    );
-                }
-            } else if warned.insert(part_ent.path(), ()).is_none() {
-                // Once per process: the scan reruns on every catalogue sweep
-                // and a stray dir would otherwise warn forever.
-                tracing::warn!(
-                    "ignoring unrecognized dir {:?} while scanning partitions of `{tp_enc}`",
-                    part_ent.path()
-                );
-            }
-            continue;
-        };
-
-        out.push((group.clone(), tp_enc.clone(), part));
-    }
-
-    Ok(())
 }
 
 fn contiguous_spans(offsets: impl IntoIterator<Item = Offset>) -> Vec<(Offset, usize)> {
@@ -7705,44 +7682,58 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn stray_dirs_do_not_brick_the_partition_scan() {
-        let dir = test_dir!("stray_dirs_scan");
+    async fn partition_tree_refuses_unknown_entries_and_sweeps_trash_at_open() {
+        let dir = test_dir!("partition_tree_scan");
         let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
             .unwrap();
         stroma.materialize("orders", 0, None).await.unwrap();
+        shutdown_stroma("partition_tree/shutdown", &stroma).await;
+        drop(stroma);
 
-        // A destroy that crashed between its atomic rename-aside and the
-        // unhurried delete, plus a directory of unknown provenance (seen in
-        // the wild as a literal `deleted`). Neither may refuse the engine.
-        let topic_dir = stroma
-            .tp_part_dir("orders", 0, None)
-            .parent()
-            .expect("partition dir has a topic parent")
-            .to_path_buf();
-        let trash = topic_dir.join("0.trash-0198aa");
-        fs::create_dir_all(&trash).unwrap();
-        let stray = topic_dir.join("deleted");
-        fs::create_dir_all(&stray).unwrap();
-        shutdown_stroma("stray_dirs/shutdown", &stroma).await;
-
+        // A destroy that crashed after its rename into trash.
+        let trashed = dir.root.join("trash").join(uuid::Uuid::now_v7().to_string());
+        fs::create_dir_all(trashed.join("g-x/log")).unwrap();
+        fs::write(dir.root.join("tmp/snapshot.tmp"), b"partial").unwrap();
         let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
-            .expect("stray dirs must not fail the engine open");
-        let parts = reopened.discover_partitions().unwrap();
-        assert!(
-            parts.contains(&(None, "orders".to_string(), 0)),
-            "real partition survives the scan: {parts:?}"
+            .unwrap();
+        assert!(!trashed.exists(), "open sweeps interrupted destroys");
+        assert!(!dir.root.join("tmp/snapshot.tmp").exists(), "open clears scratch");
+        assert_eq!(
+            reopened.discover_partitions().unwrap(),
+            vec![(None, "orders".to_string(), 0)]
         );
-        assert!(
-            !trash.exists(),
-            "the interrupted destroy is finished at scan time"
-        );
-        assert!(
-            stray.exists(),
-            "an unknown dir is preserved for a human, not deleted"
-        );
-        shutdown_stroma("stray_dirs/reopen", &reopened).await;
+        let topic_dir = reopened
+            .partition_dir("orders", 0, None)
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        shutdown_stroma("partition_tree/reopen", &reopened).await;
+        drop(reopened);
+
+        // Anything Stroma would not write is refused, naming the entry.
+        for stray in [
+            topic_dir.join("deleted"),
+            topic_dir.join("0000000000").join("unexpected"),
+            topic_dir.join("0000000000").join(layout::NO_GENERATION),
+            dir.root.join("partitions").join("Bad%zz"),
+        ] {
+            fs::create_dir_all(&stray).unwrap();
+            let err = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+                .await
+                .err()
+                .expect("an unknown partition tree entry must refuse open");
+            assert!(
+                matches!(&err, StromaError::Corruption(m) if m.contains("unexpected entry")),
+                "{stray:?}: {err:?}"
+            );
+            fs::remove_dir_all(&stray).unwrap();
+        }
+        let reopened = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        shutdown_stroma("partition_tree/final", &reopened).await;
     }
 
     #[tokio::test]
@@ -7801,6 +7792,16 @@ mod tests {
             "event dir should be deleted after destroy"
         );
 
+        assert!(
+            !stroma.partition_dir("orders", 3, None).exists(),
+            "the whole partition moves out of the tree"
+        );
+        assert_eq!(
+            fs::read_dir(dir.root.join("trash")).unwrap().count(),
+            0,
+            "the trashed partition is deleted after the move"
+        );
+
         // A recreate (later grow reusing the index) starts from empty storage.
         test_step(
             "destroy_partition/rematerialize",
@@ -7809,8 +7810,10 @@ mod tests {
         .await
         .unwrap();
         assert_eq!(stroma.indexed_queue_count(), 1);
+        let recreated = stroma.tp_part_dir("orders", 3, None);
+        assert_ne!(recreated, event_dir, "a recreated partition gets a new generation");
         assert!(
-            event_dir.exists(),
+            recreated.exists(),
             "queue log directory should be recreated on materialize"
         );
         assert!(
@@ -7994,6 +7997,91 @@ mod tests {
         );
         destroy_materialize_storm(stroma.clone(), 40, 96).await;
         shutdown_stroma("destroy_materialize_storm_bear", &stroma).await;
+    }
+
+    #[tokio::test]
+    async fn current_generation_switch_survives_reopen_and_a_torn_switch_keeps_the_old_one() {
+        let dir = test_dir!("current_switch_reopen");
+        let open = || Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default());
+        let stroma = open().await.unwrap();
+        stroma.materialize("q", 0, None).await.unwrap();
+        let first = stroma.partition_generation("q", 0, None).unwrap();
+        assert!(matches!(first, layout::Generation::Initial(_)));
+        let first_log = stroma.tp_part_dir("q", 0, None);
+        assert!(first_log.is_dir());
+        shutdown_stroma("current_switch/first", &stroma).await;
+        drop(stroma);
+
+        let part_dir = layout::partition_dir(&dir.root, "q", 0, None);
+        let second = layout::Generation::Recovery {
+            plan: [3; 32],
+            instance: [4; 16],
+        };
+        fs::create_dir(part_dir.join(second.name())).unwrap();
+
+        // Crash after current.next was written but before its rename.
+        fs::write(part_dir.join("current.next"), format!("{}\n", second.name())).unwrap();
+        let reopened = open().await.unwrap();
+        assert_eq!(reopened.partition_generation("q", 0, None), Some(first));
+        assert_eq!(reopened.tp_part_dir("q", 0, None), first_log);
+        shutdown_stroma("current_switch/torn", &reopened).await;
+        drop(reopened);
+
+        // A completed switch is what the next open serves.
+        layout::write_current(&part_dir, &second).unwrap();
+        let reopened = open().await.unwrap();
+        assert_eq!(reopened.partition_generation("q", 0, None), Some(second));
+        assert_eq!(
+            reopened.tp_part_dir("q", 0, None),
+            part_dir.join(second.name()).join("log")
+        );
+        // The previous generation stays until a retention policy removes it.
+        assert!(first_log.is_dir());
+        shutdown_stroma("current_switch/switched", &reopened).await;
+    }
+
+    #[tokio::test]
+    async fn groups_resolve_to_separate_partition_trees_and_queues_have_no_message_log() {
+        let dir = test_dir!("group_trees");
+        let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
+            .await
+            .unwrap();
+        for group in [None, Some("@none"), Some("none"), Some("default")] {
+            stroma.materialize("q", 0, group).await.unwrap();
+        }
+        stroma.create_stream("s", 0, None).await.unwrap();
+        let none = stroma.partition_dir("q", 0, None);
+        assert_eq!(none, dir.root.join("partitions/@none/q/0000000000"));
+        assert_eq!(stroma.partition_dir("q", 0, Some("default")), none);
+        let named = stroma.partition_dir("q", 0, Some("@none"));
+        assert_eq!(named, dir.root.join("partitions/%40none/q/0000000000"));
+        assert_ne!(stroma.tp_part_dir("q", 0, None), stroma.tp_part_dir("q", 0, Some("@none")));
+        for group in [None, Some("@none"), Some("none")] {
+            assert!(stroma.tp_part_dir("q", 0, group).is_dir());
+            assert!(!stroma.msg_tp_part_dir("q", 0, group).exists());
+            assert_eq!(
+                fs::read(stroma.partition_dir("q", 0, group).join("kind")).unwrap(),
+                b"queue\n"
+            );
+        }
+        // Streams keep a separate message log in the same partition shape.
+        assert!(stroma.msg_tp_part_dir("s", 0, None).is_dir());
+        assert_eq!(
+            fs::read(stroma.partition_dir("s", 0, None).join("kind")).unwrap(),
+            b"stream\n"
+        );
+        assert_eq!(
+            stroma.discover_partitions().unwrap(),
+            vec![
+                (None, "q".to_string(), 0),
+                (None, "s".to_string(), 0),
+                (Some("@none".to_string()), "q".to_string(), 0),
+                (Some("none".to_string()), "q".to_string(), 0),
+            ]
+        );
+        // The kind never changes once written.
+        assert!(stroma.create_stream("q", 0, None).await.is_err());
+        shutdown_stroma("group_trees", &stroma).await;
     }
 
     #[tokio::test]

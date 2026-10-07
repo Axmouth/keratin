@@ -24,48 +24,16 @@ impl Stroma {
         let st = self.clone();
         tokio::task::spawn_blocking(move || {
             let _permit = permit;
-            let routes = || {
-                let keys = st
-                    .recovery_routes
+            let generations = || {
+                st.generations
                     .iter()
-                    .map(|r| (r.topic.clone(), r.partition, r.group.clone()))
-                    .collect::<Vec<_>>();
-                keys.into_iter()
-                    .map(|(topic, part, group)| {
-                        let root = st.partition_root(&topic, part, group.as_deref());
-                        (topic, part, group, root)
-                    })
+                    .map(|g| (g.key().clone(), g.value().name()))
                     .collect::<BTreeSet<_>>()
             };
-            let before = routes();
-            let mut active = HashSet::new();
-            // Only routed partitions need explicit overrides. Ordinary log trees
-            // remain active without discovering or loading every queue.
-            let mut replaced = HashSet::new();
-            for (topic, part, group, _) in &before {
-                active.insert(st.msg_tp_part_dir(topic, *part, group.as_deref()));
-                active.insert(st.tp_part_dir(topic, *part, group.as_deref()));
-                active.insert(st.snap_dir(topic, *part, group.as_deref()));
-                for kind in ["messages", "events", "snapshots"] {
-                    let mut path = st.root.join(kind);
-                    if let Some(group) = group {
-                        path.push(Self::enc_component(group));
-                    }
-                    replaced.insert(
-                        path.join(Self::enc_component(topic))
-                            .join(format!("{part:010}")),
-                    );
-                }
-            }
-            let report = scan(
-                &st.root,
-                &active,
-                &replaced,
-                100_000,
-                Duration::from_secs(5),
-            )?;
-            if routes() != before {
-                return Err(io_err("storage routes changed during disk sample"));
+            let before = generations();
+            let report = scan(&st.root, 100_000, Duration::from_secs(5))?;
+            if generations() != before {
+                return Err(io_err("storage generations changed during disk sample"));
             }
             Ok(report)
         })
@@ -76,60 +44,54 @@ impl Stroma {
 
 // Lower numbers win when an inode is shared across categories. A retained hard
 // link to active data consumes no additional blocks and is attributed to active.
+//
+// `currents` caches each partition's current generation name, read once per
+// sample from `partitions/<group>/<topic>/<part>/current`.
 fn category(
     root: &Path,
     path: &Path,
-    active: &HashSet<PathBuf>,
-    replaced: &HashSet<PathBuf>,
+    currents: &mut HashMap<PathBuf, Option<String>>,
 ) -> usize {
-    if let Some(partition) = path.ancestors().find(|p| active.contains(*p)) {
-        return if path
-            .strip_prefix(partition)
-            .ok()
-            .and_then(|p| p.components().next())
-            .is_some_and(|p| p.as_os_str() == "agreed-checkpoints")
-        {
-            1
-        } else {
-            0
-        };
+    let Ok(relative) = path.strip_prefix(root.join(layout::PARTITIONS)) else {
+        return 4;
+    };
+    let parts: Vec<_> = relative.components().map(|c| c.as_os_str()).collect();
+    if parts.len() < 5 {
+        return 4;
     }
-    if path.starts_with(root.join("recovery-installed"))
-        || path.ancestors().any(|p| replaced.contains(p))
-    {
-        return 2;
-    }
-    if path.starts_with(root.join("recovery-staging")) {
+    let part_dir = root
+        .join(layout::PARTITIONS)
+        .join(parts[0])
+        .join(parts[1])
+        .join(parts[2]);
+    let entry = parts[3].to_string_lossy();
+    if entry == layout::STAGING {
         return 3;
     }
-    if ["messages", "events", "snapshots"]
-        .iter()
-        .any(|name| path.starts_with(root.join(name)))
-    {
-        let checkpoint = path
-            .strip_prefix(root.join("snapshots"))
-            .ok()
-            .is_some_and(|p| {
-                let parts: Vec<_> = p.components().map(|p| p.as_os_str()).collect();
-                [1, 2].into_iter().any(|i| {
-                    parts.get(i).is_some_and(|part| {
-                        let text = part.to_string_lossy();
-                        text.len() == 10 && text.bytes().all(|c| c.is_ascii_digit())
-                    }) && parts.get(i + 1).is_some_and(|p| *p == "agreed-checkpoints")
-                })
-            });
-        return if checkpoint { 1 } else { 0 };
+    if layout::Generation::parse(&entry).is_none() {
+        return 4;
     }
-    4
+    let current = currents
+        .entry(part_dir.clone())
+        .or_insert_with(|| {
+            layout::read_current(&part_dir)
+                .ok()
+                .flatten()
+                .map(|g| g.name())
+        });
+    if current.as_deref() != Some(&*entry) {
+        return 2;
+    }
+    if parts.get(4).is_some_and(|p| *p == layout::STATE)
+        && parts.get(5).is_some_and(|p| *p == "agreed-checkpoints")
+    {
+        1
+    } else {
+        0
+    }
 }
 
-fn scan(
-    root: &Path,
-    active: &HashSet<PathBuf>,
-    replaced: &HashSet<PathBuf>,
-    max_entries: usize,
-    max_time: Duration,
-) -> Result<RecoveryDiskUsage> {
+fn scan(root: &Path, max_entries: usize, max_time: Duration) -> Result<RecoveryDiskUsage> {
     let start = Instant::now();
     let mut report = RecoveryDiskUsage {
         basis: if cfg!(unix) {
@@ -143,6 +105,7 @@ fn scan(
     let mut pending = vec![root.to_owned()];
     let mut visited = 0;
     let mut totals = [0u64; 5];
+    let mut currents = HashMap::new();
     #[cfg(unix)]
     let mut inodes: HashMap<(u64, u64), (usize, u64)> = HashMap::new();
     while let Some(dir) = pending.pop() {
@@ -184,7 +147,7 @@ fn scan(
                 continue;
             }
             report.files += 1;
-            let kind = category(root, &path, active, replaced);
+            let kind = category(root, &path, &mut currents);
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -219,22 +182,34 @@ mod tests {
     use super::*;
     #[test]
     fn categories_distinguish_active_replacement_old_generation_and_checkpoints() {
-        let root = Path::new("/store");
-        let active = HashSet::from([root.join("recovery-installed/new/events/q/0000000000")]);
-        let replaced = HashSet::from([root.join("events/q/0000000000")]);
+        let dir = std::env::temp_dir().join(format!("recovery-disk-{}", uuid::Uuid::now_v7()));
+        struct Cleanup(PathBuf);
+        impl Drop for Cleanup {
+            fn drop(&mut self) {
+                let _ = fs::remove_dir_all(&self.0);
+            }
+        }
+        let _cleanup = Cleanup(dir.clone());
+        let root = dir.as_path();
+        let new = layout::Generation::new_initial().name();
+        let old = layout::Generation::new_initial().name();
+        let part = root.join("partitions/@none/q/0000000000");
+        fs::create_dir_all(&part).unwrap();
+        fs::write(part.join("current"), format!("{new}\n")).unwrap();
         for (path, want) in [
-            ("recovery-installed/new/events/q/0000000000/segment", 0),
-            ("recovery-installed/old/events/q/0000000000/segment", 2),
-            ("events/q/0000000000/segment", 2),
-            ("events/another/0000000000/segment", 0),
-            ("events/agreed-checkpoints/0000000000/segment", 0),
-            ("snapshots/agreed-checkpoints/0000000000/snapshot", 0),
-            ("snapshots/another/0000000000/agreed-checkpoints/base", 1),
-            ("recovery-staging/plan/messages/segment", 3),
-            ("recovery-routes/route/active", 4),
+            (format!("partitions/@none/q/0000000000/{new}/log/segment"), 0),
+            (format!("partitions/@none/q/0000000000/{old}/log/segment"), 2),
+            (format!("partitions/@none/q/0000000000/{new}/state/snapshot"), 0),
+            (format!("partitions/@none/q/0000000000/{new}/state/agreed-checkpoints/base"), 1),
+            (format!("partitions/@none/q/0000000000/{old}/state/agreed-checkpoints/base"), 2),
+            ("partitions/@none/q/0000000000/staging/plan/messages/segment".into(), 3),
+            ("partitions/@none/q/0000000000/recovery/started".into(), 4),
+            ("partitions/@none/q/0000000000/current".into(), 4),
+            (format!("partitions/@none/other/0000000000/{new}/log/segment"), 2),
+            ("global/segment".into(), 4),
         ] {
             assert_eq!(
-                category(root, &root.join(path), &active, &replaced),
+                category(root, &root.join(&path), &mut HashMap::new()),
                 want,
                 "{path}"
             );
@@ -254,22 +229,18 @@ mod tests {
         }
         let _cleanup = Cleanup(dir.clone());
         let root = dir.as_path();
-        fs::create_dir_all(root.join("events/q")).unwrap();
-        fs::create_dir_all(root.join("recovery-staging/p")).unwrap();
-        let file = root.join("events/q/data");
+        let generation = layout::Generation::new_initial().name();
+        let part = root.join("partitions/@none/q/0000000000");
+        fs::create_dir_all(part.join(&generation).join("log")).unwrap();
+        fs::create_dir_all(part.join("staging/p")).unwrap();
+        fs::write(part.join("current"), format!("{generation}\n")).unwrap();
+        let file = part.join(&generation).join("log/data");
         fs::write(&file, vec![1u8; 4096]).unwrap();
-        fs::hard_link(&file, root.join("recovery-staging/p/shared")).unwrap();
-        let sparse = fs::File::create(root.join("recovery-staging/p/sparse")).unwrap();
+        fs::hard_link(&file, part.join("staging/p/shared")).unwrap();
+        let sparse = fs::File::create(part.join("staging/p/sparse")).unwrap();
         sparse.set_len(64 * 1024 * 1024).unwrap();
         symlink(root, root.join("cycle")).unwrap();
-        let report = scan(
-            root,
-            &HashSet::new(),
-            &HashSet::new(),
-            100,
-            Duration::from_secs(5),
-        )
-        .unwrap();
+        let report = scan(root, 100, Duration::from_secs(5)).unwrap();
         assert_eq!(
             report.active_bytes,
             fs::metadata(file).unwrap().blocks() * 512
@@ -280,14 +251,7 @@ mod tests {
         );
         assert_eq!(report.skipped_entries, 1);
         assert!(
-            scan(
-                root,
-                &HashSet::new(),
-                &HashSet::new(),
-                1,
-                Duration::from_secs(5)
-            )
-            .is_err()
+            scan(root, 1, Duration::from_secs(5)).is_err()
         );
     }
 }

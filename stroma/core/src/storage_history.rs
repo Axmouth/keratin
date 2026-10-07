@@ -801,6 +801,10 @@ impl Stroma {
                     ));
                 }
             }
+            // Paths above resolved before the partition had a generation.
+            self.ensure_partition(topic, part, group, kind)?;
+            let path = self.storage_history_path(topic, part, group);
+            let intent_path = self.snap_dir(topic, part, group).join("storage.preparing");
             // Persist intent before creating log files. A crash here must leave
             // a resumable closed preparation, never an unbound legacy queue.
             if !admit {
@@ -909,7 +913,10 @@ impl Stroma {
         if admit {
             // A permanent marker also rules out empty re-preparation after a
             // process restart. Publish it before making any writer accessible.
-            recovery_stage::persist_exact(&activated_path, b"activated")?;
+            recovery_stage::persist_exact(
+                &self.snap_dir(topic, part, group).join("storage.activated"),
+                b"activated",
+            )?;
             self.admitted_histories.insert(key, binding);
         }
         Ok(())
@@ -1079,9 +1086,12 @@ mod tests {
         st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
             .await
             .unwrap();
-        assert!(
-            st.partition_root("q", 0, None)
-                .starts_with(dir.root.join("recovery-installed"))
+        assert_eq!(
+            st.partition_generation("q", 0, None),
+            Some(layout::Generation::Recovery {
+                plan: [41; 32],
+                instance: st.storage_session
+            })
         );
         st.shutdown().await.unwrap();
     }
@@ -1145,7 +1155,7 @@ mod tests {
     async fn reseed_sigkill_keeps_complete_recovery_evidence_on_either_side_of_switch() {
         for boundary in ["reseed_before_switch", "reseed_retired", "reseed_switched"] {
             let dir = keratin_log::test_dir!("reseed_sigkill");
-            let ready = dir.root.join("child.ready");
+            let ready = dir.root.join("tmp/child.ready");
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1237,7 +1247,7 @@ mod tests {
     async fn learner_generation_sigkill_preserves_old_data_and_resumes_new_route() {
         for boundary in ["learner_prepared", "learner_retired", "learner_switched"] {
             let dir = keratin_log::test_dir!("learner_generation_sigkill");
-            let ready = dir.root.join("child.ready");
+            let ready = dir.root.join("tmp/child.ready");
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -1942,7 +1952,7 @@ mod tests {
     async fn preparation_sigkill_resumes_intent_logs_and_receipt() {
         for boundary in ["intent", "logs", "receipt"] {
             let dir = keratin_log::test_dir!("preparation_sigkill");
-            let marker = dir.root.join("crash.ready");
+            let marker = dir.root.join("tmp/crash.ready");
             let mut child = std::process::Command::new(std::env::current_exe().unwrap())
                 .args([
                     "--exact",
@@ -2016,7 +2026,7 @@ mod tests {
             .await
             .unwrap();
         rx.await.unwrap().unwrap();
-        fs::write(root.join("crash.ready"), b"ready").unwrap();
+        fs::write(root.join("tmp/crash.ready"), b"ready").unwrap();
         std::future::pending::<()>().await;
     }
 
@@ -2035,7 +2045,7 @@ mod tests {
             .unwrap();
         let reached = tokio::time::timeout(Duration::from_secs(20), async {
             loop {
-                if dir.root.join("crash.ready").exists() {
+                if dir.root.join("tmp/crash.ready").exists() {
                     return true;
                 }
                 if child.try_wait().unwrap().is_some() {
@@ -2233,12 +2243,14 @@ mod tests {
         stroma
             .write_partition_kind("other", 0, None, PartitionKind::Queue)
             .unwrap();
-        fs::write(stroma.storage_history_path("other", 0, None), &original).unwrap();
+        let other = stroma.storage_history_path("other", 0, None);
+        fs::create_dir_all(other.parent().unwrap()).unwrap();
+        fs::write(other, &original).unwrap();
         assert!(matches!(
             stroma.queue_handle("other", 0, None).await,
             Err(StromaError::Corruption(_))
         ));
-        fs::remove_file(stroma.kind_marker_file("q", 0, None)).unwrap();
+        fs::remove_file(stroma.partition_dir("q", 0, None).join("kind")).unwrap();
         assert!(matches!(
             stroma.queue_handle("q", 0, None).await,
             Err(StromaError::Corruption(_))

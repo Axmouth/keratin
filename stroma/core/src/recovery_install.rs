@@ -1,5 +1,6 @@
-//! Crash-safe recovery installation: build a complete generation, then publish
-//! one durable route. Sealed generations remain available for recovery reads.
+//! Crash-safe recovery installation: build a complete generation, then switch
+//! the partition's `current` to it. Sealed generations remain available for
+//! recovery reads.
 use super::recovery_stage::{persist_exact, read_bounded};
 use super::*;
 use keratin_log::lock_existing_log;
@@ -13,30 +14,21 @@ pub struct PreparedQueueRecovery {
     pub storage: PreparedStorageHistory,
 }
 
+/// Durable pointer to a generation kept as recovery evidence, stored in the
+/// partition's `recovery/` directory.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
-pub(super) struct Route {
-    pub topic: String,
-    pub partition: u32,
-    pub group: Option<String>,
-    generation: Option<Generation>,
-}
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(deny_unknown_fields)]
-struct Generation {
-    plan: [u8; 32],
-    instance: [u8; 16],
+struct GenerationRecord {
+    topic: String,
+    partition: u32,
+    group: Option<String>,
+    generation: String,
 }
 fn invalid(message: impl Into<String>) -> StromaError {
     StromaError::InvalidArgument(message.into())
 }
 fn key(topic: &str, part: u32, group: Option<&str>) -> (Box<str>, u32, Option<Box<str>>) {
     (topic.into(), part, normalize_group(group).map(Into::into))
-}
-fn route_id(topic: &str, part: u32, group: Option<&str>) -> String {
-    let bytes =
-        rmp_serde::to_vec(&(topic, part, normalize_group(group))).expect("resource serializes");
-    blake3::hash(&bytes).to_hex().to_string()
 }
 fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
     read_bounded(path, MAX_META)?
@@ -46,34 +38,31 @@ fn read_meta<T: serde::de::DeserializeOwned>(path: &Path) -> Result<Option<T>> {
 fn save_meta<T: Serialize>(path: &Path, value: &T) -> Result<()> {
     persist_exact(path, &rmp_serde::to_vec_named(value).map_err(encode_err)?)
 }
-impl Route {
-    fn root(&self, root: &Path) -> PathBuf {
-        match &self.generation {
-            None => root.to_owned(),
-            Some(g) => root
-                .join("recovery-installed")
-                .join(blake3::Hash::from_bytes(g.plan).to_hex().as_str())
-                .join(uuid::Uuid::from_bytes(g.instance).to_string()),
+fn recovery_generation(plan: [u8; 32], instance: [u8; 16]) -> layout::Generation {
+    layout::Generation::Recovery { plan, instance }
+}
+impl GenerationRecord {
+    fn new(topic: &str, part: u32, group: Option<&str>, generation: layout::Generation) -> Self {
+        Self {
+            topic: topic.to_owned(),
+            partition: part,
+            group: normalize_group(group).map(str::to_owned),
+            generation: generation.name(),
         }
     }
-    fn validate(&self) -> Result<()> {
-        if self.topic.is_empty()
-            || self.group.as_deref() != normalize_group(self.group.as_deref())
-            || self
-                .generation
-                .as_ref()
-                .is_some_and(|g| g.plan == [0; 32] || g.instance == [0; 16])
-        {
+    fn generation_for(&self, topic: &str, part: u32, group: Option<&str>) -> Result<layout::Generation> {
+        if self.topic != topic || self.partition != part || self.group.as_deref() != normalize_group(group) {
             return Err(StromaError::Corruption(
-                "invalid recovery route identity".into(),
+                "retained generation resource mismatch".into(),
             ));
         }
-        Ok(())
+        layout::Generation::parse(&self.generation)
+            .ok_or_else(|| StromaError::Corruption("invalid retained generation name".into()))
     }
 }
 impl Stroma {
     /// Requires external revocation of this replica's write-quorum membership.
-    /// The live route remains untouched throughout copying and is still usable
+    /// The live generation remains untouched throughout copying and is still usable
     /// as recovery evidence if the owner disappears.
     pub async fn prepare_queue_reseed_storage(
         &self,
@@ -86,24 +75,9 @@ impl Stroma {
             ));
         }
         self.verify_admitted_storage_history(&receipt)?;
-        let route = Route {
-            topic: receipt.topic.clone(),
-            partition: receipt.partition,
-            group: receipt.group.clone(),
-            generation: Some(Generation {
-                plan: intent,
-                instance: self.storage_session,
-            }),
-        };
-        if self
-            .recovery_routes
-            .get(&key(
-                &receipt.topic,
-                receipt.partition,
-                receipt.group.as_deref(),
-            ))
-            .is_some_and(|current| *current == route)
-        {
+        let generation = recovery_generation(intent, self.storage_session);
+        let (topic, part, group) = (&receipt.topic, receipt.partition, receipt.group.as_deref());
+        if self.partition_generation(topic, part, group) == Some(generation) {
             return Err(invalid(
                 "reseed already installed, resume admission without resetting storage",
             ));
@@ -111,7 +85,7 @@ impl Stroma {
         let view = self
             .reseed_views
             .entry(intent)
-            .or_insert_with(|| self.generation_view(route.root(&self.root)))
+            .or_insert_with(|| self.generation_view(topic, part, group, generation))
             .clone();
         let prepared = view
             .resume_unaccepted_storage_history(
@@ -135,29 +109,15 @@ impl Stroma {
         intent: [u8; 32],
     ) -> Result<Option<(u64, u64, u64)>> {
         self.verify_admitted_storage_history(receipt)?;
-        let route = Route {
-            topic: receipt.topic.clone(),
-            partition: receipt.partition,
-            group: receipt.group.clone(),
-            generation: Some(Generation {
-                plan: intent,
-                instance: self.storage_session,
-            }),
-        };
-        if !self
-            .recovery_routes
-            .get(&key(
-                &receipt.topic,
-                receipt.partition,
-                receipt.group.as_deref(),
-            ))
-            .is_some_and(|r| *r == route)
+        let generation = recovery_generation(intent, self.storage_session);
+        if self.partition_generation(&receipt.topic, receipt.partition, receipt.group.as_deref())
+            != Some(generation)
         {
             return Ok(None);
         }
         let saved: Option<(PreparedStorageHistory, u64, u64, u64)> = read_meta(
             &self
-                .route_dir(&receipt.topic, receipt.partition, receipt.group.as_deref())
+                .recovery_dir(&receipt.topic, receipt.partition, receipt.group.as_deref())
                 .join(format!(
                     "reseed-complete-{}",
                     blake3::Hash::from_bytes(intent)
@@ -174,7 +134,7 @@ impl Stroma {
 
     /// Publish only a complete replacement that covers the original durable
     /// tails. Caller must hold fresh consensus authorization for this intent.
-    /// Sealing and route publication serialize on the same lifecycle lock.
+    /// Sealing and the `current` switch serialize on the same lifecycle lock.
     pub async fn install_queue_reseed_storage(
         &self,
         receipt: PreparedStorageHistory,
@@ -189,21 +149,9 @@ impl Stroma {
             let part = receipt.partition;
             let group = receipt.group.as_deref();
             st.verify_admitted_storage_history(&receipt)?;
-            let route = Route {
-                topic: topic.clone(),
-                partition: part,
-                group: receipt.group.clone(),
-                generation: Some(Generation {
-                    plan: intent,
-                    instance: st.storage_session,
-                }),
-            };
+            let generation = recovery_generation(intent, st.storage_session);
             let resource = key(topic, part, group);
-            if st
-                .recovery_routes
-                .get(&resource)
-                .is_some_and(|current| *current == route)
-            {
+            if st.partition_generation(topic, part, group) == Some(generation) {
                 st.verify_queue_learner_caught_up(
                     topic,
                     part,
@@ -272,20 +220,14 @@ impl Stroma {
                     return Err(invalid("reseed payload dependency changed during verification"));
                 }
             }
-            let route_dir = st.route_dir(topic, part, group);
-            fs::create_dir_all(&route_dir).map_err(io_err)?;
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(route_dir.join(".keratin.lock"))
-                .map_err(io_err)?;
+            let route_dir = st.lock_recovery_dir(topic, part, group)?;
             let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
-            let cached = st.recovery_routes.get(&resource).map(|r| r.clone());
-            let disk: Option<Route> = read_meta(&route_dir.join("active"))?;
+            let cached = st.generations.get(&resource).map(|r| *r);
+            let disk = layout::read_current(&st.partition_dir(topic, part, group))?;
             if disk != cached {
-                return Err(invalid("reseed route changed in another process"));
+                return Err(invalid("reseed generation changed in another process"));
             }
+            let original = cached.ok_or_else(|| invalid("reseed requires an existing generation"))?;
             // Keep an explicit durable pointer to the original generation. No
             // original payload, event or checkpoint file is overwritten.
             save_meta(
@@ -293,12 +235,7 @@ impl Stroma {
                     "reseed-original-{}",
                     blake3::Hash::from_bytes(intent)
                 )),
-                &cached.unwrap_or(Route {
-                    topic: topic.clone(),
-                    partition: part,
-                    group: receipt.group.clone(),
-                    generation: None,
-                }),
+                &GenerationRecord::new(topic, part, group, original),
             )?;
             let complete_path = route_dir.join(format!(
                 "reseed-complete-{}",
@@ -340,14 +277,8 @@ impl Stroma {
             st.remove_queue(topic, part, group);
             view.remove_queue(topic, part, group);
             boundary("reseed_retired");
-            let scratch = route_dir.join("next");
-            if scratch.try_exists().map_err(io_err)? {
-                fs::remove_file(&scratch).map_err(io_err)?;
-            }
-            save_meta(&scratch, &route)?;
-            fs::rename(&scratch, route_dir.join("active")).map_err(io_err)?;
-            recovery_seal::sync_directories(&route_dir)?;
-            st.recovery_routes.insert(resource, route);
+            layout::write_current(&st.partition_dir(topic, part, group), &generation)?;
+            st.generations.insert(resource, generation);
             st.reseed_views.remove(&intent);
             boundary("reseed_switched");
             Ok(())
@@ -356,43 +287,18 @@ impl Stroma {
         .map_err(io_err)?
     }
 
-    fn route_dir(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
-        self.root
-            .join("recovery-routes")
-            .join(route_id(topic, part, group))
-    }
-    pub(super) fn partition_root(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
-        self.recovery_routes
-            .get(&key(topic, part, group))
-            .map_or_else(|| self.root.clone(), |r| r.root(&self.root))
-    }
-    pub(super) fn load_recovery_routes(&self) -> Result<()> {
-        let dir = self.root.join("recovery-routes");
-        if !dir.try_exists().map_err(io_err)? {
-            return Ok(());
-        }
-        for entry in fs::read_dir(dir).map_err(io_err)? {
-            let entry = entry.map_err(io_err)?;
-            if !entry.file_type().map_err(io_err)?.is_dir() {
-                return Err(invalid("unexpected recovery route entry"));
-            }
-            if let Some(route) = read_meta::<Route>(&entry.path().join("active"))? {
-                route.validate()?;
-                if route.generation.is_none()
-                    || entry.file_name().to_string_lossy()
-                        != route_id(&route.topic, route.partition, route.group.as_deref())
-                {
-                    return Err(StromaError::Corruption(
-                        "recovery route resource mismatch".into(),
-                    ));
-                }
-                self.recovery_routes.insert(
-                    key(&route.topic, route.partition, route.group.as_deref()),
-                    route,
-                );
-            }
-        }
-        Ok(())
+    /// Create the partition's recovery directory and its lock file. The
+    /// returned directory can be locked with `lock_existing_log`.
+    fn lock_recovery_dir(&self, topic: &str, part: u32, group: Option<&str>) -> Result<PathBuf> {
+        let dir = self.recovery_dir(topic, part, group);
+        layout::create_dir_within(&self.root, &dir)?;
+        fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(dir.join(".keratin.lock"))
+            .map_err(io_err)?;
+        Ok(dir)
     }
     pub(super) fn has_recovery_installation(
         &self,
@@ -400,20 +306,32 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
     ) -> Result<bool> {
-        self.route_dir(topic, part, group)
+        // A view builds or reads one generation. Installation bookkeeping
+        // belongs to the partition, so it is visible only to the base storage.
+        if self.view_generation.is_some() {
+            return Ok(false);
+        }
+        self.recovery_dir(topic, part, group)
             .join("started")
             .try_exists()
             .map_err(io_err)
     }
-    /// A private path-only view. It shares lifecycle serialization but cannot
-    /// resolve live actors or publish ordinary admission for the original root.
-    fn generation_view(&self, root: PathBuf) -> Self {
+    /// A private path-only view of one partition generation. It resolves no
+    /// other partition, shares lifecycle serialization, and cannot resolve
+    /// live actors or publish ordinary admission for the original storage.
+    fn generation_view(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        generation: layout::Generation,
+    ) -> Self {
         let mut view = self.clone();
-        view.root = root;
+        view.view_generation = Some(Arc::new((key(topic, part, group), generation)));
+        view.generations = Arc::new(DashMap::new());
         view.reseed_views = Arc::new(DashMap::new());
         view.retired_view = Arc::new(AtomicBool::new(false));
         view.quarantined = Arc::new(DashMap::new());
-        view.recovery_routes = Arc::new(DashMap::new());
         view.queue_handles = Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new())));
         view.admitted_histories = Arc::new(DashMap::new());
         view
@@ -425,20 +343,18 @@ impl Stroma {
         group: Option<&str>,
         seal: &RecoverySealRequest,
     ) -> Result<Option<Self>> {
-        let path = self.route_dir(topic, part, group).join(format!(
+        if self.view_generation.is_some() {
+            return Ok(None);
+        }
+        let path = self.recovery_dir(topic, part, group).join(format!(
             "retained-{}",
             blake3::Hash::from_bytes(seal.transition)
         ));
-        let Some(route) = read_meta::<Route>(&path)? else {
+        let Some(record) = read_meta::<GenerationRecord>(&path)? else {
             return Ok(None);
         };
-        route.validate()?;
-        if route.topic != topic || route.partition != part || route.group.as_deref() != group {
-            return Err(StromaError::Corruption(
-                "retained route resource mismatch".into(),
-            ));
-        }
-        Ok(Some(self.generation_view(route.root(&self.root))))
+        let generation = record.generation_for(topic, part, group)?;
+        Ok(Some(self.generation_view(topic, part, group, generation)))
     }
 
     /// Fresh consensus must identify this exact local replica as excluded from
@@ -510,16 +426,8 @@ impl Stroma {
                     true,
                 )
                 .await?;
-            let route = Route {
-                topic: topic.clone(),
-                partition: part,
-                group: group.clone(),
-                generation: Some(Generation {
-                    plan: intent,
-                    instance: st.storage_session,
-                }),
-            };
-            let view = st.generation_view(route.root(&st.root));
+            let generation = recovery_generation(intent, st.storage_session);
+            let view = st.generation_view(&topic, part, group.as_deref(), generation);
             // Preparation owns the lifecycle lock itself. The old generation
             // is durably sealed before this lock is temporarily released.
             let receipt = view
@@ -529,39 +437,28 @@ impl Stroma {
             let _lifecycle = st
                 .lock_partition_lifecycle(&topic, part, group.as_deref())
                 .await;
-            let route_dir = st.route_dir(&topic, part, group.as_deref());
-            fs::create_dir_all(&route_dir).map_err(io_err)?;
-            fs::OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .write(true)
-                .open(route_dir.join(".keratin.lock"))
-                .map_err(io_err)?;
+            let route_dir = st.lock_recovery_dir(&topic, part, group.as_deref())?;
             let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
-            let disk: Option<Route> = read_meta(&route_dir.join("active"))?;
+            let part_dir = st.partition_dir(&topic, part, group.as_deref());
+            let disk = layout::read_current(&part_dir)?;
             let resource_key = key(&topic, part, group.as_deref());
-            let cached = st.recovery_routes.get(&resource_key).map(|r| r.clone());
-            if disk != cached && disk.as_ref() != Some(&route) {
+            let cached = st.generations.get(&resource_key).map(|r| *r);
+            if disk != cached && disk != Some(generation) {
                 return Err(invalid(
-                    "learner route changed in another storage instance; reopen",
+                    "learner generation changed in another storage instance; reopen",
                 ));
             }
             st.require_matching_recovery_seal(&topic, part, group.as_deref(), &sealed.request)?;
             if st.storage_history_binding(&topic, part, group.as_deref())? != current {
                 return Err(invalid("learner source history changed during preparation"));
             }
-            let old = cached.unwrap_or(Route {
-                topic: topic.clone(),
-                partition: part,
-                group: group.clone(),
-                generation: None,
-            });
+            let old = cached.ok_or_else(|| invalid("learner requires an existing generation"))?;
             save_meta(
                 &route_dir.join(format!(
                     "retained-{}",
                     blake3::Hash::from_bytes(sealed.request.transition)
                 )),
-                &old,
+                &GenerationRecord::new(&topic, part, group.as_deref(), old),
             )?;
             persist_exact(&route_dir.join("started"), b"recovery installation")?;
             let handle = {
@@ -584,15 +481,9 @@ impl Stroma {
             st.admitted_histories.remove(&resource_key);
             boundary("learner_retired");
             view.verify_admitted_storage_history(&receipt)?;
-            let scratch = route_dir.join("next");
-            if scratch.try_exists().map_err(io_err)? {
-                fs::remove_file(&scratch).map_err(io_err)?;
-            }
-            save_meta(&scratch, &route)?;
-            fs::rename(&scratch, route_dir.join("active")).map_err(io_err)?;
-            recovery_seal::sync_directories(&route_dir)?;
+            layout::write_current(&part_dir, &generation)?;
             boundary("learner_switched");
-            st.recovery_routes.insert(resource_key.clone(), route);
+            st.generations.insert(resource_key.clone(), generation);
             st.quarantined.remove(&resource_key);
             st.admitted_histories.insert(resource_key, binding);
             st.index_recovered_resource(&topic, part, group.as_deref());
@@ -640,32 +531,19 @@ impl Stroma {
         let _lifecycle = st
             .lock_partition_lifecycle(&spec.topic, spec.partition, spec.group.as_deref())
             .await;
-        let route_dir = st.route_dir(&spec.topic, spec.partition, spec.group.as_deref());
-        fs::create_dir_all(&route_dir).map_err(io_err)?;
-        fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(route_dir.join(".keratin.lock"))
-            .map_err(io_err)?;
+        let route_dir =
+            st.lock_recovery_dir(&spec.topic, spec.partition, spec.group.as_deref())?;
         let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
-        // A durable anchor prevents a missing active pointer from becoming
-        // a legacy empty queue after an interrupted first installation.
-        let route = Route {
-            topic: spec.topic.clone(),
-            partition: spec.partition,
-            group: spec.group.clone(),
-            generation: Some(Generation {
-                plan: spec.plan,
-                instance: st.storage_session,
-            }),
-        };
-        let disk_route: Option<Route> = read_meta(&route_dir.join("active"))?;
+        // A durable anchor prevents a missing current generation from
+        // becoming an empty queue after an interrupted first installation.
+        let generation = recovery_generation(spec.plan, st.storage_session);
+        let part_dir = st.partition_dir(&spec.topic, spec.partition, spec.group.as_deref());
+        let disk_current = layout::read_current(&part_dir)?;
         let cached = st
-            .recovery_routes
+            .generations
             .get(&key(&spec.topic, spec.partition, spec.group.as_deref()))
-            .map(|r| r.clone());
-        if disk_route != cached {
+            .map(|r| *r);
+        if disk_current != cached {
             let resource_key = key(&spec.topic, spec.partition, spec.group.as_deref());
             let live = {
                 let registry = st.queue_handles.load();
@@ -673,35 +551,37 @@ impl Stroma {
                     .get(&resource_key)
                     .is_some_and(|slot| slot.handle.get().is_some())
             };
-            if disk_route.as_ref() != Some(&route)
+            if disk_current != Some(generation)
                 || live
                 || st.admitted_histories.contains_key(&resource_key)
             {
                 return Err(invalid(
-                    "recovery route changed in another storage instance; reopen",
+                    "recovery generation changed in another storage instance; reopen",
                 ));
             }
             // A rename can become visible before its directory sync returns.
-            // Retry that barrier for this exact unfinished process/plan;
-            // never adopt another instance's route or reset its data.
-            let view = st.generation_view(route.root(&st.root));
+            // Retry that barrier for this exact unfinished process and plan.
+            // Never adopt another instance's generation or reset its data.
+            let view = st.generation_view(
+                &spec.topic,
+                spec.partition,
+                spec.group.as_deref(),
+                generation,
+            );
             let saved: PreparedQueueRecovery = read_meta(
                 &view
                     .snap_dir(&spec.topic, spec.partition, spec.group.as_deref())
                     .join("recovery.installed"),
             )?
-            .ok_or_else(|| invalid("visible recovery route lost its receipt"))?;
+            .ok_or_else(|| invalid("visible recovery generation lost its receipt"))?;
             if saved.spec != spec {
-                return Err(invalid("visible recovery route differs from plan"));
+                return Err(invalid("visible recovery generation differs from plan"));
             }
             view.verify_prepared_storage_history(&saved.storage)?;
-            fs::File::open(route_dir.join("active"))
-                .and_then(|f| f.sync_all())
-                .map_err(io_err)?;
-            recovery_seal::sync_directories(&route_dir)?;
-            st.recovery_routes.insert(resource_key, route.clone());
+            layout::write_current(&part_dir, &generation)?;
+            st.generations.insert(resource_key, generation);
         }
-        if disk_route.as_ref() == Some(&route) {
+        if disk_current == Some(generation) {
             let prepared: PreparedQueueRecovery = read_meta(
                 &st.snap_dir(&spec.topic, spec.partition, spec.group.as_deref())
                     .join("recovery.installed"),
@@ -714,10 +594,10 @@ impl Stroma {
             st.index_recovered_partition(&spec);
             return Ok(prepared);
         }
-        let same_plan = disk_route
-            .as_ref()
-            .and_then(|r| r.generation.as_ref())
-            .is_some_and(|g| g.plan == spec.plan);
+        let same_plan = matches!(
+            disk_current,
+            Some(layout::Generation::Recovery { plan, .. }) if plan == spec.plan
+        );
         let old_dirs = [
             st.msg_tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
             st.tp_part_dir(&spec.topic, spec.partition, spec.group.as_deref()),
@@ -730,19 +610,14 @@ impl Stroma {
                 spec.group.as_deref(),
                 &seal,
             )?;
-            // Record the source location BEFORE switching the active route.
-            let old = disk_route.clone().unwrap_or(Route {
-                topic: spec.topic.clone(),
-                partition: spec.partition,
-                group: spec.group.clone(),
-                generation: None,
-            });
+            // Record the source generation BEFORE switching `current`.
+            let old = disk_current.ok_or_else(|| invalid("sealed data has no current generation"))?;
             save_meta(
                 &route_dir.join(format!(
                     "retained-{}",
                     blake3::Hash::from_bytes(seal.transition)
                 )),
-                &old,
+                &GenerationRecord::new(&spec.topic, spec.partition, spec.group.as_deref(), old),
             )?;
         }
         persist_exact(&route_dir.join("started"), b"recovery installation")?;
@@ -771,8 +646,13 @@ impl Stroma {
         st.admitted_histories
             .remove(&key(&spec.topic, spec.partition, spec.group.as_deref()));
         boundary("retired");
-        let root = route.root(&st.root);
-        let view = st.generation_view(root.clone());
+        let view = st.generation_view(
+            &spec.topic,
+            spec.partition,
+            spec.group.as_deref(),
+            generation,
+        );
+        let root = view.partition_root(&spec.topic, spec.partition, spec.group.as_deref());
         let receipt_path = view
             .snap_dir(&spec.topic, spec.partition, spec.group.as_deref())
             .join("recovery.installed");
@@ -872,7 +752,7 @@ impl Stroma {
             .map_err(io_err)??;
         }
         // Reopen and verify the whole baseline, including a completed
-        // generation whose receipt survived an interrupted route switch.
+        // generation whose receipt survived an interrupted `current` switch.
         let messages = view
             .open_keratin(
                 view.recovery_payload_path(&spec),
@@ -893,18 +773,12 @@ impl Stroma {
             }).await.map_err(io_err)??;
         messages.shutdown().await.map_err(io_err)?;
         drop(messages);
-        // fsync the complete generation before atomically publishing its route.
-        let scratch = route_dir.join("next");
-        if scratch.exists() {
-            fs::remove_file(&scratch).map_err(io_err)?;
-        }
-        save_meta(&scratch, &route)?;
-        fs::rename(&scratch, route_dir.join("active")).map_err(io_err)?;
-        recovery_seal::sync_directories(&route_dir)?;
+        // The complete generation is durable. Publish it as `current`.
+        layout::write_current(&part_dir, &generation)?;
         boundary("switched");
-        st.recovery_routes.insert(
+        st.generations.insert(
             key(&spec.topic, spec.partition, spec.group.as_deref()),
-            route,
+            generation,
         );
         st.quarantined
             .remove(&key(&spec.topic, spec.partition, spec.group.as_deref()));
@@ -957,22 +831,15 @@ impl Stroma {
         {
             return Err(invalid("recovery receipt resource or binding mismatch"));
         }
-        let route = read_meta::<Route>(
-            &self
-                .route_dir(&s.topic, s.partition, s.group.as_deref())
-                .join("active"),
-        )?
-        .ok_or_else(|| invalid("recovery route missing"))?;
-        if route.generation
-            != Some(Generation {
-                plan: s.plan,
-                instance: prepared.storage.storage_instance,
-            })
-            || self
-                .recovery_routes
-                .get(&key(&s.topic, s.partition, s.group.as_deref()))
-                .as_deref()
-                != Some(&route)
+        let current = layout::read_current(&self.partition_dir(
+            &s.topic,
+            s.partition,
+            s.group.as_deref(),
+        ))?
+        .ok_or_else(|| invalid("recovery generation missing"))?;
+        if current != recovery_generation(s.plan, prepared.storage.storage_instance)
+            || self.partition_generation(&s.topic, s.partition, s.group.as_deref())
+                != Some(current)
             || read_meta::<PreparedQueueRecovery>(
                 &self
                     .snap_dir(&s.topic, s.partition, s.group.as_deref())
@@ -999,7 +866,7 @@ impl Stroma {
             let _lifecycle = st
                 .lock_partition_lifecycle(&s.topic, s.partition, s.group.as_deref())
                 .await;
-            let _lock = lock_existing_log(&st.route_dir(&s.topic, s.partition, s.group.as_deref()))
+            let _lock = lock_existing_log(&st.recovery_dir(&s.topic, s.partition, s.group.as_deref()))
                 .map_err(io_err)?;
             st.verify_prepared_queue_recovery(&prepared)?;
             if st
