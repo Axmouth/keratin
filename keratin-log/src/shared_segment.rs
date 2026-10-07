@@ -1,15 +1,12 @@
 //! Mutation barrier for immutable segments shared by recovery generations.
 //! Call only under the log's exclusive lock, before opening a writable handle.
 
-use std::{
-    fs::{self, File, OpenOptions},
-    io,
-    path::Path,
-};
+use std::{io, path::Path};
 
 pub(crate) fn make_private(path: &Path) -> io::Result<()> {
     #[cfg(unix)]
     {
+        use std::fs::{self, File, OpenOptions};
         use std::os::unix::fs::{MetadataExt, OpenOptionsExt};
         let metadata = match fs::metadata(path) {
             Ok(metadata) => metadata,

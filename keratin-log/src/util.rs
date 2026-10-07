@@ -60,18 +60,28 @@ impl Drop for TempDir {
     }
 }
 
+/// Make the entries of a directory durable, so a file created, renamed or
+/// removed inside it survives power loss.
 #[cfg(unix)]
-pub(crate) fn fsync_dir(path: &Path) -> io::Result<()> {
-    use std::fs::File;
-    let dir = File::open(path)?;
-    dir.sync_all()
+pub fn fsync_dir(path: &Path) -> io::Result<()> {
+    std::fs::File::open(path)?.sync_all()
 }
 
+/// Make the entries of a directory durable, so a file created, renamed or
+/// removed inside it survives power loss.
+///
+/// A directory handle needs FILE_FLAG_BACKUP_SEMANTICS, and FlushFileBuffers,
+/// which `sync_all` calls, needs write access to the handle.
 #[cfg(windows)]
-pub(crate) fn fsync_dir(_path: &Path) -> io::Result<()> {
-    // Windows directory metadata flushing is not implemented here. Callers
-    // must not treat this no-op as a power-loss durability guarantee.
-    Ok(())
+pub fn fsync_dir(path: &Path) -> io::Result<()> {
+    use std::os::windows::fs::OpenOptionsExt;
+    const FILE_FLAG_BACKUP_SEMANTICS: u32 = 0x0200_0000;
+    std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .custom_flags(FILE_FLAG_BACKUP_SEMANTICS)
+        .open(path)?
+        .sync_all()
 }
 
 #[derive(Debug, thiserror::Error)]
