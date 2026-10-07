@@ -188,41 +188,6 @@ impl Stroma {
         Ok(())
     }
 
-    /// The legacy unauthenticated reset entry point rejects single-log queues.
-    /// Use exact excluded-learner authorization for checkpoint installation.
-    /// Cancellation does not cancel a started installation; failures retain a
-    /// journal which ordinary access/restart will finish before exposing state.
-    pub async fn install_follower_state_checkpoint(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        install: FollowerStateCheckpointInstall,
-    ) -> Result<FollowerStateCheckpointInstallOutcome> {
-        if !cfg!(unix) {
-            return Err(StromaError::Unsupported(
-                "checkpoint installation requires durable directory sync on this platform".into(),
-            ));
-        }
-        let (_, meta) = validate(topic, part, &install)?;
-        let stroma = self.clone();
-        let topic = topic.to_owned();
-        let group = normalize_group(group).map(str::to_owned);
-        tokio::spawn(async move {
-            stroma
-                .install_checkpoint_inner(&topic, part, group.as_deref(), &install, None)
-                .await?;
-            Ok(FollowerStateCheckpointInstallOutcome {
-                message_next_offset: install.message_next_offset,
-                event_next_offset: install.event_start_offset,
-                applied_event_offset: install.applied_event_offset,
-                snapshot_meta: meta,
-            })
-        })
-        .await
-        .map_err(io_err)?
-    }
-
     /// The caller must freshly authorize this exact non-voting learner before
     /// each installation. Ordinary bound replicas cannot use checkpoint reset.
     pub async fn install_queue_learner_checkpoint(
@@ -243,7 +208,7 @@ impl Stroma {
                 receipt.partition,
                 receipt.group.as_deref(),
                 &install,
-                Some(&receipt),
+                &receipt,
             )
             .await?;
             Ok(FollowerStateCheckpointInstallOutcome {
@@ -263,16 +228,11 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         install: &FollowerStateCheckpointInstall,
-        learner: Option<&PreparedStorageHistory>,
+        learner: &PreparedStorageHistory,
     ) -> Result<()> {
         if !install.combined_log {
             return Err(StromaError::InvalidArgument(
                 "checkpoint layout differs from local queue format".into(),
-            ));
-        }
-        if learner.is_none() {
-            return Err(StromaError::InvalidArgument(
-                "combined checkpoint reset requires excluded learner authorization".into(),
             ));
         }
 
@@ -280,10 +240,7 @@ impl Stroma {
             self.queue_handle(topic, part, group).await?;
             let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
             // Replacing a bound history needs a lineage-aware installation receipt.
-            match learner {
-                Some(receipt) => self.verify_admitted_storage_history(receipt)?,
-                None => self.require_unbound_storage_history(topic, part, group)?,
-            }
+            self.verify_admitted_storage_history(learner)?;
             let h = {
                 let current = self.queue_handles.load();
                 slot_lookup_no_alloc(&current, topic, part, group)
@@ -321,7 +278,7 @@ impl Stroma {
                 partition: part,
                 group: group.map(str::to_owned),
                 phase: Phase::Pending(install.clone()),
-                history: learner.map(|r| r.binding.clone()),
+                history: Some(learner.binding.clone()),
             };
             let path = self.checkpoint_journal_path(topic, part, group);
             let gate = h.recovery_gate.clone();
@@ -790,11 +747,6 @@ mod tests {
                     .await
                     .unwrap();
                 follower(&st).await;
-                assert!(
-                    st.install_follower_state_checkpoint("q", 0, None, checkpoint(count))
-                        .await
-                        .is_err()
-                );
                 let mut wrong = receipt.clone();
                 wrong.storage_instance = [9; 16];
                 assert!(

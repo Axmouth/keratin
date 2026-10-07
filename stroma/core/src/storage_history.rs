@@ -2234,45 +2234,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn checkpoint_replacement_cannot_change_bound_history() {
-        let dir = keratin_log::test_dir!("history_checkpoint");
-        let stroma = open(&dir.root).await;
-        initialize(&stroma).await.unwrap();
-        stroma
-            .become_queue_follower_with_epoch("q", 0, None, 7)
-            .await
-            .unwrap();
-        let state = crate::state::QueueInternalState::new("q".into(), 0);
-        let install = FollowerStateCheckpointInstall {
-            combined_log: true,
-            event_start_offset: 0,
-            message_epoch: 7,
-            event_epoch: 7,
-            message_next_offset: 0,
-            event_next_offset: 0,
-            applied_event_offset: 0,
-            state_snapshot: state.encode_snapshot(0),
-        };
-        assert!(matches!(
-            stroma
-                .install_follower_state_checkpoint("q", 0, None, install)
-                .await,
-            Err(StromaError::InvalidArgument(message)) if message.contains("excluded learner authorization")
-        ));
-        assert!(
-            !stroma
-                .snap_dir("q", 0, None)
-                .join("checkpoint.install")
-                .exists()
-        );
-        assert_eq!(
-            stroma.storage_history_binding("q", 0, None).unwrap(),
-            Some(binding())
-        );
-        stroma.shutdown().await.unwrap();
-    }
-
-    #[tokio::test]
     async fn stream_binding_preserves_kind_across_restart() {
         let dir = keratin_log::test_dir!("history_stream");
         let stroma = open(&dir.root).await;
