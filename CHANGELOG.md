@@ -11,6 +11,20 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Stroma storage uses layout version 2. Each partition lives in one
+  directory, `partitions/<group>/<topic>/<part>/`, with a kind marker and a
+  `current` pointer to its active generation. Recovery generations, staging
+  and bookkeeping live inside the partition. Queues have no message log
+  directory. Roots without the `stroma-layout` marker, or with unknown
+  entries, are refused, with no migration. The recovery inspection cache is
+  no longer inside the storage root.
+
+- `install_follower_state_checkpoint` is removed. Queue checkpoints install
+  only through the authorized learner path.
+
+- Keratin refuses to open a log directory that has segments but no manifest,
+  instead of starting it as an empty log.
+
 - Recovery staging stores snapshot bytes in a separate resumable artifact file.
   Stage specifications bind the snapshot length as well as its digest. Previous
   private staging intents are incompatible and have no migration support.
