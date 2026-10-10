@@ -362,6 +362,17 @@ async fn dlq_routing_preserves_distinct_payloads() {
     let qh = st.queue_handle("dlq", 0, None).await.unwrap();
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
+    // The next offset can count staged records before they reach the segment
+    // file (KERATIN_STAGE_THEN_COMMIT), so wait until every record reads back.
+    wait_until(Duration::from_secs(5), "all dlq records readable", || async {
+        for i in 0..offs.len() as u64 {
+            if st.fetch_message_by_offset(&qh, i).await.unwrap().is_none() {
+                return false;
+            }
+        }
+        true
+    })
+    .await;
     for i in 0..offs.len() as u64 {
         let m = st.fetch_message_by_offset(&qh, i).await.unwrap().unwrap();
         dlq_payloads.push(m.payload);
