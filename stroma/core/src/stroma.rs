@@ -115,46 +115,12 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
     })
 }
 
-/// Exclusive payload and state frontiers for a successfully applied queue batch.
-/// Single-log queues project both frontiers into event-log coordinates. These
-/// differ from the zero physical message-lane cursor used during replication.
-/// Epochs identify the accepted log history.
+/// Exclusive end of a completed queue publication and the log epoch it was
+/// written under. Message ids are offsets in the same log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct QueuePublishCommit {
-    pub message_next: Offset,
-    pub event_next: Offset,
-    pub message_epoch: u64,
-    pub event_epoch: u64,
-}
-
-impl QueuePublishCommit {
-    /// Commit in the single queue log. Message ids are offsets in the same
-    /// log, so both coordinate pairs carry the same values.
-    pub fn queue(next: Offset, epoch: u64) -> Self {
-        Self {
-            message_next: next,
-            event_next: next,
-            message_epoch: epoch,
-            event_epoch: epoch,
-        }
-    }
-
-    /// Whether both coordinate pairs agree, as every single-log commit does.
-    pub fn is_single_log(&self) -> bool {
-        self.message_next == self.event_next && self.message_epoch == self.event_epoch
-    }
-
-    /// Exclusive end of the publication in the single queue log.
-    pub fn next(&self) -> Offset {
-        debug_assert!(self.is_single_log(), "two-lane queue commit: {self:?}");
-        self.event_next
-    }
-
-    /// Log epoch the publication was written under.
-    pub fn epoch(&self) -> u64 {
-        debug_assert!(self.is_single_log(), "two-lane queue commit: {self:?}");
-        self.event_epoch
-    }
+    pub next: Offset,
+    pub epoch: u64,
 }
 
 /// Called once, before individual successful completions, after log durability
@@ -174,25 +140,37 @@ pub struct PublishItem {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum QueuePromotionOutcome {
     Promoted {
+        next: Offset,
+    },
+    LogBehind {
+        local_next: Offset,
+        expected_next: Offset,
+    },
+    LogAhead {
+        local_next: Offset,
+        expected_next: Offset,
+    },
+    /// Records exist that the state machine has not applied. `applied_next`
+    /// is exclusive, 0 when nothing is applied.
+    NotApplied {
+        applied_next: Offset,
+        log_next: Offset,
+    },
+    /// The state references payloads at or above the local log tail.
+    PayloadsMissing {
+        log_next: Offset,
+        required_next: Offset,
+    },
+}
+
+/// Promotion of a stream follower at its local tails. Streams keep a record
+/// log and a cursor-commit event log, and every cursor event must be applied.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum StreamPromotionOutcome {
+    Promoted {
         message_next_offset: Offset,
         event_next_offset: Offset,
         applied_event_offset: Option<Offset>,
-    },
-    MessageLogBehind {
-        local_next_offset: Offset,
-        expected_next_offset: Offset,
-    },
-    MessageLogAhead {
-        local_next_offset: Offset,
-        expected_next_offset: Offset,
-    },
-    EventLogBehind {
-        local_next_offset: Offset,
-        expected_next_offset: Offset,
-    },
-    EventLogAhead {
-        local_next_offset: Offset,
-        expected_next_offset: Offset,
     },
     EventsNotApplied {
         applied_event_offset: Option<Offset>,
@@ -200,11 +178,12 @@ pub enum QueuePromotionOutcome {
     },
 }
 
+/// Single queue log position when an owner stepped down. `applied_next` is
+/// exclusive, 0 when nothing is applied.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct QueueDemotionOutcome {
-    pub message_next_offset: Offset,
-    pub event_next_offset: Offset,
-    pub applied_event_offset: Option<Offset>,
+    pub next: Offset,
+    pub applied_next: Offset,
 }
 
 struct ItemMeta {
@@ -5292,7 +5271,10 @@ impl Stroma {
     }
 
     /// Optional (used by cleanup_topic): truncate message log.
-    pub async fn truncate_messages_before(
+    /// Drop queue log records below `before`, never past the payload floor,
+    /// the applied snapshot boundary, protected followers or checkpoint pins.
+    /// Refuses stream partitions.
+    pub async fn truncate_queue_before(
         &self,
         tp: &str,
         part: u32,
@@ -5301,14 +5283,27 @@ impl Stroma {
     ) -> Result<u64> {
         let ticket = self.queue_handle(tp, part, group).await?;
         let qh = ticket.resolve()?;
+        let wq = qh.work_queue()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
-        if qh.has_combined_log() {
-            let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
-            let live = qh.work_queue()?.lowest_not_settled_offset().await;
-            let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
-            return qh.event_log().truncate_before(before.min(snapshot).min(live)).await.map_err(io_err);
-        }
+        let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
+        let live = wq.lowest_not_settled_offset().await;
+        let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
+        qh.event_log().truncate_before(before.min(snapshot).min(live)).await.map_err(io_err)
+    }
+
+    /// Drop stream records below `before`. Refuses queue partitions.
+    pub async fn truncate_stream_records_before(
+        &self,
+        tp: &str,
+        part: u32,
+        before: Offset,
+    ) -> Result<u64> {
+        let ticket = self.queue_handle(tp, part, None).await?;
+        let qh = ticket.resolve()?;
+        qh.stream()?;
+        let _apply = qh.follower_apply_state().await;
+        qh.ensure_not_recovery_sealed()?;
         let (before, _) = self.checkpoint_retention_limits(&qh, before, u64::MAX).await?;
         qh.msg_log()?.truncate_before(before).await.map_err(io_err)
     }
@@ -5944,30 +5939,28 @@ mod tests {
         let owner_ticket = owner.queue_handle("topic", 0, None).await.unwrap();
         let h = owner_ticket.resolve().unwrap();
         let generation = h.role_generation();
-        let cut = owner.export_owner_state_checkpoint("topic", 0, None).await.unwrap();
-        assert!(cut.combined_log);
-        assert_eq!((cut.message_checkpoint_offset, cut.message_next_offset, cut.event_start_offset, cut.event_next_offset, cut.applied_event_offset), (0, 0, 0, 2, 1));
-        let repeated = owner.export_owner_state_checkpoint("topic", 0, None).await.unwrap();
+        let cut = owner.export_queue_state_checkpoint("topic", 0, None).await.unwrap();
+        assert_eq!((cut.start_offset, cut.next_offset), (0, 2));
+        let repeated = owner.export_queue_state_checkpoint("topic", 0, None).await.unwrap();
         let mut first_state = QueueInternalState::new("topic".into(), 0);
         let mut second_state = QueueInternalState::new("topic".into(), 0);
         first_state.load_snapshot(&cut.state_snapshot).unwrap();
         second_state.load_snapshot(&repeated.state_snapshot).unwrap();
         assert_eq!(first_state.recovery_state_digest(), second_state.recovery_state_digest());
-        assert_eq!((repeated.message_next_offset, repeated.event_next_offset), (0, 2));
+        assert_eq!(repeated.next_offset, 2);
         assert_eq!(h.role_generation(), generation);
         assert_eq!(h.role(), QueueRole::Owner);
-        let install = FollowerStateCheckpointInstall {
-            combined_log: true, event_start_offset: 0, message_epoch: cut.message_epoch, event_epoch: cut.event_epoch,
-            message_next_offset: 0, event_next_offset: 2, applied_event_offset: 1,
+        let install = QueueStateCheckpoint {
+            epoch: cut.epoch, start_offset: 0, next_offset: 2,
             state_snapshot: if export { cut.state_snapshot } else { h.encode_snapshot(1).await.unwrap() },
         };
         let receipt = test_learner(&follower, "topic").await;
         follower.become_queue_follower("topic", 0, None).await.unwrap();
         let result = follower.install_queue_learner_checkpoint(receipt, install.clone()).await.unwrap();
-        assert_eq!((result.message_next_offset, result.event_next_offset, result.applied_event_offset), (0, 0, 1));
+        assert_eq!(result.next_offset, 0);
         assert_eq!(result.snapshot_meta.last_snapshot_event_offset, 1);
-        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
-            QueuePromotionOutcome::EventLogBehind { local_next_offset: 0, expected_next_offset: 2 });
+        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 2).await.unwrap(),
+            QueuePromotionOutcome::LogBehind { local_next: 0, expected_next: 2 });
         assert!(!matches!(follower.promote_queue_follower_to_local_tail("topic", 0, None, 1).await.unwrap(), QueuePromotionOutcome::Promoted { .. }));
         assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
         follower.shutdown().await.unwrap();
@@ -5980,17 +5973,17 @@ mod tests {
         let OwnerReplicationRead::Batch(batch) = owner.read_owner_event_records("topic", 0, None, 0, 10).await.unwrap() else { panic!("retained events") };
         assert_eq!(batch.records.len(), 2);
         for (offset, event) in batch.records {
-            follower.apply_replicated_queue_batch("topic", 0, None, None, Some(ReplicatedEventBatch {
+            follower.apply_replicated_queue_batch("topic", 0, None, ReplicatedEventBatch {
                 epoch: batch.epoch, first_offset: offset, events: vec![event], durability: Some(KDurability::AfterFsync),
-            })).await.unwrap();
+            }).await.unwrap();
             if offset == 0 {
-                assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
-                    QueuePromotionOutcome::EventLogBehind { local_next_offset: 1, expected_next_offset: 2 });
+                assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 2).await.unwrap(),
+                    QueuePromotionOutcome::LogBehind { local_next: 1, expected_next: 2 });
             }
         }
         follower.install_queue_learner_checkpoint(receipt, install).await.unwrap();
-        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
-            QueuePromotionOutcome::Promoted { message_next_offset: 0, event_next_offset: 2, applied_event_offset: Some(1) });
+        assert_eq!(follower.promote_queue_follower_if_caught_up("topic", 0, None, 2).await.unwrap(),
+            QueuePromotionOutcome::Promoted { next: 2 });
         let delivered = follower.poll_ready("topic", 0, None, 10, unix_millis()+30_000, u64::MAX).await.unwrap();
         assert_eq!(delivered.len(), 2);
         assert_eq!((delivered[0].0, delivered[1].0), (0, 1));
@@ -6466,7 +6459,17 @@ mod tests {
             .unwrap();
 
         let err = stroma
-            .apply_replicated_queue_batch("topic", 0, None, None, None)
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                ReplicatedEventBatch {
+                    epoch: 0,
+                    first_offset: 0,
+                    events: vec![test_payload(b"payload")],
+                    durability: None,
+                },
+            )
             .await
             .unwrap_err();
         assert!(matches!(
@@ -6631,18 +6634,16 @@ mod tests {
             .unwrap();
         let event_records = qh.event_log().reader().scan_from(0, 10).unwrap();
         let before_state = qh.full_debug_info().await;
-        for (message_epoch, event_epoch) in [(6, 7), (7, 6), (8, 7), (7, 8), (6, 6)] {
+        // The log is at epoch 7. An older or newer checkpoint epoch is refused
+        // before anything changes.
+        for epoch in [6, 8, 0] {
             let error = stroma
                 .install_queue_learner_checkpoint(
                     receipt.clone(),
-                    FollowerStateCheckpointInstall {
-                        combined_log: true,
-                        event_start_offset: 0,
-                        message_epoch,
-                        event_epoch,
-                        message_next_offset: 0,
-                        event_next_offset: 1,
-                        applied_event_offset: 0,
+                    QueueStateCheckpoint {
+                        epoch,
+                        start_offset: 0,
+                        next_offset: 1,
                         state_snapshot: old_snapshot.clone(),
                     },
                 )
@@ -6652,7 +6653,7 @@ mod tests {
                 matches!(error, StromaError::InvalidArgument(_)),
                 "{error:?}"
             );
-            assert!(error.to_string().contains("epoch") || error.to_string().contains("layout"), "{error}");
+            assert!(error.to_string().contains("epoch"), "{error}");
             for log in [qh.event_log()] {
                 assert_eq!(log.current_epoch(), 7);
                 assert_eq!(log.head_offset(), 0);
@@ -6696,14 +6697,10 @@ mod tests {
         let err = stroma
             .install_queue_learner_checkpoint(
                 receipt.clone(),
-                FollowerStateCheckpointInstall {
-                    combined_log: true,
-                    event_start_offset: 0,
-                    message_epoch: 0,
-                    event_epoch: 0,
-                    message_next_offset: 0,
-                    event_next_offset: 1,
-                    applied_event_offset: 0,
+                QueueStateCheckpoint {
+                    epoch: 0,
+                    start_offset: 0,
+                    next_offset: 1,
                     state_snapshot: snapshot,
                 },
             )
@@ -6744,20 +6741,31 @@ mod tests {
         let err = stroma
             .install_queue_learner_checkpoint(
                 receipt.clone(),
-                FollowerStateCheckpointInstall {
-                    combined_log: true,
-                    event_start_offset: 0,
-                    message_epoch: 0,
-                    event_epoch: 0,
-                    message_next_offset: 0,
-                    event_next_offset: 2,
-                    applied_event_offset: 1,
+                QueueStateCheckpoint {
+                    epoch: 0,
+                    start_offset: 0,
+                    next_offset: 2,
                     state_snapshot: snapshot,
                 },
             )
             .await
             .unwrap_err();
         assert!(matches!(err, StromaError::InvalidArgument(_)));
+
+        // Backfill cannot start past the applied boundary.
+        let err = stroma
+            .install_queue_learner_checkpoint(
+                receipt.clone(),
+                QueueStateCheckpoint {
+                    epoch: 0,
+                    start_offset: 2,
+                    next_offset: 1,
+                    state_snapshot: qh.encode_snapshot(0).await.unwrap(),
+                },
+            )
+            .await
+            .unwrap_err();
+        assert!(err.to_string().contains("past its applied boundary"), "{err}");
 
         shutdown_stroma("follower_state_checkpoint_validates_offset", &stroma).await;
     }
@@ -6787,14 +6795,10 @@ mod tests {
         let err = stroma
             .install_queue_learner_checkpoint(
                 receipt.clone(),
-                FollowerStateCheckpointInstall {
-                    combined_log: true,
-                    event_start_offset: 2,
-                    message_epoch: 0,
-                    event_epoch: 0,
-                    message_next_offset: 0,
-                    event_next_offset: 2,
-                    applied_event_offset: 1,
+                QueueStateCheckpoint {
+                    epoch: 0,
+                    start_offset: 2,
+                    next_offset: 2,
                     state_snapshot: snapshot,
                 },
             )
@@ -6829,7 +6833,7 @@ mod tests {
             .unwrap();
 
         let err = stroma
-            .export_owner_state_checkpoint("topic", 0, None)
+            .export_queue_state_checkpoint("topic", 0, None)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -6996,50 +7000,36 @@ mod tests {
             .await
             .unwrap();
 
-        let message_read = owner
-            .read_owner_message_records("topic", 0, None, 0, 10)
+        let OwnerReplicationRead::Batch(read) = owner
+            .read_owner_queue_records("topic", 0, None, 0, 10, usize::MAX)
             .await
-            .unwrap();
-        let event_read = owner
-            .read_owner_event_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-
-        let OwnerReplicationRead::Batch(message_read) = message_read else {
-            panic!("expected owner message batch");
+            .unwrap()
+        else {
+            panic!("expected owner queue batch");
         };
-        let OwnerReplicationRead::Batch(event_read) = event_read else {
-            panic!("expected owner event batch");
-        };
-
-        assert!(message_read.records.is_empty());
-        let events = Some(ReplicatedEventBatch {
-            epoch: event_read.epoch,
-            first_offset: event_read.records[0].0,
-            events: event_read
-                .records
-                .into_iter()
-                .map(|(_, event)| event)
-                .collect(),
-            durability: None,
-        });
 
         follower
-            .apply_replicated_queue_batch("topic", 0, None, None, events)
+            .apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                ReplicatedEventBatch {
+                    epoch: read.epoch,
+                    first_offset: read.records[0].0,
+                    events: read.records.into_iter().map(|(_, event)| event).collect(),
+                    durability: None,
+                },
+            )
             .await
             .unwrap();
 
         let outcome = follower
-            .promote_queue_follower_if_caught_up("topic", 0, None, 0, 2)
+            .promote_queue_follower_if_caught_up("topic", 0, None, 2)
             .await
             .unwrap();
         assert_eq!(
             outcome,
-            QueuePromotionOutcome::Promoted {
-                message_next_offset: 0,
-                event_next_offset: 2,
-                applied_event_offset: Some(1),
-            }
+            QueuePromotionOutcome::Promoted { next: 2 }
         );
 
         let delivered = follower
@@ -7062,14 +7052,19 @@ mod tests {
         let ticket = st.queue_handle("t", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
         h.event_log().shutdown().await.unwrap();
-        assert!(st.apply_replicated_queue_batch("t", 0, None, None, Some(ReplicatedEventBatch {
+        assert!(st.apply_replicated_queue_batch(
+            "t",
+            0,
+            None,
+            ReplicatedEventBatch {
             epoch: 0, first_offset: 0, events: vec![test_payload(b"payload")], durability: Some(KDurability::AfterFsync),
-        })).await.is_err());
+        },
+).await.is_err());
         assert_eq!(h.event_log().next_offset(), 0);
         assert_eq!(h.full_debug_info().await.state.ready_count, 0);
         assert!(*h.follower_apply_state().await);
         assert!(st.promote_queue_follower_to_local_tail("t", 0, None, 1).await.is_err());
-        assert!(st.promote_queue_follower_if_caught_up("t", 0, None, 0, 0).await.is_err());
+        assert!(st.promote_queue_follower_if_caught_up("t", 0, None, 0).await.is_err());
         assert!(st.become_queue_owner("t", 0, None).await.is_err());
         assert_eq!(h.role(), QueueRole::Follower);
         st.shutdown().await.unwrap();
@@ -7093,14 +7088,10 @@ mod tests {
         stroma
             .install_queue_learner_checkpoint(
                 receipt,
-                FollowerStateCheckpointInstall {
-                    combined_log: true,
-                    event_start_offset: 0,
-                    message_epoch: 0,
-                    event_epoch: 0,
-                    message_next_offset: 0,
-                    event_next_offset: 0,
-                    applied_event_offset: 0,
+                QueueStateCheckpoint {
+                    epoch: 0,
+                    start_offset: 0,
+                    next_offset: 0,
                     state_snapshot: snapshot,
                 },
             )
@@ -7111,13 +7102,12 @@ mod tests {
                 "t",
                 0,
                 None,
-                None,
-                Some(ReplicatedEventBatch {
+                ReplicatedEventBatch {
                     epoch: 0,
                     first_offset: 0,
                     events: vec![test_payload(b"first")],
                     durability: None,
-                }),
+                },
             )
             .await
             .unwrap();
@@ -7150,14 +7140,19 @@ mod tests {
         let st = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default()).await.unwrap();
         st.become_queue_follower("topic", 0, None).await.unwrap();
         for next in 0..2 {
-            assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
-                QueuePromotionOutcome::EventLogBehind { local_next_offset: next, expected_next_offset: 2 });
-            st.apply_replicated_queue_batch("topic", 0, None, None, Some(ReplicatedEventBatch {
+            assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 2).await.unwrap(),
+                QueuePromotionOutcome::LogBehind { local_next: next, expected_next: 2 });
+            st.apply_replicated_queue_batch(
+                "topic",
+                0,
+                None,
+                ReplicatedEventBatch {
                 epoch: 0, first_offset: next, events: vec![test_payload(&[next as u8])], durability: Some(KDurability::AfterFsync),
-            })).await.unwrap();
+            },
+).await.unwrap();
         }
-        assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 0, 2).await.unwrap(),
-            QueuePromotionOutcome::Promoted { message_next_offset: 0, event_next_offset: 2, applied_event_offset: Some(1) });
+        assert_eq!(st.promote_queue_follower_if_caught_up("topic", 0, None, 2).await.unwrap(),
+            QueuePromotionOutcome::Promoted { next: 2 });
         assert_eq!(st.poll_ready("topic", 0, None, 10, unix_millis()+30_000, u64::MAX).await.unwrap().len(), 2);
         st.shutdown().await.unwrap();
     }
@@ -8749,11 +8744,11 @@ mod open_batch_fault_tests {
             let h = qh.resolve().unwrap();
             let path = st.tp_part_dir("q", 0, None).join("segments/00000000000000000000.log");
             let armed = arm(&path, fault).unwrap();
-            let frame = (None, Some(ReplicatedEventBatch {
+            let frame = ReplicatedEventBatch {
                 epoch: 0, first_offset: 0,
                 events: vec![StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![42; 1024] }],
                 durability: Some(KDurability::AfterFsync),
-            }));
+            };
             let result = st.apply_open_replicated_queue_batch("q", 0, None, futures::stream::iter([Ok(frame)]).boxed()).await;
             assert!(result.is_err());
             assert_eq!(armed.hits(), 1);

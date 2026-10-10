@@ -24,6 +24,10 @@ struct GenerationRecord {
     group: Option<String>,
     generation: String,
 }
+/// Durable reseed completion cut: the storage receipt, the epoch and the
+/// queue log end the replacement covered.
+type ReseedCompletion = (PreparedStorageHistory, u64, u64);
+
 fn invalid(message: impl Into<String>) -> StromaError {
     StromaError::InvalidArgument(message.into())
 }
@@ -105,7 +109,7 @@ impl Stroma {
         &self,
         receipt: &PreparedStorageHistory,
         intent: [u8; 32],
-    ) -> Result<Option<(u64, u64, u64)>> {
+    ) -> Result<Option<(u64, u64)>> {
         self.verify_admitted_storage_history(receipt)?;
         let generation = recovery_generation(intent, self.storage_session);
         if self.partition_generation(&receipt.topic, receipt.partition, receipt.group.as_deref())
@@ -113,7 +117,7 @@ impl Stroma {
         {
             return Ok(None);
         }
-        let saved: Option<(PreparedStorageHistory, u64, u64, u64)> = read_meta(
+        let saved: Option<ReseedCompletion> = read_meta(
             &self
                 .recovery_dir(&receipt.topic, receipt.partition, receipt.group.as_deref())
                 .join(format!(
@@ -121,25 +125,25 @@ impl Stroma {
                     blake3::Hash::from_bytes(intent)
                 )),
         )?;
-        let Some((saved, epoch, messages, events)) = saved else {
+        let Some((saved, epoch, next)) = saved else {
             return Err(invalid("installed reseed completion receipt absent"));
         };
         if saved != *receipt {
             return Err(invalid("installed reseed receipt differs"));
         }
-        Ok(Some((epoch, messages, events)))
+        Ok(Some((epoch, next)))
     }
 
     /// Publish only a complete replacement that covers the original durable
-    /// tails. Caller must hold fresh consensus authorization for this intent.
+    /// tail. `target` is the least queue log end the replacement must hold.
+    /// Caller must hold fresh consensus authorization for this intent.
     /// Sealing and the `current` switch serialize on the same lifecycle lock.
     pub async fn install_queue_reseed_storage(
         &self,
         receipt: PreparedStorageHistory,
         intent: [u8; 32],
         epoch: u64,
-        message_target: u64,
-        event_target: u64,
+        target: u64,
     ) -> Result<()> {
         let st = self.clone();
         tokio::spawn(async move {
@@ -150,15 +154,8 @@ impl Stroma {
             let generation = recovery_generation(intent, st.storage_session);
             let resource = key(topic, part, group);
             if st.partition_generation(topic, part, group) == Some(generation) {
-                st.verify_queue_learner_caught_up(
-                    topic,
-                    part,
-                    group,
-                    epoch,
-                    message_target,
-                    event_target,
-                )
-                .await?;
+                st.verify_queue_learner_caught_up(topic, part, group, epoch, target)
+                    .await?;
                 return Ok(());
             }
             let view = st
@@ -170,14 +167,7 @@ impl Stroma {
             let old_ticket = st.queue_handle(topic, part, group).await?;
             let old = old_ticket.resolve()?;
             let ready = view
-                .verify_queue_learner_caught_up(
-                    topic,
-                    part,
-                    group,
-                    epoch,
-                    message_target,
-                    event_target,
-                )
+                .verify_queue_learner_caught_up(topic, part, group, epoch, target)
                 .await?;
             let replacement_ticket = view.queue_handle(topic, part, group).await?;
             let replacement = replacement_ticket.resolve()?;
@@ -198,16 +188,12 @@ impl Stroma {
             replacement.ensure_not_recovery_sealed()?;
             if *new_apply
                 || replacement.role()!=QueueRole::Follower
-                || replacement.message_lane_epoch()!=epoch
                 || replacement.event_log().current_epoch()!=epoch
-                || replacement.ordered_applied_next()?!=Some(ready.event_next)
+                || replacement.ordered_applied_next()?!=Some(ready.next)
                 || !matches!(old.role(), QueueRole::Follower | QueueRole::Frozen)
-                || old.message_lane_epoch() != epoch
                 || old.event_log().current_epoch() != epoch
-                || ready.message_next < old.message_lane_next()
-                || ready.event_next < old.event_log().next_offset()
-                || ready.message_next != replacement.message_lane_next()
-                || ready.event_next != replacement.event_log().next_offset()
+                || ready.next < old.event_log().next_offset()
+                || ready.next != replacement.event_log().next_offset()
             {
                 return Err(invalid(
                     "reseed replacement does not cover the unchanged original history",
@@ -239,23 +225,16 @@ impl Stroma {
                 "reseed-complete-{}",
                 blake3::Hash::from_bytes(intent)
             ));
-            if let Some((saved, saved_epoch, messages, events)) =
-                read_meta::<(PreparedStorageHistory, u64, u64, u64)>(&complete_path)?
+            if let Some((saved, saved_epoch, next)) =
+                read_meta::<ReseedCompletion>(&complete_path)?
             {
-                if saved != receipt
-                    || saved_epoch != epoch
-                    || messages > ready.message_next
-                    || events > ready.event_next
-                {
+                if saved != receipt || saved_epoch != epoch || next > ready.next {
                     return Err(invalid(
                         "reseed no longer covers its prepared completion cut",
                     ));
                 }
             } else {
-                save_meta(
-                    &complete_path,
-                    &(receipt.clone(), epoch, ready.message_next, ready.event_next),
-                )?;
+                save_meta(&complete_path, &(receipt.clone(), epoch, ready.next))?;
             }
             boundary("reseed_before_switch");
             // Cancelled callers can still hold a staging view. Revoke that

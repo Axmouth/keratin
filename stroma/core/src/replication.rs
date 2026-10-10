@@ -17,8 +17,8 @@ use crate::event::StromaEvent;
 use crate::state::{QueueHandleInner, QueueRole, SnapshotMeta};
 use crate::stream_state::StreamCommand;
 use crate::stroma::{
-    QueueDemotionOutcome, QueuePromotionOutcome, Stroma, decode_err, event_msg, io_err,
-    replicated_append_outcome_allows_state_apply,
+    QueueDemotionOutcome, QueuePromotionOutcome, Stroma, StreamPromotionOutcome, decode_err,
+    event_msg, io_err, replicated_append_outcome_allows_state_apply,
 };
 use crate::{Offset, Result, StromaError};
 
@@ -223,60 +223,49 @@ pub struct ReplicatedStreamApplyOutcome {
     pub event_log: Option<ReplicatedAppendOutcome>,
 }
 
-/// Name used by the two-lane queue apply. Queues apply through
-/// `apply_replicated_queue_log_batch`, which returns one outcome.
-pub type ReplicatedQueueApplyOutcome = ReplicatedStreamApplyOutcome;
-
-/// Compacted queue state for a follower that fell behind retained event logs.
-///
-/// This installs state, with payload backfill required before promotion. Separate
-/// queues resume messages at `message_next_offset`. Combined queues resume the
-/// event log at `event_start_offset`, retaining the snapshot's exact applied cut.
-/// Combined checkpoint reset requires an externally authorized excluded learner.
+/// Owner queue state at one coherent point, exported to a learner and
+/// installed by it.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct FollowerStateCheckpointInstall {
-    /// Whether payloads share the queue event log.
-    pub combined_log: bool,
-    /// First physical event record to backfill. State replay starts at event_next_offset.
-    pub event_start_offset: Offset,
-    /// Exact source epochs. Assignment/replication fencing must establish these
-    /// locally before checkpoint installation; installation cannot advance them.
-    pub message_epoch: u64,
-    pub event_epoch: u64,
-    pub message_next_offset: Offset,
-    /// Exclusive applied state boundary, independent of physical backfill start.
-    pub event_next_offset: Offset,
-    pub applied_event_offset: Offset,
+pub struct QueueStateCheckpoint {
+    /// Source log epoch. Assignment and replication fencing must establish it
+    /// locally before install. Installation cannot advance it.
+    pub epoch: u64,
+    /// First record to backfill: the lowest offset the state may reference.
+    pub start_offset: Offset,
+    /// Exclusive applied boundary, equal to the owner log tail at capture.
+    /// The snapshot covers every record below it.
+    pub next_offset: Offset,
     pub state_snapshot: Vec<u8>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct FollowerStateCheckpointInstallOutcome {
-    pub message_next_offset: Offset,
-    pub event_next_offset: Offset,
-    pub applied_event_offset: Offset,
+pub struct QueueStateCheckpointInstallOutcome {
+    /// Local log tail right after the reset. Payload backfill resumes here,
+    /// at the checkpoint start offset.
+    pub next_offset: Offset,
     pub snapshot_meta: SnapshotMeta,
 }
 
-/// Compacted queue state exported by an owner at one coherent point.
-///
-/// `message_checkpoint_offset` is the first message offset the installed state
-/// may still reference. `message_next_offset` is the owner message-log tail the
-/// follower must catch up to before promotion.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct OwnerStateCheckpoint {
-    /// Whether payloads share the queue event log.
-    pub combined_log: bool,
-    /// First physical event record to backfill. State replay starts at event_next_offset.
-    pub event_start_offset: Offset,
-    pub message_epoch: u64,
-    pub event_epoch: u64,
-    pub message_checkpoint_offset: Offset,
-    pub message_next_offset: Offset,
-    /// Exclusive applied state boundary, independent of physical backfill start.
-    pub event_next_offset: Offset,
-    pub applied_event_offset: Offset,
-    pub state_snapshot: Vec<u8>,
+/// Local tails and application state of a follower at a promotion attempt.
+/// Shared by queue and stream promotion so the events-applied gate stays one
+/// piece of code.
+enum LocalPromotion {
+    Promoted(LocalTails),
+    LogBehind { local_next: Offset, expected_next: Offset },
+    LogAhead { local_next: Offset, expected_next: Offset },
+    NotApplied(LocalTails),
+    PayloadsMissing { log_next: Offset, required_next: Offset },
+}
+
+struct LocalTails {
+    /// Stream record log tail. Queues have no record log.
+    record_next: Option<Offset>,
+    /// Exclusive end of the queue log, or of a stream's cursor events.
+    log_next: Offset,
+    /// Exclusive applied boundary, 0 when nothing is applied.
+    applied_next: Offset,
+    /// Last applied event offset, None when the log is empty.
+    applied_offset: Option<Offset>,
 }
 
 impl Stroma {
@@ -288,26 +277,20 @@ impl Stroma {
     ) -> Result<QueueDemotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        qh.work_queue()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         qh.freeze_owner_and_wait_operations().await?;
         for log in qh.physical_logs() { log.freeze(); }
 
-        let message_next_offset = qh.message_lane_next();
-        let event_next_offset = qh.event_log().next_offset();
-        let applied_event_offset = if event_next_offset == 0 {
-            None
-        } else {
-            Some(qh.applied_upto().load(Ordering::Acquire))
-        };
+        let tails = local_tails(&qh)?;
 
         qh.become_follower();
         for log in qh.physical_logs() { log.become_follower(); }
 
         Ok(QueueDemotionOutcome {
-            message_next_offset,
-            event_next_offset,
-            applied_event_offset,
+            next: tails.log_next,
+            applied_next: tails.applied_next,
         })
     }
 
@@ -432,27 +415,6 @@ impl Stroma {
         self.advance_queue_epoch(topic, part, None, epoch).await
     }
 
-    /// Current durable queue log frontiers, for a conservative dependency on a
-    /// recovered backlog before new publications supply exact batch boundaries.
-    pub async fn queue_durable_frontiers(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> Result<crate::QueuePublishCommit> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let h = qh.resolve()?;
-        let _apply = h.follower_apply_state().await;
-        h.ensure_not_recovery_sealed()?;
-        let _pause = h.pause_owner_operations_and_wait().await?;
-        Ok(crate::QueuePublishCommit {
-            message_next: h.message_lane_next(),
-            event_next: h.event_log().next_offset(),
-            message_epoch: h.message_lane_epoch(),
-            event_epoch: h.event_log().current_epoch(),
-        })
-    }
-
     /// Current durable end of the single queue log, as a dependency that a
     /// recovered backlog must reach before new publications supply exact batch
     /// boundaries. Refuses stream partitions.
@@ -469,7 +431,10 @@ impl Stroma {
         h.ensure_not_recovery_sealed()?;
         let _pause = h.pause_owner_operations_and_wait().await?;
         let log = h.event_log();
-        Ok(crate::QueuePublishCommit::queue(log.next_offset(), log.current_epoch()))
+        Ok(crate::QueuePublishCommit {
+            next: log.next_offset(),
+            epoch: log.current_epoch(),
+        })
     }
 
     /// Resume cursors for an idle follower, including a checkpoint whose live
@@ -570,24 +535,44 @@ impl Stroma {
         topic: &str,
         part: u32,
         epoch: u64,
-    ) -> Result<QueuePromotionOutcome> {
-        self.promote_queue_follower_to_local_tail(topic, part, None, epoch)
-            .await
+    ) -> Result<StreamPromotionOutcome> {
+        let qh = self.queue_handle(topic, part, None).await?;
+        let qh = qh.resolve()?;
+        qh.stream()?;
+        Ok(match self.promote_follower(&qh, Some(epoch), None).await? {
+            LocalPromotion::Promoted(tails) => StreamPromotionOutcome::Promoted {
+                message_next_offset: tails.record_next.unwrap_or(0),
+                event_next_offset: tails.log_next,
+                applied_event_offset: tails.applied_offset,
+            },
+            LocalPromotion::NotApplied(tails) => StreamPromotionOutcome::EventsNotApplied {
+                applied_event_offset: tails.applied_offset,
+                event_next_offset: tails.log_next,
+            },
+            LocalPromotion::LogBehind { .. }
+            | LocalPromotion::LogAhead { .. }
+            | LocalPromotion::PayloadsMissing { .. } => {
+                return Err(StromaError::Internal(
+                    "stream promotion produced a queue-only outcome".into(),
+                ));
+            }
+        })
     }
 
     /// Verify durable, fully applied follower state without granting an owner
     /// role. Used before admitting a non-voting learner to the write set.
+    /// `target` is the least queue log end the learner must hold.
     pub async fn verify_queue_learner_caught_up(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
         epoch: u64,
-        message_target: u64,
-        event_target: u64,
+        target: Offset,
     ) -> Result<crate::QueuePublishCommit> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        let wq = qh.work_queue()?;
         let apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         if *apply || qh.role() != QueueRole::Follower {
@@ -595,130 +580,47 @@ impl Stroma {
                 "learner is not a completely applied follower".into(),
             ));
         }
-        let message_next = qh.message_lane_next();
-        let event_next = qh.event_log().next_offset();
-        if qh.message_lane_epoch() != epoch
-            || qh.event_log().current_epoch() != epoch
-            || message_next < message_target
-            || event_next < event_target
-            || qh.ordered_applied_next()? != Some(event_next)
+        let log = qh.event_log();
+        let next = log.next_offset();
+        if log.current_epoch() != epoch
+            || next < target
+            || qh.ordered_applied_next()? != Some(next)
         {
             return Err(StromaError::InvalidArgument(
                 "learner has not reached its exact history and application cut".into(),
             ));
         }
-        if let Some(wq) = qh.as_work_queue() {
-            if self.payload_log_for(&qh).next_offset() < wq.required_message_next().await.map_err(io_err)? {
-                return Err(StromaError::InvalidArgument(
-                    "learner payload backfill is incomplete".into(),
-                ));
-            }
+        // The payload gate is separate from the cut: the state may reference
+        // payloads that backfill has not copied yet.
+        if next < wq.required_message_next().await.map_err(io_err)? {
+            return Err(StromaError::InvalidArgument(
+                "learner payload backfill is incomplete".into(),
+            ));
         }
-        for log in qh.physical_logs() { log.sync().await.map_err(io_err)?; }
-        Ok(crate::QueuePublishCommit {
-            message_next,
-            event_next,
-            message_epoch: epoch,
-            event_epoch: epoch,
-        })
+        log.sync().await.map_err(io_err)?;
+        Ok(crate::QueuePublishCommit { next, epoch })
     }
 
+    /// Promote a follower whose single queue log ends exactly at
+    /// `expected_next`, with every record applied and every referenced payload
+    /// present.
     pub async fn promote_queue_follower_if_caught_up(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
-        expected_message_next_offset: Offset,
-        expected_event_next_offset: Offset,
+        expected_next: Offset,
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
-        let apply_state = qh.follower_apply_state().await;
-        qh.ensure_not_recovery_sealed()?;
-        if *apply_state {
-            return Err(crate::StromaError::Io(
-                "incomplete follower apply; recover or install a checkpoint before promotion"
-                    .into(),
-            ));
-        }
-
-        let role = qh.role();
-        if role != QueueRole::Follower {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Follower,
-                actual: role,
-            });
-        }
-
-        let message_next_offset = qh.message_lane_next();
-        if message_next_offset < expected_message_next_offset {
-            return Ok(QueuePromotionOutcome::MessageLogBehind {
-                local_next_offset: message_next_offset,
-                expected_next_offset: expected_message_next_offset,
-            });
-        }
-        if message_next_offset > expected_message_next_offset {
-            return Ok(QueuePromotionOutcome::MessageLogAhead {
-                local_next_offset: message_next_offset,
-                expected_next_offset: expected_message_next_offset,
-            });
-        }
-
-        let event_next_offset = qh.event_log().next_offset();
-        if event_next_offset < expected_event_next_offset {
-            return Ok(QueuePromotionOutcome::EventLogBehind {
-                local_next_offset: event_next_offset,
-                expected_next_offset: expected_event_next_offset,
-            });
-        }
-        if event_next_offset > expected_event_next_offset {
-            return Ok(QueuePromotionOutcome::EventLogAhead {
-                local_next_offset: event_next_offset,
-                expected_next_offset: expected_event_next_offset,
-            });
-        }
-
-        let applied_upto = qh.applied_upto().load(Ordering::Acquire);
-        let applied_event_offset = if event_next_offset == 0 {
-            None
-        } else {
-            Some(applied_upto)
-        };
-        let events_unapplied = match qh.ordered_applied_next()? {
-            Some(next) => next != event_next_offset,
-            None => event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1),
-        };
-        if events_unapplied {
-            return Ok(QueuePromotionOutcome::EventsNotApplied {
-                applied_event_offset,
-                event_next_offset,
-            });
-        }
-
-        if let Some(wq) = qh.as_work_queue() {
-            let required = wq.required_message_next().await.map_err(io_err)?;
-            if self.payload_log_for(&qh).next_offset() < required {
-                return Ok(QueuePromotionOutcome::MessageLogBehind {
-                    local_next_offset: message_next_offset,
-                    expected_next_offset: required,
-                });
-            }
-        }
-        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
-        qh.become_owner();
-        for log in qh.physical_logs() { log.become_owner(); }
-
-        Ok(QueuePromotionOutcome::Promoted {
-            message_next_offset,
-            event_next_offset,
-            applied_event_offset,
-        })
+        qh.work_queue()?;
+        Ok(queue_promotion(self.promote_follower(&qh, None, Some(expected_next)).await?))
     }
 
-    /// Promote a follower to owner at its own local log tails.
+    /// Promote a follower to owner at its own local log tail.
     ///
-    /// Failover path: the previous owner is gone, so there are no external
-    /// expected tails to verify against — the assignment epoch fences the old
+    /// Failover path: the previous owner is gone, so there is no external
+    /// expected tail to verify against. The assignment epoch fences the old
     /// owner's unreplicated suffix instead. The events-applied gate stays:
     /// every locally recorded event must be applied before serving as owner.
     pub async fn promote_queue_follower_to_local_tail(
@@ -730,6 +632,19 @@ impl Stroma {
     ) -> Result<QueuePromotionOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        qh.work_queue()?;
+        Ok(queue_promotion(self.promote_follower(&qh, Some(epoch), None).await?))
+    }
+
+    /// Shared promotion core. With `epoch` the follower is fenced at that
+    /// epoch before it becomes owner. With `expected_next` its log must end
+    /// exactly there.
+    async fn promote_follower(
+        &self,
+        qh: &QueueHandleInner,
+        epoch: Option<u64>,
+        expected_next: Option<Offset>,
+    ) -> Result<LocalPromotion> {
         let apply_state = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         if *apply_state {
@@ -747,48 +662,37 @@ impl Stroma {
             });
         }
 
-        let message_next_offset = qh.message_lane_next();
-        let event_next_offset = qh.event_log().next_offset();
-        let applied_upto = qh.applied_upto().load(Ordering::Acquire);
-        let applied_event_offset = if event_next_offset == 0 {
-            None
-        } else {
-            Some(applied_upto)
-        };
-        let events_unapplied = match qh.ordered_applied_next()? {
-            Some(next) => next != event_next_offset,
-            None => event_next_offset != 0 && applied_upto < event_next_offset.saturating_sub(1),
-        };
-        if events_unapplied {
-            return Ok(QueuePromotionOutcome::EventsNotApplied {
-                applied_event_offset,
-                event_next_offset,
-            });
+        let tails = local_tails(qh)?;
+        if let Some(expected_next) = expected_next {
+            if tails.log_next < expected_next {
+                return Ok(LocalPromotion::LogBehind { local_next: tails.log_next, expected_next });
+            }
+            if tails.log_next > expected_next {
+                return Ok(LocalPromotion::LogAhead { local_next: tails.log_next, expected_next });
+            }
+        }
+        if tails.applied_next != tails.log_next {
+            return Ok(LocalPromotion::NotApplied(tails));
         }
 
         if let Some(wq) = qh.as_work_queue() {
             let required = wq.required_message_next().await.map_err(io_err)?;
-            if self.payload_log_for(&qh).next_offset() < required {
-                return Ok(QueuePromotionOutcome::MessageLogBehind {
-                    local_next_offset: message_next_offset,
-                    expected_next_offset: required,
-                });
+            let log_next = self.payload_log_for(qh).next_offset();
+            if log_next < required {
+                return Ok(LocalPromotion::PayloadsMissing { log_next, required_next: required });
             }
         }
-        // Persist the fencing epoch BEFORE serving as owner: from here on,
-        // replicated traffic from the previous (older-epoch) owner is
-        // rejected by both logs.
-        for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
+        if let Some(epoch) = epoch {
+            // Persist the fencing epoch BEFORE serving as owner: from here on,
+            // replicated traffic from the previous (older-epoch) owner is
+            // rejected by every log.
+            for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
+        }
 
         if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
         qh.become_owner();
         for log in qh.physical_logs() { log.become_owner(); }
-
-        Ok(QueuePromotionOutcome::Promoted {
-            message_next_offset,
-            event_next_offset,
-            applied_event_offset,
-        })
+        Ok(LocalPromotion::Promoted(tails))
     }
 
     #[cfg(feature = "early-replication-experiment")]
@@ -1103,14 +1007,17 @@ impl Stroma {
         read_owner_event_log(&qh, from, max, max_bytes, early).await
     }
 
-    pub async fn export_owner_state_checkpoint(
+    /// Capture the owner's queue state at its log tail for a learner. Refuses
+    /// stream partitions.
+    pub async fn export_queue_state_checkpoint(
         &self,
         topic: &str,
         part: u32,
         group: Option<&str>,
-    ) -> Result<OwnerStateCheckpoint> {
+    ) -> Result<QueueStateCheckpoint> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        qh.work_queue()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         let role = qh.role();
@@ -1123,64 +1030,41 @@ impl Stroma {
 
         let _pause = qh.pause_owner_operations_and_wait().await?;
 
-        async {
-            let message_next_offset = qh.message_lane_next();
-            let event_next_offset = qh.event_log().next_offset();
-            let applied_event_offset = event_next_offset.saturating_sub(1);
-            let state_checkpoint = if qh.has_ordered_apply() {
-                let captured = qh.capture_exact_checkpoint(false).await?;
-                if captured.event_next != event_next_offset {
-                    return Err(StromaError::Io("owner checkpoint has unapplied events".into()));
-                }
-                tokio::task::spawn_blocking(move || crate::state::QueueStateCheckpointSnapshot {
-                    message_checkpoint_offset: captured.message_floor,
-                    state_snapshot: captured.encode(),
-                }).await.map_err(io_err)?
-            } else {
-                qh
-                .work_queue()?
-                .export_state_checkpoint_snapshot(applied_event_offset)
-                .await
-                .map_err(|err| {
-                    StromaError::Io(format!(
-                        "owner checkpoint snapshot export failed for tp={topic} part={part} group={group:?}: {err}"
-                    ))
-                })?
-            };
+        let log = qh.event_log();
+        let next_offset = log.next_offset();
+        let state_checkpoint = if qh.has_ordered_apply() {
+            let captured = qh.capture_exact_checkpoint(false).await?;
+            if captured.event_next != next_offset {
+                return Err(StromaError::Io("owner checkpoint has unapplied events".into()));
+            }
+            tokio::task::spawn_blocking(move || crate::state::QueueStateCheckpointSnapshot {
+                message_checkpoint_offset: captured.message_floor,
+                state_snapshot: captured.encode(),
+            }).await.map_err(io_err)?
+        } else {
+            qh
+            .work_queue()?
+            .export_state_checkpoint_snapshot(next_offset.saturating_sub(1))
+            .await
+            .map_err(|err| {
+                StromaError::Io(format!(
+                    "owner checkpoint snapshot export failed for tp={topic} part={part} group={group:?}: {err}"
+                ))
+            })?
+        };
 
-            Ok(OwnerStateCheckpoint {
-                combined_log: qh.has_combined_log(),
-                event_start_offset: if qh.has_combined_log() { state_checkpoint.message_checkpoint_offset.min(event_next_offset) } else { event_next_offset },
-                message_epoch: qh.message_lane_epoch(),
-                event_epoch: qh.event_log().current_epoch(),
-                message_checkpoint_offset: if qh.has_combined_log() { 0 } else { state_checkpoint.message_checkpoint_offset },
-                message_next_offset,
-                event_next_offset,
-                applied_event_offset,
-                state_snapshot: state_checkpoint.state_snapshot,
-            })
-        }
-        .await
-    }
-
-    pub async fn apply_replicated_queue_batch(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        messages: Option<ReplicatedMessageBatch>,
-        events: Option<ReplicatedEventBatch>,
-    ) -> Result<ReplicatedQueueApplyOutcome> {
-        self.apply_replicated_two_log_batch(
-            topic, part, group, messages, events, FollowerApplyTarget::LegacyQueue,
-        )
-        .await
+        Ok(QueueStateCheckpoint {
+            epoch: log.current_epoch(),
+            start_offset: state_checkpoint.message_checkpoint_offset.min(next_offset),
+            next_offset,
+            state_snapshot: state_checkpoint.state_snapshot,
+        })
     }
 
     /// Apply one batch from the owner's single queue log. Payload enqueues
     /// and state events share offsets, so one batch carries both. The batch
     /// must not be empty. Refuses stream partitions.
-    pub async fn apply_replicated_queue_log_batch(
+    pub async fn apply_replicated_queue_batch(
         &self,
         topic: &str,
         part: u32,
@@ -1421,25 +1305,12 @@ impl Stroma {
         Ok(())
     }
 
-    /// Experimental open durability group. Input is polled only after the
-    /// previous frame has staged. The caller owns its deadline and byte budget.
-    /// The recovery guard spans staging, both sync completions and actor apply.
-    /// Dropping this future after mutation leaves the existing dirty fence set.
-    pub async fn apply_open_replicated_queue_batch(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
-    ) -> Result<Vec<ReplicatedQueueApplyOutcome>> {
-        self.apply_open_follower_frames(topic, part, group, frames, FollowerApplyTarget::LegacyQueue)
-            .await
-    }
-
     /// Open durability group over batches from the single queue log. Every
-    /// frame must carry records. Refuses stream partitions. See
-    /// `apply_open_replicated_queue_batch` for the staging and fence rules.
-    pub async fn apply_open_replicated_queue_log_batch(
+    /// frame must carry records. Refuses stream partitions. Input is polled
+    /// only after the previous frame has staged. The caller owns its deadline
+    /// and byte budget. The recovery guard spans staging, the sync and actor
+    /// apply. Dropping this future after mutation leaves the dirty fence set.
+    pub async fn apply_open_replicated_queue_batch(
         &self,
         topic: &str,
         part: u32,
@@ -1585,12 +1456,10 @@ impl Stroma {
     }
 }
 
-/// Which follower apply entry point is running. The two-lane queue entry
-/// points predate kind checks and accept any partition. The single-log queue
-/// and stream entry points refuse the other kind.
+/// Which follower apply entry point is running. Each refuses the other
+/// partition kind.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FollowerApplyTarget {
-    LegacyQueue,
     Queue,
     Stream,
 }
@@ -1598,7 +1467,6 @@ enum FollowerApplyTarget {
 impl FollowerApplyTarget {
     fn check_kind(self, qh: &QueueHandleInner) -> Result<()> {
         match self {
-            Self::LegacyQueue => {}
             Self::Queue => {
                 qh.work_queue()?;
             }
@@ -1618,5 +1486,42 @@ fn single_queue_log_outcome(outcome: ReplicatedStreamApplyOutcome) -> Result<Rep
         other => Err(StromaError::Internal(format!(
             "queue log apply produced unexpected outcomes: {other:?}"
         ))),
+    }
+}
+
+fn local_tails(qh: &QueueHandleInner) -> Result<LocalTails> {
+    let log_next = qh.event_log().next_offset();
+    let applied_upto = qh.applied_upto().load(Ordering::Acquire);
+    let applied_next = match qh.ordered_applied_next()? {
+        Some(next) => next,
+        None if log_next == 0 => 0,
+        // Without an exact frontier the handle only tracks the last applied
+        // offset, so an empty application reads as offset zero applied.
+        None => applied_upto.saturating_add(1).min(log_next),
+    };
+    Ok(LocalTails {
+        record_next: qh.optional_message_log().map(|log| log.next_offset()),
+        log_next,
+        applied_next,
+        applied_offset: (log_next != 0).then_some(applied_upto),
+    })
+}
+
+fn queue_promotion(outcome: LocalPromotion) -> QueuePromotionOutcome {
+    match outcome {
+        LocalPromotion::Promoted(tails) => QueuePromotionOutcome::Promoted { next: tails.log_next },
+        LocalPromotion::LogBehind { local_next, expected_next } => {
+            QueuePromotionOutcome::LogBehind { local_next, expected_next }
+        }
+        LocalPromotion::LogAhead { local_next, expected_next } => {
+            QueuePromotionOutcome::LogAhead { local_next, expected_next }
+        }
+        LocalPromotion::NotApplied(tails) => QueuePromotionOutcome::NotApplied {
+            applied_next: tails.applied_next,
+            log_next: tails.log_next,
+        },
+        LocalPromotion::PayloadsMissing { log_next, required_next } => {
+            QueuePromotionOutcome::PayloadsMissing { log_next, required_next }
+        }
     }
 }

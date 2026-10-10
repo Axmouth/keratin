@@ -232,10 +232,10 @@ async fn event_zero_in_log_without_application_cannot_promote_or_checkpoint() {
     }
     st.become_queue_follower("q", 0, None).await.unwrap();
     assert!(matches!(
-        st.promote_queue_follower_if_caught_up("q", 0, None, 0, 1)
+        st.promote_queue_follower_if_caught_up("q", 0, None, 1)
             .await
             .unwrap(),
-        QueuePromotionOutcome::EventsNotApplied { .. }
+        QueuePromotionOutcome::NotApplied { .. }
     ));
     assert!(st.become_queue_owner("q", 0, None).await.is_err());
     assert!(st.snapshot_partition("q", 0, None).await.is_err());
@@ -319,13 +319,12 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
         "q",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: batch.epoch,
             first_offset: 0,
             events: replay.clone(),
             durability: None,
-        }),
+        },
     )
     .await
     .unwrap();
@@ -347,20 +346,16 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
             "q",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: batch.epoch,
                 first_offset: 0,
                 events: suffix,
                 durability: None,
-            }),
+            },
         )
         .await
         .unwrap();
-    assert!(matches!(
-        rejected.event_log,
-        Some(ReplicatedAppendOutcome::Overlap { .. })
-    ));
+    assert!(matches!(rejected, ReplicatedAppendOutcome::Overlap { .. }));
     assert_eq!(
         ticket.resolve().unwrap().ordered_applied_next().unwrap(),
         Some(2)
@@ -369,13 +364,12 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
         "q",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: batch.epoch,
             first_offset: 2,
             events: vec![StromaEvent::Ack { off: 0 }],
             durability: None,
-        }),
+        },
     )
     .await
     .unwrap();

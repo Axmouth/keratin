@@ -345,10 +345,10 @@ impl Stroma {
                 match outcome {
                     Ok(ar) => {
                         if let Some(observer) = observer {
-                            observer(QueuePublishCommit::queue(
-                                ar.base_offset + ar.count as u64,
+                            observer(QueuePublishCommit {
+                                next: ar.base_offset + ar.count as u64,
                                 epoch,
-                            ));
+                            });
                         }
                         for (i, item) in items.into_iter().enumerate() {
                             item.completion.complete(Ok(AppendResult {

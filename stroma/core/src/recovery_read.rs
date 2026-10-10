@@ -619,8 +619,7 @@ mod tests {
                 "q",
                 0,
                 None,
-                None,
-                Some(ReplicatedEventBatch {
+                ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: offset,
                     durability: Some(KDurability::AfterFsync),
@@ -630,7 +629,7 @@ mod tests {
                         headers: vec![2, 3],
                         payload: vec![offset as u8; 80],
                     }],
-                }),
+                },
             )
             .await
             .unwrap();

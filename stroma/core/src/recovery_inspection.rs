@@ -2011,8 +2011,7 @@ mod tests {
                     "q",
                     0,
                     None,
-                    None,
-                    Some(ReplicatedEventBatch {
+                    ReplicatedEventBatch {
                         epoch: 7,
                         first_offset: 0,
                         durability: Some(KDurability::AfterFsync),
@@ -2025,7 +2024,7 @@ mod tests {
                                 payload: r.payload,
                             })
                             .collect(),
-                    }),
+                    },
                 )
                 .await
                 .unwrap();

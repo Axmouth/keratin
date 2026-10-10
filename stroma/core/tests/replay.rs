@@ -59,19 +59,12 @@ async fn delayed_publish_nack_preserves_retry_count_on_log_replay() {
         .await
         .unwrap();
     follower.become_queue_follower("q", 0, None).await.unwrap();
-    let OwnerReplicationRead::Batch(messages) = st
-        .read_owner_message_records("q", 0, None, 0, 100)
-        .await
-        .unwrap()
-    else {
-        panic!("message batch")
-    };
     let OwnerReplicationRead::Batch(events) = st
-        .read_owner_event_records("q", 0, None, 0, 100)
+        .read_owner_queue_records("q", 0, None, 0, 100, usize::MAX)
         .await
         .unwrap()
     else {
-        panic!("event batch")
+        panic!("queue batch")
     };
     assert!(
         events
@@ -84,22 +77,12 @@ async fn delayed_publish_nack_preserves_retry_count_on_log_replay() {
             "q",
             0,
             None,
-            Some(ReplicatedMessageBatch {
-                epoch: messages.epoch,
-                first_offset: 0,
-                records: messages
-                    .records
-                    .into_iter()
-                    .map(|(_, record)| record)
-                    .collect(),
-                durability: None,
-            }),
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: events.epoch,
                 first_offset: 0,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: None,
-            }),
+            },
         )
         .await
         .unwrap();

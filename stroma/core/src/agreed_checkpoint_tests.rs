@@ -95,7 +95,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
     st.write_exact_queue_checkpoint(ticket.clone(), true)
         .await
         .unwrap();
-    st.truncate_messages_before("q", 0, None, 40).await.unwrap();
+    st.truncate_queue_before("q", 0, None, 40).await.unwrap();
     st.truncate_partition_log(ticket.clone(), u64::MAX)
         .await
         .unwrap();
@@ -284,7 +284,7 @@ async fn corrupt_retention_blocks_compaction_without_blocking_publish() {
             .await
             .is_err()
     );
-    assert!(st.truncate_messages_before("q", 0, None, 4).await.is_err());
+    assert!(st.truncate_queue_before("q", 0, None, 4).await.is_err());
     publish(&st, 1).await;
     assert_eq!(ticket.resolve().unwrap().payload_log().head_offset(), 0);
     assert!(

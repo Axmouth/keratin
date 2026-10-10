@@ -157,7 +157,7 @@ async fn delayed_payload_pins_retention_below_snapshot_replay_boundary() {
     let snapshot_next = boundary.event_next();
     assert!(snapshot_next > 12);
     assert_eq!(
-        st.truncate_messages_before("q", 0, None, u64::MAX)
+        st.truncate_queue_before("q", 0, None, u64::MAX)
             .await
             .unwrap(),
         0
@@ -235,12 +235,17 @@ async fn event_only_follower_keeps_payloads_and_overlap_does_not_repeat_nack() {
         },
     ];
     for _ in 0..2 {
-        st.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+        st.apply_replicated_queue_batch(
+                "q",
+                0,
+                None,
+                ReplicatedEventBatch {
                 epoch: 1,
                 first_offset: 0,
                 events: events.clone(),
                 durability: Some(KDurability::AfterFsync),
-            })
+            },
+)
         .await
         .unwrap();
     }
@@ -453,19 +458,18 @@ async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
             .unwrap(),
         (0, 1)
     );
-    // A malformed absent-lane frame is refused before poisoning follower apply.
+    // An empty single-log frame is refused before poisoning follower apply.
     assert!(
         st.apply_replicated_queue_batch(
             "q",
             0,
             None,
-            Some(crate::ReplicatedMessageBatch {
+            ReplicatedEventBatch {
                 epoch: 6,
-                first_offset: 0,
-                records: vec![],
+                first_offset: 1,
+                events: vec![],
                 durability: Some(KDurability::AfterFsync),
-            }),
-            None
+            },
         )
         .await
         .is_err()
@@ -603,7 +607,7 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
             };
             assert_eq!(tentative.next_offset, prefix + 1);
             follower
-                .apply_open_replicated_queue_log_batch(
+                .apply_open_replicated_queue_batch(
                     "q",
                     0,
                     None,
@@ -946,7 +950,7 @@ async fn combined_learner_checkpoint_crash_child() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reapplying_nack() {
-    use crate::{FollowerStateCheckpointInstall, OwnerReplicationRead, StorageHistoryBinding};
+    use crate::{OwnerReplicationRead, StorageHistoryBinding};
     let dir = keratin_log::test_dir!("combined_learner_checkpoint");
     let owner = open(&dir.root.join("owner")).await;
     let binding = StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] };
@@ -955,9 +959,8 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
     assert_eq!(publish(&owner, true).await, 0);
     assert_eq!(publish(&owner, false).await, 1);
     owner.nack_one("q", 0, None, 1, true).await.unwrap();
-    let cut = owner.export_owner_state_checkpoint("q", 0, None).await.unwrap();
-    assert!(cut.combined_log);
-    assert_eq!((cut.message_checkpoint_offset, cut.message_next_offset, cut.event_start_offset, cut.event_next_offset), (0, 0, 0, 3));
+    let cut = owner.export_queue_state_checkpoint("q", 0, None).await.unwrap();
+    assert_eq!((cut.epoch, cut.start_offset, cut.next_offset), (7, 0, 3));
     let OwnerReplicationRead::Batch(batch) = owner.read_owner_queue_records("q", 0, None, 0, 100, usize::MAX).await.unwrap() else { panic!("retained source") };
     let events: Vec<_> = batch.records.into_iter().map(|(_, e)| e).collect();
     assert_eq!(events.len(), 3);
@@ -967,14 +970,9 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
             let mut st = open(&root).await;
             let receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [4; 32]).await.unwrap();
             st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-            let install = FollowerStateCheckpointInstall {
-                combined_log: cut.combined_log, event_start_offset: cut.event_start_offset,
-                message_epoch: cut.message_epoch, event_epoch: cut.event_epoch,
-                message_next_offset: cut.message_checkpoint_offset, event_next_offset: cut.event_next_offset,
-                applied_event_offset: cut.applied_event_offset, state_snapshot: cut.state_snapshot.clone(),
-            };
+            let install = cut.clone();
             let mut wrong = install.clone();
-            wrong.event_start_offset = 1;
+            wrong.start_offset = 1;
             assert!(st.install_queue_learner_checkpoint(receipt.clone(), wrong).await.is_err());
             if hard_kill {
                 st.shutdown().await.unwrap();
@@ -1017,11 +1015,11 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
             assert!(st.queue_handle("q", 0, None).await.is_err());
             let mut receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [5; 32]).await.unwrap();
             for (offset, event) in events.iter().enumerate() {
-                assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.is_err());
+                assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 3).await.is_err());
                 assert!(st.become_queue_owner("q", 0, None).await.is_err());
                 for _ in 0..2 {
                     let batch = ReplicatedEventBatch { epoch: 7, first_offset: offset as u64, events: vec![event.clone()], durability: Some(KDurability::AfterFsync) };
-                    st.apply_replicated_queue_log_batch("q", 0, None, batch).await.unwrap();
+                    st.apply_replicated_queue_batch("q", 0, None, batch).await.unwrap();
                 }
                 if offset == 0 {
                     st.shutdown().await.unwrap();
@@ -1032,7 +1030,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
                     assert!(!st.msg_tp_part_dir("q", 0, None).exists());
                 }
             }
-            st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 3).await.unwrap();
+            st.verify_queue_learner_caught_up("q", 0, None, 7, 3).await.unwrap();
             let ticket = st.queue_handle("q", 0, None).await.unwrap();
             let h = ticket.resolve().unwrap();
             assert_eq!(h.work_queue().unwrap().retries(1).await, 1);
@@ -1054,7 +1052,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_records() {
-    use crate::{FollowerStateCheckpointInstall, StorageHistoryBinding};
+    use crate::{QueueStateCheckpoint, StorageHistoryBinding};
     for missing_receipt in [true, false] {
         let dir = keratin_log::test_dir!("combined_learner_rejects_bad_backfill");
         let st = open(&dir.root).await;
@@ -1064,18 +1062,24 @@ async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_recor
         let mut state = crate::QueueInternalState::new("q".into(), 0);
         state.enqueue(0, 1, None);
         state.ack(1);
-        st.install_queue_learner_checkpoint(receipt, FollowerStateCheckpointInstall {
-            combined_log: true, event_start_offset: 0, message_epoch: 7, event_epoch: 7,
-            message_next_offset: 0, event_next_offset: 2, applied_event_offset: 1,
+        st.install_queue_learner_checkpoint(receipt, QueueStateCheckpoint {
+            epoch: 7,
+            start_offset: 0,
+            next_offset: 2,
             state_snapshot: state.into_recovery_snapshot(2),
         }).await.unwrap();
         if !missing_receipt {
-            let err = st.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+            let err = st.apply_replicated_queue_batch(
+                "q",
+                0,
+                None,
+                ReplicatedEventBatch {
                 epoch: 7, first_offset: 0, durability: Some(KDurability::AfterFsync),
                 events: vec![StromaEvent::AckMany { reqs: vec![] }, StromaEvent::Ack { off: 0 }],
-            }).await.unwrap_err();
+            },
+).await.unwrap_err();
             assert!(err.to_string().contains("retained payload enqueue"), "{err}");
-            assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 2).await.is_err());
+            assert!(st.verify_queue_learner_caught_up("q", 0, None, 7, 2).await.is_err());
         }
         let journal = st.snap_dir("q", 0, None).join("checkpoint.install");
         st.shutdown().await.unwrap();
@@ -1108,7 +1112,7 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
     };
     let view = st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.unwrap();
     view.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-    assert!(st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0).await.is_err());
+    assert!(st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0).await.is_err());
     assert_eq!(st.queue_replication_next_offset("q", 0, None).await.unwrap(), 1);
     let original_root = st.partition_root("q", 0, None);
     if seal_during_copy {
@@ -1116,10 +1120,10 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
             RecoverySealRequest { transition: [45; 32], fence_epoch: 8 }).await.unwrap();
         assert_eq!((seal.message_next, seal.event_next), (0, 1));
     }
-    view.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+    view.apply_replicated_queue_batch("q", 0, None, ReplicatedEventBatch {
         epoch: 7, first_offset: 0, events, durability: Some(KDurability::AfterFsync),
     }).await.unwrap();
-    let installed = st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1).await;
+    let installed = st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 1).await;
     if seal_during_copy {
         assert!(installed.is_err());
         assert_eq!(st.partition_root("q", 0, None), original_root);
@@ -1129,10 +1133,10 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
         assert!(view.verify_admitted_storage_history(&receipt).is_err());
         assert!(view.resume_unaccepted_storage_history("q", 0, None, binding).await.is_err());
         st.become_queue_follower_with_epoch("q", 0, None, 7).await.unwrap();
-        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1).await.unwrap();
-        assert_eq!(st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(), Some((7, 0, 1)));
+        st.verify_queue_learner_caught_up("q", 0, None, 7, 1).await.unwrap();
+        assert_eq!(st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(), Some((7, 1)));
         assert!(st.prepare_queue_reseed_storage(receipt.clone(), [41; 32]).await.is_err());
-        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1).await.unwrap();
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1).await.unwrap();
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
         assert!(h.optional_message_log().is_none());
@@ -1232,10 +1236,15 @@ async fn combined_direct_settlement_paths_leave_no_metadata_frontier_holes() {
     let crate::OwnerReplicationRead::Batch(batch) = st.read_owner_queue_records("q", 0, None, 0, 100, usize::MAX).await.unwrap() else { panic!("retained history") };
     let follower = open(&dir.root.join("follower")).await;
     follower.become_queue_follower_with_epoch("q", 0, None, batch.epoch).await.unwrap();
-    follower.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+    follower.apply_replicated_queue_batch(
+        "q",
+        0,
+        None,
+        ReplicatedEventBatch {
         epoch: batch.epoch, first_offset: 0, events: batch.records.into_iter().map(|(_, event)| event).collect(),
         durability: Some(KDurability::AfterFsync),
-    }).await.unwrap();
+    },
+).await.unwrap();
     let fq = follower.queue_handle("q", 0, None).await.unwrap();
     let fh = fq.resolve().unwrap();
     assert_eq!(fh.work_queue().unwrap().settled_until().await, next);
@@ -1306,22 +1315,32 @@ async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
         not_before: None, expire_at: None, headers: headers().encode().unwrap(), payload: vec![42],
     };
     for invalid in [StromaEvent::Ack { off: 1 }, StromaEvent::CancelEnqueueMany { offs: vec![u64::MAX] }] {
-        let error = st.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+        let error = st.apply_replicated_queue_batch(
+            "q",
+            0,
+            None,
+            ReplicatedEventBatch {
             epoch: 7, first_offset: 0, events: vec![payload.clone(), invalid], durability: Some(KDurability::AfterFsync),
-        }).await.unwrap_err();
+        },
+).await.unwrap_err();
         assert!(error.to_string().contains("forward payload reference"), "{error}");
         assert_eq!(h.event_log().next_offset(), 0);
         assert_eq!(h.ordered_applied_next().unwrap(), Some(0));
         assert!(!*h.follower_apply_state().await);
     }
-    assert!(st.apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+    assert!(st.apply_replicated_queue_batch(
+        "q",
+        0,
+        None,
+        ReplicatedEventBatch {
         epoch: 7, first_offset: u64::MAX, events: vec![payload.clone()], durability: Some(KDurability::AfterFsync),
-    }).await.unwrap_err().to_string().contains("offset exhausted"));
+    },
+).await.unwrap_err().to_string().contains("offset exhausted"));
     assert_eq!(h.event_log().next_offset(), 0);
     for _ in 0..2 {
         let batch = ReplicatedEventBatch { epoch: 7, first_offset: 0,
             events: vec![payload.clone(), StromaEvent::Nack { off: 0, requeue: true }], durability: Some(KDurability::AfterFsync) };
-        st.apply_replicated_queue_log_batch("q", 0, None, batch).await.unwrap();
+        st.apply_replicated_queue_batch("q", 0, None, batch).await.unwrap();
     }
     assert_eq!(h.event_log().next_offset(), 2);
     assert_eq!(h.ordered_applied_next().unwrap(), Some(2));
@@ -1341,14 +1360,14 @@ async fn combined_open_group_keeps_dirty_fence_when_later_frame_is_invalid() {
     let invalid = || ReplicatedEventBatch { epoch: 7, first_offset: 1, durability: None,
         events: vec![StromaEvent::Ack { off: 1 }] };
     let frames = futures::stream::iter([Ok(first), Ok(invalid())]).boxed();
-    let error = st.apply_open_replicated_queue_log_batch("q", 0, None, frames).await.unwrap_err();
+    let error = st.apply_open_replicated_queue_batch("q", 0, None, frames).await.unwrap_err();
     assert!(error.to_string().contains("forward payload reference"), "{error}");
     let q = st.queue_handle("q", 0, None).await.unwrap();
     let h = q.resolve().unwrap();
     assert_eq!(h.event_log().next_offset(), 1);
     assert_eq!(h.ordered_applied_next().unwrap(), Some(0));
     assert!(*h.follower_apply_state().await);
-    assert!(st.apply_replicated_queue_log_batch("q", 0, None, invalid()).await.unwrap_err().to_string().contains("incomplete follower apply"));
+    assert!(st.apply_replicated_queue_batch("q", 0, None, invalid()).await.unwrap_err().to_string().contains("incomplete follower apply"));
     st.shutdown().await.unwrap();
 }
 
@@ -1442,12 +1461,17 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
         .await
         .unwrap();
     follower
-        .apply_replicated_queue_log_batch("q", 0, None, ReplicatedEventBatch {
+        .apply_replicated_queue_batch(
+                "q",
+                0,
+                None,
+                ReplicatedEventBatch {
                 epoch: events.epoch,
                 first_offset: 0,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: Some(KDurability::AfterFsync),
-            })
+            },
+)
         .await
         .unwrap();
 
@@ -1457,7 +1481,7 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
     owner.write_exact_queue_checkpoint(q, true).await.unwrap();
     assert_eq!(
         owner
-            .truncate_messages_before("q", 0, None, u64::MAX)
+            .truncate_queue_before("q", 0, None, u64::MAX)
             .await
             .unwrap(),
         0
@@ -1703,18 +1727,18 @@ async fn single_log_queue_api_and_stream_api_refuse_the_other_kind() {
         epoch: 3, first_offset, events, durability: Some(KDurability::AfterFsync),
     };
     assert!(wrong_kind(
-        follower.apply_replicated_queue_log_batch("s", 0, None, queue_batch(0, events[..1].to_vec())).await.unwrap_err()
+        follower.apply_replicated_queue_batch("s", 0, None, queue_batch(0, events[..1].to_vec())).await.unwrap_err()
     ));
     let frames = futures::stream::iter([Ok(queue_batch(0, events[..1].to_vec()))]).boxed();
-    assert!(wrong_kind(follower.apply_open_replicated_queue_log_batch("s", 0, None, frames).await.unwrap_err()));
+    assert!(wrong_kind(follower.apply_open_replicated_queue_batch("s", 0, None, frames).await.unwrap_err()));
     assert!(wrong_kind(follower.apply_replicated_stream_batch("q", 0, None, None).await.unwrap_err()));
     assert!(wrong_kind(follower.queue_replication_next_offset("s", 0, None).await.unwrap_err()));
 
     // Empty single-log batches are refused instead of being treated as progress.
-    let empty = follower.apply_replicated_queue_log_batch("q", 0, None, queue_batch(0, vec![])).await;
+    let empty = follower.apply_replicated_queue_batch("q", 0, None, queue_batch(0, vec![])).await;
     assert!(matches!(empty, Err(StromaError::InvalidArgument(_))));
     let frames = futures::stream::iter([Ok(queue_batch(0, vec![]))]).boxed();
-    assert!(follower.apply_open_replicated_queue_log_batch("q", 0, None, frames).await.is_err());
+    assert!(follower.apply_open_replicated_queue_batch("q", 0, None, frames).await.is_err());
     let q = follower.queue_handle("q", 0, None).await.unwrap();
     let h = q.resolve().unwrap();
     assert!(!*h.follower_apply_state().await, "a refused empty frame must not set the dirty fence");
@@ -1722,12 +1746,12 @@ async fn single_log_queue_api_and_stream_api_refuse_the_other_kind() {
     drop(q);
 
     let outcome = follower
-        .apply_replicated_queue_log_batch("q", 0, None, queue_batch(0, events[..1].to_vec()))
+        .apply_replicated_queue_batch("q", 0, None, queue_batch(0, events[..1].to_vec()))
         .await
         .unwrap();
     assert!(matches!(outcome, ReplicatedAppendOutcome::Applied(r) if r.base_offset == 0 && r.count == 1));
     let frames = futures::stream::iter([Ok(queue_batch(1, events[1..].to_vec()))]).boxed();
-    let outcomes = follower.apply_open_replicated_queue_log_batch("q", 0, None, frames).await.unwrap();
+    let outcomes = follower.apply_open_replicated_queue_batch("q", 0, None, frames).await.unwrap();
     assert!(matches!(outcomes.as_slice(), [ReplicatedAppendOutcome::Applied(r)] if r.base_offset == 1));
     assert_eq!(follower.queue_replication_next_offset("q", 0, None).await.unwrap(), 2);
     owner.shutdown().await.unwrap();
@@ -1744,7 +1768,7 @@ async fn queue_commits_name_one_offset_and_one_epoch_in_the_single_log() {
         st.queue_durable_commit("s", 0, None).await,
         Err(StromaError::WrongPartitionKind { .. })
     ));
-    assert_eq!(st.queue_durable_commit("q", 0, None).await.unwrap(), QueuePublishCommit::queue(0, 5));
+    assert_eq!(st.queue_durable_commit("q", 0, None).await.unwrap(), QueuePublishCommit { next: 0, epoch: 5 });
     assert_eq!(publish(&st, false).await, 0);
 
     // A two-record publish commits once, at the end of its last record.
@@ -1772,13 +1796,26 @@ async fn queue_commits_name_one_offset_and_one_epoch_in_the_single_log() {
     for done in completions {
         done.await.unwrap().unwrap();
     }
-    assert!(commit.is_single_log());
-    assert_eq!((commit.next(), commit.epoch()), (3, 5));
+    assert_eq!(commit, QueuePublishCommit { next: 3, epoch: 5 });
     let durable = st.queue_durable_commit("q", 0, None).await.unwrap();
-    assert!(durable.is_single_log());
     assert_eq!(durable, commit);
-    // A commit whose pairs disagree is visible as such to its consumer.
-    assert!(!QueuePublishCommit { message_next: 0, ..commit }.is_single_log());
-    assert!(!QueuePublishCommit { message_epoch: 4, ..commit }.is_single_log());
+    st.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_and_stream_role_calls_refuse_the_other_kind() {
+    let dir = keratin_log::test_dir!("combined_role_calls_refuse_other_kind");
+    let st = open(&dir.root).await;
+    st.ensure_queue_owner_epoch("q", 0, None, Some(1)).await.unwrap();
+    st.create_stream("s", 0, None).await.unwrap();
+    let wrong_kind = |result: Result<()>| matches!(result, Err(StromaError::WrongPartitionKind { .. }));
+    assert!(wrong_kind(st.export_queue_state_checkpoint("s", 0, None).await.map(|_| ())));
+    assert!(wrong_kind(st.verify_queue_learner_caught_up("s", 0, None, 0, 0).await.map(|_| ())));
+    assert!(wrong_kind(st.promote_queue_follower_if_caught_up("s", 0, None, 0).await.map(|_| ())));
+    assert!(wrong_kind(st.promote_queue_follower_to_local_tail("s", 0, None, 1).await.map(|_| ())));
+    assert!(wrong_kind(st.demote_queue_owner_to_follower("s", 0, None).await.map(|_| ())));
+    assert!(wrong_kind(st.truncate_queue_before("s", 0, None, 1).await.map(|_| ())));
+    assert!(wrong_kind(st.promote_stream_follower_to_local_tail("q", 0, 1).await.map(|_| ())));
+    assert!(wrong_kind(st.truncate_stream_records_before("q", 0, 1).await.map(|_| ())));
     st.shutdown().await.unwrap();
 }

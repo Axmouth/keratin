@@ -5,7 +5,8 @@ use super::*;
 use crate::QueueInternalState;
 use std::io::Write;
 
-const MAGIC: &[u8; 8] = b"CINST\0\0\x01";
+// Version 2 journals hold a single-log QueueStateCheckpoint.
+const MAGIC: &[u8; 8] = b"CINST\0\0\x02";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct Journal {
@@ -19,60 +20,53 @@ struct Journal {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 enum Phase {
-    Pending(FollowerStateCheckpointInstall),
+    Pending(QueueStateCheckpoint),
     Complete {
         digest: [u8; 32],
-        backfill: Option<Box<FollowerStateCheckpointInstall>>,
+        backfill: Option<Box<QueueStateCheckpoint>>,
     },
 }
 
-fn digest(install: &FollowerStateCheckpointInstall) -> Result<[u8; 32]> {
+fn digest(install: &QueueStateCheckpoint) -> Result<[u8; 32]> {
     Ok(*blake3::hash(&rmp_serde::to_vec_named(install).map_err(encode_err)?).as_bytes())
 }
 
 fn validate(
     topic: &str,
     part: u32,
-    install: &FollowerStateCheckpointInstall,
+    install: &QueueStateCheckpoint,
 ) -> Result<(QueueInternalState, crate::SnapshotMeta)> {
-    if !install.combined_log
-        || install.event_start_offset > install.event_next_offset
-        || install.message_next_offset != 0
-        || install.message_epoch != install.event_epoch
-    {
-        return Err(StromaError::InvalidArgument(
-            "invalid checkpoint layout or physical start".into(),
-        ));
-    }
-    if install.applied_event_offset != install.event_next_offset.saturating_sub(1) {
+    if install.start_offset > install.next_offset {
         return Err(StromaError::InvalidArgument(format!(
-            "checkpoint applied event offset {} does not match event continuation {}",
-            install.applied_event_offset, install.event_next_offset,
+            "checkpoint start {} is past its applied boundary {}",
+            install.start_offset, install.next_offset,
         )));
     }
+    // The snapshot covers every record below the boundary.
+    let applied = install.next_offset.saturating_sub(1);
     let mut state = QueueInternalState::new(topic.to_owned(), part);
     let meta = state
         .load_snapshot(&install.state_snapshot)
         .map_err(decode_err)?;
-    if meta.last_snapshot_event_offset != install.applied_event_offset {
+    if meta.last_snapshot_event_offset != applied {
         return Err(StromaError::InvalidArgument(format!(
-            "checkpoint snapshot event offset {} does not match applied offset {}",
-            meta.last_snapshot_event_offset, install.applied_event_offset,
+            "checkpoint snapshot event offset {} does not match applied boundary {}",
+            meta.last_snapshot_event_offset, install.next_offset,
         )));
     }
-    let payload_start = install.event_start_offset;
-    if payload_start > state.lowest_not_settled_offset()
-        || state.required_message_next() > install.event_next_offset
+    // Backfill must start at or below every payload the state can still
+    // reference, and the state cannot reference records past the boundary.
+    if install.start_offset > state.lowest_not_settled_offset()
+        || state.required_message_next() > install.next_offset
     {
         return Err(StromaError::InvalidArgument(format!(
             "checkpoint payload range {}..{} does not cover state-referenced messages from {} through {}",
-            payload_start,
-            install.event_next_offset,
+            install.start_offset,
+            install.next_offset,
             state.lowest_not_settled_offset(),
             state.required_message_next(),
         )));
-    }
-    Ok((state, meta))
+    }    Ok((state, meta))
 }
 
 fn read_journal(path: &Path) -> Result<Option<Journal>> {
@@ -193,8 +187,8 @@ impl Stroma {
     pub async fn install_queue_learner_checkpoint(
         &self,
         receipt: PreparedStorageHistory,
-        install: FollowerStateCheckpointInstall,
-    ) -> Result<FollowerStateCheckpointInstallOutcome> {
+        install: QueueStateCheckpoint,
+    ) -> Result<QueueStateCheckpointInstallOutcome> {
         if receipt.stream {
             return Err(StromaError::Unsupported(
                 "learner checkpoint requires queue storage".into(),
@@ -211,10 +205,8 @@ impl Stroma {
                 &receipt,
             )
             .await?;
-            Ok(FollowerStateCheckpointInstallOutcome {
-                message_next_offset: install.message_next_offset,
-                event_next_offset: install.event_start_offset,
-                applied_event_offset: install.applied_event_offset,
+            Ok(QueueStateCheckpointInstallOutcome {
+                next_offset: install.start_offset,
                 snapshot_meta: meta,
             })
         })
@@ -227,15 +219,9 @@ impl Stroma {
         topic: &str,
         part: u32,
         group: Option<&str>,
-        install: &FollowerStateCheckpointInstall,
+        install: &QueueStateCheckpoint,
         learner: &PreparedStorageHistory,
     ) -> Result<()> {
-        if !install.combined_log {
-            return Err(StromaError::InvalidArgument(
-                "checkpoint layout differs from local queue format".into(),
-            ));
-        }
-
         loop {
             self.queue_handle(topic, part, group).await?;
             let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
@@ -258,7 +244,7 @@ impl Stroma {
                 });
             }
             h.work_queue()?;
-            Self::checkpoint_epochs(&h, install)?;
+            Self::checkpoint_epoch(&h, install)?;
             let hash = digest(install)?;
             if matches!(self.checkpoint_journal(topic, part, group)?.map(|j| j.phase), Some(Phase::Complete { digest, .. }) if digest == hash)
             {
@@ -309,8 +295,7 @@ impl Stroma {
             self.checkpoint_boundary("intent")?;
             tracing::info!(topic, partition = part, group,
                 checkpoint = %blake3::Hash::from_bytes(hash),
-                message_epoch = install.message_epoch, event_epoch = install.event_epoch,
-                message_next = install.message_next_offset, event_next = install.event_next_offset,
+                epoch = install.epoch, start = install.start_offset, next = install.next_offset,
                 "checkpoint intent durable; replacing follower logs and state");
             self.finish_live_checkpoint(topic, part, group, &h, &mut apply)
                 .await?;
@@ -318,20 +303,12 @@ impl Stroma {
         }
     }
 
-    fn checkpoint_epochs(
-        h: &QueueHandleInner,
-        install: &FollowerStateCheckpointInstall,
-    ) -> Result<()> {
-        if install.combined_log != h.optional_message_log().is_none()
-            || (h.message_lane_epoch(), h.event_log().current_epoch())
-                != (install.message_epoch, install.event_epoch)
-        {
+    fn checkpoint_epoch(h: &QueueHandleInner, install: &QueueStateCheckpoint) -> Result<()> {
+        let local = h.event_log().current_epoch();
+        if local != install.epoch {
             return Err(StromaError::InvalidArgument(format!(
-                "checkpoint epochs ({}, {}) do not match local epochs ({}, {})",
-                install.message_epoch,
-                install.event_epoch,
-                h.message_lane_epoch(),
-                h.event_log().current_epoch(),
+                "checkpoint epoch {} does not match local epoch {local}",
+                install.epoch,
             )));
         }
         Ok(())
@@ -389,15 +366,15 @@ impl Stroma {
         match &journal.phase {
             Phase::Pending(install) => {
                 let (state, meta) = validate(topic, part, install)?;
-                Self::checkpoint_epochs(h, install)?;
+                Self::checkpoint_epoch(h, install)?;
                 for log in h.physical_logs() {
                     log.become_follower();
                 }
                 self.checkpoint_boundary("messages")?;
                 h.event_log()
                     .destructive_reset_to_checkpoint_at_epoch(
-                        install.event_start_offset,
-                        install.event_epoch,
+                        install.start_offset,
+                        install.epoch,
                     )
                     .await
                     .map_err(io_err)?;
@@ -407,8 +384,8 @@ impl Stroma {
                     .await
                     .map_err(io_err)?;
                 h.applied_upto()
-                    .store(install.applied_event_offset, Ordering::Release);
-                h.reset_ordered_apply_after_recovery(install.event_next_offset);
+                    .store(install.next_offset.saturating_sub(1), Ordering::Release);
+                h.reset_ordered_apply_after_recovery(install.next_offset);
                 self.checkpoint_boundary("state")?;
                 let gate = h.recovery_gate.clone();
                 let stroma = self.clone();
@@ -478,15 +455,14 @@ impl Stroma {
             return Ok(false);
         };
         validate(topic, part, &install)?;
-        Ok(install.combined_log
-            && digest(&install)? == expected
+        Ok(digest(&install)? == expected
             && journal.history.is_some()
             && journal.history == self.storage_history_binding(topic, part, group)?
-            && install.event_epoch == log.current_epoch()
-            && install.event_next_offset == next
+            && install.epoch == log.current_epoch()
+            && install.next_offset == next
             && install.state_snapshot == snapshot
-            && install.event_start_offset == log.head_offset()
-            && log.next_offset() >= install.event_start_offset
+            && install.start_offset == log.head_offset()
+            && log.next_offset() >= install.start_offset
             && log.next_offset() < next)
     }
 
@@ -499,7 +475,7 @@ impl Stroma {
             journal.partition,
             journal.group.as_deref(),
             2,
-            install.event_next_offset,
+            install.next_offset,
             &install.state_snapshot,
         )?;
         recovery_seal::sync_directories(&self.snap_dir(
@@ -583,18 +559,12 @@ impl Stroma {
                 validate(&journal.topic, journal.partition, install)?;
                 tracing::info!(topic = journal.topic, partition = journal.partition,
                     group = journal.group, checkpoint = %blake3::Hash::from_bytes(digest(install)?),
-                    message_epoch = install.message_epoch, event_epoch = install.event_epoch,
-                    message_next = install.message_next_offset, event_next = install.event_next_offset,
+                    epoch = install.epoch, start = install.start_offset, next = install.next_offset,
                     "resuming interrupted checkpoint before ordinary log recovery");
-                if !install.combined_log {
-                    return Err(StromaError::Corruption(
-                        "checkpoint journal layout mismatch".into(),
-                    ));
-                }
                 let logs = vec![(
                     self.tp_part_dir(&journal.topic, journal.partition, journal.group.as_deref()),
-                    install.event_start_offset,
-                    install.event_epoch,
+                    install.start_offset,
+                    install.epoch,
                 )];
                 Keratin::rebuild_for_checkpoint_recovery(logs)
                     .await
@@ -642,19 +612,15 @@ mod tests {
         .unwrap()
     }
 
-    fn checkpoint(count: u64) -> FollowerStateCheckpointInstall {
+    fn checkpoint(count: u64) -> QueueStateCheckpoint {
         let mut state = QueueInternalState::new("q".into(), 0);
         for offset in 0..count {
             state.enqueue(offset, 0, None);
         }
-        FollowerStateCheckpointInstall {
-            combined_log: true,
-            event_start_offset: 0,
-            message_epoch: 7,
-            event_epoch: 7,
-            message_next_offset: 0,
-            event_next_offset: count,
-            applied_event_offset: count.saturating_sub(1),
+        QueueStateCheckpoint {
+            epoch: 7,
+            start_offset: 0,
+            next_offset: count,
             state_snapshot: state.encode_snapshot(count.saturating_sub(1)),
         }
     }
@@ -682,7 +648,7 @@ mod tests {
             .unwrap();
     }
 
-    async fn install(stroma: &Stroma, checkpoint: FollowerStateCheckpointInstall) -> Result<()> {
+    async fn install(stroma: &Stroma, checkpoint: QueueStateCheckpoint) -> Result<()> {
         stroma
             .install_queue_learner_checkpoint(
                 PreparedStorageHistory {
@@ -779,7 +745,7 @@ mod tests {
                 );
                 if count > 0 {
                     assert!(
-                        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, count)
+                        st.verify_queue_learner_caught_up("q", 0, None, 7, count)
                             .await
                             .is_err()
                     );
@@ -787,18 +753,17 @@ mod tests {
                         "q",
                         0,
                         None,
-                        None,
-                        Some(ReplicatedEventBatch {
+                        ReplicatedEventBatch {
                             epoch: 7,
                             first_offset: 0,
                             durability: Some(KDurability::AfterFsync),
                             events: vec![payload(b"backfill")],
-                        }),
+                        },
                     )
                     .await
                     .unwrap();
                 }
-                st.verify_queue_learner_caught_up("q", 0, None, 7, 0, count)
+                st.verify_queue_learner_caught_up("q", 0, None, 7, count)
                     .await
                     .unwrap();
                 st.install_queue_learner_checkpoint(renewed, checkpoint(count))
@@ -871,13 +836,12 @@ mod tests {
                 "q",
                 0,
                 None,
-                None,
-                Some(ReplicatedEventBatch {
+                ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
                     events: vec![payload(b"a"), payload(b"b")],
                     durability: Some(KDurability::AfterFsync),
-                }),
+                },
             )
             .await
             .unwrap();

@@ -472,8 +472,7 @@ mod tests {
                 "q",
                 0,
                 None,
-                None,
-                Some(ReplicatedEventBatch {
+                ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
                     durability: Some(KDurability::AfterFsync),
@@ -483,7 +482,7 @@ mod tests {
                         headers: vec![],
                         payload: b"confirmed".to_vec(),
                     }],
-                }),
+                },
             )
             .await
             .unwrap();
@@ -519,7 +518,7 @@ mod tests {
         assert!(stroma.snapshot_partition("q", 0, None).await.is_err());
         assert!(
             stroma
-                .truncate_messages_before("q", 0, None, 1)
+                .truncate_queue_before("q", 0, None, 1)
                 .await
                 .is_err()
         );

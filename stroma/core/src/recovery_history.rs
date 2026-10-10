@@ -461,8 +461,7 @@ mod tests {
             "q",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: 7,
                 first_offset: 0,
                 events: vec![StromaEvent::PayloadEnqueue {
@@ -472,7 +471,7 @@ mod tests {
                     payload: payload.to_vec(),
                 }],
                 durability: Some(KDurability::AfterFsync),
-            }),
+            },
         )
         .await
         .unwrap();

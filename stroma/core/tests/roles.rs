@@ -257,16 +257,12 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
         .unwrap();
     assert_eq!(
         outcome,
-        QueueDemotionOutcome {
-            message_next_offset: 0,
-            event_next_offset: 1,
-            applied_event_offset: Some(0),
-        }
+        QueueDemotionOutcome { next: 1, applied_next: 1 }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
 
-    st.apply_replicated_queue_log_batch(
+    st.apply_replicated_queue_batch(
         "topic-a",
         0,
         None,
@@ -423,7 +419,7 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
     let outcome = st
-        .apply_replicated_queue_log_batch(
+        .apply_replicated_queue_batch(
             "topic-a",
             0,
             None,
@@ -461,7 +457,7 @@ async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
     let qh = qh.work_queue().unwrap();
 
     let outcome = st
-        .apply_replicated_queue_log_batch(
+        .apply_replicated_queue_batch(
             "topic-a",
             0,
             None,
@@ -491,7 +487,7 @@ async fn replicated_ingest_rejects_owner_queue() {
     let (st, _dir) = open_test_stroma("stroma_roles_replicated_ingest_rejects_owner").await;
 
     let result = st
-        .apply_replicated_queue_log_batch(
+        .apply_replicated_queue_batch(
             "topic-a",
             0,
             None,
@@ -521,7 +517,7 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
     let src = src.resolve().unwrap();
     let src = src.work_queue().unwrap();
 
-    st.apply_replicated_queue_log_batch(
+    st.apply_replicated_queue_batch(
         "src",
         0,
         None,
@@ -562,7 +558,7 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
 
-    st.apply_replicated_queue_log_batch(
+    st.apply_replicated_queue_batch(
         "topic-a",
         0,
         None,
@@ -577,16 +573,12 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
     .unwrap();
 
     let promoted = st
-        .promote_queue_follower_if_caught_up("topic-a", 0, None, 0, 1)
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 1)
         .await
         .unwrap();
     assert_eq!(
         promoted,
-        QueuePromotionOutcome::Promoted {
-            message_next_offset: 0,
-            event_next_offset: 1,
-            applied_event_offset: Some(0),
-        }
+        QueuePromotionOutcome::Promoted { next: 1 }
     );
     assert_eq!(qh.role(), QueueRole::Owner);
 
@@ -618,15 +610,12 @@ async fn promotion_reports_follower_lag_without_changing_role() {
     let qh = qh.work_queue().unwrap();
 
     let outcome = st
-        .promote_queue_follower_if_caught_up("topic-a", 0, None, 0, 1)
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 1)
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        QueuePromotionOutcome::EventLogBehind {
-            local_next_offset: 0,
-            expected_next_offset: 1,
-        }
+        QueuePromotionOutcome::LogBehind { local_next: 0, expected_next: 1 }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);
@@ -640,7 +629,7 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
 
-    st.apply_replicated_queue_log_batch(
+    st.apply_replicated_queue_batch(
         "topic-a",
         0,
         None,
@@ -655,15 +644,12 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
     .unwrap();
 
     let outcome = st
-        .promote_queue_follower_if_caught_up("topic-a", 0, None, 0, 0)
+        .promote_queue_follower_if_caught_up("topic-a", 0, None, 0)
         .await
         .unwrap();
     assert_eq!(
         outcome,
-        QueuePromotionOutcome::EventLogAhead {
-            local_next_offset: 1,
-            expected_next_offset: 0,
-        }
+        QueuePromotionOutcome::LogAhead { local_next: 1, expected_next: 0 }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);
@@ -677,7 +663,7 @@ async fn independent_declaration_prefix_is_rejected_by_replication() {
         .unwrap();
     st.become_queue_follower("topic", 0, None).await.unwrap();
     let error = st
-        .apply_replicated_queue_log_batch(
+        .apply_replicated_queue_batch(
             "topic",
             0,
             None,
@@ -729,7 +715,7 @@ async fn open_follower_batch_stages_before_close_and_applies_after_sync() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let frames =
         futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) }).boxed();
-    let apply = st.apply_open_replicated_queue_log_batch("q", 0, None, frames);
+    let apply = st.apply_open_replicated_queue_batch("q", 0, None, frames);
     tokio::pin!(apply);
     for offset in 0..2 {
         tx.send(open_frame(offset)).await.unwrap();
@@ -777,7 +763,7 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
         let frames =
             futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) })
                 .boxed();
-        let mut apply = Box::pin(st.apply_open_replicated_queue_log_batch("q", 0, None, frames));
+        let mut apply = Box::pin(st.apply_open_replicated_queue_batch("q", 0, None, frames));
         tx.send(open_frame(0)).await.unwrap();
         timeout(Duration::from_secs(2), async {
             while h.event_log().next_offset() != 1 {
@@ -797,7 +783,7 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
         drop(tx);
         assert!(!h.work_queue().unwrap().is_ready(0).await);
         let err = st
-            .apply_replicated_queue_log_batch("q", 0, None, open_frame(0).unwrap())
+            .apply_replicated_queue_batch("q", 0, None, open_frame(0).unwrap())
             .await
             .unwrap_err();
         assert!(
@@ -805,7 +791,7 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
             "{err}"
         );
         assert!(
-            st.promote_queue_follower_if_caught_up("q", 0, None, 0, 1)
+            st.promote_queue_follower_if_caught_up("q", 0, None, 1)
                 .await
                 .is_err()
         );

@@ -11,6 +11,16 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Stroma storage uses layout version 3. The learner checkpoint journal and
+  the queue reseed completion record now hold single queue log offsets.
+  Version 2 roots are refused with a clear error, with no migration. The
+  queue role API speaks one log: `QueuePublishCommit` is `{ next, epoch }`,
+  queue promotion and demotion report one log position, a stream promotes
+  through its own `StreamPromotionOutcome`, and `QueueStateCheckpoint`
+  replaces the owner export and learner install types. Queue follower apply
+  takes one log batch, and queue log truncation is split from stream record
+  truncation. Each of these refuses the other partition kind.
+
 - Stroma storage uses layout version 2. Each partition lives in one
   directory, `partitions/<group>/<topic>/<part>/`, with a kind marker and a
   `current` pointer to its active generation. Recovery generations, staging

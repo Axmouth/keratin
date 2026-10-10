@@ -978,13 +978,12 @@ mod tests {
                 "q",
                 0,
                 None,
-                None,
-                Some(ReplicatedEventBatch {
+                ReplicatedEventBatch {
                     epoch: 7,
                     first_offset: 0,
                     durability: Some(KDurability::AfterFsync),
                     events: vec![retained_event()],
-                }),
+                },
             )
             .await
             .unwrap();
@@ -1020,7 +1019,7 @@ mod tests {
         let st = open(&dir.root).await;
         let (receipt, view) = reseed_fixture(&st).await;
         assert!(
-            st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 0)
+            st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0)
                 .await
                 .is_err(),
             "an empty replacement must not erase old confirmed data"
@@ -1032,7 +1031,7 @@ mod tests {
             (0, 1)
         );
         learner_message(&view).await;
-        st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 0, 1)
+        st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 1)
             .await
             .unwrap();
         assert!(view.verify_admitted_storage_history(&receipt).is_err());
@@ -1045,12 +1044,12 @@ mod tests {
         st.become_queue_follower_with_epoch("q", 0, None, 7)
             .await
             .unwrap();
-        st.verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
+        st.verify_queue_learner_caught_up("q", 0, None, 7, 1)
             .await
             .unwrap();
         assert_eq!(
             st.installed_queue_reseed_cut(&receipt, [41; 32]).unwrap(),
-            Some((7, 0, 1))
+            Some((7, 1))
         );
         assert!(
             st.prepare_queue_reseed_storage(receipt.clone(), [41; 32])
@@ -1058,7 +1057,7 @@ mod tests {
                 .is_err(),
             "retry cannot obtain a resettable view of the live replacement"
         );
-        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1)
             .await
             .unwrap();
         assert_eq!(
@@ -1105,7 +1104,7 @@ mod tests {
         assert_eq!(page.records[0].payload, retained_event().encode().unwrap());
         learner_message(&view).await;
         assert!(
-            st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
+            st.install_queue_reseed_storage(receipt, [41; 32], 7, 1)
                 .await
                 .is_err()
         );
@@ -1120,7 +1119,7 @@ mod tests {
         let st = open(Path::new(&root)).await;
         let (receipt, view) = reseed_fixture(&st).await;
         learner_message(&view).await;
-        st.install_queue_reseed_storage(receipt, [41; 32], 7, 0, 1)
+        st.install_queue_reseed_storage(receipt, [41; 32], 7, 1)
             .await
             .unwrap();
         panic!("child did not stop at reseed boundary");
@@ -1313,25 +1312,25 @@ mod tests {
             .await
             .unwrap();
         let empty = stroma
-            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 0)
+            .verify_queue_learner_caught_up("q", 0, None, 7, 0)
             .await
             .unwrap();
-        assert_eq!((empty.message_next, empty.event_next), (0, 0));
+        assert_eq!(empty.next, 0);
         assert!(
             stroma
-                .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 7, 1)
                 .await
                 .is_err()
         );
         learner_message(&stroma).await;
         assert!(
             stroma
-                .verify_queue_learner_caught_up("q", 0, None, 8, 0, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 8, 1)
                 .await
                 .is_err()
         );
         stroma
-            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
+            .verify_queue_learner_caught_up("q", 0, None, 7, 1)
             .await
             .unwrap();
         stroma.evict("q", 0, None).await.unwrap();
@@ -1373,7 +1372,7 @@ mod tests {
             (0, 1)
         );
         resumed
-            .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
+            .verify_queue_learner_caught_up("q", 0, None, 7, 1)
             .await
             .unwrap();
         resumed
@@ -1382,7 +1381,7 @@ mod tests {
             .unwrap();
         assert!(
             resumed
-                .verify_queue_learner_caught_up("q", 0, None, 7, 0, 1)
+                .verify_queue_learner_caught_up("q", 0, None, 7, 1)
                 .await
                 .is_err()
         );
@@ -1435,7 +1434,7 @@ mod tests {
                 .unwrap();
             assert!(
                 stroma
-                    .verify_queue_learner_caught_up("q", 0, None, 8, 0, 1)
+                    .verify_queue_learner_caught_up("q", 0, None, 8, 1)
                     .await
                     .is_err()
             );

@@ -1,4 +1,4 @@
-//! On-disk layout of a Stroma root, version 2.
+//! On-disk layout of a Stroma root, version 3.
 //!
 //! ```text
 //! <root>/
@@ -23,7 +23,10 @@ use std::ffi::OsString;
 
 pub(crate) const MARKER: &str = "stroma-layout";
 const MAGIC: &str = "stroma-layout";
-const VERSION: u32 = 2;
+// Version 3 keeps the version 2 directory tree. It changed the learner
+// checkpoint journal and the reseed completion record to single queue log
+// offsets, so a version 2 root is refused rather than misread.
+const VERSION: u32 = 3;
 pub(super) const GLOBAL: &str = "global";
 pub(super) const PARTITIONS: &str = "partitions";
 pub(super) const TRASH: &str = "trash";
@@ -512,9 +515,15 @@ mod tests {
         assert!(err.to_string().contains("unknown entry `recovery-inspection`"), "{err}");
         fs::remove_file(dir.root.join("recovery-inspection")).unwrap();
 
-        fs::write(dir.root.join(MARKER), b"stroma-layout\nversion 3\n").unwrap();
+        for older in [1, 2] {
+            fs::write(dir.root.join(MARKER), format!("stroma-layout\nversion {older}\n")).unwrap();
+            let err = prepare_root(&dir.root).unwrap_err();
+            assert!(err.to_string().contains(&format!("version {older}")), "{err}");
+            assert!(err.to_string().contains("only opens version 3"), "{err}");
+        }
+        fs::write(dir.root.join(MARKER), b"stroma-layout\nversion 4\n").unwrap();
         let err = prepare_root(&dir.root).unwrap_err();
-        assert!(err.to_string().contains("version 3"), "{err}");
+        assert!(err.to_string().contains("version 4"), "{err}");
         fs::write(dir.root.join(MARKER), b"something else\n").unwrap();
         assert!(matches!(
             prepare_root(&dir.root),
