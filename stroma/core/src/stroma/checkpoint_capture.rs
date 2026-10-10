@@ -97,13 +97,13 @@ impl Stroma {
             dirty_guard.armed = false;
             qh.record_checkpoint_persisted(event_next, timestamp);
             if compact {
-                let (message_floor, event_next) = stroma.checkpoint_retention_limits(&qh, message_floor, event_next).await?;
-                let event_next = event_next.min(message_floor);
+                let floor = stroma
+                    .checkpoint_truncation_floor(&qh, message_floor, event_next)
+                    .await?;
                 qh.event_log()
-                    .truncate_before(event_next)
+                    .truncate_before(floor)
                     .await
                     .map_err(io_err)?;
-
             }
             Ok(())
         })

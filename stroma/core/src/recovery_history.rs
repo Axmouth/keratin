@@ -257,7 +257,6 @@ impl Stroma {
                 part,
                 group,
                 storage_history.as_ref(),
-                messages.unwrap_or(events),
                 events,
             )?
         };

@@ -11,6 +11,15 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Agreed queue checkpoints describe one log. Pins carry one epoch, the
+  applied boundary, the payload floor and the physical log tail. Targets and
+  contents carry `next` and `payload_head`, and the payload digest replaces
+  the message digest. `queue_checkpoint_target` takes the minimum cut and the
+  minimum payload floor. `QueueCheckpointActivity` reports one log head, tail
+  and epoch. Retention, base and capsule files use a new header and the
+  capsule digest tag moves to `stroma-queue-checkpoint-capsule-v2`, so files
+  and receipts from earlier builds are refused.
+
 - Stroma storage uses layout version 3. The learner checkpoint journal and
   the queue reseed completion record now hold single queue log offsets.
   Version 2 roots are refused with a clear error, with no migration. The

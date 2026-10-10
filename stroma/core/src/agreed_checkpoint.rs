@@ -12,29 +12,27 @@ use std::{
 /// No snapshot, disk reads or actor pause; never use these values as evidence.
 #[derive(Debug, Clone, Copy, Serialize)]
 pub struct QueueCheckpointActivity {
-    pub event_head: u64,
-    pub event_next: u64,
-    pub message_head: u64,
-    pub message_next: u64,
+    pub head: u64,
+    pub next: u64,
     pub local_append_bytes: u64,
-    pub event_epoch: u64,
+    pub epoch: u64,
 }
 impl Stroma {
     pub fn queue_checkpoint_activity(&self, topic: &str, part: u32, group: Option<&str>) -> Option<QueueCheckpointActivity> {
         let current = self.queue_handles.load();
         let h = slot_lookup_no_alloc(current.as_ref(), topic, part, group)?.handle.get()?;
+        h.as_work_queue()?;
+        let log = h.event_log();
         Some(QueueCheckpointActivity {
-            event_head: h.event_log().head_offset(),
-            event_next: h.event_log().next_offset(),
-            message_head: h.payload_log().head_offset(),
-            message_next: h.payload_log().next_offset(),
-            local_append_bytes: h.physical_logs().map(|log| log.local_append_bytes()).fold(0u64, u64::saturating_add),
-            event_epoch: h.event_log().current_epoch(),
+            head: log.head_offset(),
+            next: log.next_offset(),
+            local_append_bytes: log.local_append_bytes(),
+            epoch: log.current_epoch(),
         })
     }
 }
 
-const MAGIC: &[u8; 8] = b"QCPIN\0\0\x01";
+const MAGIC: &[u8; 8] = b"QCPIN\0\0\x02";
 const MAX_INDEX: usize = 65_536;
 const MAX_SNAPSHOT: usize = 16 * 1024 * 1024;
 const MAX_BASE: usize = 2 * MAX_SNAPSHOT + MAX_INDEX;
@@ -43,18 +41,17 @@ const MAX_PINS: usize = 2; // Last accepted checkpoint and one candidate.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointPin {
-    pub log_layout: QueueLogLayout,
     pub attempt: [u8; 32],
     pub storage: PreparedStorageHistory,
-    pub event_epoch: u64,
-    pub message_epoch: u64,
-    /// Fully applied, exclusive event boundary, including the empty cut at zero.
-    pub event_next: u64,
-    /// Payload-carrying log bounds, including not-yet-applied enqueues.
-    /// Combined queues use event offsets here, unlike the empty wire message lane.
-    pub message_head: u64,
-    pub message_next: u64,
-    pub required_message_next: u64,
+    pub epoch: u64,
+    /// Exclusive fully applied boundary, including the empty cut at zero.
+    pub applied_next: u64,
+    /// Lowest offset still holding a payload the state may reference.
+    pub payload_head: u64,
+    /// Physical log tail at capture, including enqueues not yet applied. It is
+    /// kept apart from `applied_next` so a common cut must cover both.
+    pub log_next: u64,
+    pub required_next: u64,
     pub snapshot_digest: [u8; 32],
     pub state_digest: [u8; 32],
 }
@@ -190,9 +187,9 @@ fn reclaim_unpinned(root: &Path, index: &Retention) -> Result<()> {
 
 fn validate_pin(pin: &QueueCheckpointPin) -> Result<()> {
     let s = &pin.storage;
-    if (pin.log_layout == QueueLogLayout::Combined && ( pin.required_message_next > pin.event_next || pin.event_next > pin.message_next
-            || pin.message_head > pin.event_next
-            || pin.event_epoch != pin.message_epoch))
+    if pin.payload_head > pin.applied_next
+        || pin.applied_next > pin.log_next
+        || pin.required_next > pin.applied_next
         || pin.attempt == [0; 32]
         || s.stream
         || s.topic.is_empty()
@@ -204,13 +201,21 @@ fn validate_pin(pin: &QueueCheckpointPin) -> Result<()> {
             s.binding.writer_session,
         ]
         .contains(&[0; 16])
-        || pin.message_head > pin.message_next
-        || pin.required_message_next > pin.message_next
     {
         return Err(corrupt("invalid checkpoint pin identity or boundaries"));
     }
     Ok(())
 }
+/// A common cut must cover each pin's applied boundary and its physical log
+/// tail. These are different offsets in the one queue log, so checking only
+/// the applied boundary would let a cut drop records a replica already holds.
+fn target_covers_pin(pin: &QueueCheckpointPin, target: &QueueCheckpointTarget) -> bool {
+    target.next >= pin.applied_next
+        && target.next >= pin.log_next
+        && target.payload_head >= pin.payload_head
+        && target.payload_head <= target.next
+}
+
 fn load_index(root: &Path, topic: &str, part: u32, group: Option<&str>) -> Result<Retention> {
     let index: Retention = read(&root.join("retention"), MAX_INDEX)?.unwrap_or_default();
     if index.version != 1 || index.pins.len() > MAX_PINS {
@@ -232,7 +237,7 @@ fn load_index(root: &Path, topic: &str, part: u32, group: Option<&str>) -> Resul
         accepted.contents.validate().map_err(corrupt)?;
         if accepted.certificate == [0; 32]
             || accepted.capsule == [0; 32]
-            || index.pins.get(&name(accepted.attempt)).is_none_or(|pin| pin.log_layout != accepted.contents.log_layout)
+            || !index.pins.contains_key(&name(accepted.attempt))
         {
             return Err(corrupt("accepted checkpoint has no retained identity"));
         }
@@ -254,13 +259,13 @@ fn load_base(root: &Path, pin: &QueueCheckpointPin) -> Result<QueueCheckpointBas
     let meta = state
         .load_snapshot(&base.snapshot)
         .map_err(|e| corrupt(e.to_string()))?;
-    if meta.last_snapshot_event_offset != pin.event_next.saturating_sub(1)
-        || state.required_message_next() != pin.required_message_next
+    if meta.last_snapshot_event_offset != pin.applied_next.saturating_sub(1)
+        || state.required_message_next() != pin.required_next
         || state.recovery_lease_normalized_digest() != pin.state_digest
         || state
             .recovery_live_ranges()
             .iter()
-            .any(|r| r.start < pin.message_head || r.end > pin.message_next)
+            .any(|r| r.start < pin.payload_head || r.end > pin.log_next)
     {
         return Err(corrupt(
             "checkpoint base state or payload coverage is invalid",
@@ -270,17 +275,6 @@ fn load_base(root: &Path, pin: &QueueCheckpointPin) -> Result<QueueCheckpointBas
 }
 
 impl Stroma {
-    fn checkpoint_layout(&self) -> QueueLogLayout {
-        QueueLogLayout::Combined
-    }
-
-    fn require_checkpoint_layout(&self, pin: &QueueCheckpointPin) -> Result<()> {
-        if pin.log_layout != self.checkpoint_layout() {
-            return Err(invalid("checkpoint layout differs from local queue format"));
-        }
-        validate_pin(pin)
-    }
-
     fn checkpoint_pin_root(&self, topic: &str, part: u32, group: Option<&str>) -> PathBuf {
         self.snap_dir(topic, part, group).join("agreed-checkpoints")
     }
@@ -359,12 +353,10 @@ impl Stroma {
                 .await
                 .map_err(io_err)??;
                 if let Some(base) = existing {
-                    if base.pin.log_layout != stroma.checkpoint_layout()
-                        || base.pin.storage != storage
-                        || base.pin.event_epoch != h.event_log().current_epoch()
-                        || base.pin.message_epoch != h.payload_log().current_epoch()
-                        || base.pin.event_next < h.event_log().head_offset()
-                        || base.pin.message_head < h.payload_log().head_offset()
+                    if base.pin.storage != storage
+                        || base.pin.epoch != h.event_log().current_epoch()
+                        || base.pin.applied_next < h.event_log().head_offset()
+                        || base.pin.payload_head < h.event_log().head_offset()
                     {
                         return Err(invalid("checkpoint pin no longer matches local history"));
                     }
@@ -389,15 +381,13 @@ impl Stroma {
                 events.sync().await.map_err(io_err)?;
                 let captured = h.capture_exact_checkpoint(false).await?;
                 let pin = QueueCheckpointPin {
-                    log_layout: stroma.checkpoint_layout(),
                     attempt,
                     storage: storage.clone(),
-                    event_epoch: h.event_log().current_epoch(),
-                    message_epoch: h.payload_log().current_epoch(),
-                    event_next: captured.event_next,
-                    message_head: h.payload_log().head_offset(),
-                    message_next: h.payload_log().next_offset(),
-                    required_message_next: captured.state.required_message_next(),
+                    epoch: events.current_epoch(),
+                    applied_next: captured.event_next,
+                    payload_head: events.head_offset(),
+                    log_next: events.next_offset(),
+                    required_next: captured.state.required_message_next(),
                     snapshot_digest: [0; 32],
                     state_digest: [0; 32],
                 };
@@ -405,7 +395,7 @@ impl Stroma {
                 return tokio::task::spawn_blocking(move || {
                     let mut pin = pin;
                     pin.state_digest = captured.state.recovery_lease_normalized_digest();
-                    let snapshot = captured.state.into_recovery_snapshot(pin.event_next);
+                    let snapshot = captured.state.into_recovery_snapshot(pin.applied_next);
                     if snapshot.len() > MAX_SNAPSHOT {
                         return Err(invalid("checkpoint snapshot exceeds limit"));
                     }
@@ -438,7 +428,7 @@ impl Stroma {
         &self,
         pin: QueueCheckpointPin,
     ) -> Result<QueueCheckpointBase> {
-        self.require_checkpoint_layout(&pin)?;
+        validate_pin(&pin)?;
         let stroma = self.clone();
         tokio::spawn(async move {
             let s = &pin.storage;
@@ -529,18 +519,20 @@ impl Stroma {
         .map_err(io_err)?
     }
 
-    /// Caller holds follower_apply through the eventual truncate commands. Read
+    /// Lowest offset queue compaction may truncate before: the minimum of the
+    /// payload floor, the applied snapshot floor, protected followers and every
+    /// retained checkpoint pin. The payload floor is an input of its own because
+    /// unsettled payloads can sit below the applied boundary.
+    /// Caller holds follower_apply through the eventual truncate command. Read
     /// the small durable index only at compaction, with no append-path atomics.
     /// Corrupt/unreadable retention blocks compaction rather than dropping pins.
-    pub(super) async fn checkpoint_retention_limits(
+    pub(super) async fn checkpoint_truncation_floor(
         &self,
         h: &QueueHandleInner,
-        message: u64,
-        event: u64,
-    ) -> Result<(u64, u64)> {
-        if h.as_work_queue().is_none() {
-            return Ok((message, event));
-        }
+        payload_floor: u64,
+        applied_floor: u64,
+    ) -> Result<u64> {
+        h.work_queue()?;
         let root = self.checkpoint_pin_root(h.topic(), h.partition(), h.group());
         let (topic, part, group) = (
             h.topic().to_owned(),
@@ -550,22 +542,19 @@ impl Stroma {
         let storage = self.clone();
         let protects_followers = h.role() == QueueRole::Owner;
         tokio::task::spawn_blocking(move || {
-            // Followers read the single queue log, so their floor bounds the
-            // applied-state side. The payload floor in `message` is kept apart
-            // and still bounds truncation below.
             let replica = if protects_followers {
                 storage.replication_retention_limit(&topic, part, group.as_deref())?
             } else {
                 u64::MAX
             };
-            let event = event.min(replica);
             let index = load_index(&root, &topic, part, group.as_deref())?;
-            Ok(index.pins.values().fold((message, event), |(m, e), pin| {
-                let accepted = index.accepted.as_ref().filter(|a| a.attempt == pin.attempt);
-                (
-                    m.min(accepted.map_or(pin.message_head, |a| a.contents.message_head)),
-                    e.min(accepted.map_or(pin.event_next, |a| a.contents.event_next)),
-                )
+            let floor = payload_floor.min(applied_floor).min(replica);
+            Ok(index.pins.values().fold(floor, |floor, pin| {
+                let (payload, applied) = match index.accepted.as_ref().filter(|a| a.attempt == pin.attempt) {
+                    Some(accepted) => (accepted.contents.payload_head, accepted.contents.next),
+                    None => (pin.payload_head, pin.applied_next),
+                };
+                floor.min(payload).min(applied)
             }))
         })
         .await
@@ -578,44 +567,39 @@ impl Stroma {
 mod tests;
 
 /// The common cut chosen after all replicas have pinned replay bases. No field
-/// is a serving/confirmation authorization. Message bounds name the payload log,
-/// which is the event log in the combined layout.
+/// is a serving/confirmation authorization. The owner log tail equals the
+/// applied boundary at this cut.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointTarget {
-    pub log_layout: QueueLogLayout,
-    pub event_next: u64,
-    pub message_head: u64,
-    pub message_next: u64,
+    pub next: u64,
+    /// Lowest offset still holding a payload the state may reference.
+    pub payload_head: u64,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct QueueCheckpointContents {
-    pub log_layout: QueueLogLayout,
-    pub event_next: u64,
-    pub message_head: u64,
-    pub message_next: u64,
-    pub required_message_next: u64,
+    pub next: u64,
+    pub payload_head: u64,
+    pub required_next: u64,
     pub snapshot_digest: [u8; 32],
     pub state_digest: [u8; 32],
-    pub message_digest: [u8; 32],
+    /// Digest of records [payload_head, next).
+    pub payload_digest: [u8; 32],
     pub live_payload_digest: [u8; 32],
 }
 impl QueueCheckpointContents {
     pub fn validate(&self) -> std::result::Result<(), String> {
-        if (self.log_layout == QueueLogLayout::Combined && ( self.message_next != self.event_next))
-            || self.message_head > self.message_next || self.required_message_next > self.message_next {
+        if self.payload_head > self.next || self.required_next > self.next {
             return Err("checkpoint payload bounds do not cover state dependencies".into());
         }
         Ok(())
     }
     pub fn target(&self) -> QueueCheckpointTarget {
         QueueCheckpointTarget {
-            log_layout: self.log_layout,
-            event_next: self.event_next,
-            message_head: self.message_head,
-            message_next: self.message_next,
+            next: self.next,
+            payload_head: self.payload_head,
         }
     }
 }
@@ -633,7 +617,7 @@ pub struct QueueCheckpointCapsule {
 impl QueueCheckpointCapsule {
     pub fn digest(&self) -> Result<[u8; 32]> {
         let mut h = blake3::Hasher::new();
-        h.update(b"stroma-queue-checkpoint-capsule-v1\0");
+        h.update(b"stroma-queue-checkpoint-capsule-v2\0");
         h.update(&rmp_serde::to_vec_named(self).map_err(encode_err)?);
         Ok(*h.finalize().as_bytes())
     }
@@ -641,11 +625,8 @@ impl QueueCheckpointCapsule {
         validate_pin(&self.pin)?;
         let c = &self.contents;
         c.validate().map_err(invalid)?;
-        if self.version != 1
-            || c.log_layout != self.pin.log_layout
-            || c.event_next < self.pin.event_next
-            || c.message_head < self.pin.message_head
-            || c.message_next < self.pin.message_next
+        if self.version != 2
+            || !target_covers_pin(&self.pin, &c.target())
             || self.snapshot.len() > MAX_SNAPSHOT
             || *blake3::hash(&self.snapshot).as_bytes() != c.snapshot_digest
         {
@@ -658,13 +639,13 @@ impl QueueCheckpointCapsule {
         let meta = state
             .load_snapshot(&self.snapshot)
             .map_err(|e| corrupt(e.to_string()))?;
-        if meta.last_snapshot_event_offset != c.event_next.saturating_sub(1)
-            || state.required_message_next() != c.required_message_next
+        if meta.last_snapshot_event_offset != c.next.saturating_sub(1)
+            || state.required_message_next() != c.required_next
             || state.recovery_state_digest() != c.state_digest
             || state
                 .recovery_live_ranges()
                 .iter()
-                .any(|r| r.start < c.message_head || r.end > c.message_next)
+                .any(|r| r.start < c.payload_head || r.end > c.next)
         {
             return Err(corrupt(
                 "checkpoint capsule state or payload dependencies mismatch",
@@ -699,9 +680,8 @@ impl Stroma {
     pub async fn queue_checkpoint_target(
         &self,
         storage: PreparedStorageHistory,
-        minimum_event_next: u64,
-        minimum_message_head: u64,
-        minimum_message_next: u64,
+        minimum_next: u64,
+        minimum_payload_head: u64,
     ) -> Result<QueueCheckpointTarget> {
         let stroma = self.clone();
         tokio::spawn(async move {
@@ -742,25 +722,17 @@ impl Stroma {
             h.ensure_owner()?;
             let _paused = h.pause_owner_operations_and_wait().await?;
             let captured = h.capture_exact_checkpoint(false).await?;
-            let message_next = h.payload_log().next_offset();
-            if captured.event_next < minimum_event_next
-                || message_next < minimum_message_next
-                || captured.event_next != h.event_log().next_offset()
-            {
+            let next = captured.event_next;
+            if next < minimum_next || next != h.event_log().next_offset() {
                 return Err(invalid("owner has not reached every pinned replay base"));
             }
-            let message_head = minimum_message_head
+            let payload_head = minimum_payload_head
                 .max(captured.message_floor)
-                .max(h.payload_log().head_offset());
-            if message_head > message_next {
+                .max(h.event_log().head_offset());
+            if payload_head > next {
                 return Err(invalid("checkpoint payload floor exceeds owner tail"));
             }
-            Ok(QueueCheckpointTarget {
-                log_layout: stroma.checkpoint_layout(),
-                event_next: captured.event_next,
-                message_head,
-                message_next,
-            })
+            Ok(QueueCheckpointTarget { next, payload_head })
         })
         .await
         .map_err(io_err)?
@@ -775,11 +747,7 @@ impl Stroma {
         target: QueueCheckpointTarget,
         limits: QueueCheckpointBuildLimits,
     ) -> Result<QueueCheckpointCapsule> {
-        self.require_checkpoint_layout(&pin)?;
-        if target.log_layout != pin.log_layout
-            || (target.log_layout == QueueLogLayout::Combined && target.message_next != target.event_next) {
-            return Err(invalid("checkpoint target layout or combined boundary mismatch"));
-        }
+        validate_pin(&pin)?;
         if limits.records == 0
             || limits.records > 1_000_000
             || limits.bytes == 0
@@ -814,26 +782,21 @@ impl Stroma {
             stroma.verify_prepared_storage_history(s)?;
             if *apply
                 || h.ordered_applied_next()?
-                    .is_none_or(|n| n < target.event_next)
+                    .is_none_or(|n| n < target.next)
             {
                 return Err(invalid(
                     "replica has not fully applied the checkpoint target",
                 ));
             }
-            let messages = h.payload_log();
             let events = h.event_log();
-            if pin.event_epoch != events.current_epoch()
-                || pin.message_epoch != messages.current_epoch()
-                || target.event_next < pin.event_next
-                || target.message_head < pin.message_head
-                || target.message_next < pin.message_next
-                || target.message_head > target.message_next
-                || messages.head_offset() > target.message_head
-                || messages.next_offset() < target.message_next
-                || events.head_offset() > pin.event_next
-                || target.event_next - pin.event_next > limits.records
-                || target.message_next - target.message_head
-                    > limits.records - (target.event_next - pin.event_next)
+            if pin.epoch != events.current_epoch()
+                || !target_covers_pin(&pin, &target)
+                || events.head_offset() > target.payload_head
+                || events.next_offset() < target.next
+                || events.head_offset() > pin.applied_next
+                || target.next - pin.applied_next > limits.records
+                || target.next - target.payload_head
+                    > limits.records - (target.next - pin.applied_next)
             {
                 return Err(invalid(
                     "checkpoint target has incompatible bounds, epoch or record budget",
@@ -858,17 +821,14 @@ impl Stroma {
                     return Ok(existing);
                 }
                 let base = load_base(&scan_root, &input_pin)?;
-                build_capsule(base, target, messages, events, limits)
+                build_capsule(base, target, events, limits)
             })
             .await
             .map_err(io_err)??;
             let apply = h.follower_apply_state().await;
             h.ensure_not_recovery_sealed()?;
             stroma.verify_admitted_storage_history(&pin.storage)?;
-            if *apply
-                || h.event_log().current_epoch() != pin.event_epoch
-                || h.payload_log().current_epoch() != pin.message_epoch
-            {
+            if *apply || h.event_log().current_epoch() != pin.epoch {
                 return Err(invalid("checkpoint history changed during verification"));
             }
             let writer = stroma.clone();
@@ -889,8 +849,7 @@ impl Stroma {
 fn build_capsule(
     base: QueueCheckpointBase,
     target: QueueCheckpointTarget,
-    messages: Arc<Keratin>,
-    events: Arc<Keratin>,
+    log: Arc<Keratin>,
     limits: QueueCheckpointBuildLimits,
 ) -> Result<QueueCheckpointCapsule> {
     use crate::{
@@ -898,39 +857,38 @@ fn build_capsule(
         recovery_replay::{QueueReplay, RecoveryReplayLimits},
     };
     let started = Instant::now();
-    let envelope = Stroma::queue_snapshot_envelope(2, base.pin.event_next, &base.snapshot)?;
+    let envelope = Stroma::queue_snapshot_envelope(2, base.pin.applied_next, &base.snapshot)?;
     // This private replay input is not a sealed-recovery receipt. Its output is
     // used only to construct a checkpoint capsule after both physical scans.
-    let combined = base.pin.log_layout == QueueLogLayout::Combined;
     let history = RetainedHistoryIdentity {
-        log_layout: base.pin.log_layout,
+        log_layout: QueueLogLayout::Combined,
         version: 2,
         storage_history: Some(base.pin.storage.clone()),
         id: base.pin.attempt,
-        message_digest: if combined { recovery_history::empty_log_digest() } else { [0; 32] },
+        message_digest: recovery_history::empty_log_digest(),
         event_digest: [0; 32],
         snapshot_digest: Some(*blake3::hash(&envelope).as_bytes()),
-        message_head: if combined { 0 } else { target.message_head },
-        message_next: if combined { 0 } else { target.message_next },
-        event_head: if combined { base.pin.event_next.min(target.message_head) } else { base.pin.event_next },
-        event_next: target.event_next,
+        message_head: 0,
+        message_next: 0,
+        event_head: base.pin.applied_next.min(target.payload_head),
+        event_next: target.next,
     };
     let mut replay = QueueReplay::from_checkpoint(
         &base.pin.storage.topic,
         base.pin.storage.partition,
         history,
-        target.event_next,
+        target.next,
         RecoveryReplayLimits {
             operations_per_replica: limits.bytes,
         },
         &envelope,
     )
     .map_err(invalid)?;
-    let mut cursor = events
+    let mut cursor = log
         .retained_durable_cursor(
-            base.pin.event_epoch,
-            base.pin.event_next,
-            target.event_next,
+            base.pin.epoch,
+            base.pin.applied_next,
+            target.next,
             limits.bytes,
         )
         .map_err(io_err)?;
@@ -953,18 +911,13 @@ fn build_capsule(
         .checked_sub(event_bytes)
         .filter(|n| *n > 0)
         .ok_or_else(|| invalid("checkpoint payload verification byte budget exhausted"))?;
-    let mut cursor = messages
-        .retained_durable_cursor(
-            base.pin.message_epoch,
-            target.message_head,
-            target.message_next,
-            remaining,
-        )
+    let mut cursor = log
+        .retained_durable_cursor(base.pin.epoch, target.payload_head, target.next, remaining)
         .map_err(io_err)?;
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
-    hash.update(&target.message_head.to_be_bytes());
-    hash.update(&target.message_next.to_be_bytes());
+    hash.update(&target.payload_head.to_be_bytes());
+    hash.update(&target.next.to_be_bytes());
     while let Some(record) = cursor.next_record(MAX_SNAPSHOT).map_err(io_err)? {
         if started.elapsed() > limits.elapsed {
             return Err(invalid("checkpoint verification deadline exceeded"));
@@ -984,17 +937,15 @@ fn build_capsule(
     }
     let evidence = artifact.evidence();
     let capsule = QueueCheckpointCapsule {
-        version: 1,
+        version: 2,
         pin: base.pin,
         contents: QueueCheckpointContents {
-            log_layout: target.log_layout,
-            event_next: target.event_next,
-            message_head: target.message_head,
-            message_next: target.message_next,
-            required_message_next: evidence.required_message_next,
+            next: target.next,
+            payload_head: target.payload_head,
+            required_next: evidence.required_message_next,
             snapshot_digest: artifact.snapshot_digest(),
             state_digest: evidence.lease_normalized_state_digest,
-            message_digest: *hash.finalize().as_bytes(),
+            payload_digest: *hash.finalize().as_bytes(),
             live_payload_digest: evidence
                 .live_payload_digest
                 .ok_or_else(|| invalid("checkpoint did not verify live payloads"))?,
@@ -1004,9 +955,9 @@ fn build_capsule(
     capsule.validate()?;
     tracing::debug!(
         event_bytes,
-        message_bytes = cursor.scanned_bytes(),
+        payload_bytes = cursor.scanned_bytes(),
         elapsed_ms = started.elapsed().as_millis(),
-        event_next = target.event_next,
+        next = target.next,
         "verified local checkpoint capsule"
     );
     Ok(capsule)
@@ -1023,7 +974,7 @@ impl Stroma {
         capsule_digest: [u8; 32],
         previous: Option<[u8; 32]>,
     ) -> Result<()> {
-        self.require_checkpoint_layout(&pin)?;
+        validate_pin(&pin)?;
         if certificate == [0; 32] || capsule_digest == [0; 32] {
             return Err(invalid(
                 "checkpoint acceptance requires certificate and capsule identities",
@@ -1052,10 +1003,7 @@ impl Stroma {
             h.ensure_not_recovery_sealed()?;
             stroma.verify_admitted_storage_history(s)?;
             stroma.verify_prepared_storage_history(s)?;
-            if *apply
-                || h.event_log().current_epoch() != pin.event_epoch
-                || h.payload_log().current_epoch() != pin.message_epoch
-            {
+            if *apply || h.event_log().current_epoch() != pin.epoch {
                 return Err(invalid("checkpoint acceptance history changed"));
             }
             let root = stroma.checkpoint_pin_root(&s.topic, s.partition, s.group.as_deref());
@@ -1080,7 +1028,7 @@ impl Stroma {
                 capsule.validate()?;
                 if capsule.pin != input
                     || capsule.digest()? != capsule_digest
-                    || capsule.contents.event_next > applied
+                    || capsule.contents.next > applied
                 {
                     return Err(invalid(
                         "accepted certificate differs from local capsule or applied boundary",
@@ -1099,9 +1047,8 @@ impl Stroma {
                         return Err(invalid("checkpoint acceptance predecessor changed"));
                     }
                     if let Some(old) = &index.accepted {
-                        if accepted.contents.event_next <= old.contents.event_next
-                            || accepted.contents.message_head < old.contents.message_head
-                            || accepted.contents.message_next < old.contents.message_next
+                        if accepted.contents.next <= old.contents.next
+                            || accepted.contents.payload_head < old.contents.payload_head
                         {
                             return Err(invalid("checkpoint acceptance regresses retained state"));
                         }
@@ -1120,7 +1067,7 @@ impl Stroma {
                                 s.group.as_deref(),
                             ))?;
                             if current.as_ref().is_none_or(|(boundary, _)| {
-                                boundary.event_next() < capsule.contents.event_next
+                                boundary.event_next() < capsule.contents.next
                                     || boundary.ambiguous_zero()
                             }) {
                                 writer.write_queue_snapshot_envelope(
@@ -1128,7 +1075,7 @@ impl Stroma {
                                     s.partition,
                                     s.group.as_deref(),
                                     2,
-                                    capsule.contents.event_next,
+                                    capsule.contents.next,
                                     &capsule.snapshot,
                                 )?;
                             }
@@ -1148,21 +1095,16 @@ impl Stroma {
             })
             .await
             .map_err(io_err)??;
-            // Durable accepted metadata and restart state precede both logical
-            // floors. A crash between these commands leaves extra retained data.
-            let (message, event) = stroma
-                .checkpoint_retention_limits(&h, target.message_head, target.event_next)
+            // Durable accepted metadata and restart state precede the logical
+            // floor. A crash before it leaves extra retained data.
+            let floor = stroma
+                .checkpoint_truncation_floor(&h, target.payload_head, target.next)
                 .await?;
-            let event = if pin.log_layout == QueueLogLayout::Combined { event.min(message) } else { event };
             h.event_log()
-                .advance_retained_head(event, pin.event_epoch)
+                .advance_retained_head(floor, pin.epoch)
                 .await
                 .map_err(io_err)?;
-            stroma.checkpoint_boundary("agreement_event_floor")?;
-            if pin.log_layout == QueueLogLayout::Separate {
-                h.payload_log().advance_retained_head(message, pin.message_epoch).await.map_err(io_err)?;
-            }
-            stroma.checkpoint_boundary("agreement_message_floor")?;
+            stroma.checkpoint_boundary("agreement_floor")?;
             Ok(())
         })
         .await
@@ -1231,7 +1173,7 @@ impl Stroma {
                         s.group.as_deref(),
                     ))?;
                     if snapshot.is_none_or(|(boundary, _)| {
-                        boundary.ambiguous_zero() || boundary.event_next() < old.contents.event_next
+                        boundary.ambiguous_zero() || boundary.event_next() < old.contents.next
                     }) {
                         return Err(corrupt(
                             "checkpoint abandonment lacks a covering restart snapshot",
@@ -1268,8 +1210,7 @@ impl Stroma {
         part: u32,
         group: Option<&str>,
         storage: Option<&PreparedStorageHistory>,
-        messages: &Keratin,
-        events: &Keratin,
+        log: &Keratin,
     ) -> Result<Option<Vec<u8>>> {
         let root = self.checkpoint_pin_root(topic, part, group);
         let index = load_index(&root, topic, part, group)?;
@@ -1292,7 +1233,6 @@ impl Stroma {
             return Ok(None);
         };
         capsule.validate()?;
-        self.require_checkpoint_layout(pin)?;
         if capsule.pin != *pin
             || capsule.contents != accepted.contents
             || capsule.digest()? != accepted.capsule
@@ -1301,10 +1241,8 @@ impl Stroma {
                 "accepted recovery checkpoint differs from durable receipt",
             ));
         }
-        if events.head_offset() > capsule.contents.event_next
-            || events.next_offset() < capsule.contents.event_next
-            || messages.head_offset() > capsule.contents.message_head
-            || messages.next_offset() < capsule.contents.message_next
+        if log.head_offset() > capsule.contents.payload_head
+            || log.next_offset() < capsule.contents.next
         {
             return Err(corrupt(
                 "accepted checkpoint dependencies no longer retained",
@@ -1312,7 +1250,7 @@ impl Stroma {
         }
         Ok(Some(Self::queue_snapshot_envelope(
             2,
-            capsule.contents.event_next,
+            capsule.contents.next,
             &capsule.snapshot,
         )?))
     }

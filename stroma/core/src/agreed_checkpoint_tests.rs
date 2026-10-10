@@ -85,8 +85,8 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
         .begin_queue_checkpoint_pin(storage.clone(), [7; 32])
         .await
         .unwrap();
-    assert_eq!(base.pin.event_next, 8);
-    assert_eq!(base.pin.required_message_next, 8);
+    assert_eq!(base.pin.applied_next, 8);
+    assert_eq!(base.pin.required_next, 8);
     publish(&st, 32).await;
     st.ack_batch("q".into(), 0, None, &(0..40).collect::<Vec<_>>())
         .await
@@ -102,8 +102,8 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
     {
         let h = ticket.resolve().unwrap();
         assert_eq!(h.payload_log().head_offset(), 0);
-        assert!(h.event_log().head_offset() <= base.pin.event_next);
-        assert!(h.event_log().next_offset() > base.pin.event_next);
+        assert!(h.event_log().head_offset() <= base.pin.applied_next);
+        assert!(h.event_log().next_offset() > base.pin.applied_next);
     }
     assert_eq!(
         st.read_queue_checkpoint_base(base.pin.clone())
@@ -115,7 +115,7 @@ async fn pin_keeps_separate_base_while_snapshots_and_writes_advance() {
         .read_queue_snapshot(&st.snap_file("q", 0, None))
         .unwrap()
         .unwrap();
-    assert!(boundary.event_next() > base.pin.event_next);
+    assert!(boundary.event_next() > base.pin.applied_next);
     assert_eq!(
         st.begin_queue_checkpoint_pin(storage, [7; 32])
             .await
@@ -147,9 +147,9 @@ async fn pin_zero_and_cold_restart_preserve_original_storage_identity() {
         .unwrap();
     assert_eq!(
         (
-            base.pin.event_next,
-            base.pin.message_head,
-            base.pin.message_next
+            base.pin.applied_next,
+            base.pin.payload_head,
+            base.pin.log_next
         ),
         (0, 0, 0)
     );
@@ -191,7 +191,7 @@ async fn pin_faults_before_and_after_index_publication_are_retryable() {
             .await
             .unwrap();
         assert_eq!(
-            base.pin.event_next,
+            base.pin.applied_next,
             if boundary == "agreement_base" { 2 } else { 1 }
         );
         assert_eq!(
@@ -253,7 +253,7 @@ async fn pin_bounded_count_conflicting_identity_and_release_are_checked() {
         .begin_queue_checkpoint_pin(storage, [9; 32])
         .await
         .unwrap();
-    assert_eq!(c.pin.event_next, b.pin.event_next);
+    assert_eq!(c.pin.applied_next, b.pin.applied_next);
     assert_eq!(
         st.read_queue_checkpoint_base(b.pin.clone()).await.unwrap(),
         b
@@ -344,14 +344,14 @@ async fn capsules_reconcile_unequal_bases_and_ignore_later_application() {
             .unwrap();
     }
     let pb = b.begin_queue_checkpoint_pin(sb, [7; 32]).await.unwrap();
-    assert!(pb.pin.event_next > pa.pin.event_next);
+    assert!(pb.pin.applied_next > pa.pin.applied_next);
     publish(&a, 8).await;
     publish(&b, 8).await;
     let target = a
-        .queue_checkpoint_target(sa, pb.pin.event_next, 0, pb.pin.message_next)
+        .queue_checkpoint_target(sa, pb.pin.log_next, 0)
         .await
         .unwrap();
-    assert_eq!(target.message_head, 5);
+    assert_eq!(target.payload_head, 5);
     // Both actors move beyond the selected boundary before verification begins.
     publish(&a, 3).await;
     publish(&b, 3).await;
@@ -373,9 +373,9 @@ async fn capsules_reconcile_unequal_bases_and_ignore_later_application() {
         .unwrap();
     assert_eq!(ca.contents, cb.contents);
     assert_eq!(ca.snapshot, cb.snapshot);
-    assert_eq!(ca.contents.event_next, target.event_next);
+    assert_eq!(ca.contents.next, target.next);
     // Twenty-four payloads plus five ACK records precede the cut.
-    assert_eq!(ca.contents.required_message_next, 29);
+    assert_eq!(ca.contents.required_next, 29);
     assert_ne!(ca.digest().unwrap(), cb.digest().unwrap()); // Local storage/base identities differ.
     let replay = a
         .build_queue_checkpoint_capsule(
@@ -387,7 +387,7 @@ async fn capsules_reconcile_unequal_bases_and_ignore_later_application() {
         .unwrap();
     assert_eq!(replay, ca);
     let mut wrong = target;
-    wrong.event_next += 1;
+    wrong.next += 1;
     assert!(
         a.build_queue_checkpoint_capsule(pa.pin, wrong, QueueCheckpointBuildLimits::default())
             .await
@@ -409,18 +409,19 @@ async fn capsule_limits_incomplete_dependencies_and_old_live_payloads_fail_close
         .unwrap();
     publish(&st, 2).await;
     let target = st
-        .queue_checkpoint_target(storage, base.pin.event_next, 0, base.pin.message_next)
+        .queue_checkpoint_target(storage, base.pin.log_next, 0)
         .await
         .unwrap();
-    for mutation in 0..5 {
+    for mutation in 0..6 {
         let mut target = target.clone();
         let mut limits = QueueCheckpointBuildLimits::default();
         match mutation {
             0 => limits.records = 1,
             1 => limits.bytes = 32,
-            2 => target.event_next += 100,
-            3 => target.message_head = 1, // Message zero is still live.
-            _ => target.message_next = 2, // Events reference newer messages.
+            2 => target.next += 100,
+            3 => target.payload_head = 1, // Message zero is still live.
+            4 => target.next = 1, // Below the pinned applied boundary.
+            _ => target.payload_head = target.next + 1,
         }
         assert!(
             st.build_queue_checkpoint_capsule(base.pin.clone(), target, limits)
@@ -447,7 +448,7 @@ async fn empty_capsule_zero_and_retry_after_durable_publication() {
         .begin_queue_checkpoint_pin(storage.clone(), [7; 32])
         .await
         .unwrap();
-    let target = st.queue_checkpoint_target(storage, 0, 0, 0).await.unwrap();
+    let target = st.queue_checkpoint_target(storage, 0, 0).await.unwrap();
     *st.checkpoint_fault.lock().unwrap() = Some("agreement_capsule");
     assert!(
         st.build_queue_checkpoint_capsule(
@@ -464,10 +465,10 @@ async fn empty_capsule_zero_and_retry_after_durable_publication() {
         .await
         .unwrap();
     assert_eq!(
-        (capsule.contents.event_next, capsule.contents.message_next),
+        (capsule.contents.next, capsule.contents.payload_head),
         (0, 0)
     );
-    assert_eq!(capsule.contents.required_message_next, 0);
+    assert_eq!(capsule.contents.required_next, 0);
     st.shutdown().await.unwrap();
 }
 
@@ -476,8 +477,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
     for boundary in [
         "agreement_restart_snapshot",
         "agreement_acceptance",
-        "agreement_event_floor",
-        "agreement_message_floor",
+        "agreement_floor",
     ] {
         let dir = keratin_log::test_dir!("agreement_accept_retry");
         let st = open(&dir.root).await;
@@ -493,9 +493,8 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
         let target = st
             .queue_checkpoint_target(
                 storage.clone(),
-                base.pin.event_next,
-                base.pin.message_head,
-                base.pin.message_next,
+                base.pin.log_next,
+                base.pin.payload_head,
             )
             .await
             .unwrap();
@@ -524,11 +523,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         assert_eq!(
             ticket.resolve().unwrap().event_log().head_offset(),
-            target.event_next
-        );
-        assert_eq!(
-            ticket.resolve().unwrap().payload_log().head_offset(),
-            target.message_head
+            target.payload_head
         );
         publish(&st, 4).await;
         let new = st
@@ -538,9 +533,8 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
         let next = st
             .queue_checkpoint_target(
                 storage,
-                new.pin.event_next,
-                new.pin.message_head,
-                new.pin.message_next,
+                new.pin.log_next,
+                new.pin.payload_head,
             )
             .await
             .unwrap();
@@ -574,12 +568,12 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
                 None,
                 RecoverySealRequest {
                     transition: [21; 32],
-                    fence_epoch: capsule.pin.event_epoch + 1,
+                    fence_epoch: capsule.pin.epoch + 1,
                 },
             )
             .await
             .unwrap();
-        assert_eq!(sealed.history.event_head, capsule.contents.message_head);
+        assert_eq!(sealed.history.event_head, capsule.contents.payload_head);
         assert_eq!(sealed.history.message_next, 0);
         st.shutdown().await.unwrap();
     }
@@ -603,9 +597,8 @@ async fn agreement_crash_child() {
     let target = st
         .queue_checkpoint_target(
             storage,
-            base.pin.event_next,
-            base.pin.message_head,
-            base.pin.message_next,
+            base.pin.log_next,
+            base.pin.payload_head,
         )
         .await
         .unwrap();
@@ -639,8 +632,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
             "agreement_capsule",
             "agreement_restart_snapshot",
             "agreement_acceptance",
-            "agreement_event_floor",
-            "agreement_message_floor",
+            "agreement_floor",
         ] {
             let dir = keratin_log::test_dir!("agreement_sigkill");
             let ready = dir.root.join("tmp/ready");
@@ -730,9 +722,8 @@ async fn missing_agreed_capsule_falls_back_but_corruption_cannot_authorize_recov
         let target = st
             .queue_checkpoint_target(
                 storage,
-                base.pin.event_next,
-                base.pin.message_head,
-                base.pin.message_next,
+                base.pin.log_next,
+                base.pin.payload_head,
             )
             .await
             .unwrap();
@@ -802,11 +793,123 @@ async fn activity_hint_does_not_materialize_and_observes_local_append_work() {
             tokio::task::yield_now().await;
         }
     }).await.unwrap();
-    assert_eq!(activity.message_next, 2);
-    assert!(activity.event_next > 0);
+    assert_eq!(activity.next, 2);
+    assert_eq!(activity.head, 0);
     assert!(activity.local_append_bytes >= 1024);
     st.shutdown().await.unwrap();
     let reopened = open(&dir.root).await;
     assert!(reopened.queue_checkpoint_activity("q", 0, None).is_none());
     reopened.shutdown().await.unwrap();
+}
+
+fn sample_pin() -> QueueCheckpointPin {
+    QueueCheckpointPin {
+        attempt: [7; 32],
+        storage: PreparedStorageHistory {
+            topic: "q".into(),
+            partition: 0,
+            group: None,
+            stream: false,
+            storage_instance: [4; 16],
+            binding: StorageHistoryBinding {
+                resource_incarnation: [1; 16],
+                accepted_history: [2; 16],
+                writer_session: [3; 16],
+            },
+        },
+        epoch: 1,
+        applied_next: 10,
+        payload_head: 4,
+        log_next: 14,
+        required_next: 9,
+        snapshot_digest: [5; 32],
+        state_digest: [6; 32],
+    }
+}
+
+/// Each single-log pin invariant is checked on its own, so dropping any one
+/// of them makes this test fail.
+#[test]
+fn pin_rejects_each_broken_single_log_invariant() {
+    validate_pin(&sample_pin()).unwrap();
+    let broken: [fn(&mut QueueCheckpointPin); 4] = [
+        |p| p.payload_head = p.applied_next + 1,
+        |p| p.log_next = p.applied_next - 1,
+        |p| p.required_next = p.applied_next + 1,
+        |p| p.storage.stream = true,
+    ];
+    for (n, mutate) in broken.into_iter().enumerate() {
+        let mut pin = sample_pin();
+        mutate(&mut pin);
+        assert!(validate_pin(&pin).is_err(), "mutation {n}");
+    }
+}
+
+#[test]
+fn contents_reject_bounds_beyond_the_cut() {
+    let contents = QueueCheckpointContents {
+        next: 10,
+        payload_head: 4,
+        required_next: 10,
+        snapshot_digest: [0; 32],
+        state_digest: [0; 32],
+        payload_digest: [0; 32],
+        live_payload_digest: [0; 32],
+    };
+    contents.validate().unwrap();
+    let mut bad = contents.clone();
+    bad.payload_head = 11;
+    assert!(bad.validate().is_err());
+    let mut bad = contents;
+    bad.required_next = 11;
+    assert!(bad.validate().is_err());
+}
+
+/// A pin's physical tail can sit above its applied boundary. The cut must
+/// cover both, so a target between them is refused.
+#[test]
+fn target_must_cover_pin_log_tail_and_applied_boundary() {
+    let pin = sample_pin();
+    let covers = |next, payload_head| {
+        target_covers_pin(&pin, &QueueCheckpointTarget { next, payload_head })
+    };
+    assert!(covers(14, 4));
+    assert!(covers(20, 8));
+    assert!(!covers(13, 4), "cut below the pin log tail");
+    assert!(!covers(9, 4), "cut below the pin applied boundary");
+    assert!(!covers(14, 3), "payload floor below the pin floor");
+    assert!(!covers(14, 15), "payload floor above the cut");
+}
+
+/// Queue compaction takes the payload floor as its own input. An unsettled
+/// payload below the applied snapshot boundary stops truncation.
+#[tokio::test]
+async fn compaction_stops_at_unsettled_payload_below_applied_boundary() {
+    let dir = keratin_log::test_dir!("agreement_payload_floor");
+    let st = open(&dir.root).await;
+    admitted(&st).await;
+    publish(&st, 16).await;
+    let settled: Vec<_> = (0..16).filter(|o| *o != 3).collect();
+    st.ack_batch("q".into(), 0, None, &settled).await.unwrap();
+    let ticket = st.queue_handle("q", 0, None).await.unwrap();
+    st.write_exact_queue_checkpoint(ticket.clone(), true)
+        .await
+        .unwrap();
+    st.truncate_queue_before("q", 0, None, u64::MAX).await.unwrap();
+    st.truncate_partition_log(ticket.clone(), u64::MAX)
+        .await
+        .unwrap();
+    let h = ticket.resolve().unwrap();
+    let (boundary, _) = st
+        .read_queue_snapshot(&st.snap_file("q", 0, None))
+        .unwrap()
+        .unwrap();
+    assert!(boundary.event_next() > 3);
+    assert!(h.event_log().head_offset() <= 3);
+    assert_eq!(
+        crate::stroma::combined::fetch_payload(&h, 3).unwrap().unwrap().payload,
+        vec![3; 512]
+    );
+    drop(h);
+    st.shutdown().await.unwrap();
 }

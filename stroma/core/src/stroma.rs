@@ -3155,7 +3155,6 @@ impl Stroma {
         stroma
             .write_snapshots_for_partition(tp, part, group, applied_upto)
             .await?;
-        let (safe_msg_truncate, applied_upto) = stroma.checkpoint_retention_limits(&qh, safe_msg_truncate, applied_upto).await?;
         let event_log = qh.event_log();
         let event_head = event_log
             .truncate_before(applied_upto)
@@ -5288,8 +5287,8 @@ impl Stroma {
         qh.ensure_not_recovery_sealed()?;
         let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
         let live = wq.lowest_not_settled_offset().await;
-        let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
-        qh.event_log().truncate_before(before.min(snapshot).min(live)).await.map_err(io_err)
+        let floor = self.checkpoint_truncation_floor(&qh, live, snapshot).await?;
+        qh.event_log().truncate_before(before.min(floor)).await.map_err(io_err)
     }
 
     /// Drop stream records below `before`. Refuses queue partitions.
@@ -5304,7 +5303,6 @@ impl Stroma {
         qh.stream()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
-        let (before, _) = self.checkpoint_retention_limits(&qh, before, u64::MAX).await?;
         qh.msg_log()?.truncate_before(before).await.map_err(io_err)
     }
 
@@ -5548,10 +5546,9 @@ impl Stroma {
         if qh.has_combined_log() {
             let snapshot = self.read_queue_snapshot(&self.snap_file(tp,part,group))?.map(|(boundary,_)|boundary.event_next()).unwrap_or(0);
             let live = qh.work_queue()?.lowest_not_settled_offset().await;
-            let (live,snapshot) = self.checkpoint_retention_limits(&qh,live,snapshot).await?;
-            return qh.event_log().truncate_before(before_event.min(snapshot).min(live)).await.map_err(io_err);
+            let floor = self.checkpoint_truncation_floor(&qh, live, snapshot).await?;
+            return qh.event_log().truncate_before(before_event.min(floor)).await.map_err(io_err);
         }
-        let (tp_msg_floor, before_event) = self.checkpoint_retention_limits(&qh, u64::MAX, before_event).await?;
         let event_log = qh.event_log();
         let event_head = event_log
             .truncate_before(before_event)
@@ -5574,7 +5571,7 @@ impl Stroma {
             None => 0,
         };
         let msg_head = msg_log
-            .truncate_before(safe_msg_truncate.min(tp_msg_floor))
+            .truncate_before(safe_msg_truncate)
             .await
             .map_err(io_err)?;
         tracing::info!(
