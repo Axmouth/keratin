@@ -862,9 +862,8 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
     #[derive(Debug)]
     struct NoLag;
     impl QueueReplicationRetention for NoLag {
-        fn retained_from(&self, _: &str, _: u32, _: Option<&str>, _: Option<&StorageHistoryBinding>) -> Result<(u64, u64)> {
-            // The absent message lane stays at zero. Only event progress pins a combined queue.
-            Ok((0, u64::MAX))
+        fn retained_next(&self, _: &str, _: u32, _: Option<&str>, _: Option<&StorageHistoryBinding>) -> Result<u64> {
+            Ok(u64::MAX)
         }
     }
     let dir = keratin_log::test_dir!("combined_agreed_checkpoint");
@@ -1733,4 +1732,53 @@ async fn single_log_queue_api_and_stream_api_refuse_the_other_kind() {
     assert_eq!(follower.queue_replication_next_offset("q", 0, None).await.unwrap(), 2);
     owner.shutdown().await.unwrap();
     follower.shutdown().await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn queue_commits_name_one_offset_and_one_epoch_in_the_single_log() {
+    let dir = keratin_log::test_dir!("combined_single_log_commits");
+    let st = open(&dir.root).await;
+    st.ensure_queue_owner_epoch("q", 0, None, Some(5)).await.unwrap();
+    st.create_stream("s", 0, None).await.unwrap();
+    assert!(matches!(
+        st.queue_durable_commit("s", 0, None).await,
+        Err(StromaError::WrongPartitionKind { .. })
+    ));
+    assert_eq!(st.queue_durable_commit("q", 0, None).await.unwrap(), QueuePublishCommit::queue(0, 5));
+    assert_eq!(publish(&st, false).await, 0);
+
+    // A two-record publish commits once, at the end of its last record.
+    let (tx, rx) = tokio::sync::oneshot::channel();
+    let mut completions = Vec::new();
+    let items = (0..2)
+        .map(|_| {
+            let (completion, done) = KeratinAppendCompletion::pair();
+            completions.push(done);
+            PublishItem {
+                headers: headers(),
+                payload: vec![7; 64],
+                completion,
+                not_before: None,
+                expire_at: None,
+            }
+        })
+        .collect();
+    st.append_message_batch_observed("q", 0, None, items, Some(Box::new(move |c| {
+        let _ = tx.send(c);
+    })))
+    .await
+    .unwrap();
+    let commit = rx.await.unwrap();
+    for done in completions {
+        done.await.unwrap().unwrap();
+    }
+    assert!(commit.is_single_log());
+    assert_eq!((commit.next(), commit.epoch()), (3, 5));
+    let durable = st.queue_durable_commit("q", 0, None).await.unwrap();
+    assert!(durable.is_single_log());
+    assert_eq!(durable, commit);
+    // A commit whose pairs disagree is visible as such to its consumer.
+    assert!(!QueuePublishCommit { message_next: 0, ..commit }.is_single_log());
+    assert!(!QueuePublishCommit { message_epoch: 4, ..commit }.is_single_log());
+    st.shutdown().await.unwrap();
 }

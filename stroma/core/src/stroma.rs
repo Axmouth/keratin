@@ -127,6 +127,36 @@ pub struct QueuePublishCommit {
     pub event_epoch: u64,
 }
 
+impl QueuePublishCommit {
+    /// Commit in the single queue log. Message ids are offsets in the same
+    /// log, so both coordinate pairs carry the same values.
+    pub fn queue(next: Offset, epoch: u64) -> Self {
+        Self {
+            message_next: next,
+            event_next: next,
+            message_epoch: epoch,
+            event_epoch: epoch,
+        }
+    }
+
+    /// Whether both coordinate pairs agree, as every single-log commit does.
+    pub fn is_single_log(&self) -> bool {
+        self.message_next == self.event_next && self.message_epoch == self.event_epoch
+    }
+
+    /// Exclusive end of the publication in the single queue log.
+    pub fn next(&self) -> Offset {
+        debug_assert!(self.is_single_log(), "two-lane queue commit: {self:?}");
+        self.event_next
+    }
+
+    /// Log epoch the publication was written under.
+    pub fn epoch(&self) -> u64 {
+        debug_assert!(self.is_single_log(), "two-lane queue commit: {self:?}");
+        self.event_epoch
+    }
+}
+
 /// Called once, before individual successful completions, after log durability
 /// and queue application complete. The callback must do bounded, nonblocking work.
 pub type QueuePublishObserver = Box<dyn FnOnce(QueuePublishCommit) + Send>;

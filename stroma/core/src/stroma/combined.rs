@@ -301,8 +301,8 @@ impl Stroma {
             });
         }
         let bytes: usize = records.iter().map(Message::bytes_len).sum();
-        let message_epoch = h.message_lane_epoch();
-        let event_epoch = event_log.current_epoch();
+        // One log carries the batch, so one epoch describes it.
+        let epoch = event_log.current_epoch();
         let receiver = event_log.append_batch_enqueue_receiver(
             records,
             Some(self.queue_event_log_config().default_durability),
@@ -345,12 +345,10 @@ impl Stroma {
                 match outcome {
                     Ok(ar) => {
                         if let Some(observer) = observer {
-                            observer(QueuePublishCommit {
-                                message_next: ar.base_offset + ar.count as u64,
-                                event_next: ar.base_offset + ar.count as u64,
-                                message_epoch,
-                                event_epoch,
-                            });
+                            observer(QueuePublishCommit::queue(
+                                ar.base_offset + ar.count as u64,
+                                epoch,
+                            ));
                         }
                         for (i, item) in items.into_iter().enumerate() {
                             item.completion.complete(Ok(AppendResult {

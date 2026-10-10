@@ -453,6 +453,25 @@ impl Stroma {
         })
     }
 
+    /// Current durable end of the single queue log, as a dependency that a
+    /// recovered backlog must reach before new publications supply exact batch
+    /// boundaries. Refuses stream partitions.
+    pub async fn queue_durable_commit(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<crate::QueuePublishCommit> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let h = qh.resolve()?;
+        h.work_queue()?;
+        let _apply = h.follower_apply_state().await;
+        h.ensure_not_recovery_sealed()?;
+        let _pause = h.pause_owner_operations_and_wait().await?;
+        let log = h.event_log();
+        Ok(crate::QueuePublishCommit::queue(log.next_offset(), log.current_epoch()))
+    }
+
     /// Resume cursors for an idle follower, including a checkpoint whose live
     /// payloads still require backfill. These cursors alone do not prove readiness.
     pub async fn queue_replication_next_offsets(

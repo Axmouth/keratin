@@ -550,12 +550,15 @@ impl Stroma {
         let storage = self.clone();
         let protects_followers = h.role() == QueueRole::Owner;
         tokio::task::spawn_blocking(move || {
-            let (_, replica_event) = if protects_followers {
-                storage.replication_retention_limits(&topic, part, group.as_deref())?
+            // Followers read the single queue log, so their floor bounds the
+            // applied-state side. The payload floor in `message` is kept apart
+            // and still bounds truncation below.
+            let replica = if protects_followers {
+                storage.replication_retention_limit(&topic, part, group.as_deref())?
             } else {
-                (u64::MAX, u64::MAX)
+                u64::MAX
             };
-            let event = event.min(replica_event);
+            let event = event.min(replica);
             let index = load_index(&root, &topic, part, group.as_deref())?;
             Ok(index.pins.values().fold((message, event), |(m, e), pin| {
                 let accepted = index.accepted.as_ref().filter(|a| a.attempt == pin.attempt);

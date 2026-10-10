@@ -3,14 +3,14 @@ use super::*;
 #[derive(Debug)]
 struct NoLaggingReplicas;
 impl QueueReplicationRetention for NoLaggingReplicas {
-    fn retained_from(
+    fn retained_next(
         &self,
         _: &str,
         _: u32,
         _: Option<&str>,
         _: Option<&StorageHistoryBinding>,
-    ) -> Result<(u64, u64)> {
-        Ok((u64::MAX, u64::MAX))
+    ) -> Result<u64> {
+        Ok(u64::MAX)
     }
 }
 
