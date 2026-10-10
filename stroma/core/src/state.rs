@@ -1115,7 +1115,7 @@ pub struct QueueHandleInner {
 /// strong there). A `QueueHandle` holds a `Weak` to the current incarnation
 /// plus the registry ref and key, so it can re-resolve. This means a handed-out
 /// handle (or a long-lived task that clones it) can NEVER pin a dead incarnation
-/// alive: when the slot drops the `Inner`, the logs close and the flock releases
+/// alive: when the slot drops the `Inner`, the logs close and the file lock releases
 /// even if tickets still exist. Resolution upgrades the `Weak`; if the
 /// incarnation has rotated (destroy then recreate) it re-looks-up the live slot
 /// by key, so a stale ticket transparently rebinds to the current incarnation.

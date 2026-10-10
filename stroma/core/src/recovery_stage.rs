@@ -98,7 +98,7 @@ pub(super) struct StageInner {
     pub(super) complete: bool,
     pub(super) needs_reopen: bool,
     // Keep admission/OS locks through all owned work and writer shutdown.
-    _lock: fs::File,
+    _lock: keratin_log::lock::FileLock,
     _permit: tokio::sync::OwnedSemaphorePermit,
 }
 
@@ -570,12 +570,7 @@ impl Stroma {
             let (lock, mut initialized, complete) = tokio::task::spawn_blocking(move || {
                 if !resume_only {
                     fs::create_dir_all(&setup_root).map_err(io_err)?;
-                    fs::OpenOptions::new()
-                        .create(true)
-                        .truncate(false)
-                        .write(true)
-                        .open(setup_root.join(".keratin.lock"))
-                        .map_err(io_err)?;
+                    keratin_log::create_log_lock_file(&setup_root).map_err(io_err)?;
                 }
                 let lock = lock_existing_log(&setup_root).map_err(io_err)?;
                 if resume_only

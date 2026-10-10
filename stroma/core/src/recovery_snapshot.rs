@@ -42,7 +42,7 @@ pub struct RecoverySnapshotFile {
     verified: bool,
     needs_reopen: bool,
     data: File,
-    _lock: File,
+    _lock: keratin_log::lock::FileLock,
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -87,13 +87,7 @@ impl RecoverySnapshotFile {
         let encoded = rmp_serde::to_vec_named(&identity).map_err(io::Error::other)?;
         let root = parent.join(blake3::hash(&encoded).to_hex().as_str());
         fs::create_dir_all(&root)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join("lock"))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        let lock = keratin_log::lock::FileLock::try_exclusive_or_create(&root.join("lock"))?;
         crate::dir_sync::sync_dir_chain(&root)?;
         match bounded_read(&root.join("identity"), 1024) {
             Ok(saved) if saved != encoded => return Err(invalid("snapshot identity changed")),

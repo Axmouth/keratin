@@ -47,7 +47,7 @@ pub struct RecoveryInspectionJournal {
     identity: RecoveryJournalIdentity,
     limits: RecoveryJournalLimits,
     // The lock follows owned blocking work through caller cancellation.
-    _lock: File,
+    _lock: keratin_log::lock::FileLock,
 }
 fn invalid(message: &str) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message)
@@ -89,13 +89,7 @@ impl RecoveryInspectionJournal {
         let root = parent.join(blake3::hash(&encoded).to_hex().as_str());
         fs::create_dir_all(&root)?;
         crate::dir_sync::sync_dir_chain(&root)?;
-        let lock = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(root.join("lock"))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        let lock = keratin_log::lock::FileLock::try_exclusive_or_create(&root.join("lock"))?;
         let journal = Self {
             root,
             identity,

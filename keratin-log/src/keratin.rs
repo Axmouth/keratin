@@ -1,4 +1,3 @@
-use fs2::FileExt;
 use parking_lot::RwLock;
 use std::collections::BTreeMap;
 use std::fs::File;
@@ -8,6 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
 use tokio::sync::oneshot;
 
+use crate::lock::FileLock;
 use crate::log::{AppendResult, Log, LogState, ReplicatedAppendMode, ReplicatedAppendOutcome};
 use crate::reader::LogReader;
 use crate::record::Message;
@@ -23,7 +23,7 @@ pub struct Keratin {
     log_state: Arc<LogState>,
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
     tail_cache: Arc<TailCache>,
-    _lock: Option<Arc<File>>,
+    _lock: Option<Arc<FileLock>>,
     shutdown_started: AtomicBool,
     role: AtomicU8,
 }
@@ -158,12 +158,7 @@ impl Keratin {
         tokio::task::spawn_blocking(move || {
             let mut locks = Vec::with_capacity(logs.len());
             for (root, _, expected_epoch) in &logs {
-                let lock = std::fs::OpenOptions::new()
-                    .read(true)
-                    .write(true)
-                    .open(root.join(".keratin.lock"))?;
-                lock.try_lock_exclusive()?;
-                locks.push(lock);
+                locks.push(crate::lock_existing_log(root)?);
                 let manifest = crate::manifest::Manifest::read_from(&mut File::open(
                     crate::manifest::Manifest::path(root),
                 )?)?;
@@ -227,24 +222,20 @@ impl Keratin {
 
         std::fs::create_dir_all(&root)?;
 
-        let lock_path = root.join(".keratin.lock");
-        let lock_file = std::fs::OpenOptions::new()
-            .create(true)
-            .truncate(true)
-            .read(true)
-            .write(true)
-            .open(&lock_path)?;
-
+        let lock_path = crate::lock::log_lock_path(&root);
         tracing::debug!(
             "attempting to acquire Keratin lock at {}",
             lock_path.display()
         );
-        // Try to acquire exclusive lock (non-blocking)
-        lock_file.try_lock_exclusive().map_err(|_| {
-            io::Error::new(
-                io::ErrorKind::AlreadyExists,
-                format!("Keratin already open for {}", root.display()),
-            )
+        let lock_file = FileLock::try_exclusive_or_create(&lock_path).map_err(|e| {
+            if e.kind() == io::ErrorKind::WouldBlock {
+                io::Error::new(
+                    io::ErrorKind::AlreadyExists,
+                    format!("Keratin already open for {}", root.display()),
+                )
+            } else {
+                e
+            }
         })?;
         tracing::debug!("acquired Keratin lock at {}", lock_path.display());
         let lock_file = Arc::new(lock_file);
@@ -684,16 +675,10 @@ impl Keratin {
             .await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?;
         tracing::debug!("shutdown command sent to Keratin writer");
-        tracing::debug!(
-            "releasing Keratin lock at {}",
-            self.root.join(".keratin.lock").display()
-        );
-        self._lock.as_ref().map(|f| f.unlock()).transpose()?;
-        self._lock.as_ref().map(|f| f.sync_all()).transpose()?;
-        tracing::debug!(
-            "released Keratin lock at {}",
-            self.root.join(".keratin.lock").display()
-        );
+        if let Some(lock) = &self._lock {
+            lock.release();
+            tracing::debug!("released Keratin lock at {}", lock.path().display());
+        }
         Ok(())
     }
 
@@ -743,8 +728,7 @@ impl Keratin {
     pub async fn force_close(self) -> std::io::Result<()> {
         tracing::warn!("force closing Keratin instance without waiting for writer acknowledgment");
         if let Some(lock) = &self._lock {
-            lock.unlock()?;
-            lock.sync_all()?;
+            lock.release();
         }
 
         std::mem::forget(self); // 💀 Drop will NOT run: the lock was already released above
@@ -837,20 +821,10 @@ impl Drop for Keratin {
         }
 
         tracing::debug!("shutdown command sent to Keratin writer");
-        tracing::debug!(
-            "releasing Keratin lock at {}",
-            self.root.join(".keratin.lock").display()
-        );
-        if let Err(e) = self._lock.as_ref().map(|f| f.unlock()).transpose() {
-            tracing::warn!("failed to unlock Keratin lock file: {e}");
+        if let Some(lock) = &self._lock {
+            lock.release();
+            tracing::debug!("released Keratin lock at {}", lock.path().display());
         }
-        if let Err(e) = self._lock.as_ref().map(|f| f.sync_all()).transpose() {
-            tracing::warn!("failed to sync Keratin lock file: {e}");
-        }
-        tracing::debug!(
-            "released Keratin lock at {}",
-            self.root.join(".keratin.lock").display()
-        );
     }
 }
 

@@ -846,7 +846,7 @@ pub struct Stroma {
     /// path), destroy_partition, and evict - so two never race on the same dir.
     /// Without it, a build whose slot was retired mid-flight (or two churning
     /// builds) both `create_dir_all` + open the same path and collide on the
-    /// `.keratin.lock` flock ("Keratin already open"). The flock stays as a
+    /// `.keratin.lock` lock ("Keratin already open"). The file lock stays as a
     /// redundant safety net; this is the real in-process serialization. Keyed by
     /// the stable partition key (survives slot churn); entries are tiny and the
     /// partition set is bounded.

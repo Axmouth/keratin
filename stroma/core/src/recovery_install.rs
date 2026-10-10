@@ -269,12 +269,7 @@ impl Stroma {
     fn lock_recovery_dir(&self, topic: &str, part: u32, group: Option<&str>) -> Result<PathBuf> {
         let dir = self.recovery_dir(topic, part, group);
         layout::create_dir_within(&self.root, &dir)?;
-        fs::OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .write(true)
-            .open(dir.join(".keratin.lock"))
-            .map_err(io_err)?;
+        keratin_log::create_log_lock_file(&dir).map_err(io_err)?;
         Ok(dir)
     }
     pub(super) fn has_recovery_installation(

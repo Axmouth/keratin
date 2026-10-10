@@ -2,11 +2,11 @@
 //! log's existing lock and prevent mutation for the scan's entire lifetime.
 
 use crate::{
+    lock::{FileLock, create_lock_file, log_lock_path},
     manifest::Manifest,
     record::{DecodedRecord, RECORD_HEADER_LEN, decode_record_prefix},
     segment::LOG_HEADER_LEN,
 };
-use fs2::FileExt;
 use std::{
     collections::BTreeMap,
     fs::{self, File},
@@ -207,10 +207,14 @@ fn invalid(message: &str) -> io::Error {
 
 /// Acquire the existing log lock without creating/truncating any file. Live
 /// callers already holding the writer's lock retain that owner instead.
-pub fn lock_existing_log(root: &Path) -> io::Result<File> {
-    let lock = File::open(root.join(".keratin.lock"))?;
-    lock.try_lock_exclusive()?;
-    Ok(lock)
+pub fn lock_existing_log(root: &Path) -> io::Result<FileLock> {
+    FileLock::try_exclusive(&log_lock_path(root))
+}
+
+/// Create a log directory's lock file if missing, so `lock_existing_log` can
+/// take it later. Leaves any lock already held on it in place.
+pub fn create_log_lock_file(root: &Path) -> io::Result<()> {
+    create_lock_file(&log_lock_path(root))
 }
 
 impl FrozenLogReader {

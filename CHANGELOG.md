@@ -188,6 +188,13 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- Log, recovery and cache directory locks are POSIX record locks owned by the
+  process, managed by the new `keratin_log::lock` module. A child process
+  spawned while a lock was held could keep it looking held after release,
+  which made opens fail with "Resource temporarily unavailable". Lock files
+  are opened only through that module. `lock_existing_log` returns a
+  `FileLock`, and `create_log_lock_file` prepares a log lock file.
+
 - Avoid scanning every TTL range on each enqueue. Deadline updates notify the
   coalescing expiry worker, keeping fragmented TTL publication and recovery replay
   independent of a growing per-message minimum search. Expiry selection still

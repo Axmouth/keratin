@@ -1,8 +1,8 @@
 //! Bounded reclamation of private inspection caches after a transition retires.
 //! Active logs, recovery stages and installed receipts are outside this tree.
-use keratin_log::util::fsync_dir;
+use keratin_log::{lock::FileLock, util::fsync_dir};
 use std::{
-    fs::{self, File, OpenOptions},
+    fs::{self, File},
     io,
     path::Path,
 };
@@ -21,20 +21,11 @@ fn hashed_name(path: &Path) -> bool {
                 .all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b))
     })
 }
-fn lock(root: &Path) -> io::Result<Option<File>> {
-    let file = match OpenOptions::new()
-        .read(true)
-        .write(true)
-        .open(root.join("lock"))
-    {
-        Ok(file) => file,
-        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
-        Err(e) => return Err(e),
-    };
-    match file.try_lock() {
-        Ok(()) => Ok(Some(file)),
-        Err(std::fs::TryLockError::WouldBlock) => Ok(None),
-        Err(std::fs::TryLockError::Error(e)) => Err(e),
+fn lock(root: &Path) -> io::Result<Option<FileLock>> {
+    match FileLock::try_exclusive(&root.join("lock")) {
+        Ok(lock) => Ok(Some(lock)),
+        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::WouldBlock) => Ok(None),
+        Err(e) => Err(e),
     }
 }
 fn remove(path: &Path, max_files: usize, result: &mut RecoveryCacheCleanup) -> io::Result<bool> {
@@ -184,25 +175,19 @@ pub(crate) const NAMESPACE_LOCK: &str = ".namespace.lock";
 /// All resumable inspection work holds shared namespace ownership. Retirement
 /// takes exclusive ownership and leaves a durable marker to reject stale work.
 pub(crate) struct RecoveryCacheLease {
-    _file: File,
+    _lock: FileLock,
 }
 impl RecoveryCacheLease {
     pub(crate) fn acquire(root: &Path) -> io::Result<Self> {
         crate::dir_sync::create_dir_all_synced(root)?;
-        let file = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join(NAMESPACE_LOCK))?;
-        file.try_lock_shared().map_err(io::Error::other)?;
+        let lock = FileLock::try_shared_or_create(&root.join(NAMESPACE_LOCK))?;
         if root.join("retired").try_exists()? {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
                 "inspection transition cache has retired",
             ));
         }
-        Ok(Self { _file: file })
+        Ok(Self { _lock: lock })
     }
 }
 /// Retire one obsolete transition and reclaim at most `max_files` files. Shared
@@ -219,23 +204,17 @@ pub fn retire_recovery_cache(root: &Path, max_files: usize) -> io::Result<Recove
     if !root.try_exists()? {
         return Ok(Default::default());
     }
-    let file = OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .read(true)
-        .write(true)
-        .open(root.join(NAMESPACE_LOCK))?;
-    match file.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
+    let _lock = match FileLock::try_exclusive_or_create(&root.join(NAMESPACE_LOCK)) {
+        Ok(lock) => lock,
+        Err(e) if e.kind() == io::ErrorKind::WouldBlock => {
             return Ok(RecoveryCacheCleanup {
                 busy_entries: 1,
                 more: true,
                 ..Default::default()
             });
         }
-        Err(std::fs::TryLockError::Error(e)) => return Err(e),
-    }
+        Err(e) => return Err(e),
+    };
     if !root.join("retired").try_exists()? {
         let mut marker = File::create(root.join("retired"))?;
         marker.write_all(b"retired-v1\n")?;

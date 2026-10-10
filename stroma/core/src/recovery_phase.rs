@@ -127,7 +127,7 @@ pub struct RecoveryPhaseStore {
     root: PathBuf,
     recipe: RecoveryPhaseRecipe,
     id: [u8; 32],
-    _lock: File,
+    _lock: keratin_log::lock::FileLock,
 }
 fn invalid(message: impl ToString) -> io::Error {
     io::Error::new(io::ErrorKind::InvalidData, message.to_string())
@@ -197,13 +197,7 @@ impl RecoveryPhaseStore {
             .join("phases")
             .join(blake3::Hash::from_bytes(id).to_hex().as_str());
         fs::create_dir_all(&root)?;
-        let lock = OpenOptions::new()
-            .create(true)
-            .truncate(false)
-            .read(true)
-            .write(true)
-            .open(root.join("lock"))?;
-        lock.try_lock().map_err(io::Error::other)?;
+        let lock = keratin_log::lock::FileLock::try_exclusive_or_create(&root.join("lock"))?;
         crate::dir_sync::sync_dir_chain(&root)?;
         match read(&root.join("identity"))? {
             Some(saved) if saved != identity => return Err(invalid("phase identity mismatch")),

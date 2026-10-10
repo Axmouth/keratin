@@ -213,7 +213,7 @@ pub struct Log {
     last_stats_dump: Instant,
     manifest_worker: crate::manifest_worker::ManifestWorker,
     // Drop order keeps the directory locked until the worker has drained.
-    _directory_lock: Option<Arc<File>>,
+    _directory_lock: Option<Arc<crate::lock::FileLock>>,
     manifest_flush_interval: Duration,
     last_manifest_flush: Instant,
     /// First flush, sync or manifest failure seen by this handle. After a
@@ -340,7 +340,7 @@ impl Log {
     }
 
     /// Retain ownership until outstanding periodic checkpoints have drained.
-    pub(crate) fn retain_directory_lock(&mut self, lock: Arc<File>) {
+    pub(crate) fn retain_directory_lock(&mut self, lock: Arc<crate::lock::FileLock>) {
         if self.manifest_worker.enabled {
             self._directory_lock = Some(lock);
         }
@@ -2502,34 +2502,20 @@ mod background_manifest_tests {
 
     #[test]
     fn directory_lock_outlives_pending_manifest_on_drop() {
-        use fs2::FileExt;
+        use crate::lock::{FileLock, log_lock_path};
         let dir = crate::test_dir!("manifest_lock_lifetime");
         let mut log = open(&dir.root);
-        let path = dir.root.join(".keratin.lock");
-        let lock = Arc::new(
-            OpenOptions::new()
-                .create(true)
-                .truncate(false)
-                .read(true)
-                .write(true)
-                .open(&path)
-                .unwrap(),
-        );
-        lock.try_lock_exclusive().unwrap();
+        let path = log_lock_path(&dir.root);
+        let lock = Arc::new(FileLock::try_exclusive_or_create(&path).unwrap());
         log.retain_directory_lock(lock.clone());
-        let other = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .open(&path)
-            .unwrap();
         let (tx, rx) = bounded(1);
         log.manifest_worker.pending = Some(rx);
         drop(lock);
         let thread = std::thread::spawn(move || drop(log));
-        assert!(other.try_lock_exclusive().is_err());
+        assert!(FileLock::try_exclusive(&path).is_err());
         tx.send(Ok(Duration::ZERO)).unwrap();
         thread.join().unwrap();
-        other.try_lock_exclusive().unwrap();
+        FileLock::try_exclusive(&path).unwrap();
     }
 
     #[test]
