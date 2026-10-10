@@ -97,6 +97,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- `Keratin::durable_next` returns the exclusive durable frontier, which is
+  unambiguous where the inclusive `durable_offset` is not. `next_offset` is
+  documented as counting staged records that may not be durable or readable
+  yet. Stroma exposes the stream record log frontier as `stream_durable_next`.
+
 - Persist completed local recovery inspection and comparison phases with exact
   source/configuration binding and a versioned recipe. Restored artifacts verify
   their snapshot and state digests. Namespace leases and bounded retirement keep

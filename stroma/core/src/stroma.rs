@@ -4466,11 +4466,23 @@ impl Stroma {
         Ok(qh.resolve()?.stream()?.cursors().await?)
     }
 
-    /// Read a stream's current head/tail watermarks (lowest retained offset and
-    /// one past the last appended offset).
+    /// Read a stream's current head/tail watermarks: the lowest retained offset
+    /// and one past the last staged record. The tail counts staged records that
+    /// may not be durable or readable yet. Use `stream_durable_next` for the
+    /// frontier that `read_stream_records` can reach.
     pub async fn stream_head_tail(&self, tp: &str, part: u32) -> Result<(Offset, Offset)> {
         let qh = self.queue_handle(tp, part, None).await?;
         Ok(qh.resolve()?.stream()?.head_tail().await?)
+    }
+
+    /// Exclusive durable frontier of a stream's record log. Every offset below
+    /// it is durable and readable through `read_stream_records`, which never
+    /// returns a record at or above it.
+    pub async fn stream_durable_next(&self, tp: &str, part: u32) -> Result<Offset> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        let h = qh.resolve()?;
+        h.stream()?;
+        Ok(h.msg_log()?.durable_next())
     }
 
     /// Read up to `max` stream records starting at `from`, for subscribe backfill.

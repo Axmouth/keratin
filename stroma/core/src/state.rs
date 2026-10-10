@@ -3068,6 +3068,8 @@ impl StreamHandle<'_> {
         rx.await.map_err(|_| QueueHandleError::ActorGone)
     }
 
+    /// `(head, tail)` of the retained window. The tail is one past the last
+    /// staged record, which may not be durable or readable yet.
     pub async fn head_tail(&self) -> Result<(Offset, Offset), QueueHandleError> {
         let (tx, rx) = oneshot::channel();
         self.stream_command_enqueue(StreamCommand::GetHeadTail { response: tx })

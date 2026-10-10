@@ -455,6 +455,9 @@ impl Keratin {
         self.log_state.local_append_bytes.load(Ordering::Relaxed)
     }
 
+    /// The next offset to assign. Counts every assigned or staged record, so
+    /// records just below it may not be readable or durable yet. Use
+    /// `durable_next` for the frontier that durable reads can reach.
     pub fn next_offset(&self) -> u64 {
         self.log_state.tail.load(Ordering::Acquire)
     }
@@ -488,6 +491,14 @@ impl Keratin {
         crate::FrozenLogCursor::durable_prefix(segments, head, next, max_scan_bytes)
     }
 
+    /// The exclusive durable frontier: every offset below it is durable and
+    /// readable through durable reads. `0` means nothing is durable yet.
+    pub fn durable_next(&self) -> u64 {
+        self.log_state.durable.load().first_non_durable()
+    }
+
+    /// Inclusive form of `durable_next`. Ambiguous at `0` (empty log or only
+    /// offset 0 durable), so prefer `durable_next`.
     pub fn durable_offset(&self) -> u64 {
         // The watermark is the exclusive durable frontier (count of durable
         // records). Convert back to an inclusive offset for this public accessor.
@@ -1070,5 +1081,38 @@ async fn checkpoint_reset_drains_prior_fsync_completions() {
         assert_eq!(log.next_offset(), 0);
         assert_eq!(log.log_state.durable.load().first_non_durable(), 0);
     }
+    log.shutdown().await.unwrap();
+}
+
+#[cfg(test)]
+#[tokio::test]
+async fn durable_next_trails_next_offset_until_sync() {
+    let dir = crate::test_dir!("durable_next_trails");
+    let cfg = KeratinConfig {
+        fsync_interval_ms: 60_000,
+        ..KeratinConfig::test_default()
+    };
+    let log = Keratin::open(&dir.root, cfg).await.unwrap();
+    assert_eq!(log.durable_next(), 0);
+    for _ in 0..3 {
+        log.append(
+            Message {
+                flags: 0,
+                headers: vec![],
+                payload: vec![1; 16],
+            },
+            Some(KDurability::AfterWrite),
+        )
+        .await
+        .unwrap();
+    }
+    // Written but not fsynced: assigned, yet not durable.
+    assert_eq!(log.next_offset(), 3);
+    assert_eq!(log.durable_next(), 0);
+    assert_eq!(log.reader().scan_from(0, 10).unwrap().len(), 0);
+    log.sync().await.unwrap();
+    assert_eq!(log.durable_next(), 3);
+    assert_eq!(log.durable_offset(), 2);
+    assert_eq!(log.reader().scan_from(0, 10).unwrap().len(), 3);
     log.shutdown().await.unwrap();
 }
