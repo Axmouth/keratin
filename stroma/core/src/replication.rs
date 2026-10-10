@@ -415,9 +415,11 @@ impl Stroma {
         self.advance_queue_epoch(topic, part, None, epoch).await
     }
 
-    /// Current durable end of the single queue log, as a dependency that a
-    /// recovered backlog must reach before new publications supply exact batch
-    /// boundaries. Refuses stream partitions.
+    /// Current end of the single queue log, as a dependency that a recovered
+    /// backlog must reach before new publications supply exact batch boundaries.
+    /// Refuses stream partitions. `next` is the staged next offset, which can be
+    /// ahead of the durable frontier. That is safe for a dependency: a confirm
+    /// gated on it only waits for more records, never fewer.
     pub async fn queue_durable_commit(
         &self,
         topic: &str,
