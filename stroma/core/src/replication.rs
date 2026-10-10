@@ -5,13 +5,16 @@
 //! helpers, lifted out of stroma.rs. Re-exported from `stroma` so existing
 //! `stroma_core::` and `crate::stroma::` paths keep resolving.
 
+use std::sync::Arc;
 use std::sync::atomic::Ordering;
 
-use keratin_log::{KDurability, Keratin, KeratinReplicaExt, Message, ReplicatedAppendOutcome};
+use keratin_log::{
+    KDurability, Keratin, KeratinReplicaExt, Message, OwnedRecord, ReplicatedAppendOutcome,
+};
 
 use crate::engine::PartitionKind;
 use crate::event::StromaEvent;
-use crate::state::{QueueRole, SnapshotMeta};
+use crate::state::{QueueHandleInner, QueueRole, SnapshotMeta};
 use crate::stream_state::StreamCommand;
 use crate::stroma::{
     QueueDemotionOutcome, QueuePromotionOutcome, Stroma, decode_err, event_msg, io_err,
@@ -98,11 +101,131 @@ pub(crate) fn owner_replication_gap<T>(
     )))
 }
 
+fn ensure_owner(qh: &QueueHandleInner) -> Result<()> {
+    let role = qh.role();
+    if role != QueueRole::Owner {
+        return Err(StromaError::WrongQueueRole {
+            expected: QueueRole::Owner,
+            actual: role,
+        });
+    }
+    Ok(())
+}
+
+/// Read a stream's record log. Queues have no such log.
+async fn read_owner_message_log(
+    qh: &QueueHandleInner,
+    from: Offset,
+    max: usize,
+    max_bytes: usize,
+    early: bool,
+) -> Result<OwnerReplicationRead<Message>> {
+    ensure_owner(qh)?;
+    let log = qh.msg_log()?;
+    read_owner_log(qh, log, "message", from, max, max_bytes, early, false, |record| {
+        Ok(record.to_message())
+    })
+    .await
+}
+
+/// Read the event log: the single queue log, or a stream's cursor events.
+async fn read_owner_event_log(
+    qh: &QueueHandleInner,
+    from: Offset,
+    max: usize,
+    max_bytes: usize,
+    early: bool,
+) -> Result<OwnerReplicationRead<StromaEvent>> {
+    ensure_owner(qh)?;
+    // Queue records carry payloads, so they get the same byte cap a payload
+    // log read has. Stream cursor events are small and rely on the scan budget.
+    let payload_cap = qh.has_combined_log();
+    read_owner_log(qh, qh.event_log(), "event", from, max, max_bytes, early, payload_cap, |record| {
+        StromaEvent::decode(&record.payload).map_err(decode_err)
+    })
+    .await
+}
+
+async fn read_owner_log<T>(
+    qh: &QueueHandleInner,
+    log: Arc<Keratin>,
+    lane: &'static str,
+    from: Offset,
+    max: usize,
+    max_bytes: usize,
+    early: bool,
+    payload_cap: bool,
+    decode: impl Fn(OwnedRecord) -> Result<T>,
+) -> Result<OwnerReplicationRead<T>> {
+    let epoch = log.current_epoch();
+    let head_offset = log.head_offset();
+    if from < head_offset {
+        return Ok(owner_replication_checkpoint_required(&log, from));
+    }
+
+    let (records, batch_next_offset) = if max == 0 {
+        (Vec::new(), from)
+    } else {
+        // Keratin readers are synchronous. Keep replica owner scans off
+        // Tokio workers so replication polling cannot starve timers.
+        let read_log = log.clone();
+        let raw = tokio::task::spawn_blocking(move || {
+            let reader = read_log.reader();
+            #[cfg(feature = "early-replication-experiment")]
+            if early {
+                return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
+            }
+            #[cfg(not(feature = "early-replication-experiment"))]
+            let _ = early;
+            reader.scan_from_with_byte_budget(from, max, max_bytes)
+        })
+        .await
+        .map_err(|err| StromaError::Io(err.to_string()))?
+        .map_err(io_err)?;
+        let mut expected = from;
+        let mut records = Vec::with_capacity(raw.len());
+        let mut used_bytes = 0usize;
+        for record in raw {
+            if payload_cap {
+                // The reader includes one lookahead record. Always allow one
+                // oversized record so the cursor can advance.
+                let bytes = record.headers.len().saturating_add(record.payload.len()).saturating_add(32);
+                if !records.is_empty() && used_bytes.saturating_add(bytes) > max_bytes { break; }
+                used_bytes = used_bytes.saturating_add(bytes);
+            }
+            if record.offset != expected {
+                return owner_replication_gap(lane, &log, from, expected, record.offset);
+            }
+            expected = record.offset + 1;
+            let offset = record.offset;
+            records.push((offset, decode(record)?));
+        }
+        (records, expected)
+    };
+
+    if qh.role() != QueueRole::Owner || log.current_epoch() != epoch {
+        return Err(StromaError::Io(
+            "owner changed during replication read".into(),
+        ));
+    }
+    Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
+        epoch,
+        requested_offset: from,
+        next_offset: batch_next_offset,
+        records,
+    }))
+}
+
+/// Per-log append outcomes for a two-log stream batch.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ReplicatedQueueApplyOutcome {
+pub struct ReplicatedStreamApplyOutcome {
     pub message_log: Option<ReplicatedAppendOutcome>,
     pub event_log: Option<ReplicatedAppendOutcome>,
 }
+
+/// Name used by the two-lane queue apply. Queues apply through
+/// `apply_replicated_queue_log_batch`, which returns one outcome.
+pub type ReplicatedQueueApplyOutcome = ReplicatedStreamApplyOutcome;
 
 /// Compacted queue state for a follower that fell behind retained event logs.
 ///
@@ -351,6 +474,28 @@ impl Stroma {
             handle.message_lane_next(),
             handle.event_log().next_offset(),
         ))
+    }
+
+    /// Resume cursor in the single queue log for an idle follower, including
+    /// one whose installed checkpoint still needs payload backfill. The cursor
+    /// alone does not prove readiness. Refuses stream partitions.
+    pub async fn queue_replication_next_offset(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<Offset> {
+        let handle = self.queue_handle(topic, part, group).await?;
+        let handle = handle.resolve()?;
+        handle.work_queue()?;
+        let apply = handle.follower_apply_state().await;
+        handle.ensure_not_recovery_sealed()?;
+        if *apply || handle.role() != QueueRole::Follower {
+            return Err(StromaError::InvalidArgument(
+                "follower apply is incomplete or role changed".into(),
+            ));
+        }
+        Ok(handle.event_log().next_offset())
     }
 
     /// A stream follower's next offsets for both logs: `(record_next,
@@ -645,6 +790,152 @@ impl Stroma {
         ))
     }
 
+    /// Write notifications for the single queue log.
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn subscribe_owner_queue_written(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<tokio::sync::watch::Receiver<()>> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        qh.work_queue()?;
+        Ok(qh.event_log().subscribe_written())
+    }
+
+    /// Durable prefix of the single queue log from `from`, bounded by record
+    /// count and approximate bytes. Payload enqueues and state events share
+    /// these offsets, so one cursor covers the whole queue history. One
+    /// oversized record is always returned so the cursor can advance.
+    pub async fn read_owner_queue_records(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_queue_records_inner(topic, part, group, from, max, max_bytes, false)
+            .await
+    }
+
+    /// Tentative bytes for a fenced, enrolled queue history only. The caller
+    /// keeps responsibility for authority and confirmation gates.
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_queue_records_early(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_queue_records_inner(topic, part, group, from, max, max_bytes, true)
+            .await
+    }
+
+    async fn read_owner_queue_records_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+        early: bool,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        qh.work_queue()?;
+        read_owner_event_log(&qh, from, max, max_bytes, early).await
+    }
+
+    /// Durable prefix of a stream's record log. Refuses queue partitions.
+    pub async fn read_owner_stream_records(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_stream_records_inner(topic, part, from, max, max_bytes, false)
+            .await
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_stream_records_early(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        self.read_owner_stream_records_inner(topic, part, from, max, max_bytes, true)
+            .await
+    }
+
+    async fn read_owner_stream_records_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+        early: bool,
+    ) -> Result<OwnerReplicationRead<Message>> {
+        let qh = self.queue_handle(topic, part, None).await?;
+        let qh = qh.resolve()?;
+        qh.stream()?;
+        read_owner_message_log(&qh, from, max, max_bytes, early).await
+    }
+
+    /// Durable prefix of a stream's cursor-commit event log. Refuses queue
+    /// partitions.
+    pub async fn read_owner_stream_cursor_events(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_stream_cursor_events_inner(topic, part, from, max, max_bytes, false)
+            .await
+    }
+
+    #[cfg(feature = "early-replication-experiment")]
+    pub async fn read_owner_stream_cursor_events_early(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        self.read_owner_stream_cursor_events_inner(topic, part, from, max, max_bytes, true)
+            .await
+    }
+
+    async fn read_owner_stream_cursor_events_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+        early: bool,
+    ) -> Result<OwnerReplicationRead<StromaEvent>> {
+        let qh = self.queue_handle(topic, part, None).await?;
+        let qh = qh.resolve()?;
+        qh.stream()?;
+        read_owner_event_log(&qh, from, max, max_bytes, early).await
+    }
+
     pub async fn read_owner_message_records(
         &self,
         topic: &str,
@@ -698,6 +989,8 @@ impl Stroma {
         self.read_owner_message_records_inner(topic, part, group, from, max, max_bytes, true).await
     }
 
+    /// Two-lane wire compatibility: a queue answers with an empty message lane
+    /// at cursor zero, a stream reads its record log.
     async fn read_owner_message_records_inner(
         &self,
         topic: &str,
@@ -710,15 +1003,8 @@ impl Stroma {
     ) -> Result<OwnerReplicationRead<Message>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
-        let role = qh.role();
-        if role != QueueRole::Owner {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Owner,
-                actual: role,
-            });
-        }
-
         if qh.optional_message_log().is_none() {
+            ensure_owner(&qh)?;
             if from != 0 {
                 return Err(StromaError::InvalidArgument("combined message lane cursor must be zero".into()));
             }
@@ -727,55 +1013,7 @@ impl Stroma {
                 next_offset: 0, records: Vec::new(),
             }));
         }
-        let log = qh.msg_log()?;
-        let epoch = log.current_epoch();
-        let head_offset = log.head_offset();
-        if from < head_offset {
-            return Ok(owner_replication_checkpoint_required(&log, from));
-        }
-
-        let (records, batch_next_offset) = if max == 0 {
-            (Vec::new(), from)
-        } else {
-            // Keratin readers are synchronous; keep replica owner scans off
-            // Tokio workers so replication polling cannot starve timers.
-            let read_log = log.clone();
-            let raw = tokio::task::spawn_blocking(move || {
-                let reader = read_log.reader();
-                #[cfg(feature = "early-replication-experiment")]
-                if early {
-                    return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
-                }
-                #[cfg(not(feature = "early-replication-experiment"))]
-                let _ = early;
-                reader.scan_from_with_byte_budget(from, max, max_bytes)
-            })
-            .await
-            .map_err(|err| StromaError::Io(err.to_string()))?
-            .map_err(io_err)?;
-            let mut expected = from;
-            let mut records = Vec::with_capacity(raw.len());
-            for record in raw {
-                if record.offset != expected {
-                    return owner_replication_gap("message", &log, from, expected, record.offset);
-                }
-                expected = record.offset + 1;
-                records.push((record.offset, record.to_message()));
-            }
-            (records, expected)
-        };
-
-        if qh.role() != QueueRole::Owner || log.current_epoch() != epoch {
-            return Err(StromaError::Io(
-                "owner changed during replication read".into(),
-            ));
-        }
-        Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch,
-            requested_offset: from,
-            next_offset: batch_next_offset,
-            records,
-        }))
+        read_owner_message_log(&qh, from, max, max_bytes, early).await
     }
 
     pub async fn read_owner_event_records(
@@ -843,73 +1081,7 @@ impl Stroma {
     ) -> Result<OwnerReplicationRead<StromaEvent>> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
-        let role = qh.role();
-        if role != QueueRole::Owner {
-            return Err(StromaError::WrongQueueRole {
-                expected: QueueRole::Owner,
-                actual: role,
-            });
-        }
-
-        let log = qh.event_log();
-        let epoch = log.current_epoch();
-        let head_offset = log.head_offset();
-        if from < head_offset {
-            return Ok(owner_replication_checkpoint_required(&log, from));
-        }
-
-        let (records, batch_next_offset) = if max == 0 {
-            (Vec::new(), from)
-        } else {
-            // Keratin readers are synchronous; keep replica owner scans off
-            // Tokio workers so replication polling cannot starve timers.
-            let read_log = log.clone();
-            let raw = tokio::task::spawn_blocking(move || {
-                let reader = read_log.reader();
-                #[cfg(feature = "early-replication-experiment")]
-                if early {
-                    return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
-                }
-                #[cfg(not(feature = "early-replication-experiment"))]
-                let _ = early;
-                reader.scan_from_with_byte_budget(from, max, max_bytes)
-            })
-            .await
-            .map_err(|err| StromaError::Io(err.to_string()))?
-            .map_err(io_err)?;
-            let mut expected = from;
-            let mut records = Vec::with_capacity(raw.len());
-            let mut combined_bytes = 0usize;
-            for record in raw {
-                if qh.has_combined_log() {
-                    // The reader includes one lookahead record. Payload-bearing
-                    // events now need the same cap the message lane had. Always
-                    // allow one oversized record so the cursor can advance.
-                    let bytes = record.headers.len().saturating_add(record.payload.len()).saturating_add(32);
-                    if !records.is_empty() && combined_bytes.saturating_add(bytes) > max_bytes { break; }
-                    combined_bytes = combined_bytes.saturating_add(bytes);
-                }
-                if record.offset != expected {
-                    return owner_replication_gap("event", &log, from, expected, record.offset);
-                }
-                expected = record.offset + 1;
-                let event = StromaEvent::decode(&record.payload).map_err(decode_err)?;
-                records.push((record.offset, event));
-            }
-            (records, expected)
-        };
-
-        if qh.role() != QueueRole::Owner || log.current_epoch() != epoch {
-            return Err(StromaError::Io(
-                "owner changed during replication read".into(),
-            ));
-        }
-        Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-            epoch,
-            requested_offset: from,
-            next_offset: batch_next_offset,
-            records,
-        }))
+        read_owner_event_log(&qh, from, max, max_bytes, early).await
     }
 
     pub async fn export_owner_state_checkpoint(
@@ -980,8 +1152,31 @@ impl Stroma {
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
     ) -> Result<ReplicatedQueueApplyOutcome> {
-        self.apply_replicated_two_log_batch(topic, part, group, messages, events, false)
-            .await
+        self.apply_replicated_two_log_batch(
+            topic, part, group, messages, events, FollowerApplyTarget::LegacyQueue,
+        )
+        .await
+    }
+
+    /// Apply one batch from the owner's single queue log. Payload enqueues
+    /// and state events share offsets, so one batch carries both. The batch
+    /// must not be empty. Refuses stream partitions.
+    pub async fn apply_replicated_queue_log_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        batch: ReplicatedEventBatch,
+    ) -> Result<ReplicatedAppendOutcome> {
+        if batch.events.is_empty() {
+            return Err(StromaError::InvalidArgument("replicated queue batch is empty".into()));
+        }
+        let outcome = self
+            .apply_replicated_two_log_batch(
+                topic, part, group, None, Some(batch), FollowerApplyTarget::Queue,
+            )
+            .await?;
+        single_queue_log_outcome(outcome)
     }
 
     /// Apply a replicated two-log batch to a STREAM partition: records to the
@@ -989,16 +1184,18 @@ impl Stroma {
     /// after the record append, so the
     /// follower's head/tail (and a promoted owner's fan-out + cursor clamping)
     /// reflect the applied records, mirroring the owner append path. Streams have
-    /// no group.
+    /// no group. Refuses queue partitions.
     pub async fn apply_replicated_stream_batch(
         &self,
         topic: &str,
         part: u32,
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
-    ) -> Result<ReplicatedQueueApplyOutcome> {
-        self.apply_replicated_two_log_batch(topic, part, None, messages, events, true)
-            .await
+    ) -> Result<ReplicatedStreamApplyOutcome> {
+        self.apply_replicated_two_log_batch(
+            topic, part, None, messages, events, FollowerApplyTarget::Stream,
+        )
+        .await
     }
 
     async fn append_follower_frame(
@@ -1007,7 +1204,7 @@ impl Stroma {
         apply_state: &mut bool,
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
-    ) -> Result<(ReplicatedQueueApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
+    ) -> Result<(ReplicatedStreamApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
         {
             if qh.has_combined_log() && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
                 return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
@@ -1159,7 +1356,7 @@ impl Stroma {
             };
             (message, event)
         };
-        Ok((ReplicatedQueueApplyOutcome { message_log, event_log }, events, message_next, parallel))
+        Ok((ReplicatedStreamApplyOutcome { message_log, event_log }, events, message_next, parallel))
     }
 
     async fn apply_follower_events(
@@ -1214,11 +1411,51 @@ impl Stroma {
         topic: &str,
         part: u32,
         group: Option<&str>,
-        mut frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
+        frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
     ) -> Result<Vec<ReplicatedQueueApplyOutcome>> {
+        self.apply_open_follower_frames(topic, part, group, frames, FollowerApplyTarget::LegacyQueue)
+            .await
+    }
+
+    /// Open durability group over batches from the single queue log. Every
+    /// frame must carry records. Refuses stream partitions. See
+    /// `apply_open_replicated_queue_batch` for the staging and fence rules.
+    pub async fn apply_open_replicated_queue_log_batch(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        frames: futures::stream::BoxStream<'_, Result<ReplicatedEventBatch>>,
+    ) -> Result<Vec<ReplicatedAppendOutcome>> {
+        use futures::StreamExt;
+        let frames = frames
+            .map(|frame| {
+                let batch = frame?;
+                if batch.events.is_empty() {
+                    return Err(StromaError::InvalidArgument("replicated queue batch is empty".into()));
+                }
+                Ok((None, Some(batch)))
+            })
+            .boxed();
+        self.apply_open_follower_frames(topic, part, group, frames, FollowerApplyTarget::Queue)
+            .await?
+            .into_iter()
+            .map(single_queue_log_outcome)
+            .collect()
+    }
+
+    async fn apply_open_follower_frames(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        mut frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
+        target: FollowerApplyTarget,
+    ) -> Result<Vec<ReplicatedStreamApplyOutcome>> {
         use futures::StreamExt;
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        target.check_kind(&qh)?;
         let mut apply_state = qh.follower_apply_state().await;
         if *apply_state {
             return Err(StromaError::Io("incomplete follower apply; recover or install a checkpoint before retry".into()));
@@ -1272,10 +1509,12 @@ impl Stroma {
         group: Option<&str>,
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
-        advance_stream_tail: bool,
-    ) -> Result<ReplicatedQueueApplyOutcome> {
+        target: FollowerApplyTarget,
+    ) -> Result<ReplicatedStreamApplyOutcome> {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
+        target.check_kind(&qh)?;
+        let advance_stream_tail = target == FollowerApplyTarget::Stream;
         let mut apply_state = qh.follower_apply_state().await;
         if *apply_state {
             return Err(crate::StromaError::Io(
@@ -1293,7 +1532,7 @@ impl Stroma {
 
         let (outcome, events, message_next, parallel) = self
             .append_follower_frame(&qh, &mut apply_state, messages, events).await?;
-        let ReplicatedQueueApplyOutcome { message_log, event_log } = outcome;
+        let ReplicatedStreamApplyOutcome { message_log, event_log } = outcome;
         let messages_allowed = message_log
             .as_ref()
             .is_none_or(replicated_append_outcome_allows_state_apply);
@@ -1320,9 +1559,45 @@ impl Stroma {
             // append. Errors and cancellation return above with the flag set.
             *apply_state = false;
         }
-        Ok(ReplicatedQueueApplyOutcome {
+        Ok(ReplicatedStreamApplyOutcome {
             message_log,
             event_log,
         })
+    }
+}
+
+/// Which follower apply entry point is running. The two-lane queue entry
+/// points predate kind checks and accept any partition. The single-log queue
+/// and stream entry points refuse the other kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FollowerApplyTarget {
+    LegacyQueue,
+    Queue,
+    Stream,
+}
+
+impl FollowerApplyTarget {
+    fn check_kind(self, qh: &QueueHandleInner) -> Result<()> {
+        match self {
+            Self::LegacyQueue => {}
+            Self::Queue => {
+                qh.work_queue()?;
+            }
+            Self::Stream => {
+                qh.stream()?;
+            }
+        }
+        Ok(())
+    }
+}
+
+/// A queue partition has no separate message log, so a queue batch yields
+/// exactly one event-log outcome.
+fn single_queue_log_outcome(outcome: ReplicatedStreamApplyOutcome) -> Result<ReplicatedAppendOutcome> {
+    match outcome {
+        ReplicatedStreamApplyOutcome { message_log: None, event_log: Some(outcome) } => Ok(outcome),
+        other => Err(StromaError::Internal(format!(
+            "queue log apply produced unexpected outcomes: {other:?}"
+        ))),
     }
 }

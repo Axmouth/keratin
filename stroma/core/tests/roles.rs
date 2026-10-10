@@ -6,8 +6,8 @@ use keratin_log::{
 };
 use stroma_core::{
     DeadLetterMeta, DeadLetterReason, MessageHeaders, QueueDemotionOutcome, QueueHandleError,
-    QueueHandleInner, QueuePromotionOutcome, QueueRole, ReplicatedEventBatch,
-    ReplicatedMessageBatch, SnapshotConfig, Stroma, StromaError, StromaEvent, StromaKeratinConfig,
+    QueueHandleInner, QueuePromotionOutcome, QueueRole, ReplicatedEventBatch, SnapshotConfig,
+    Stroma, StromaError, StromaEvent, StromaKeratinConfig,
 };
 use tokio::time::{Instant, timeout};
 
@@ -266,17 +266,16 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
 
-    st.apply_replicated_queue_batch(
+    st.apply_replicated_queue_log_batch(
         "topic-a",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: 0,
             first_offset: 1,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
-        }),
+        },
     )
     .await
     .unwrap();
@@ -424,25 +423,23 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
     let outcome = st
-        .apply_replicated_queue_batch(
+        .apply_replicated_queue_log_batch(
             "topic-a",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
                 events: vec![payload(b"one"), payload(b"two")],
                 durability: Some(KDurability::AfterFsync),
-            }),
+            },
         )
         .await
         .unwrap();
 
-    assert!(outcome.message_log.is_none());
     assert!(matches!(
-        outcome.event_log,
-        Some(ReplicatedAppendOutcome::Applied(result))
+        outcome,
+        ReplicatedAppendOutcome::Applied(result)
             if result.base_offset == 0 && result.count == 2
     ));
     assert_eq!(qh.role(), QueueRole::Follower);
@@ -464,29 +461,27 @@ async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
     let qh = qh.work_queue().unwrap();
 
     let outcome = st
-        .apply_replicated_queue_batch(
+        .apply_replicated_queue_log_batch(
             "topic-a",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
-            }),
+            },
         )
         .await
         .unwrap();
 
     assert!(matches!(
-        outcome.event_log,
-        Some(ReplicatedAppendOutcome::StaleEpoch {
+        outcome,
+        ReplicatedAppendOutcome::StaleEpoch {
             current_epoch: 2,
             attempted_epoch: 0,
-        })
+        }
     ));
-    assert_eq!(outcome.message_log, None);
     assert!(!qh.is_ready(0).await);
     assert!(st.fetch_message_by_offset(&qh, 0).await.unwrap().is_none());
 }
@@ -496,17 +491,16 @@ async fn replicated_ingest_rejects_owner_queue() {
     let (st, _dir) = open_test_stroma("stroma_roles_replicated_ingest_rejects_owner").await;
 
     let result = st
-        .apply_replicated_queue_batch(
+        .apply_replicated_queue_log_batch(
             "topic-a",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
-            }),
+            },
         )
         .await;
 
@@ -527,12 +521,11 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
     let src = src.resolve().unwrap();
     let src = src.work_queue().unwrap();
 
-    st.apply_replicated_queue_batch(
+    st.apply_replicated_queue_log_batch(
         "src",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: 0,
             first_offset: 0,
             events: vec![
@@ -549,7 +542,7 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
                 },
             ],
             durability: Some(KDurability::AfterFsync),
-        }),
+        },
     )
     .await
     .unwrap();
@@ -569,17 +562,16 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
 
-    st.apply_replicated_queue_batch(
+    st.apply_replicated_queue_log_batch(
         "topic-a",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: 0,
             first_offset: 0,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
-        }),
+        },
     )
     .await
     .unwrap();
@@ -648,17 +640,16 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
     let qh = qh.resolve().unwrap();
     let qh = qh.work_queue().unwrap();
 
-    st.apply_replicated_queue_batch(
+    st.apply_replicated_queue_log_batch(
         "topic-a",
         0,
         None,
-        None,
-        Some(ReplicatedEventBatch {
+        ReplicatedEventBatch {
             epoch: 0,
             first_offset: 0,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
-        }),
+        },
     )
     .await
     .unwrap();
@@ -686,17 +677,16 @@ async fn independent_declaration_prefix_is_rejected_by_replication() {
         .unwrap();
     st.become_queue_follower("topic", 0, None).await.unwrap();
     let error = st
-        .apply_replicated_queue_batch(
+        .apply_replicated_queue_log_batch(
             "topic",
             0,
             None,
-            None,
-            Some(ReplicatedEventBatch {
+            ReplicatedEventBatch {
                 epoch: 0,
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
-            }),
+            },
         )
         .await
         .unwrap_err();
@@ -720,18 +710,13 @@ async fn independent_declaration_prefix_is_rejected_by_replication() {
     st.shutdown().await.unwrap();
 }
 
-fn open_frame(
-    offset: u64,
-) -> stroma_core::Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)> {
-    Ok((
-        None,
-        Some(ReplicatedEventBatch {
-            epoch: 0,
-            first_offset: offset,
-            events: vec![payload(b"replicated")],
-            durability: Some(KDurability::AfterFsync),
-        }),
-    ))
+fn open_frame(offset: u64) -> stroma_core::Result<ReplicatedEventBatch> {
+    Ok(ReplicatedEventBatch {
+        epoch: 0,
+        first_offset: offset,
+        events: vec![payload(b"replicated")],
+        durability: Some(KDurability::AfterFsync),
+    })
 }
 
 #[tokio::test]
@@ -744,7 +729,7 @@ async fn open_follower_batch_stages_before_close_and_applies_after_sync() {
     let (tx, rx) = tokio::sync::mpsc::channel(8);
     let frames =
         futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) }).boxed();
-    let apply = st.apply_open_replicated_queue_batch("q", 0, None, frames);
+    let apply = st.apply_open_replicated_queue_log_batch("q", 0, None, frames);
     tokio::pin!(apply);
     for offset in 0..2 {
         tx.send(open_frame(offset)).await.unwrap();
@@ -792,7 +777,7 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
         let frames =
             futures::stream::unfold(rx, |mut rx| async { rx.recv().await.map(|f| (f, rx)) })
                 .boxed();
-        let mut apply = Box::pin(st.apply_open_replicated_queue_batch("q", 0, None, frames));
+        let mut apply = Box::pin(st.apply_open_replicated_queue_log_batch("q", 0, None, frames));
         tx.send(open_frame(0)).await.unwrap();
         timeout(Duration::from_secs(2), async {
             while h.event_log().next_offset() != 1 {
@@ -811,9 +796,8 @@ async fn open_follower_batch_cancellation_and_later_input_error_keep_recovery_fe
         drop(apply);
         drop(tx);
         assert!(!h.work_queue().unwrap().is_ready(0).await);
-        let (m, e) = open_frame(0).unwrap();
         let err = st
-            .apply_replicated_queue_batch("q", 0, None, m, e)
+            .apply_replicated_queue_log_batch("q", 0, None, open_frame(0).unwrap())
             .await
             .unwrap_err();
         assert!(
