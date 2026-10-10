@@ -3,7 +3,6 @@
 use super::*;
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::QueueInternalState;
-use crate::recovery_replay::RecoveryPayloadLog;
 use keratin_log::{KeratinReplicaExt, ReplicatedAppendOutcome, lock_existing_log};
 use std::io::{Read, Write};
 
@@ -12,7 +11,7 @@ const MAX_SNAPSHOT: usize = MAX_RECOVERY_SNAPSHOT_BYTES;
 const MAX_PAGE: u64 = 16 * 1024 * 1024;
 // Snapshot bytes live in a separately verified raw artifact file.
 const MAX_METADATA: usize = 65_536;
-const MAGIC: &[u8; 8] = b"RSTAGE\0\x01";
+const MAGIC: &[u8; 8] = b"RSTAGE\0\x02";
 
 /// Exact baseline authorized by a consensus recovery plan. The caller owns
 /// fresh consensus authorization; these fields alone are not proof of authority.
@@ -26,11 +25,9 @@ pub struct QueueRecoveryStageSpec {
     pub binding: StorageHistoryBinding,
     pub fence_epoch: u64,
     pub source_history: [u8; 32],
-    pub payload_log: RecoveryPayloadLog,
-    pub message_head: u64,
-    pub message_next: u64,
-    pub event_next: u64,
-    pub message_digest: [u8; 32],
+    /// Source queue log. Its `next` is the selected applied boundary, because
+    /// selection only accepts a source whose replay reaches its sealed tail.
+    pub log: RetainedLog,
     pub snapshot_digest: [u8; 32],
     pub snapshot_bytes: u64,
     pub state_digest: [u8; 32],
@@ -87,12 +84,11 @@ pub struct QueueRecoveryStageReceipt {
     pub plan: [u8; 32],
     pub source_history: [u8; 32],
     pub snapshot_digest: [u8; 32],
-    pub message_next: u64,
-    pub event_next: u64,
+    pub next: u64,
 }
 
 pub(super) struct StageInner {
-    pub(super) messages: Arc<Keratin>,
+    pub(super) log: Arc<Keratin>,
     pub(super) root: PathBuf,
     pub(super) intent: Intent,
     pub(super) limits: RecoveryStageLimits,
@@ -171,7 +167,7 @@ pub(super) fn persist_exact(path: &Path, content: &[u8]) -> Result<()> {
 
 fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInternalState> {
     let s = &intent.spec;
-    s.validate_payload_log()?;
+    s.validate_log()?;
     if s.plan == [0; 32]
         || s.source_history == [0; 32]
         || s.topic.is_empty()
@@ -184,7 +180,6 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
             s.binding.writer_session,
         ]
         .contains(&[0; 16])
-        || s.payload_log.head > s.payload_log.next
         || limits.max_bytes == 0
         || intent.snapshot.is_empty()
     {
@@ -192,8 +187,8 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
             "invalid recovery staging identity, snapshot or budget",
         ));
     }
-    if s.payload_log.next - s.payload_log.head > limits.max_records {
-        return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.payload_log.next - s.payload_log.head)));
+    if s.log.next - s.log.head > limits.max_records {
+        return Err(invalid(Limit::message(Budget::StageRecords, limits.max_records, 0, s.log.next - s.log.head)));
     }
     if intent.snapshot.len() as u64 != s.snapshot_bytes {
         return Err(invalid("recovery staging snapshot length differs from plan"));
@@ -209,14 +204,14 @@ fn validate(intent: &Intent, limits: RecoveryStageLimits) -> Result<QueueInterna
     if state.recovery_retained_entries() > 1_000_000 {
         return Err(invalid(Limit::message(Budget::ReplayStateEntries, 1_000_000, 0, state.recovery_retained_entries())));
     }
-    if meta.last_snapshot_event_offset != s.event_next.saturating_sub(1)
+    if meta.last_snapshot_event_offset != s.log.next.saturating_sub(1)
         || state.recovery_state_digest() != s.state_digest
         || state.recovery_lease_normalized_digest() != s.state_digest
-        || state.required_message_next() > s.payload_log.next
+        || state.required_message_next() > s.log.next
         || state
             .recovery_live_ranges()
             .iter()
-            .any(|r| r.start < s.payload_log.head || r.end > s.payload_log.next)
+            .any(|r| r.start < s.log.head || r.end > s.log.next)
     {
         return Err(invalid(
             "recovery snapshot does not match the exact staged baseline",
@@ -234,7 +229,7 @@ fn record_bytes(record: &RecoveryRecord) -> Result<u64> {
 
 pub(super) fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
     scan_parts(
-        &inner.messages,
+        &inner.log,
         &inner.intent,
         inner.limits,
         require_complete,
@@ -242,17 +237,17 @@ pub(super) fn scan(inner: &StageInner, require_complete: bool) -> Result<u64> {
 }
 
 pub(super) fn scan_parts(
-    messages: &Keratin,
+    log: &Keratin,
     intent: &Intent,
     limits: RecoveryStageLimits,
     require_complete: bool,
 ) -> Result<u64> {
     let s = &intent.spec;
-    let end = messages.next_offset();
-    if messages.head_offset() != s.payload_log.head
-        || end > s.payload_log.next
-        || messages.current_epoch() != s.fence_epoch
-        || require_complete && end != s.payload_log.next
+    let end = log.next_offset();
+    if log.head_offset() != s.log.head
+        || end > s.log.next
+        || log.current_epoch() != s.fence_epoch
+        || require_complete && end != s.log.next
     {
         return Err(corrupt("staged log does not cover the expected boundaries"));
     }
@@ -260,8 +255,8 @@ pub(super) fn scan_parts(
     let live = state.recovery_live_ranges();
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
-    hash.update(&s.payload_log.head.to_be_bytes());
-    hash.update(&s.payload_log.next.to_be_bytes());
+    hash.update(&s.log.head.to_be_bytes());
+    hash.update(&s.log.next.to_be_bytes());
     let mut live_hash = blake3::Hasher::new();
     live_hash.update(b"fibril-recovery-live-payloads-v1\0");
     let mut used = 0u64;
@@ -275,9 +270,9 @@ pub(super) fn scan_parts(
             }
         }
     }
-    let _role = RestoreRole(&messages, messages.role());
-    messages.freeze();
-    let reader = messages.frozen_reader().map_err(io_err)?;
+    let _role = RestoreRole(log, log.role());
+    log.freeze();
+    let reader = log.frozen_reader().map_err(io_err)?;
     reader
         .scan(|record| {
             let bytes = 18u64
@@ -300,12 +295,10 @@ pub(super) fn scan_parts(
             };
             hash_record(&mut hash);
             if live.contains(&record.offset) {
-                if s.payload_log.source == RecoveryReadSource::Log {
-                    let record = RecoveryRecord { offset: record.offset, flags: record.flags,
-                        headers: record.headers.to_vec(), payload: record.payload.to_vec() };
-                    if !matches!(crate::recovery_inspection::decode_evidence_semantics(&record), Ok(StromaEvent::PayloadEnqueue { .. })) {
-                        return Err(io::Error::other("staged live payload points to non-payload event"));
-                    }
+                let record_copy = RecoveryRecord { offset: record.offset, flags: record.flags,
+                    headers: record.headers.to_vec(), payload: record.payload.to_vec() };
+                if !matches!(crate::recovery_inspection::decode_evidence_semantics(&record_copy), Ok(StromaEvent::PayloadEnqueue { .. })) {
+                    return Err(io::Error::other("staged live payload points to non-payload event"));
                 }
                 hash_record(&mut live_hash);
             }
@@ -313,7 +306,7 @@ pub(super) fn scan_parts(
         })
         .map_err(io_err)?;
     if require_complete
-        && (*hash.finalize().as_bytes() != s.payload_log.digest
+        && (*hash.finalize().as_bytes() != s.log.digest
             || *live_hash.finalize().as_bytes() != s.live_payload_digest)
     {
         return Err(corrupt(
@@ -328,15 +321,10 @@ impl QueueRecoveryStageSpec {
         RecoverySnapshotIdentity { plan: self.plan, digest: self.snapshot_digest, bytes: self.snapshot_bytes }
     }
 
-    pub(super) fn validate_payload_log(&self) -> Result<()> {
-        let p = &self.payload_log;
-        let valid = p.head <= p.next && match p.source {
-            RecoveryReadSource::Log => self.message_head == 0 && self.message_next == 0
-                && self.message_digest == recovery_history::empty_log_digest()
-                && p.next == self.event_next,
-            RecoveryReadSource::StreamRecords | RecoveryReadSource::Snapshot => false,
-        };
-        if !valid { return Err(invalid("recovery payload source differs from exact selected baseline")); }
+    pub(super) fn validate_log(&self) -> Result<()> {
+        if self.log.head > self.log.next {
+            return Err(invalid("recovery source log bounds are inverted"));
+        }
         Ok(())
     }
 }
@@ -373,11 +361,7 @@ impl Stroma {
     }
 
     pub(super) fn validate_recovery_payload_layout(&self, spec: &QueueRecoveryStageSpec) -> Result<()> {
-        spec.validate_payload_log()?;
-        if spec.payload_log.source != RecoveryReadSource::Log {
-            return Err(invalid("recovery staging layout differs from local queue format"));
-        }
-        Ok(())
+        spec.validate_log()
     }
 
     pub(super) fn recovery_payload_path(&self, spec: &QueueRecoveryStageSpec) -> PathBuf {
@@ -482,8 +466,8 @@ impl Stroma {
                 return Err(invalid("sealed reuse source still has a writer role"));
             }
             if messages.current_epoch() != s.fence_epoch
-                || messages.head_offset() != s.payload_log.head
-                || messages.next_offset() != s.payload_log.next
+                || messages.head_offset() != s.log.head
+                || messages.next_offset() != s.log.next
             {
                 return Ok(false);
             }
@@ -506,7 +490,7 @@ impl Stroma {
                 admit_stage_bytes(&admission_parent, limits, private_bytes.saturating_add(1024 * 1024))
             }).await.map_err(io_err)??;
             let stats = messages
-                .fork_frozen(destination, s.fence_epoch, s.payload_log.head, s.payload_log.next)
+                .fork_frozen(destination, s.fence_epoch, s.log.head, s.log.next)
                 .await
                 .map_err(io_err)?;
             tracing::info!(
@@ -663,7 +647,7 @@ impl Stroma {
                     .map_err(io_err)?;
                 messages
                     .destructive_reset_to_checkpoint_at_epoch(
-                        intent.spec.payload_log.head,
+                        intent.spec.log.head,
                         intent.spec.fence_epoch,
                     )
                     .await
@@ -680,7 +664,7 @@ impl Stroma {
                 .map_err(io_err)??;
             }
             let mut inner = StageInner {
-                messages,
+                log: messages,
                 root,
                 intent,
                 limits,
@@ -697,7 +681,7 @@ impl Stroma {
             .await
             .map_err(io_err)??;
             if complete {
-                inner.messages.freeze();
+                inner.log.freeze();
             }
             Ok(QueueRecoveryStage {
                 inner: Arc::new(AsyncMutex::new(inner)),
@@ -760,8 +744,8 @@ impl QueueRecoveryStage {
             .map_err(|_| invalid("stage is busy"))?;
         if !guard.complete
             || guard.needs_reopen
-            || from < guard.intent.spec.payload_log.head
-            || from > guard.intent.spec.payload_log.next
+            || from < guard.intent.spec.log.head
+            || from > guard.intent.spec.log.next
         {
             return Err(invalid("invalid completed stage read"));
         }
@@ -770,17 +754,17 @@ impl QueueRecoveryStage {
             let s = &guard.intent.spec;
             let mut page = RecoveryReadPage {
                 history_id: s.source_history,
-                source: s.payload_log.source,
+                source: RecoveryReadSource::Log,
                 from,
                 next: from,
-                end: s.payload_log.next,
+                end: s.log.next,
                 records: vec![],
                 snapshot_bytes: vec![],
             };
             let mut used = 0usize;
             let mut full = false;
             guard
-                .messages
+                .log
                 .frozen_reader()
                 .map_err(io_err)?
                 .scan(|record| {
@@ -815,7 +799,7 @@ impl QueueRecoveryStage {
     }
 
     pub async fn next_offset(&self) -> u64 {
-        self.inner.lock().await.messages.next_offset()
+        self.inner.lock().await.log.next_offset()
     }
 
     /// An exact repeated page is idempotent. Gaps, partial overlaps, substituted
@@ -842,12 +826,12 @@ impl QueueRecoveryStage {
                 .checked_add(record_bytes(record)?)
                 .ok_or_else(|| invalid("page size overflow"))?;
         }
-        let next = guard.messages.next_offset();
+        let next = guard.log.next_offset();
         let duplicate = page.next <= next;
-        if page.source != s.payload_log.source
+        if page.source != RecoveryReadSource::Log
             || page.history_id != s.source_history
-            || page.end != s.payload_log.next
-            || page.from < s.payload_log.head
+            || page.end != s.log.next
+            || page.from < s.log.head
             || page.next > page.end
             || page.from.checked_add(page.records.len() as u64) != Some(page.next)
             || page.records.is_empty()
@@ -884,7 +868,7 @@ impl QueueRecoveryStage {
                 .collect();
             guard.needs_reopen = true;
             let outcome = guard
-                .messages
+                .log
                 .append_replicated_batch(
                     guard.intent.spec.fence_epoch,
                     page.from,
@@ -905,7 +889,7 @@ impl QueueRecoveryStage {
                 guard.used += bytes;
             }
             guard.needs_reopen = false;
-            Ok(guard.messages.next_offset())
+            Ok(guard.log.next_offset())
         })
         .await
         .map_err(io_err)?
@@ -920,7 +904,7 @@ impl QueueRecoveryStage {
         Ok(guard.complete.then(|| {
             let s = &guard.intent.spec;
             QueueRecoveryStageReceipt { plan: s.plan, source_history: s.source_history,
-                snapshot_digest: s.snapshot_digest, message_next: s.message_next, event_next: s.event_next }
+                snapshot_digest: s.snapshot_digest, next: s.log.next }
         }))
     }
 
@@ -936,21 +920,20 @@ impl QueueRecoveryStage {
             return Err(invalid("recovery stage must reopen after an append error"));
         }
         tokio::spawn(async move {
-            guard.messages.sync().await.map_err(io_err)?;
+            guard.log.sync().await.map_err(io_err)?;
             tokio::task::spawn_blocking(move || {
                 scan(&guard, true)?;
                 recovery_seal::sync_directories(&guard.root.join("messages"))?;
                 persist_exact(&guard.root.join("complete"), &guard.intent.spec.plan)?;
                 stage_boundary("complete");
                 guard.complete = true;
-                guard.messages.freeze();
+                guard.log.freeze();
                 let s = &guard.intent.spec;
                 Ok(QueueRecoveryStageReceipt {
                     plan: s.plan,
                     source_history: s.source_history,
                     snapshot_digest: s.snapshot_digest,
-                    message_next: s.message_next,
-                    event_next: s.event_next,
+                    next: s.log.next,
                 })
             })
             .await

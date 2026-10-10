@@ -84,16 +84,16 @@ pub struct RecoveryLogInspection {
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub struct RecoveryReferenceGap {
     pub event_offset: u64,
-    pub message_offset: u64,
+    /// First referenced payload offset outside the retained log.
+    pub payload_offset: u64,
     /// Includes every reference in this event, including an entire enqueue batch.
     /// None means an offset was u64::MAX and has no representable exclusive end.
-    pub event_required_message_next: Option<u64>,
+    pub event_required_next: Option<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 pub enum RecoverySemanticGap {
     UnknownOrMalformedEncoding,
-    CombinedQueueFormatUnsupported,
     EventEntryLimit,
     StateReplayRequired,
     CheckpointRequired,
@@ -104,7 +104,8 @@ pub enum RecoverySemanticGap {
 pub struct RecoveryReferenceInspection {
     pub checked_events: u64,
     pub reference_count: u64,
-    pub required_message_next: u64,
+    /// Exclusive bound of every payload offset referenced so far.
+    pub required_next: u64,
     pub offset_overflow: bool,
     pub first_outside_retained: Option<RecoveryReferenceGap>,
     pub first_semantic_gap: Option<(u64, RecoverySemanticGap)>,
@@ -125,8 +126,8 @@ pub enum RecoveryProofRequirement {
 pub struct RecoveryPairInspection {
     pub transition: [u8; 32],
     pub history_ids: [[u8; 32]; 2],
-    pub messages: RecoveryLogInspection,
-    pub events: RecoveryLogInspection,
+    /// Comparison of the two single queue logs.
+    pub log: RecoveryLogInspection,
     pub references: [RecoveryReferenceInspection; 2],
     /// Reported digests only: snapshot state/lineage has NOT been interpreted.
     pub snapshot_digests: [Option<[u8; 32]>; 2],
@@ -778,13 +779,7 @@ impl RecoveryPairInspector {
             RecoveryPairInspection {
                 transition: self.seals[0].request.transition,
                 history_ids: [self.seals[0].history.id, self.seals[1].history.id],
-                // Queues have no separate message lane.
-                messages: RecoveryLogInspection {
-                    left_range: (0, 0),
-                    right_range: (0, 0),
-                    overlap: RecoveryOverlap::NoSharedRecords,
-                },
-                events: self.log.result(),
+                log: self.log.result(),
                 references: if self.single_source {
                     [self.references[0].clone(), self.references[0].clone()]
                 } else {
@@ -866,7 +861,7 @@ impl RecoveryReferenceInspection {
             self.reference_count += 1;
             match off.checked_add(1) {
                 Some(next) => {
-                    self.required_message_next = self.required_message_next.max(next);
+                    self.required_next = self.required_next.max(next);
                     required = required.map(|r| r.max(next));
                 }
                 None => {
@@ -938,12 +933,12 @@ impl RecoveryReferenceInspection {
             }
             StromaEvent::Declare(_) => {}
         }
-        if let Some(message_offset) = first_missing {
+        if let Some(payload_offset) = first_missing {
             self.first_outside_retained
                 .get_or_insert(RecoveryReferenceGap {
                     event_offset: record.offset,
-                    message_offset,
-                    event_required_message_next: required,
+                    payload_offset,
+                    event_required_next: required,
                 });
         }
     }
@@ -987,7 +982,7 @@ mod tests {
             let report = run(pair, [&log, &log]).unwrap();
             let [a, b] = report.queue_replay.unwrap();
             assert_eq!(a, b);
-            assert_eq!(a.event_next, target);
+            assert_eq!(a.next, target);
             let mut expected = crate::QueueInternalState::new("q".into(), 0);
             if target >= 1 {
                 expected.enqueue(0, 0, None);
@@ -1028,10 +1023,10 @@ mod tests {
         let report = run(pair, [&a, &b]).unwrap();
         let [a, b] = report.queue_replay.unwrap();
         assert_eq!(a.state_digest, b.state_digest);
-        assert_ne!(a.payload_log.digest, b.payload_log.digest);
+        assert_ne!(a.log.digest, b.log.digest);
         assert_ne!(a.history_id, b.history_id);
         assert!(matches!(
-            report.events.overlap,
+            report.log.overlap,
             RecoveryOverlap::Divergent {
                 first: RecoveryRecordDifference { offset: 0, .. },
                 ..
@@ -1076,7 +1071,7 @@ mod tests {
             .with_queue_replay(2, Default::default())
             .unwrap();
         let result = run(pair, [&log, &log]).unwrap().queue_replay.unwrap();
-        assert!(result[0].required_message_next <= 2);
+        assert!(result[0].required_next <= 2);
     }
 
     #[test]
@@ -1431,15 +1426,14 @@ mod tests {
                             let (from, next) =
                                 (left_head.max(right_head), left_next.min(right_next));
                             assert_eq!(
-                                report.events.overlap,
+                                report.log.overlap,
                                 if from < next {
                                     RecoveryOverlap::Matching { from, next }
                                 } else {
                                     RecoveryOverlap::NoSharedRecords
                                 }
                             );
-                            assert_eq!(report.events.left_range, (left_head, left_next));
-                            assert_eq!(report.messages.overlap, RecoveryOverlap::NoSharedRecords);
+                            assert_eq!(report.log.left_range, (left_head, left_next));
                             assert_eq!(report.records, left.len() as u64 + right.len() as u64);
                         }
                     }
@@ -1469,7 +1463,7 @@ mod tests {
             );
             let report = run(check, [&left, &right]).unwrap();
             assert_eq!(
-                report.events.overlap,
+                report.log.overlap,
                 RecoveryOverlap::Divergent {
                     from: 0,
                     next: 9,
@@ -1523,8 +1517,8 @@ mod tests {
                 refs.first_outside_retained,
                 Some(RecoveryReferenceGap {
                     event_offset: 2,
-                    message_offset: 8,
-                    event_required_message_next: Some(9)
+                    payload_offset: 8,
+                    event_required_next: Some(9)
                 })
             );
             assert_eq!(
@@ -1558,7 +1552,7 @@ mod tests {
                 .first_outside_retained
                 .as_ref()
                 .unwrap()
-                .message_offset,
+                .payload_offset,
             0
         );
         assert!(report.references[0].offset_overflow);
@@ -1577,7 +1571,7 @@ mod tests {
                 .first_outside_retained
                 .as_ref()
                 .unwrap()
-                .event_required_message_next,
+                .event_required_next,
             None
         );
     }
@@ -1714,7 +1708,7 @@ mod tests {
         // The shared payload record matches and the first difference is the
         // settlement event after it.
         assert!(matches!(
-            report.events.overlap,
+            report.log.overlap,
             RecoveryOverlap::Divergent {
                 first: RecoveryRecordDifference { offset: 1, .. },
                 ..
@@ -1766,7 +1760,7 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(
-            report.events.overlap,
+            report.log.overlap,
             RecoveryOverlap::Divergent {
                 from: 0,
                 next: 3,
@@ -1778,8 +1772,8 @@ mod tests {
             report.references[1].first_outside_retained,
             Some(RecoveryReferenceGap {
                 event_offset: 2,
-                message_offset: 3,
-                event_required_message_next: Some(4)
+                payload_offset: 3,
+                event_required_next: Some(4)
             })
         );
     }
@@ -1875,7 +1869,7 @@ mod tests {
         }
         let report = check.finish().unwrap();
         assert_eq!(
-            report.events.overlap,
+            report.log.overlap,
             RecoveryOverlap::Matching { from: 0, next: 2 }
         );
         assert_ne!(report.history_ids[0], report.history_ids[1]);

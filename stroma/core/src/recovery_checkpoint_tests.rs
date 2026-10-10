@@ -126,7 +126,7 @@ fn verified_queue_artifact_preserves_state_and_is_bound_to_complete_payload_evid
     let (report, [left, right]) = transferred().finish_with_queue_artifacts(4096).unwrap();
     assert_eq!(left, right);
     assert_eq!(left.evidence().history_id, source.history.id);
-    assert_eq!(left.evidence().event_next, 4);
+    assert_eq!(left.evidence().next, 4);
     assert_eq!(left.evidence().live_payload_digest, report.queue_replay.unwrap()[0].live_payload_digest);
     assert_eq!(left.snapshot_digest(), *blake3::hash(left.state_snapshot()).as_bytes());
     let mut restored = crate::QueueInternalState::new("q".into(), 0);
@@ -150,8 +150,8 @@ fn artifacts_require_live_payload_verification_even_when_plain_replay_succeeds()
     let checked = build().with_queue_checkpoint_replay(0, Default::default(), 4096).unwrap();
     let checked = drive_checkpoints(checked, [&[], &[]], [&[], &[]]).unwrap();
     let (_, [artifact, _]) = checked.finish_with_queue_artifacts(4096).unwrap();
-    assert_eq!(artifact.evidence().event_next, 0);
-    assert_eq!(artifact.evidence().required_message_next, 0);
+    assert_eq!(artifact.evidence().next, 0);
+    assert_eq!(artifact.evidence().required_next, 0);
 }
 
 #[test]
@@ -201,16 +201,16 @@ fn unequal_checkpoints_preserve_retry_count_and_compare_live_payloads_and_lease_
             .contains(&RecoveryProofRequirement::CommonOriginAndInstalledLineage)
     );
     let [left, right] = report.queue_replay.unwrap();
-    assert_eq!(left.checkpoint_event_next, Some(3));
-    assert_eq!(right.checkpoint_event_next, Some(5));
+    assert_eq!(left.checkpoint_next, Some(3));
+    assert_eq!(right.checkpoint_next, Some(5));
     assert_ne!(left.state_digest, right.state_digest); // owner-local lease
     assert_eq!(
         left.lease_normalized_state_digest,
         right.lease_normalized_state_digest
     );
     assert_eq!(left.live_payload_digest, right.live_payload_digest);
-    assert_ne!(left.payload_log.digest, right.payload_log.digest); // obsolete payload zero
-    assert_eq!((left.payload_log.head, right.payload_log.head), (0, 1));
+    assert_ne!(left.log.digest, right.log.digest); // obsolete payload zero
+    assert_eq!((left.log.head, right.log.head), (0, 1));
     assert_ne!(left.event_prefix_digest, right.event_prefix_digest); // different starts
 }
 

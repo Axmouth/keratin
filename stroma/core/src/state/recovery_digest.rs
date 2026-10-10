@@ -463,13 +463,11 @@ async fn large_recovery_state_transfers_in_bounded_chunks() {
         crate::recovery_inspection::hash_record(&mut digest, &r);
         crate::recovery_inspection::hash_record(&mut live, &r);
     }
-    let empty = { let mut h = blake3::Hasher::new(); h.update(b"fibril-retained-log-v1\0"); h.update(&0u64.to_be_bytes()); h.update(&0u64.to_be_bytes()); *h.finalize().as_bytes() };
     let spec = QueueRecoveryStageSpec {
         plan: [7; 32], topic: "q".into(), partition: 0, group: None,
         binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] },
         fence_epoch: 8, source_history: [4; 32],
-        payload_log: crate::recovery_replay::RecoveryPayloadLog { source: RecoveryReadSource::Log, head: 0, next: count, digest: *digest.finalize().as_bytes() },
-        message_head: 0, message_next: 0, event_next: count, message_digest: empty,
+        log: crate::RetainedLog { head: 0, next: count, digest: *digest.finalize().as_bytes() },
         snapshot_digest: *blake3::hash(&snapshot).as_bytes(), snapshot_bytes: snapshot.len() as u64,
         state_digest, live_payload_digest: *live.finalize().as_bytes(),
     };

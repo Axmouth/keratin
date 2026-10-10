@@ -940,7 +940,7 @@ fn build_capsule(
         contents: QueueCheckpointContents {
             next: target.next,
             payload_head: target.payload_head,
-            required_next: evidence.required_message_next,
+            required_next: evidence.required_next,
             snapshot_digest: artifact.snapshot_digest(),
             state_digest: evidence.lease_normalized_state_digest,
             payload_digest: *hash.finalize().as_bytes(),

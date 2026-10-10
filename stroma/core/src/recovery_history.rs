@@ -158,14 +158,6 @@ impl RetainedHistoryIdentity {
     }
 }
 
-pub(crate) fn empty_log_digest() -> [u8; 32] {
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"fibril-retained-log-v1\0");
-    hash.update(&0u64.to_be_bytes());
-    hash.update(&0u64.to_be_bytes());
-    *hash.finalize().as_bytes()
-}
-
 fn retained_log(log: &Keratin) -> Result<RetainedLog> {
     Ok(RetainedLog {
         head: log.head_offset(),

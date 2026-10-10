@@ -57,16 +57,11 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
             },
             fence_epoch: 8,
             source_history: [5; 32],
-            payload_log: RecoveryPayloadLog {
-                source: RecoveryReadSource::Log,
+            log: RetainedLog {
                 head,
                 next,
                 digest: *messages.finalize().as_bytes(),
             },
-            message_head: 0,
-            message_next: 0,
-            event_next: next,
-            message_digest: recovery_history::empty_log_digest(),
             snapshot_digest: *blake3::hash(&snapshot).as_bytes(),
             snapshot_bytes: snapshot.len() as u64,
             state_digest,
@@ -79,10 +74,10 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
 fn page(spec: &QueueRecoveryStageSpec, records: &[RecoveryRecord]) -> RecoveryReadPage {
     RecoveryReadPage {
         history_id: spec.source_history,
-        source: spec.payload_log.source,
+        source: RecoveryReadSource::Log,
         from: records[0].offset,
         next: records.last().unwrap().offset + 1,
-        end: spec.payload_log.next,
+        end: spec.log.next,
         records: records.to_vec(),
         snapshot_bytes: vec![],
     }
@@ -136,7 +131,7 @@ async fn stage_resumes_without_touching_active_bound_sealed_storage() {
     assert_eq!(stage.next_offset().await, 1);
     assert_eq!(stage.append(page(&spec, &records[1..])).await.unwrap(), 3);
     let receipt = stage.finish().await.unwrap();
-    assert_eq!(receipt.event_next, 3);
+    assert_eq!(receipt.next, 3);
     assert_eq!(stage.finish().await.unwrap(), receipt);
     assert!(stage.append(page(&spec, &records)).await.is_err());
     assert_eq!(
@@ -209,7 +204,7 @@ async fn stage_supports_empty_zero_and_compacted_boundaries() {
             stage.append(page(&spec, &records)).await.unwrap();
         }
         let receipt = stage.finish().await.unwrap();
-        assert_eq!((receipt.message_next, receipt.event_next), (0, next));
+        assert_eq!(receipt.next, next);
         drop(stage);
         drop(snapshot);
         let stage = st
@@ -330,7 +325,7 @@ async fn stage_rejects_wrong_pages_and_enforces_budget_across_resume() {
     stage.finish().await.unwrap();
     drop(stage);
     let mut wrong = spec.clone();
-    wrong.event_next += 1;
+    wrong.log.next += 1;
     assert!(
         st.open_queue_recovery_stage(wrong, snapshot.clone(), Default::default())
             .await
@@ -449,7 +444,7 @@ async fn stage_resumes_after_sigkill_at_each_durable_boundary() {
             stage.append(page(&spec, &records)).await.unwrap();
         }
         let receipt = stage.finish().await.unwrap();
-        assert_eq!((receipt.message_next, receipt.event_next), (0, 2));
+        assert_eq!(receipt.next, 2);
         assert!(!st.tp_part_dir("q", 0, None).exists());
         assert!(!st.msg_tp_part_dir("q", 0, None).exists());
         assert!(!st.snap_dir("q", 0, None).exists());
@@ -702,7 +697,8 @@ async fn installation_sigkill_resumes_each_publication_boundary_without_old_sour
         st.admit_prepared_queue_recovery(installed).await.unwrap();
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
-        assert_eq!((h.message_lane_next(), h.event_log().next_offset()), (0, 3));
+        assert!(h.optional_message_log().is_none());
+        assert_eq!(h.event_log().next_offset(), 3);
         assert_eq!(h.event_log().head_offset(), 0);
         assert!(!st.msg_tp_part_dir("q", 0, None).exists());
         st.shutdown().await.unwrap();
@@ -914,25 +910,25 @@ async fn reuse_resumes_after_kill_before_and_after_initialized_marker() {
 
 #[test]
 fn stage_descriptor_binds_source_bounds_and_complete_target() {
-    let (spec, _, _) = fixture(1, 3);
-    spec.validate_payload_log().unwrap();
-    for change in 0..8 {
+    let (spec, snapshot, _) = fixture(1, 3);
+    spec.validate_log().unwrap();
+    for change in 0..2 {
         let mut bad = spec.clone();
         match change {
-            0 => bad.payload_log.source = RecoveryReadSource::Snapshot,
-            1 => bad.payload_log.head = 4,
-            2 => bad.payload_log.next = 4,
-            3 => bad.message_digest[0] ^= 1,
-            4 => bad.message_head = 1,
-            5 => bad.message_next = 1,
-            6 => bad.event_next = 2,
-            _ => bad.payload_log.source = RecoveryReadSource::StreamRecords,
+            0 => bad.log.head = 4,
+            _ => bad.log.next = 0,
         }
-        assert!(
-            bad.validate_payload_log().is_err(),
-            "accepted mutation {change}"
-        );
+        assert!(bad.validate_log().is_err(), "accepted mutation {change}");
     }
+    // The applied boundary is the source log tail. A tail that disagrees
+    // with the snapshot boundary is refused even with ordered bounds.
+    for next in [2, 4] {
+        let mut bad = spec.clone();
+        bad.log.next = next;
+        let intent = Intent { spec: bad, snapshot: snapshot.clone() };
+        assert!(validate(&intent, Default::default()).is_err(), "next {next}");
+    }
+    validate(&Intent { spec, snapshot }, Default::default()).unwrap();
 }
 
 #[tokio::test]
@@ -940,8 +936,8 @@ async fn stage_verifies_selected_event_digest_even_when_live_payloads_match() {
     let dir = keratin_log::test_dir!("stage_selected_digest");
     let st = open(&dir.root).await;
     let (mut spec, snapshot, records) = fixture(1, 3);
-    spec.payload_log.digest[0] ^= 1;
-    spec.validate_payload_log().unwrap();
+    spec.log.digest[0] ^= 1;
+    spec.validate_log().unwrap();
     let stage = st
         .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
         .await
@@ -1046,9 +1042,8 @@ async fn incremental_stage_crosses_legacy_record_and_byte_budgets() {
     assert!(logical_bytes > RecoveryStageLimits::default().max_bytes);
     assert!(count > RecoveryStageLimits::default().max_records);
     let (mut spec, _, _) = fixture(0, 0);
-    spec.event_next = count;
-    spec.payload_log.next = count;
-    spec.payload_log.digest = *digest.finalize().as_bytes();
+    spec.log.next = count;
+    spec.log.digest = *digest.finalize().as_bytes();
     spec.snapshot_bytes = snapshot.len() as u64;
     spec.snapshot_digest = *blake3::hash(&snapshot).as_bytes();
     spec.state_digest = state_digest;

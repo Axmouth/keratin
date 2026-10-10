@@ -41,12 +41,10 @@ fn combined_recovery_replays_sparse_payloads_timers_and_settlement() {
     let done = drive_checkpoints(check, [&ev, &ev], [&[], &[]]).unwrap();
     let (report, [a, b]) = done.finish_with_queue_artifacts(4096).unwrap();
     assert_eq!(a, b);
-    assert_eq!(report.messages.left_range, (0, 0));
+    assert_eq!(report.log.left_range, (0, ev.len() as u64));
     assert_eq!(report.records, 4 * ev.len() as u64); // two bounded passes per replica
-    assert_eq!(a.evidence().log_layout, crate::QueueLogLayout::Combined);
-    assert_eq!(a.evidence().message_next, 0); // physical compatibility lane
-    assert_eq!(a.evidence().payload_log.source, RecoveryReadSource::Log);
-    assert_eq!(a.evidence().payload_log.next, ev.len() as u64);
+    assert_eq!(a.evidence().log, *combined_seal(0, &ev).history.queue_log().unwrap());
+    assert_eq!(a.evidence().next, ev.len() as u64);
     assert_eq!(a.evidence().state_digest, expected.recovery_state_digest());
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-recovery-live-payloads-v1\0");
@@ -73,7 +71,7 @@ fn combined_recovery_keeps_old_live_payload_across_compacted_checkpoints() {
     let [left, right] = report.queue_replay.unwrap();
     assert_eq!(left.state_digest, right.state_digest);
     assert_eq!(left.live_payload_digest, right.live_payload_digest);
-    assert_eq!(left.payload_log.head, 0); assert_eq!(right.payload_log.head, 2);
+    assert_eq!(left.log.head, 0); assert_eq!(right.log.head, 2);
     b.enqueue(5, 0, Some(1000)); b.ack(5); b.ack(6);
     assert_eq!(left.state_digest, b.recovery_state_digest());
 }

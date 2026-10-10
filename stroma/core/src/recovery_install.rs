@@ -662,7 +662,7 @@ impl Stroma {
             })
             .await
             .map_err(io_err)??;
-            let stats = guard.messages.fork_frozen(target, spec.fence_epoch, spec.payload_log.head, spec.payload_log.next)
+            let stats = guard.log.fork_frozen(target, spec.fence_epoch, spec.log.head, spec.log.next)
                 .await.map_err(io_err)?;
             tracing::info!(topic = spec.topic, partition = spec.partition,
                 shared_bytes = stats.shared_bytes, copied_bytes = stats.copied_bytes,
@@ -700,7 +700,7 @@ impl Stroma {
                     s.partition,
                     s.group.as_deref(),
                     2,
-                    s.event_next,
+                    s.log.next,
                     &guard.intent.snapshot,
                 )?;
                 storage_history::persist(
@@ -741,7 +741,7 @@ impl Stroma {
         let messages = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan_parts(&messages, &verification_intent, verification_limits, true)?;
                 let s = &verification_intent.spec;
-                if !matches!(reader.read_queue_snapshot(&reader.snap_file(&s.topic, s.partition, s.group.as_deref()))?, Some((checkpoint_capture::SnapshotBoundary::ExactNext(next), ref blob)) if next == s.event_next && *blob == verification_intent.snapshot) {
+                if !matches!(reader.read_queue_snapshot(&reader.snap_file(&s.topic, s.partition, s.group.as_deref()))?, Some((checkpoint_capture::SnapshotBoundary::ExactNext(next), ref blob)) if next == s.log.next && *blob == verification_intent.snapshot) {
                     return Err(invalid("installed snapshot differs from plan"));
                 }
                 Ok::<_, StromaError>(messages)

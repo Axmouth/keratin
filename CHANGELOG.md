@@ -11,6 +11,17 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Queue recovery evidence, inspection and staging describe one log.
+  `RecoveryQueueReplayEvidence` carries the retained queue log, the applied
+  `next`, `required_next` and `checkpoint_next`, and drops the layout and
+  message lane fields. Artifacts and summaries drop `message_head`.
+  `RecoveryPairInspection` reports one `log` comparison and reference gaps
+  name a `payload_offset`. `QueueRecoveryStageSpec` carries the source `log`,
+  whose tail is the applied boundary, and the stage receipt reports one
+  `next`. The recovery phase store semantics and the stage intent header
+  move to new versions, so completed phases and stages from earlier builds
+  are refused.
+
 - Recovery evidence names its physical logs by resource kind.
   `RetainedHistoryIdentity` carries `logs: RetainedLogs`, either one queue
   log or a stream record log plus a cursor event log, and the variant is part

@@ -744,7 +744,7 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
                 state.load_snapshot(a.state_snapshot()).unwrap();
                 assert!(!state.is_ready(1));
                 assert_eq!(state.recovery_live_ranges().iter().cloned().collect::<Vec<_>>(), vec![1..2]);
-                assert_eq!(a.evidence().payload_log.next, 5);
+                assert_eq!(a.evidence().log.next, 5);
                 drop(cursors);
             }
         }
@@ -781,16 +781,16 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
             plan: [8; 32], topic: "q".into(), partition: 0, group: None,
             binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [4; 16], writer_session: [5; 16] },
             fence_epoch: 8, source_history: sealed.history.id,
-            payload_log: sealed.history.payload_log().unwrap(), message_head: 0, message_next: 0, event_next: 4,
-            message_digest: crate::stroma::empty_log_digest(), snapshot_digest: artifact.snapshot_digest(),
+            log: *sealed.history.queue_log().unwrap(), snapshot_digest: artifact.snapshot_digest(),
             snapshot_bytes: artifact.state_snapshot().len() as u64,
             state_digest: artifact.evidence().lease_normalized_state_digest,
             live_payload_digest: artifact.evidence().live_payload_digest.unwrap(),
         };
         let target = if reuse { source.clone() } else { open(&dir.root.join("target")).await };
-        // A snapshot behind the copied suffix must never authorize installation.
+        // A snapshot whose boundary differs from the source log tail must
+        // never authorize installation.
         let mut wrong = spec.clone();
-        wrong.event_next -= 1;
+        wrong.log.next -= 1;
         assert!(target.open_queue_recovery_stage(wrong, artifact.state_snapshot().to_vec(), Default::default()).await.is_err());
         let mut stage = if reuse {
             target.open_queue_recovery_stage_reusing(spec.clone(), artifact.state_snapshot().to_vec(), Default::default(), seal.clone()).await.unwrap()
@@ -800,7 +800,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         assert_eq!(stage.next_offset().await, if reuse { 4 } else { 0 });
         if !reuse {
             let mut from = 0;
-            while from < spec.payload_log.next {
+            while from < spec.log.next {
                 let page = source.read_sealed_replica("q", 0, None, PartitionKind::Queue, RecoveryReadRequest {
                     seal: seal.clone(), history_id: sealed.history.id, source: RecoveryReadSource::Log,
                     from, max_records: 2, max_bytes: 4096,
@@ -818,7 +818,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
             }
         }
         let receipt = stage.finish().await.unwrap();
-        assert_eq!((receipt.message_next, receipt.event_next), (0, 4));
+        assert_eq!(receipt.next, 4);
         let page = stage.read_completed_messages(0, 10, 16384).await.unwrap();
         assert_eq!((page.source, page.end, page.records.len()), (RecoveryReadSource::Log, 4, 4));
         let installed = target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap();

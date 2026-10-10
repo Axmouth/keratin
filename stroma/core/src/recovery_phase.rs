@@ -21,7 +21,7 @@ use std::{
 };
 
 // Bump whenever evidence decoding, replay or comparison semantics change.
-const SEMANTICS: u32 = 1;
+const SEMANTICS: u32 = 2;
 const MAX_METADATA: usize = 64 * 1024;
 const MAGIC: &[u8; 8] = b"RIPHASE1";
 
@@ -111,7 +111,6 @@ struct Identity {
 #[serde(deny_unknown_fields)]
 struct ArtifactMetadata {
     evidence: RecoveryQueueReplayEvidence,
-    message_head: u64,
     snapshot: RecoverySnapshotIdentity,
 }
 #[derive(Serialize, Deserialize)]
@@ -236,10 +235,8 @@ impl RecoveryPhaseStore {
         };
         if report.transition != a.seal.request.transition
             || report.history_ids != [a.seal.history.id, b.seal.history.id]
-            || Some(report.events.left_range) != range(&a.seal)
-            || Some(report.events.right_range) != range(&b.seal)
-            || report.messages.left_range != (0, 0)
-            || report.messages.right_range != (0, 0)
+            || Some(report.log.left_range) != range(&a.seal)
+            || Some(report.log.right_range) != range(&b.seal)
             || report.snapshot_digests
                 != [
                     a.seal.history.snapshot_digest,
@@ -267,13 +264,10 @@ impl RecoveryPhaseStore {
             .ok_or_else(|| invalid("source artifact requires a queue history"))?;
         if artifact.state_snapshot().is_empty()
             || artifact.state_snapshot().len() > artifact_bytes
-            || artifact.message_head() != 0
             || e.version != 2
-            || e.log_layout != crate::QueueLogLayout::Combined
             || e.history_id != source.seal.history.id
-            || Some(&e.payload_log) != source.seal.history.payload_log().as_ref()
-            || e.event_next != log.next
-            || e.message_next != 0
+            || e.log != *log
+            || e.next != log.next
             || e.live_payload_digest.is_none()
             || report.queue_replay.as_ref() != Some(&[e.clone(), e.clone()])
             || blake3::hash(artifact.state_snapshot()).as_bytes() != &artifact.snapshot_digest()
@@ -284,7 +278,7 @@ impl RecoveryPhaseStore {
         let meta = state
             .load_snapshot(artifact.state_snapshot())
             .map_err(invalid)?;
-        if meta.last_snapshot_event_offset != e.event_next.saturating_sub(1)
+        if meta.last_snapshot_event_offset != e.next.saturating_sub(1)
             || state.recovery_state_digest() != e.lease_normalized_state_digest
             || state.recovery_retained_entries() > self.recipe.state_entries
         {
@@ -318,7 +312,6 @@ impl RecoveryPhaseStore {
                 )?;
                 let artifact = RecoveryQueueStateArtifact {
                     evidence: metadata.evidence,
-                    message_head: metadata.message_head,
                     state_snapshot: file.read_complete()?,
                     snapshot_digest: metadata.snapshot.digest,
                 };
@@ -361,7 +354,6 @@ impl RecoveryPhaseStore {
                 file.verify_complete()?;
                 Some(ArtifactMetadata {
                     evidence: artifact.evidence().clone(),
-                    message_head: artifact.message_head(),
                     snapshot,
                 })
             }

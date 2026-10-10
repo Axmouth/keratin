@@ -5,7 +5,7 @@
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_semantics, hash_record};
-use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, RetainedLog, StromaEvent};
+use crate::{QueueInternalState, RecoveryRecord, RetainedHistoryIdentity, RetainedLog, StromaEvent};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -22,46 +22,28 @@ impl Default for RecoveryReplayLimits {
     }
 }
 
-/// Exact retained physical log carrying payloads. Combined records also carry
-/// state events. A state artifact does not authorize truncating this coverage.
+/// Evidence at an exclusive applied boundary of one queue log, reconstructed
+/// from offset zero or a verified checkpoint. Equal `state_digest` values alone
+/// neither establish ancestry nor preserve payload identity. Compare input
+/// history and establish lineage separately.
 #[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
-pub struct RecoveryPayloadLog {
-    pub source: RecoveryReadSource,
-    pub head: u64,
-    pub next: u64,
-    pub digest: [u8; 32],
-}
-impl RetainedHistoryIdentity {
-    /// The queue log as payload coverage. None for a stream history.
-    pub fn payload_log(&self) -> Option<RecoveryPayloadLog> {
-        self.queue_log().map(|log| RecoveryPayloadLog {
-            source: RecoveryReadSource::Log,
-            head: log.head,
-            next: log.next,
-            digest: log.digest,
-        })
-    }
-}
-
-/// Evidence at an exclusive event frontier, reconstructed from event zero.
-/// Equal `state_digest` values alone neither establish ancestry nor preserve
-/// payload identity. Compare input history and establish lineage separately.
-#[derive(Debug, Clone, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RecoveryQueueReplayEvidence {
-    pub log_layout: QueueLogLayout,
-    pub payload_log: RecoveryPayloadLog,
+    /// Exact retained queue log carrying payloads and state events. A state
+    /// artifact does not authorize truncating this coverage.
+    pub log: RetainedLog,
     pub version: u32,
-    pub event_next: u64,
-    pub required_message_next: u64,
+    /// Exclusive applied boundary of the replay target.
+    pub next: u64,
+    /// Exclusive bound of payloads the replayed state still references.
+    pub required_next: u64,
     pub state_digest: [u8; 32],
     pub event_prefix_digest: [u8; 32],
-    pub message_digest: [u8; 32],
-    pub message_next: u64,
     pub history_id: [u8; 32],
     pub operations: u64,
     /// Starting boundary of a verified version-two snapshot, if used. These
     /// identify evidence, not an authoritative or quorum-installed baseline.
-    pub checkpoint_event_next: Option<u64>,
+    pub checkpoint_next: Option<u64>,
     pub checkpoint_digest: Option<[u8; 32]>,
     pub lease_normalized_state_digest: [u8; 32],
     /// Exact offsets and content of live payloads at the target. Present only
@@ -75,7 +57,6 @@ pub struct RecoveryQueueReplayEvidence {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryQueueStateArtifact {
     pub(crate) evidence: RecoveryQueueReplayEvidence,
-    pub(crate) message_head: u64,
     pub(crate) state_snapshot: Vec<u8>,
     pub(crate) snapshot_digest: [u8; 32],
 }
@@ -84,28 +65,23 @@ pub struct RecoveryQueueStateArtifact {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoveryQueueStateSummary {
     evidence: RecoveryQueueReplayEvidence,
-    message_head: u64,
     snapshot_digest: [u8; 32],
     snapshot_bytes: u64,
 }
 impl RecoveryQueueStateSummary {
     pub fn evidence(&self) -> &RecoveryQueueReplayEvidence { &self.evidence }
-    pub fn message_head(&self) -> u64 { self.message_head }
     pub fn snapshot_digest(&self) -> [u8; 32] { self.snapshot_digest }
     pub fn snapshot_bytes(&self) -> u64 { self.snapshot_bytes }
 }
 
 impl RecoveryQueueStateArtifact {
     pub fn summary(&self) -> RecoveryQueueStateSummary {
-        RecoveryQueueStateSummary { evidence: self.evidence.clone(), message_head: self.message_head,
+        RecoveryQueueStateSummary { evidence: self.evidence.clone(),
             snapshot_digest: self.snapshot_digest, snapshot_bytes: self.state_snapshot.len() as u64 }
     }
 
     pub fn evidence(&self) -> &RecoveryQueueReplayEvidence {
         &self.evidence
-    }
-    pub fn message_head(&self) -> u64 {
-        self.message_head
     }
     pub fn state_snapshot(&self) -> &[u8] {
         &self.state_snapshot
@@ -421,10 +397,8 @@ impl QueueReplay {
             );
         }
         let (topic, partition) = self.state.recovery_resource();
-        // Queues have no separate message lane, so its head is always zero.
-        let message_head = 0;
         let (evidence, state) = self.finish_parts()?;
-        let state_snapshot = state.into_recovery_snapshot(evidence.event_next);
+        let state_snapshot = state.into_recovery_snapshot(evidence.next);
         if state_snapshot.len() > max_bytes {
             return Err(Limit::message(Budget::ArtifactBytes, max_bytes as u64, 0, state_snapshot.len() as u64));
         }
@@ -434,14 +408,13 @@ impl QueueReplay {
         let meta = decoded
             .load_snapshot(&state_snapshot)
             .map_err(|e| e.to_string())?;
-        if meta.last_snapshot_event_offset != evidence.event_next.saturating_sub(1)
+        if meta.last_snapshot_event_offset != evidence.next.saturating_sub(1)
             || decoded.recovery_state_digest() != evidence.lease_normalized_state_digest
         {
             return Err("recovery snapshot does not preserve the verified projected state".into());
         }
         Ok(RecoveryQueueStateArtifact {
             evidence,
-            message_head,
             snapshot_digest: *blake3::hash(&state_snapshot).as_bytes(),
             state_snapshot,
         })
@@ -457,10 +430,10 @@ impl QueueReplay {
                 self.target
             ));
         }
-        let required_message_next = self.state.required_message_next();
+        let required_next = self.state.required_message_next();
         let payload_head = self.log.head;
         let payload_next = self.log.next.min(self.target);
-        if required_message_next > payload_next {
+        if required_next > payload_next {
             return Err("recovery state exceeds verified payload coverage".into());
         }
         let live_payload_digest = if self.verify_live {
@@ -485,23 +458,15 @@ impl QueueReplay {
             None
         };
         let evidence = RecoveryQueueReplayEvidence {
-            log_layout: QueueLogLayout::Combined,
-            payload_log: RecoveryPayloadLog {
-                source: RecoveryReadSource::Log,
-                head: self.log.head,
-                next: self.log.next,
-                digest: self.log.digest,
-            },
+            log: self.log,
             version: 2,
-            event_next: self.target,
-            required_message_next,
+            next: self.target,
+            required_next,
             state_digest: self.state.recovery_state_digest(),
             event_prefix_digest: *self.prefix_hash.finalize().as_bytes(),
-            message_digest: crate::stroma::empty_log_digest(),
-            message_next: 0,
             history_id: self.history.id,
             operations: self.operations,
-            checkpoint_event_next: self.checkpoint_event_next,
+            checkpoint_next: self.checkpoint_event_next,
             checkpoint_digest: self.checkpoint_event_next.and(self.history.snapshot_digest),
             lease_normalized_state_digest: self.state.recovery_lease_normalized_digest(),
             live_payload_digest,

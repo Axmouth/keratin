@@ -61,7 +61,6 @@ mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
 pub use recovery_history::{QueueLogLayout, RetainedHistoryIdentity, RetainedLog, RetainedLogs};
-pub(crate) use recovery_history::empty_log_digest;
 #[path = "recovery_read.rs"]
 mod recovery_read;
 pub use recovery_read::{
