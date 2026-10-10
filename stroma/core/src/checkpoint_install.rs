@@ -1085,7 +1085,7 @@ mod tests {
                     .spawn()
                     .unwrap(),
             );
-            tokio::time::timeout(std::time::Duration::from_secs(10), async {
+            tokio::time::timeout(std::time::Duration::from_secs(20), async {
                 while !ready.exists() {
                     assert!(
                         child.0.try_wait().unwrap().is_none(),

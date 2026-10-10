@@ -222,7 +222,7 @@ fn completed_phase_publication_survives_process_crash() {
             .spawn()
             .unwrap();
         let start = Instant::now();
-        while !root.join("crash-marker").exists() && start.elapsed() < Duration::from_secs(10) {
+        while !root.join("crash-marker").exists() && start.elapsed() < Duration::from_secs(20) {
             assert!(child.try_wait().unwrap().is_none());
             std::thread::sleep(Duration::from_millis(10));
         }

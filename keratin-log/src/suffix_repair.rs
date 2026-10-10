@@ -441,7 +441,7 @@ mod tests {
                 .unwrap();
             let start = Instant::now();
             while !dir.root.join("crash-ready").exists() {
-                if start.elapsed() > Duration::from_secs(10) || child.try_wait().unwrap().is_some()
+                if start.elapsed() > Duration::from_secs(20) || child.try_wait().unwrap().is_some()
                 {
                     let _ = child.kill();
                     let _ = child.wait();

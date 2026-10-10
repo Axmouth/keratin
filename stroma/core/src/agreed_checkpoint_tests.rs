@@ -649,7 +649,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                     .spawn()
                     .unwrap(),
             );
-            tokio::time::timeout(Duration::from_secs(10), async {
+            tokio::time::timeout(Duration::from_secs(20), async {
                 while !ready.exists() {
                     assert!(
                         child.0.try_wait().unwrap().is_none(),

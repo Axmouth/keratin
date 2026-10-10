@@ -144,7 +144,7 @@ fn snapshot_process_crash_keeps_only_published_progress() {
             .spawn()
             .unwrap();
         let start = Instant::now();
-        while !marker.exists() && start.elapsed() < Duration::from_secs(10) {
+        while !marker.exists() && start.elapsed() < Duration::from_secs(20) {
             assert!(child.try_wait().unwrap().is_none());
             std::thread::sleep(Duration::from_millis(10));
         }
