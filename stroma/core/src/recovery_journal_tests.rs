@@ -5,7 +5,6 @@ fn journal_identity(
         topic: "q".into(),
         partition: 0,
         group: None,
-        stream: false,
         replica: "node-a".into(),
         seal: combined_seal(0, records),
     }

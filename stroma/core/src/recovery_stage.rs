@@ -11,7 +11,9 @@ const MAX_SNAPSHOT: usize = MAX_RECOVERY_SNAPSHOT_BYTES;
 const MAX_PAGE: u64 = 16 * 1024 * 1024;
 // Snapshot bytes live in a separately verified raw artifact file.
 const MAX_METADATA: usize = 65_536;
-const MAGIC: &[u8; 8] = b"RSTAGE\0\x02";
+// Version 3 stages the queue log under `log/`. Older stages are refused at
+// the header check instead of being reopened with a missing log.
+const MAGIC: &[u8; 8] = b"RSTAGE\0\x03";
 
 /// Exact baseline authorized by a consensus recovery plan. The caller owns
 /// fresh consensus authorization; these fields alone are not proof of authority.
@@ -408,7 +410,7 @@ impl Stroma {
             .await
     }
 
-    async fn try_reuse_stage_messages(
+    async fn try_reuse_stage_log(
         &self,
         intent: &Intent,
         limits: RecoveryStageLimits,
@@ -446,7 +448,7 @@ impl Stroma {
             Some(handle) => Some(handle.follower_apply_state().await),
             None => None,
         };
-        let messages = match &handle {
+        let source = match &handle {
             Some(handle) => handle.payload_log(),
             None => Arc::new(
                 self.open_keratin(
@@ -460,18 +462,18 @@ impl Stroma {
         };
         let result = async {
             if handle.is_none() {
-                messages.freeze();
+                source.freeze();
             }
-            if messages.role() != KeratinRole::Frozen {
+            if source.role() != KeratinRole::Frozen {
                 return Err(invalid("sealed reuse source still has a writer role"));
             }
-            if messages.current_epoch() != s.fence_epoch
-                || messages.head_offset() != s.log.head
-                || messages.next_offset() != s.log.next
+            if source.current_epoch() != s.fence_epoch
+                || source.head_offset() != s.log.head
+                || source.next_offset() != s.log.next
             {
                 return Ok(false);
             }
-            let checked = messages.clone();
+            let checked = source.clone();
             let expected = intent.clone();
             let compatible =
                 tokio::task::spawn_blocking(move || scan_parts(&checked, &expected, limits, true))
@@ -482,14 +484,14 @@ impl Stroma {
                     "local retained payloads cannot be reused; using verified transfer");
                 return Ok(false);
             }
-            let admission_source = messages.clone();
+            let admission_source = source.clone();
             let admission_root = intent.spec.clone();
             let admission_parent = self.recovery_stage_root(&admission_root);
             tokio::task::spawn_blocking(move || {
                 let private_bytes = admission_source.segment_infos().map_err(io_err)?.last().map_or(0, |s| s.bytes);
                 admit_stage_bytes(&admission_parent, limits, private_bytes.saturating_add(1024 * 1024))
             }).await.map_err(io_err)??;
-            let stats = messages
+            let stats = source
                 .fork_frozen(destination, s.fence_epoch, s.log.head, s.log.next)
                 .await
                 .map_err(io_err)?;
@@ -501,12 +503,12 @@ impl Stroma {
                 shared_segments = stats.shared_segments,
                 "recovery stage reused compatible retained payloads"
             );
-            stage_boundary("reused-messages");
+            stage_boundary("reused-log");
             Ok(true)
         }
         .await;
         if handle.is_none() {
-            messages.shutdown().await.map_err(io_err)?;
+            source.shutdown().await.map_err(io_err)?;
         }
         result
     }
@@ -600,7 +602,7 @@ impl Stroma {
             }
             if !initialized {
                 // Only an unpublished attempt owned by this stage lock is disposable.
-                let unfinished = root.join("messages");
+                let unfinished = root.join(layout::LOG);
                 tokio::task::spawn_blocking(move || {
                     if unfinished.try_exists().map_err(io_err)? {
                         fs::remove_dir_all(unfinished).map_err(io_err)?;
@@ -608,7 +610,7 @@ impl Stroma {
                     Ok::<_, StromaError>(())
                 }).await.map_err(io_err)??;
                 if let Some(seal) = reuse_seal {
-                    if st.try_reuse_stage_messages(&intent, limits, &seal, root.join("messages")).await? {
+                    if st.try_reuse_stage_log(&intent, limits, &seal, root.join(layout::LOG)).await? {
                         let initialized_root = root.clone();
                         tokio::task::spawn_blocking(move || {
                             persist_exact(&initialized_root.join("initialized"), &plan)?;
@@ -626,36 +628,36 @@ impl Stroma {
             }
             // Unfinished staging is not accepted history and can repair an
             // interrupted append. Completed data must never silently lose a tail.
-            let messages = Arc::new(
+            let staged = Arc::new(
                 match runtime {
                     Some(runtime) => {
-                        Keratin::open_with_runtime(root.join("messages"), cfg, complete, runtime)
+                        Keratin::open_with_runtime(root.join(layout::LOG), cfg, complete, runtime)
                             .await
                     }
                     None if complete => {
-                        Keratin::open_preserving_history(root.join("messages"), cfg).await
+                        Keratin::open_preserving_history(root.join(layout::LOG), cfg).await
                     }
-                    None => Keratin::open(root.join("messages"), cfg).await,
+                    None => Keratin::open(root.join(layout::LOG), cfg).await,
                 }
                 .map_err(io_err)?,
             );
-            messages.become_follower();
+            staged.become_follower();
             if !initialized {
-                messages
+                staged
                     .advance_epoch(intent.spec.fence_epoch)
                     .await
                     .map_err(io_err)?;
-                messages
+                staged
                     .destructive_reset_to_checkpoint_at_epoch(
                         intent.spec.log.head,
                         intent.spec.fence_epoch,
                     )
                     .await
                     .map_err(io_err)?;
-                messages.sync().await.map_err(io_err)?;
+                staged.sync().await.map_err(io_err)?;
                 let initialized_root = root.clone();
                 tokio::task::spawn_blocking(move || {
-                    recovery_seal::sync_directories(&initialized_root.join("messages"))?;
+                    recovery_seal::sync_directories(&initialized_root.join(layout::LOG))?;
                     persist_exact(&initialized_root.join("initialized"), &plan)?;
                     stage_boundary("initialized");
                     Ok::<_, StromaError>(())
@@ -664,7 +666,7 @@ impl Stroma {
                 .map_err(io_err)??;
             }
             let mut inner = StageInner {
-                log: messages,
+                log: staged,
                 root,
                 intent,
                 limits,
@@ -923,7 +925,7 @@ impl QueueRecoveryStage {
             guard.log.sync().await.map_err(io_err)?;
             tokio::task::spawn_blocking(move || {
                 scan(&guard, true)?;
-                recovery_seal::sync_directories(&guard.root.join("messages"))?;
+                recovery_seal::sync_directories(&guard.root.join(layout::LOG))?;
                 persist_exact(&guard.root.join("complete"), &guard.intent.spec.plan)?;
                 stage_boundary("complete");
                 guard.complete = true;

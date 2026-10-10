@@ -2905,16 +2905,6 @@ impl QueueHandleInner {
         self.msg_log.clone().unwrap_or_else(|| self.event_log.clone())
     }
 
-    /// Wire compatibility: the absent message lane has no records. Its fencing
-    /// epoch follows the sole physical log, rather than a second persisted epoch.
-    pub fn message_lane_next(&self) -> u64 {
-        self.msg_log.as_ref().map_or(0, |log| log.next_offset())
-    }
-
-    pub fn message_lane_epoch(&self) -> u64 {
-        self.msg_log.as_ref().unwrap_or(&self.event_log).current_epoch()
-    }
-
     pub fn event_log(&self) -> Arc<Keratin> {
         self.event_log.clone()
     }

@@ -60,7 +60,7 @@ pub use storage_history::{PreparedStorageHistory, StorageHistoryBinding};
 mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
-pub use recovery_history::{QueueLogLayout, RetainedHistoryIdentity, RetainedLog, RetainedLogs};
+pub use recovery_history::{RetainedHistoryIdentity, RetainedLog, RetainedLogs};
 #[path = "recovery_read.rs"]
 mod recovery_read;
 pub use recovery_read::{
@@ -2361,17 +2361,6 @@ impl Stroma {
             }
         }
         Ok(())
-    }
-
-    /// Resolve this partition's payload lane. Live handles avoid filesystem reads
-    /// on replication progress reports. Cold partitions use their durable kind.
-    pub fn partition_payloads_in_event_log(&self, tp: &str, part: u32, group: Option<&str>) -> bool {
-        let group = normalize_group(group);
-        let current = self.queue_handles.load();
-        if let Some(h) = slot_lookup_no_alloc(&current, tp, part, group).and_then(|s| s.handle.get()) {
-            return h.has_combined_log();
-        }
-        self.read_partition_kind(tp, part, group) == PartitionKind::Queue
     }
 
     pub(crate) fn payload_log_for(&self, qh: &QueueHandleInner) -> Arc<Keratin> {
@@ -5967,7 +5956,7 @@ mod tests {
         let receipt = test_learner(&follower, "topic").await;
         assert!(follower.become_queue_owner("topic", 0, None).await.is_err());
         assert!(!matches!(follower.promote_queue_follower_to_local_tail("topic", 0, None, 1).await.unwrap(), QueuePromotionOutcome::Promoted { .. }));
-        let OwnerReplicationRead::Batch(batch) = owner.read_owner_event_records("topic", 0, None, 0, 10).await.unwrap() else { panic!("retained events") };
+        let OwnerReplicationRead::Batch(batch) = owner.read_owner_queue_records("topic", 0, None, 0, 10, usize::MAX).await.unwrap() else { panic!("retained events") };
         assert_eq!(batch.records.len(), 2);
         for (offset, event) in batch.records {
             follower.apply_replicated_queue_batch("topic", 0, None, ReplicatedEventBatch {
@@ -6265,7 +6254,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_replication_byte_budget_keeps_contiguous_event_and_message_prefixes() {
+    async fn owner_replication_byte_budget_keeps_contiguous_queue_prefix() {
         let dir = test_dir!("owner_replication_byte_budget");
         let stroma = Stroma::open(&dir.root, test_keratin_config(), SnapshotConfig::default())
             .await
@@ -6273,17 +6262,8 @@ mod tests {
         for _ in 0..5 {
             publish_one(&stroma, "topic", 0, None).await;
         }
-        let OwnerReplicationRead::Batch(messages) = stroma
-            .read_owner_message_records_with_byte_budget("topic", 0, None, 0, 100, 1)
-            .await
-            .unwrap()
-        else {
-            panic!("message batch");
-        };
-        assert!(messages.records.is_empty());
-        assert_eq!(messages.next_offset, 0);
         let OwnerReplicationRead::Batch(full) = stroma
-            .read_owner_event_records("topic", 0, None, 0, 100)
+            .read_owner_queue_records("topic", 0, None, 0, 100, usize::MAX)
             .await
             .unwrap()
         else {
@@ -6291,7 +6271,7 @@ mod tests {
         };
         assert!(full.records.len() > 2);
         let OwnerReplicationRead::Batch(events) = stroma
-            .read_owner_event_records_with_byte_budget("topic", 0, None, 0, 100, 1)
+            .read_owner_queue_records("topic", 0, None, 0, 100, 1)
             .await
             .unwrap()
         else {
@@ -6300,7 +6280,7 @@ mod tests {
         assert_eq!(events.records, full.records[..1]);
         assert_eq!(events.next_offset, 1);
         let OwnerReplicationRead::Batch(next) = stroma
-            .read_owner_event_records_with_byte_budget("topic", 0, None, events.next_offset, 100, 1)
+            .read_owner_queue_records("topic", 0, None, events.next_offset, 100, 1)
             .await
             .unwrap()
         else {
@@ -6310,7 +6290,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn owner_replication_read_returns_message_and_event_records() {
+    async fn owner_replication_read_returns_queue_records() {
         let dir = test_dir!("owner_replication_read_records");
         let stroma = Stroma::open(
             &dir.root,
@@ -6323,20 +6303,8 @@ mod tests {
         let offset = publish_one(&stroma, "topic", 0, None).await;
         assert_eq!(offset, 0);
 
-        let messages = stroma
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap();
-        let OwnerReplicationRead::Batch(messages) = messages else {
-            panic!("expected message batch");
-        };
-        assert_eq!(messages.epoch, 0);
-        assert_eq!(messages.requested_offset, 0);
-        assert_eq!(messages.next_offset, 0);
-        assert!(messages.records.is_empty());
-
         let events = stroma
-            .read_owner_event_records("topic", 0, None, 0, 10)
+            .read_owner_queue_records("topic", 0, None, 0, 10, usize::MAX)
             .await
             .unwrap();
         let OwnerReplicationRead::Batch(events) = events else {
@@ -6366,7 +6334,7 @@ mod tests {
         publish_one(&stroma, "topic", 0, None).await;
 
         let events = stroma
-            .read_owner_event_records("topic", 0, None, 0, 1)
+            .read_owner_queue_records("topic", 0, None, 0, 1, usize::MAX)
             .await
             .unwrap();
         let OwnerReplicationRead::Batch(events) = events else {
@@ -6378,7 +6346,7 @@ mod tests {
         assert_eq!(events.records[0].0, 0);
 
         let events = stroma
-            .read_owner_event_records("topic", 0, None, events.next_offset, 1)
+            .read_owner_queue_records("topic", 0, None, events.next_offset, 1, usize::MAX)
             .await
             .unwrap();
         let OwnerReplicationRead::Batch(events) = events else {
@@ -6409,19 +6377,7 @@ mod tests {
             .unwrap();
 
         let err = stroma
-            .read_owner_message_records("topic", 0, None, 0, 10)
-            .await
-            .unwrap_err();
-        assert!(matches!(
-            err,
-            StromaError::WrongQueueRole {
-                expected: QueueRole::Owner,
-                actual: QueueRole::Follower
-            }
-        ));
-
-        let err = stroma
-            .read_owner_event_records("topic", 0, None, 0, 10)
+            .read_owner_queue_records("topic", 0, None, 0, 10, usize::MAX)
             .await
             .unwrap_err();
         assert!(matches!(
@@ -6593,7 +6549,7 @@ mod tests {
         qh.event_log().become_owner();
 
         let events = stroma
-            .read_owner_event_records("topic", 0, None, 0, 10)
+            .read_owner_queue_records("topic", 0, None, 0, 10, usize::MAX)
             .await
             .unwrap();
         assert_eq!(

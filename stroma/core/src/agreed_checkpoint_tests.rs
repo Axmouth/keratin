@@ -686,7 +686,7 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                 assert_eq!(snapshot.as_ref().unwrap().0.event_next(), log.next);
             }
             let mut inspector = crate::recovery_inspection::RecoveryPairInspector::new(
-                "q", 0, None, false, seal.clone(), seal, Default::default(),
+                "q", 0, None, seal.clone(), seal, Default::default(),
             ).unwrap().with_queue_checkpoint_replay(20, Default::default(), 16384).unwrap();
             while let Some((side, request)) = inspector.next_read().unwrap() {
                 let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();

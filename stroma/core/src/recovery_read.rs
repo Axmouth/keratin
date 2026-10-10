@@ -836,7 +836,7 @@ mod tests {
         let s = populate(&dir.root).await;
         let request = seal(&s).await;
         let sealed = s.seal_replica_for_recovery("q", 0, None, request.seal.clone()).await.unwrap();
-        let mut inspector = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed,
+        let mut inspector = RecoveryPairInspector::new("q", 0, None, sealed.clone(), sealed,
             RecoveryInspectionLimits { page_records: 2, page_bytes: 300, ..Default::default() })
             .unwrap().with_single_source().unwrap();
         let (side, request) = inspector.next_read().unwrap().unwrap();

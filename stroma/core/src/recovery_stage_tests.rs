@@ -360,7 +360,7 @@ async fn stage_refuses_full_but_incorrect_payloads_and_damaged_completed_data() 
             assert!(!stage.inner.lock().await.root.join("complete").exists());
         } else {
             stage.finish().await.unwrap();
-            let messages = stage.inner.lock().await.root.join("messages");
+            let messages = stage.inner.lock().await.root.join("log");
             drop(stage);
             fs::remove_file(messages.join("manifest.bin")).unwrap();
             assert!(
@@ -645,7 +645,7 @@ async fn install_crash_child() {
 
 #[tokio::test]
 async fn installation_sigkill_resumes_each_publication_boundary_without_old_source() {
-    for boundary in ["retired", "messages", "prepared", "switched"] {
+    for boundary in ["retired", "log", "prepared", "switched"] {
         let dir = keratin_log::test_dir!("install_sigkill");
         let ready = dir.root.join("tmp/ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())
@@ -787,7 +787,7 @@ async fn reuse_checks_actual_payloads_and_installs_private_writable_tail() {
                 assert_eq!(stage.next_offset().await, 3);
                 assert_eq!(
                     fs::metadata(source.join(prefix)).unwrap().ino(),
-                    fs::metadata(stage.inner.lock().await.root.join("messages").join(prefix))
+                    fs::metadata(stage.inner.lock().await.root.join("log").join(prefix))
                         .unwrap()
                         .ino()
                 );
@@ -801,7 +801,7 @@ async fn reuse_checks_actual_payloads_and_installs_private_writable_tail() {
             let destination = st.tp_part_dir("q", 0, None);
             assert_eq!(
                 fs::metadata(destination.join(prefix)).unwrap().ino(),
-                fs::metadata(stage.inner.lock().await.root.join("messages").join(prefix))
+                fs::metadata(stage.inner.lock().await.root.join("log").join(prefix))
                     .unwrap()
                     .ino()
             );
@@ -861,7 +861,7 @@ async fn reuse_crash_child() {
 
 #[tokio::test]
 async fn reuse_resumes_after_kill_before_and_after_initialized_marker() {
-    for boundary in ["reused-messages", "initialized"] {
+    for boundary in ["reused-log", "initialized"] {
         let dir = keratin_log::test_dir!("reuse_sigkill");
         let ready = dir.root.join("tmp/ready");
         let mut child = std::process::Command::new(std::env::current_exe().unwrap())

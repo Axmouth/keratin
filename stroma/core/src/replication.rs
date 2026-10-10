@@ -330,10 +330,10 @@ impl Stroma {
             && let Some(wq) = qh.as_work_queue()
         {
             let required = wq.required_message_next().await.map_err(io_err)?;
-            if self.payload_log_for(&qh).next_offset() < required {
+            let log_next = self.payload_log_for(&qh).next_offset();
+            if log_next < required {
                 return Err(crate::StromaError::InvalidArgument(format!(
-                    "queue payload backfill incomplete: message next {} requires {required}",
-                    qh.message_lane_next()
+                    "queue payload backfill incomplete: log next {log_next} requires {required}"
                 )));
             }
         }
@@ -361,7 +361,7 @@ impl Stroma {
         Ok(())
     }
 
-    /// Advance both queue logs to the assignment fencing epoch.
+    /// Advance the partition logs to the assignment fencing epoch.
     ///
     /// The epoch is persisted (Keratin manifest) BEFORE any role-specific
     /// work uses it; replicated appends carrying an older epoch are rejected
@@ -437,29 +437,6 @@ impl Stroma {
         })
     }
 
-    /// Resume cursors for an idle follower, including a checkpoint whose live
-    /// payloads still require backfill. These cursors alone do not prove readiness.
-    pub async fn queue_replication_next_offsets(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-    ) -> Result<(Offset, Offset)> {
-        let handle = self.queue_handle(topic, part, group).await?;
-        let handle = handle.resolve()?;
-        let apply = handle.follower_apply_state().await;
-        handle.ensure_not_recovery_sealed()?;
-        if *apply || handle.role() != QueueRole::Follower {
-            return Err(StromaError::InvalidArgument(
-                "follower apply is incomplete or role changed".into(),
-            ));
-        }
-        Ok((
-            handle.message_lane_next(),
-            handle.event_log().next_offset(),
-        ))
-    }
-
     /// Resume cursor in the single queue log for an idle follower, including
     /// one whose installed checkpoint still needs payload backfill. The cursor
     /// alone does not prove readiness. Refuses stream partitions.
@@ -492,7 +469,8 @@ impl Stroma {
     ) -> Result<(Offset, Offset)> {
         let qh = self.queue_handle(topic, part, None).await?;
         let qh = qh.resolve()?;
-        Ok((qh.message_lane_next(), qh.event_log().next_offset()))
+        qh.stream()?;
+        Ok((qh.msg_log()?.next_offset(), qh.event_log().next_offset()))
     }
 
     pub async fn become_stream_follower_with_epoch(
@@ -859,154 +837,6 @@ impl Stroma {
         read_owner_event_log(&qh, from, max, max_bytes, early).await
     }
 
-    pub async fn read_owner_message_records(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-    ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
-            .await
-    }
-
-    /// Byte-bounded durable prefix, including one lookahead record.
-    pub async fn read_owner_message_records_with_byte_budget(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-    ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_inner(topic, part, group, from, max, max_bytes, false).await
-    }
-
-    /// Tentative bytes for a fenced, enrolled queue history only. The caller
-    /// retains responsibility for authority and both-log confirmation gates.
-    #[cfg(feature = "early-replication-experiment")]
-    pub async fn read_owner_message_records_early(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-    ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_early_with_byte_budget(topic, part, group, from, max, usize::MAX)
-            .await
-    }
-
-    #[cfg(feature = "early-replication-experiment")]
-    pub async fn read_owner_message_records_early_with_byte_budget(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-    ) -> Result<OwnerReplicationRead<Message>> {
-        self.read_owner_message_records_inner(topic, part, group, from, max, max_bytes, true).await
-    }
-
-    /// Two-lane wire compatibility: a queue answers with an empty message lane
-    /// at cursor zero, a stream reads its record log.
-    async fn read_owner_message_records_inner(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-        early: bool,
-    ) -> Result<OwnerReplicationRead<Message>> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
-        if qh.optional_message_log().is_none() {
-            ensure_owner(&qh)?;
-            if from != 0 {
-                return Err(StromaError::InvalidArgument("combined message lane cursor must be zero".into()));
-            }
-            return Ok(OwnerReplicationRead::Batch(OwnerReplicationBatch {
-                epoch: qh.message_lane_epoch(), requested_offset: 0,
-                next_offset: 0, records: Vec::new(),
-            }));
-        }
-        read_owner_message_log(&qh, from, max, max_bytes, early).await
-    }
-
-    pub async fn read_owner_event_records(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-    ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_with_byte_budget(topic, part, group, from, max, usize::MAX)
-            .await
-    }
-
-    /// Byte-bounded durable prefix, including one lookahead record.
-    pub async fn read_owner_event_records_with_byte_budget(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-    ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_inner(topic, part, group, from, max, max_bytes, false).await
-    }
-
-    /// Tentative bytes for a fenced, enrolled queue history only. The caller
-    /// retains responsibility for authority and both-log confirmation gates.
-    #[cfg(feature = "early-replication-experiment")]
-    pub async fn read_owner_event_records_early(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-    ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_early_with_byte_budget(topic, part, group, from, max, usize::MAX)
-            .await
-    }
-
-    #[cfg(feature = "early-replication-experiment")]
-    pub async fn read_owner_event_records_early_with_byte_budget(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-    ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        self.read_owner_event_records_inner(topic, part, group, from, max, max_bytes, true).await
-    }
-
-    async fn read_owner_event_records_inner(
-        &self,
-        topic: &str,
-        part: u32,
-        group: Option<&str>,
-        from: Offset,
-        max: usize,
-        max_bytes: usize,
-        early: bool,
-    ) -> Result<OwnerReplicationRead<StromaEvent>> {
-        let qh = self.queue_handle(topic, part, group).await?;
-        let qh = qh.resolve()?;
-        read_owner_event_log(&qh, from, max, max_bytes, early).await
-    }
-
     /// Capture the owner's queue state at its log tail for a learner. Refuses
     /// stream partitions.
     pub async fn export_queue_state_checkpoint(
@@ -1108,17 +938,17 @@ impl Stroma {
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
     ) -> Result<(ReplicatedStreamApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
-        {
-            if qh.has_combined_log() && messages.as_ref().is_some_and(|batch| !batch.records.is_empty()) {
-                return Err(StromaError::InvalidArgument("combined queue rejects separate payload-lane records".into()));
-            }
-            if !qh.has_combined_log() && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
-                return Err(StromaError::InvalidArgument("queue payload event received by a stream".into()));
-            }
+        // Queue payloads travel as records of the single queue log, so a
+        // queue frame never carries a record batch.
+        if qh.has_combined_log() && messages.is_some() {
+            return Err(StromaError::InvalidArgument("queue partition has no record log".into()));
+        }
+        if !qh.has_combined_log() && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
+            return Err(StromaError::InvalidArgument("queue payload event received by a stream".into()));
         }
         // Validate the entire incoming frame before enqueueing any writes or
         // setting the dirty-apply fence. This also covers open durability groups.
-        if qh.optional_message_log().is_none() {
+        if qh.has_combined_log() {
             if let Some(batch) = &events {
                 batch.first_offset.checked_add(batch.events.len() as u64)
                     .ok_or_else(|| StromaError::InvalidArgument("combined event offset exhausted".into()))?;
@@ -1129,14 +959,6 @@ impl Stroma {
                 }
             }
         }
-        let messages = if qh.optional_message_log().is_none() {
-            if let Some(batch) = &messages {
-                if !batch.records.is_empty() || batch.first_offset != 0 || batch.epoch != qh.message_lane_epoch() {
-                    return Err(StromaError::InvalidArgument("invalid combined message lane frame".into()));
-                }
-            }
-            None
-        } else { messages };
         let topic = qh.topic();
         let part = qh.partition();
         let group = qh.group();
@@ -1167,9 +989,10 @@ impl Stroma {
             }
             events
         };
-        let parallel = matches!((&messages, &events), (Some(m), Some(e))
-            if m.epoch == qh.message_lane_epoch() && e.epoch == qh.event_log().current_epoch()
-                && m.first_offset <= qh.message_lane_next() && e.first_offset <= qh.event_log().next_offset());
+        let record_log = qh.optional_message_log();
+        let parallel = matches!((&messages, &events, &record_log), (Some(m), Some(e), Some(records))
+            if m.epoch == records.current_epoch() && e.epoch == qh.event_log().current_epoch()
+                && m.first_offset <= records.next_offset() && e.first_offset <= qh.event_log().next_offset());
         let message_next = messages
             .as_ref()
             .map(|b| b.first_offset + b.records.len() as u64);
@@ -1391,7 +1214,7 @@ impl Stroma {
 
     /// Shared follower apply for single-log queues and two-log streams.
     /// Streams advance their record tail after accepted writes. Queues apply
-    /// payload-bearing events in order and reject a separate message lane.
+    /// payload-bearing events in order and refuse any record batch.
     async fn apply_replicated_two_log_batch(
         &self,
         topic: &str,

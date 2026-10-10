@@ -667,8 +667,8 @@ impl Stroma {
             tracing::info!(topic = spec.topic, partition = spec.partition,
                 shared_bytes = stats.shared_bytes, copied_bytes = stats.copied_bytes,
                 shared_segments = stats.shared_segments, "recovery installation reused staged payloads");
-            boundary("messages");
-            let messages = view
+            boundary("log");
+            let installed = view
                 .open_keratin(
                     view.recovery_payload_path(&spec),
                     st.keratin_cfg_msg,
@@ -676,15 +676,15 @@ impl Stroma {
                 )
                 .await
                 .map_err(io_err)?;
-            messages.freeze();
-            let (messages, guard) = tokio::task::spawn_blocking(move || {
-                recovery_stage::scan_parts(&messages, &guard.intent, guard.limits, true)?;
-                Ok::<_, StromaError>((messages, guard))
+            installed.freeze();
+            let (installed, guard) = tokio::task::spawn_blocking(move || {
+                recovery_stage::scan_parts(&installed, &guard.intent, guard.limits, true)?;
+                Ok::<_, StromaError>((installed, guard))
             })
             .await
             .map_err(io_err)??;
-            messages.shutdown().await.map_err(io_err)?;
-            drop(messages);
+            installed.shutdown().await.map_err(io_err)?;
+            drop(installed);
             let writer = view.clone();
             let saved = prepared.clone();
             tokio::task::spawn_blocking(move || {
@@ -728,7 +728,7 @@ impl Stroma {
         }
         // Reopen and verify the whole baseline, including a completed
         // generation whose receipt survived an interrupted `current` switch.
-        let messages = view
+        let installed = view
             .open_keratin(
                 view.recovery_payload_path(&spec),
                 st.keratin_cfg_msg,
@@ -736,18 +736,18 @@ impl Stroma {
             )
             .await
             .map_err(io_err)?;
-        messages.freeze();
+        installed.freeze();
         let reader = view.clone();
-        let messages = tokio::task::spawn_blocking(move || {
-                recovery_stage::scan_parts(&messages, &verification_intent, verification_limits, true)?;
+        let installed = tokio::task::spawn_blocking(move || {
+                recovery_stage::scan_parts(&installed, &verification_intent, verification_limits, true)?;
                 let s = &verification_intent.spec;
                 if !matches!(reader.read_queue_snapshot(&reader.snap_file(&s.topic, s.partition, s.group.as_deref()))?, Some((checkpoint_capture::SnapshotBoundary::ExactNext(next), ref blob)) if next == s.log.next && *blob == verification_intent.snapshot) {
                     return Err(invalid("installed snapshot differs from plan"));
                 }
-                Ok::<_, StromaError>(messages)
+                Ok::<_, StromaError>(installed)
             }).await.map_err(io_err)??;
-        messages.shutdown().await.map_err(io_err)?;
-        drop(messages);
+        installed.shutdown().await.map_err(io_err)?;
+        drop(installed);
         // The complete generation is durable. Publish it as `current`.
         layout::write_current(&part_dir, &generation)?;
         boundary("switched");

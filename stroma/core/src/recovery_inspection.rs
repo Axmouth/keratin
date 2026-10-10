@@ -278,7 +278,6 @@ impl RecoveryPairInspector {
         topic: &str,
         partition: u32,
         group: Option<&str>,
-        stream: bool,
         left: SealedReplicaFrontiers,
         right: SealedReplicaFrontiers,
         limits: RecoveryInspectionLimits,
@@ -293,7 +292,7 @@ impl RecoveryPairInspector {
         {
             return Err("invalid recovery inspection limits".into());
         }
-        if stream || left.history.logs.is_stream() || right.history.logs.is_stream() {
+        if left.history.logs.is_stream() || right.history.logs.is_stream() {
             return Err("recovery inspection supports queue histories only".into());
         }
         if left.request != right.request {
@@ -336,7 +335,7 @@ impl RecoveryPairInspector {
     /// records after the target. No authority or activation proof is implied.
     pub fn with_queue_replay(
         mut self,
-        event_next: u64,
+        next: u64,
         limits: RecoveryReplayLimits,
     ) -> Result<Self, String> {
         if self.pages != 0
@@ -353,14 +352,14 @@ impl RecoveryPairInspector {
                 &self.resource.0,
                 self.resource.1,
                 self.seals[0].history.clone(),
-                event_next,
+                next,
                 limits,
             )?,
             QueueReplay::new(
                 &self.resource.0,
                 self.resource.1,
                 self.seals[1].history.clone(),
-                event_next,
+                next,
                 limits,
             )?,
         ]);
@@ -373,7 +372,7 @@ impl RecoveryPairInspector {
     /// authority, timer transitions and installed lineage still require proof.
     pub fn with_queue_checkpoint_replay(
         mut self,
-        event_next: u64,
+        next: u64,
         limits: RecoveryReplayLimits,
         max_checkpoint_bytes: u32,
     ) -> Result<Self, String> {
@@ -390,7 +389,7 @@ impl RecoveryPairInspector {
         }
         self.live_payloads = Some(LogPair::new(queue_log(&self.seals[0]), queue_log(&self.seals[1])));
         self.checkpoint_replay = Some(CheckpointReplayPlan {
-            target: event_next,
+            target: next,
             limits,
             max_bytes: max_checkpoint_bytes,
             buffers: Default::default(),
@@ -1258,9 +1257,9 @@ mod tests {
         );
     }
 
-    /// Only queue histories are inspected. A stream history, or a queue
-    /// resource asked about as a stream, is refused before any read, so one of
-    /// its two logs can never be compared on its own.
+    /// Only queue histories are inspected. A stream history is refused
+    /// before any read, so one of its two logs can never be compared on its
+    /// own.
     #[test]
     fn stream_histories_are_refused_before_inspection() {
         let queue = seal(0, &records(0, 2));
@@ -1269,13 +1268,12 @@ mod tests {
         stream.history.logs = crate::RetainedLogs::Stream { records: log, cursor_events: log };
         stream.history.storage_history.as_mut().unwrap().stream = true;
         stream.history.id = stream.history.compute_id("q", 0, None, true).unwrap();
-        for (left, right, flag) in [
-            (queue.clone(), stream.clone(), false),
-            (stream.clone(), queue.clone(), false),
-            (stream.clone(), stream.clone(), true),
-            (queue.clone(), queue.clone(), true),
+        for (left, right) in [
+            (queue.clone(), stream.clone()),
+            (stream.clone(), queue.clone()),
+            (stream.clone(), stream.clone()),
         ] {
-            let error = RecoveryPairInspector::new("q", 0, None, flag, left, right, Default::default())
+            let error = RecoveryPairInspector::new("q", 0, None, left, right, Default::default())
                 .err()
                 .expect("stream inspection must fail");
             assert!(error.contains("queue histories only"), "{error}");
@@ -1400,7 +1398,7 @@ mod tests {
         right: SealedReplicaFrontiers,
         limits: RecoveryInspectionLimits,
     ) -> RecoveryPairInspector {
-        RecoveryPairInspector::new("q", 0, None, false, left, right, limits).unwrap()
+        RecoveryPairInspector::new("q", 0, None, left, right, limits).unwrap()
     }
 
     #[test]
@@ -1623,7 +1621,6 @@ mod tests {
                 "other",
                 0,
                 None,
-                false,
                 left.clone(),
                 left.clone(),
                 Default::default()
@@ -1637,7 +1634,6 @@ mod tests {
                 "q",
                 0,
                 None,
-                false,
                 left.clone(),
                 wrong,
                 Default::default()

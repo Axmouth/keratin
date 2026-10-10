@@ -303,7 +303,7 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
     st.nack_enqueue("q", 0, None, 0, true, done).await.unwrap();
     rx.await.unwrap().unwrap();
     let OwnerReplicationRead::Batch(batch) = st
-        .read_owner_event_records("q", 0, None, 0, 10)
+        .read_owner_queue_records("q", 0, None, 0, 10, usize::MAX)
         .await
         .unwrap()
     else {

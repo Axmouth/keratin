@@ -50,7 +50,6 @@ impl RecoveryPhaseRecipe {
         if a.topic != b.topic
             || a.partition != b.partition
             || a.group != b.group
-            || a.stream != b.stream
         {
             return Err("phase sources belong to different resources".into());
         }
@@ -58,7 +57,6 @@ impl RecoveryPhaseRecipe {
             &a.topic,
             a.partition,
             a.group.as_deref(),
-            a.stream,
             a.seal.clone(),
             b.seal.clone(),
             self.limits,

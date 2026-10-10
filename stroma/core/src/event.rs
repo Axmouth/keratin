@@ -484,13 +484,11 @@ impl StromaEvent {
         }
     }
 
-    /// The highest message-log offset this event references, if any.
+    /// The highest payload offset this event references, if any.
     ///
-    /// Used by recovery to verify the event log does not reference messages the
-    /// message log has not (yet) durably accepted (a dangling forward reference,
-    /// e.g. after the event log was fsynced ahead of the message log and a crash
-    /// lost the message tail). `None` for events that carry no message offset
-    /// (Declare / ResetQueue / Snapshot).
+    /// Used to refuse an event that references a payload the log has not
+    /// durably accepted (a dangling forward reference). `None` for events that
+    /// carry no payload offset (Declare / ResetQueue / Snapshot).
     pub fn max_referenced_msg_offset(&self) -> Option<Offset> {
         match self {
             StromaEvent::PayloadEnqueue { .. } => None,

@@ -69,7 +69,7 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
                 );
 
                 let OwnerReplicationRead::Batch(batch) = owner
-                    .read_owner_event_records_early("q", 0, None, prefix, 10)
+                    .read_owner_queue_records_early("q", 0, None, prefix, 10, usize::MAX)
                     .await
                     .unwrap()
                 else {

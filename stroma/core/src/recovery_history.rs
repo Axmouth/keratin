@@ -10,21 +10,6 @@ const MAGIC: &[u8; 8] = b"RHIST\0\0\x02";
 /// layout changes so an old id never verifies under a new meaning.
 const HISTORY_ID_TAG: &[u8] = b"fibril-retained-history-v2\0";
 
-/// Physical queue layout bound into recovery evidence. Empty separate queues
-/// remain distinct from a queue whose payloads live in the event records.
-#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
-#[serde(rename_all = "snake_case")]
-pub enum QueueLogLayout {
-    #[default]
-    Separate,
-    Combined,
-}
-impl QueueLogLayout {
-    pub fn is_separate(&self) -> bool {
-        matches!(self, Self::Separate)
-    }
-}
-
 /// Retained bounds and content digest of one physical log.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct RetainedLog {

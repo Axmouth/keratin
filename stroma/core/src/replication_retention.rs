@@ -1,36 +1,19 @@
 //! Compaction constraints supplied by the replication coordinator.
 use super::*;
 
-/// Exclusive durable positions still needed by protected followers. This is
+/// Exclusive durable position still needed by protected followers. This is
 /// consulted only during compaction, never on the append path. Returning zero
 /// conservatively retains everything. Errors must prevent compaction.
 pub trait QueueReplicationRetention: std::fmt::Debug + Send + Sync {
     /// Exclusive position in the single queue log still needed by protected
-    /// followers. Stroma consults only this method. The default reads the
-    /// event half of `retained_from` for sources that implement only that.
+    /// followers.
     fn retained_next(
         &self,
         topic: &str,
         partition: u32,
         group: Option<&str>,
         history: Option<&StorageHistoryBinding>,
-    ) -> Result<u64> {
-        self.retained_from(topic, partition, group, history)
-            .map(|(_, event)| event)
-    }
-
-    /// Two-lane form kept so older sources still build. Only its event half
-    /// was ever read. The default retains everything.
-    fn retained_from(
-        &self,
-        topic: &str,
-        partition: u32,
-        group: Option<&str>,
-        history: Option<&StorageHistoryBinding>,
-    ) -> Result<(u64, u64)> {
-        let _ = (topic, partition, group, history);
-        Ok((0, 0))
-    }
+    ) -> Result<u64>;
 }
 
 #[cfg(test)]
@@ -49,33 +32,6 @@ mod tests {
         ) -> Result<u64> {
             Ok(*self.0.lock().unwrap())
         }
-    }
-
-    /// A source that implements only the two-lane method keeps working: its
-    /// event half becomes the single-log floor.
-    #[derive(Debug)]
-    struct TwoLaneProgress;
-    impl QueueReplicationRetention for TwoLaneProgress {
-        fn retained_from(
-            &self,
-            _: &str,
-            _: u32,
-            _: Option<&str>,
-            _: Option<&StorageHistoryBinding>,
-        ) -> Result<(u64, u64)> {
-            Ok((3, 7))
-        }
-    }
-
-    /// A source that implements neither method retains everything.
-    #[derive(Debug)]
-    struct Silent;
-    impl QueueReplicationRetention for Silent {}
-
-    #[test]
-    fn single_log_retention_defaults_are_conservative() {
-        assert_eq!(TwoLaneProgress.retained_next("q", 0, None, None).unwrap(), 7);
-        assert_eq!(Silent.retained_next("q", 0, None, None).unwrap(), 0);
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 4)]

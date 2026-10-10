@@ -15,13 +15,14 @@ const MAX_PAGE: u64 = 16 * 1024 * 1024;
 // MessagePack encodes Vec<u8> as integers, at most two bytes per input byte.
 const MAX_ENCODED: u64 = 2 * MAX_PAGE + 1024 * 1024;
 
+/// Resource and seal a journal caches pages for. Only queue histories are
+/// inspected, and the seal history carries the resource kind.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct RecoveryJournalIdentity {
     pub topic: String,
     pub partition: u32,
     pub group: Option<String>,
-    pub stream: bool,
     pub replica: String,
     pub seal: SealedReplicaFrontiers,
 }
@@ -75,7 +76,6 @@ impl RecoveryInspectionJournal {
             &identity.topic,
             identity.partition,
             identity.group.as_deref(),
-            identity.stream,
             identity.seal.clone(),
             identity.seal.clone(),
             Default::default(),

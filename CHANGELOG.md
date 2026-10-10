@@ -11,6 +11,20 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- The two-lane queue adapters are gone. `read_owner_message_records*`,
+  `read_owner_event_records*`, `queue_replication_next_offsets`,
+  `partition_payloads_in_event_log`, `QueueLogLayout` and the handle
+  accessors `message_lane_next` and `message_lane_epoch` are removed. Queues
+  use `read_owner_queue_records*` and `queue_replication_next_offset`, and
+  streams use their own record and cursor event reads. A queue follower frame
+  that carries a record batch is refused. `QueueReplicationRetention` has one
+  required method, `retained_next`. `RecoveryPairInspector::new` loses its
+  `stream` flag and `RecoveryJournalIdentity` loses its `stream` field, since
+  the seal history already carries the resource kind. A recovery stage keeps
+  its staged log under `log/` and its intent header moves to a new version,
+  so stages from earlier builds are refused.
+  `stream_replication_next_offsets` refuses queue partitions.
+
 - Queue recovery evidence, inspection and staging describe one log.
   `RecoveryQueueReplayEvidence` carries the retained queue log, the applied
   `next`, `required_next` and `checkpoint_next`, and drops the layout and

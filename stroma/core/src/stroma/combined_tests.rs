@@ -415,8 +415,7 @@ async fn combined_writer_uses_payload_budgets_and_read_cap_allows_one_oversized_
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
-    use crate::OwnerReplicationRead;
+async fn single_log_lifecycle_and_stream_reads_are_explicit() {
     let dir = keratin_log::test_dir!("combined_single_log_lifecycle");
     let st = open(&dir.root).await;
     let q = st.queue_handle("q", 0, None).await.unwrap();
@@ -428,35 +427,30 @@ async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
     st.ensure_queue_owner_epoch("q", 0, None, Some(7))
         .await
         .unwrap();
-    let OwnerReplicationRead::Batch(lane) = st
-        .read_owner_message_records("q", 0, None, 0, 100)
-        .await
-        .unwrap()
-    else {
-        panic!()
-    };
-    assert_eq!(
-        (lane.epoch, lane.requested_offset, lane.next_offset),
-        (7, 0, 0)
-    );
-    assert!(lane.records.is_empty());
+    // A queue has no stream record log, so stream reads are refused rather
+    // than answered with an empty page.
     assert!(
-        st.read_owner_message_records("q", 0, None, 1, 100)
+        st.read_owner_stream_records("q", 0, 0, 100, usize::MAX)
+            .await
+            .is_err()
+    );
+    assert!(
+        st.read_owner_stream_cursor_events("q", 0, 0, 100, usize::MAX)
             .await
             .is_err()
     );
     publish(&st, false).await;
     st.become_queue_follower("q", 0, None).await.unwrap();
     assert!(
-        st.read_owner_message_records("q", 0, None, 0, 100)
+        st.read_owner_queue_records("q", 0, None, 0, 100, usize::MAX)
             .await
             .is_err()
     );
     assert_eq!(
-        st.queue_replication_next_offsets("q", 0, None)
+        st.queue_replication_next_offset("q", 0, None)
             .await
             .unwrap(),
-        (0, 1)
+        1
     );
     // An empty single-log frame is refused before poisoning follower apply.
     assert!(
@@ -477,7 +471,7 @@ async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
     st.become_queue_owner_with_epoch("q", 0, None, 8)
         .await
         .unwrap();
-    assert_eq!(h.message_lane_epoch(), 8);
+    assert_eq!(h.event_log().current_epoch(), 8);
     assert!(st.advance_queue_epoch("q", 0, None, 7).await.is_err());
     drop(h);
     drop(q);
@@ -487,7 +481,7 @@ async fn single_log_lifecycle_and_empty_replication_lane_are_explicit() {
     let q = st.queue_handle("q", 0, None).await.unwrap();
     let h = q.resolve().unwrap();
     assert!(h.optional_message_log().is_none());
-    assert_eq!(h.message_lane_epoch(), 8);
+    assert_eq!(h.event_log().current_epoch(), 8);
     assert_eq!(
         fetch_payload(&h, 0).unwrap().unwrap().payload,
         vec![42; 2048]
@@ -714,7 +708,7 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
             assert_eq!(st.seal_replica_for_recovery("q", 0, None, seal.clone()).await.unwrap(), sealed);
             let mut paired = None;
             for single in [false, true] {
-                let mut check = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed.clone(),
+                let mut check = RecoveryPairInspector::new("q", 0, None, sealed.clone(), sealed.clone(),
                     RecoveryInspectionLimits { total_records: if single { 10 } else { 20 }, page_records: 2, page_bytes: 4096, ..Default::default() }).unwrap()
                     .with_queue_checkpoint_replay(5, Default::default(), 4096).unwrap();
                 if single { check = check.with_single_source().unwrap(); }
@@ -769,7 +763,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         assert_eq!(publish(&source, false).await, 3);
         let seal = RecoverySealRequest { transition: [9; 32], fence_epoch: 8 };
         let sealed = source.seal_replica_for_recovery("q", 0, None, seal.clone()).await.unwrap();
-        let mut check = RecoveryPairInspector::new("q", 0, None, false, sealed.clone(), sealed.clone(),
+        let mut check = RecoveryPairInspector::new("q", 0, None, sealed.clone(), sealed.clone(),
             RecoveryInspectionLimits { page_records: 2, page_bytes: 4096, ..Default::default() }).unwrap()
             .with_queue_checkpoint_replay(4, Default::default(), 4096).unwrap();
         while let Some((side, request)) = check.next_read().unwrap() {
@@ -919,7 +913,7 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
     let log = seal.history.queue_log().unwrap();
     assert_eq!((log.head, log.next), (8, 8));
     assert!(seal.history.snapshot_digest.is_some());
-    let mut check = crate::recovery_inspection::RecoveryPairInspector::new("q", 0, None, false,
+    let mut check = crate::recovery_inspection::RecoveryPairInspector::new("q", 0, None,
         seal.clone(), seal.clone(), Default::default()).unwrap().with_queue_checkpoint_replay(8, Default::default(), 4096).unwrap();
     while let Some((side, request)) = check.next_read().unwrap() {
         let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();
@@ -964,7 +958,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
     let events: Vec<_> = batch.records.into_iter().map(|(_, e)| e).collect();
     assert_eq!(events.len(), 3);
     for hard_kill in [false, true].into_iter().filter(|hard_kill| !hard_kill || cfg!(unix)) {
-        for boundary in ["intent", "messages", "events", "state", "snapshot", "complete"] {
+        for boundary in ["intent", "follower", "log_reset", "state", "snapshot", "complete"] {
             let root = dir.root.join(format!("{boundary}-{hard_kill}"));
             let mut st = open(&root).await;
             let receipt = st.prepare_queue_learner_storage("q", 0, None, binding.clone(), [4; 32]).await.unwrap();
@@ -1558,8 +1552,8 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
     drop(follower);
     for node in ["owner", "follower"] {
         let st = open(&dir.root.join(node)).await;
-        assert!(st.partition_payloads_in_event_log("q", 0, None));
-        assert!(!st.partition_payloads_in_event_log("s", 0, None));
+        assert_eq!(st.partition_kind("q", 0, None), PartitionKind::Queue);
+        assert_eq!(st.partition_kind("s", 0, None), PartitionKind::Stream);
         let q = st.queue_handle("q", 0, None).await.unwrap();
         let h = q.resolve().unwrap();
         assert!(h.has_combined_log());
