@@ -442,6 +442,11 @@ impl Stroma {
     /// Resume cursor in the single queue log for an idle follower, including
     /// one whose installed checkpoint still needs payload backfill. The cursor
     /// alone does not prove readiness. Refuses stream partitions.
+    ///
+    /// The cursor is the durable frontier, and the call refuses while any local
+    /// record is not durable yet, so a caller may report it as durable progress.
+    /// Follower appends wait for fsync and the dirty-apply fence covers an
+    /// append in flight, so the refusal is not expected in practice.
     pub async fn queue_replication_next_offset(
         &self,
         topic: &str,
@@ -458,7 +463,14 @@ impl Stroma {
                 "follower apply is incomplete or role changed".into(),
             ));
         }
-        Ok(handle.event_log().next_offset())
+        let log = handle.event_log();
+        let durable = log.durable_next();
+        if durable != log.next_offset() {
+            return Err(StromaError::InvalidArgument(
+                "follower log has records that are not durable yet".into(),
+            ));
+        }
+        Ok(durable)
     }
 
     /// A stream follower's next offsets for both logs: `(record_next,
