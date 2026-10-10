@@ -54,7 +54,7 @@ pub use stroma::{
     QueuePublishCommit, QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageSpec,
     QueueRecoveryStageReceipt, RecoveryStageLimits, RecoveryReadPage, RecoveryReadRequest,
     RecoveryReadSource, RecoveryRecord, RecoverySequentialRead, RecoverySealRequest, ReplicatedEventBatch,
-    ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, QueueLogLayout, RetainedHistoryIdentity,
+    ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, QueueLogLayout, RetainedHistoryIdentity, RetainedLog, RetainedLogs,
     PreparedQueueRecovery, PreparedStorageHistory, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma,
     StromaKeratinConfig, StromaOptions, TaskGroup,
 };

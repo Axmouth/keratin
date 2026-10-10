@@ -58,7 +58,7 @@ fn fixture(head: u64, next: u64) -> (QueueRecoveryStageSpec, Vec<u8>, Vec<Recove
             fence_epoch: 8,
             source_history: [5; 32],
             payload_log: RecoveryPayloadLog {
-                source: RecoveryReadSource::Events,
+                source: RecoveryReadSource::Log,
                 head,
                 next,
                 digest: *messages.finalize().as_bytes(),
@@ -150,9 +150,9 @@ async fn stage_resumes_without_touching_active_bound_sealed_storage() {
             None,
             PartitionKind::Queue,
             RecoveryReadRequest {
-                seal: request,
+                seal: request.clone(),
                 history_id: sealed.history.id,
-                source: RecoveryReadSource::Messages,
+                source: RecoveryReadSource::Log,
                 from: 0,
                 max_records: 10,
                 max_bytes: 1024,
@@ -160,7 +160,25 @@ async fn stage_resumes_without_touching_active_bound_sealed_storage() {
         )
         .await
         .unwrap();
-    assert_eq!((read.from, read.next, read.end), (0, 0, 0));
+    assert_eq!((read.from, read.end), (0, sealed.history.queue_log().unwrap().next));
+    assert!(
+        st.read_sealed_replica(
+            "q",
+            0,
+            None,
+            PartitionKind::Queue,
+            RecoveryReadRequest {
+                seal: request,
+                history_id: sealed.history.id,
+                source: RecoveryReadSource::StreamRecords,
+                from: 0,
+                max_records: 10,
+                max_bytes: 1024,
+            },
+        )
+        .await
+        .is_err()
+    );
     assert!(
         st.ensure_queue_owner_epoch("q", 0, None, Some(8))
             .await
@@ -283,7 +301,7 @@ async fn stage_rejects_wrong_pages_and_enforces_budget_across_resume() {
             0 => wrong.history_id = [0; 32],
             1 => wrong.end += 1,
             2 => wrong.records[0].offset += 1,
-            3 => wrong.source = RecoveryReadSource::Messages,
+            3 => wrong.source = RecoveryReadSource::StreamRecords,
             _ => wrong.snapshot_bytes.push(1),
         }
         assert!(stage.append(wrong).await.is_err());
@@ -503,7 +521,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
             RecoveryReadRequest {
                 seal: seal.clone(),
                 history_id: sealed.history.id,
-                source: RecoveryReadSource::Messages,
+                source: RecoveryReadSource::Log,
                 from: 0,
                 max_records: 10,
                 max_bytes: 1024,
@@ -511,7 +529,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         )
         .await
         .unwrap();
-    assert_eq!(old.end, 0);
+    assert_eq!(old.end, sealed.history.queue_log().unwrap().next);
     st.admit_prepared_queue_recovery(installed.clone())
         .await
         .unwrap();
@@ -574,7 +592,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
             RecoveryReadRequest {
                 seal,
                 history_id: sealed.history.id,
-                source: RecoveryReadSource::Messages,
+                source: RecoveryReadSource::Log,
                 from: 0,
                 max_records: 10,
                 max_bytes: 1024,
@@ -582,7 +600,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         )
         .await
         .unwrap();
-    assert_eq!(old.end, 0);
+    assert_eq!(old.end, sealed.history.queue_log().unwrap().next);
     let next_seal = st
         .seal_replica_for_recovery(
             "q",
@@ -595,8 +613,7 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         )
         .await
         .unwrap();
-    assert_eq!(next_seal.message_next, 0);
-    assert_eq!(next_seal.event_next, expected_event_next);
+    assert_eq!(next_seal.history.queue_log().unwrap().next, expected_event_next);
     assert_eq!(
         next_seal.history.storage_history.unwrap().binding,
         spec.binding
@@ -909,7 +926,7 @@ fn stage_descriptor_binds_source_bounds_and_complete_target() {
             4 => bad.message_head = 1,
             5 => bad.message_next = 1,
             6 => bad.event_next = 2,
-            _ => bad.payload_log.source = RecoveryReadSource::Messages,
+            _ => bad.payload_log.source = RecoveryReadSource::StreamRecords,
         }
         assert!(
             bad.validate_payload_log().is_err(),
@@ -1039,7 +1056,7 @@ async fn incremental_stage_crosses_legacy_record_and_byte_budgets() {
     let mut stage = st.open_queue_recovery_stage(spec.clone(), snapshot, RecoveryStageLimits::incremental()).await.unwrap();
     for from in (0..count).step_by(4096) {
         let next = (from + 4096).min(count);
-        stage.append(RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Events,
+        stage.append(RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Log,
             from, next, end: count, records: (from..next).map(make_record).collect(), snapshot_bytes: vec![] }).await.unwrap();
         if next == 4096 * 100 {
             drop(stage);

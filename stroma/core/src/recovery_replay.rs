@@ -5,7 +5,7 @@
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_semantics, hash_record};
-use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, StromaEvent};
+use crate::{QueueInternalState, QueueLogLayout, RecoveryReadSource, RecoveryRecord, RetainedHistoryIdentity, RetainedLog, StromaEvent};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -32,17 +32,14 @@ pub struct RecoveryPayloadLog {
     pub digest: [u8; 32],
 }
 impl RetainedHistoryIdentity {
-    pub fn payload_log(&self) -> RecoveryPayloadLog {
-        match self.log_layout {
-            QueueLogLayout::Separate => RecoveryPayloadLog {
-                source: RecoveryReadSource::Messages, head: self.message_head,
-                next: self.message_next, digest: self.message_digest,
-            },
-            QueueLogLayout::Combined => RecoveryPayloadLog {
-                source: RecoveryReadSource::Events, head: self.event_head,
-                next: self.event_next, digest: self.event_digest,
-            },
-        }
+    /// The queue log as payload coverage. None for a stream history.
+    pub fn payload_log(&self) -> Option<RecoveryPayloadLog> {
+        self.queue_log().map(|log| RecoveryPayloadLog {
+            source: RecoveryReadSource::Log,
+            head: log.head,
+            next: log.next,
+            digest: log.digest,
+        })
     }
 }
 
@@ -121,6 +118,7 @@ impl RecoveryQueueStateArtifact {
 pub(crate) struct QueueReplay {
     state: QueueInternalState,
     history: RetainedHistoryIdentity,
+    log: RetainedLog,
     target: u64,
     next: u64,
     remaining: u64,
@@ -142,10 +140,11 @@ impl QueueReplay {
         target: u64,
         limits: RecoveryReplayLimits,
     ) -> Result<Self, String> {
-        if history.event_head != 0 || history.message_head != 0 {
+        let log = *history.queue_log().ok_or("queue replay requires a queue history")?;
+        if log.head != 0 {
             return Err("recovery replay needs a proven checkpoint for compacted history".into());
         }
-        if !history.valid_version() || target > history.event_next || limits.operations_per_replica == 0 {
+        if !history.valid_version() || target > log.next || limits.operations_per_replica == 0 {
             return Err("invalid recovery replay target or operation budget".into());
         }
         let mut prefix_hash = blake3::Hasher::new();
@@ -155,6 +154,7 @@ impl QueueReplay {
         Ok(Self {
             state: QueueInternalState::new(topic.to_string(), partition),
             history,
+            log,
             target,
             next: 0,
             remaining: limits.operations_per_replica,
@@ -179,6 +179,7 @@ impl QueueReplay {
         envelope: &[u8],
     ) -> Result<Self, String> {
         // The enclosing inspector verifies the receipt's resource binding.
+        let log = *history.queue_log().ok_or("queue replay requires a queue history")?;
         if !history.valid_version() || history.snapshot_digest != Some(*blake3::hash(envelope).as_bytes()) {
             return Err("checkpoint differs from sealed snapshot digest".into());
         }
@@ -193,9 +194,9 @@ impl QueueReplay {
         if len.checked_add(28) != Some(envelope.len())
             || crc32c::crc32c(&envelope[8..envelope.len() - 4])
                 != u32::from_be_bytes(envelope[envelope.len() - 4..].try_into().unwrap())
-            || next < history.event_head
+            || next < log.head
             || next > target
-            || target > history.event_next
+            || target > log.next
         {
             return Err("checkpoint envelope or replay coverage is invalid".into());
         }
@@ -210,7 +211,7 @@ impl QueueReplay {
             .load_snapshot(&envelope[24..24 + len])
             .map_err(|e| e.to_string())?;
         if meta.last_snapshot_event_offset != next.saturating_sub(1)
-            || (history.log_layout == QueueLogLayout::Combined && state.required_message_next() > next)
+            || state.required_message_next() > next
         {
             return Err("checkpoint state/envelope boundary mismatch".into());
         }
@@ -222,6 +223,7 @@ impl QueueReplay {
         Ok(Self {
             state,
             history,
+            log,
             target,
             next,
             remaining: limits.operations_per_replica - cost,
@@ -271,8 +273,7 @@ impl QueueReplay {
             .live_ranges
             .get_or_insert_with(|| self.state.recovery_live_ranges());
         if live.contains(&record.offset) {
-            if self.history.log_layout == QueueLogLayout::Combined
-                && !matches!(decode_evidence_semantics(record), Ok(StromaEvent::PayloadEnqueue { .. }))
+            if !matches!(decode_evidence_semantics(record), Ok(StromaEvent::PayloadEnqueue { .. }))
             {
                 return Err("live payload points to a non-payload combined record".into());
             }
@@ -297,11 +298,7 @@ impl QueueReplay {
         let ev = decode_evidence_semantics(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
         let payload = matches!(ev, StromaEvent::PayloadEnqueue { .. });
-        let combined = self.history.log_layout == QueueLogLayout::Combined;
-        if payload && !combined {
-            return Err("payload-bearing event in a separate-log history".into());
-        }
-        if combined && !payload && ev.max_combined_referenced_offset().is_some_and(|off| off >= record.offset) {
+        if !payload && ev.max_combined_referenced_offset().is_some_and(|off| off >= record.offset) {
             return Err("combined recovery event has a forward payload reference".into());
         }
         let refs = ev.referenced_msg_offsets();
@@ -330,7 +327,7 @@ impl QueueReplay {
             }
             if cancel {
                 self.missing_enqueues.remove(&off);
-            } else if off >= self.history.payload_bounds().1 {
+            } else if off >= self.log.next {
                 if enqueue {
                     // Parallel log append may leave a cancelled, never-confirmed
                     // enqueue. It must be cancelled by this exact target.
@@ -400,7 +397,8 @@ impl QueueReplay {
                 ));
             }
         }
-        if combined && !payload {
+        // A state event occupies a log position that carries no payload.
+        if !payload {
             self.state.ack(record.offset);
         }
         self.check_retained_state()?;
@@ -423,7 +421,8 @@ impl QueueReplay {
             );
         }
         let (topic, partition) = self.state.recovery_resource();
-        let message_head = self.history.message_head;
+        // Queues have no separate message lane, so its head is always zero.
+        let message_head = 0;
         let (evidence, state) = self.finish_parts()?;
         let state_snapshot = state.into_recovery_snapshot(evidence.event_next);
         if state_snapshot.len() > max_bytes {
@@ -459,10 +458,8 @@ impl QueueReplay {
             ));
         }
         let required_message_next = self.state.required_message_next();
-        let (payload_head, mut payload_next) = self.history.payload_bounds();
-        if self.history.log_layout == QueueLogLayout::Combined {
-            payload_next = payload_next.min(self.target);
-        }
+        let payload_head = self.log.head;
+        let payload_next = self.log.next.min(self.target);
         if required_message_next > payload_next {
             return Err("recovery state exceeds verified payload coverage".into());
         }
@@ -488,15 +485,20 @@ impl QueueReplay {
             None
         };
         let evidence = RecoveryQueueReplayEvidence {
-            log_layout: self.history.log_layout,
-            payload_log: self.history.payload_log(),
+            log_layout: QueueLogLayout::Combined,
+            payload_log: RecoveryPayloadLog {
+                source: RecoveryReadSource::Log,
+                head: self.log.head,
+                next: self.log.next,
+                digest: self.log.digest,
+            },
             version: 2,
             event_next: self.target,
             required_message_next,
             state_digest: self.state.recovery_state_digest(),
             event_prefix_digest: *self.prefix_hash.finalize().as_bytes(),
-            message_digest: self.history.message_digest,
-            message_next: self.history.message_next,
+            message_digest: crate::stroma::empty_log_digest(),
+            message_next: 0,
             history_id: self.history.id,
             operations: self.operations,
             checkpoint_event_next: self.checkpoint_event_next,

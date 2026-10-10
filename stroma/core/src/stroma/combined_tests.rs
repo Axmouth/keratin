@@ -686,7 +686,7 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
     use crate::recovery_inspection::{RecoveryInspectionLimits, RecoveryPairInspector};
-    use crate::{RecoveryReadSource, RecoverySealRequest, QueueLogLayout};
+    use crate::{RecoveryReadSource, RecoverySealRequest};
     for snapshot in [false, true] {
         let dir = keratin_log::test_dir!("combined_recovery_cold");
         let mut st = open(&dir.root).await;
@@ -701,8 +701,7 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
         ack(&st, 3).await;
         let seal = RecoverySealRequest { transition: [9; 32], fence_epoch: 8 };
         let sealed = st.seal_replica_for_recovery("q", 0, None, seal.clone()).await.unwrap();
-        assert_eq!(sealed.history.log_layout, QueueLogLayout::Combined);
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 5));
+        assert_eq!(sealed.history.queue_log().unwrap().next, 5);
         assert_eq!(sealed.history.snapshot_digest.is_some(), snapshot);
         for cold in [false, true] {
             if cold {
@@ -723,8 +722,8 @@ async fn combined_recovery_seal_and_two_pass_reads_survive_cold_reopen() {
                 let mut repeated = [0, 0];
                 while let Some((side, request)) = check.next_read().unwrap() {
                     let i = match side { crate::recovery_inspection::RecoverySide::Left => 0, crate::recovery_inspection::RecoverySide::Right => 1 };
-                    assert_ne!(request.source, RecoveryReadSource::Messages);
-                    if request.source == RecoveryReadSource::Events && request.from == sealed.event_head { repeated[i] += 1; }
+                    assert_ne!(request.source, RecoveryReadSource::StreamRecords);
+                    if request.source == RecoveryReadSource::Log && request.from == sealed.history.queue_log().unwrap().head { repeated[i] += 1; }
                     let strict = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request.clone()).await.unwrap();
                     let (page, cursor) = st.read_sealed_replica_sequential("q", 0, None, PartitionKind::Queue, request, cursors[i].take()).await.unwrap();
                     assert_eq!(strict, page);
@@ -782,8 +781,8 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
             plan: [8; 32], topic: "q".into(), partition: 0, group: None,
             binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [4; 16], writer_session: [5; 16] },
             fence_epoch: 8, source_history: sealed.history.id,
-            payload_log: sealed.history.payload_log(), message_head: 0, message_next: 0, event_next: 4,
-            message_digest: sealed.history.message_digest, snapshot_digest: artifact.snapshot_digest(),
+            payload_log: sealed.history.payload_log().unwrap(), message_head: 0, message_next: 0, event_next: 4,
+            message_digest: crate::stroma::empty_log_digest(), snapshot_digest: artifact.snapshot_digest(),
             snapshot_bytes: artifact.state_snapshot().len() as u64,
             state_digest: artifact.evidence().lease_normalized_state_digest,
             live_payload_digest: artifact.evidence().live_payload_digest.unwrap(),
@@ -803,7 +802,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
             let mut from = 0;
             while from < spec.payload_log.next {
                 let page = source.read_sealed_replica("q", 0, None, PartitionKind::Queue, RecoveryReadRequest {
-                    seal: seal.clone(), history_id: sealed.history.id, source: RecoveryReadSource::Events,
+                    seal: seal.clone(), history_id: sealed.history.id, source: RecoveryReadSource::Log,
                     from, max_records: 2, max_bytes: 4096,
                 }).await.unwrap();
                 let next = page.next;
@@ -821,7 +820,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         let receipt = stage.finish().await.unwrap();
         assert_eq!((receipt.message_next, receipt.event_next), (0, 4));
         let page = stage.read_completed_messages(0, 10, 16384).await.unwrap();
-        assert_eq!((page.source, page.end, page.records.len()), (RecoveryReadSource::Events, 4, 4));
+        assert_eq!((page.source, page.end, page.records.len()), (RecoveryReadSource::Log, 4, 4));
         let installed = target.install_queue_recovery_stage(spec.clone(), seal.clone(), &stage).await.unwrap();
         assert!(target.queue_handle("q", 0, None).await.is_err());
         assert!(!target.msg_tp_part_dir("q", 0, None).exists());
@@ -853,7 +852,7 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         assert!(reopened.admit_prepared_queue_recovery(installed).await.is_err());
         let sealed = reopened.seal_replica_for_recovery("q", 0, None,
             RecoverySealRequest { transition: [10; 32], fence_epoch: 9 }).await.unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 5));
+        assert_eq!(sealed.history.queue_log().unwrap().next, 5);
         assert_eq!(sealed.history.storage_history.unwrap().binding, spec.binding);
         assert!(!reopened.msg_tp_part_dir("q", 0, None).exists());
         reopened.shutdown().await.unwrap();
@@ -917,7 +916,8 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
     let st = open(&dir.root).await;
     let seal = st.seal_replica_for_recovery("q", 0, None,
         RecoverySealRequest { transition: [9; 32], fence_epoch: 9 }).await.unwrap();
-    assert_eq!((seal.event_head, seal.event_next, seal.message_next), (8, 8, 0));
+    let log = seal.history.queue_log().unwrap();
+    assert_eq!((log.head, log.next), (8, 8));
     assert!(seal.history.snapshot_digest.is_some());
     let mut check = crate::recovery_inspection::RecoveryPairInspector::new("q", 0, None, false,
         seal.clone(), seal.clone(), Default::default()).unwrap().with_queue_checkpoint_replay(8, Default::default(), 4096).unwrap();
@@ -1117,7 +1117,7 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
     if seal_during_copy {
         let seal = st.seal_replica_for_recovery("q", 0, None,
             RecoverySealRequest { transition: [45; 32], fence_epoch: 8 }).await.unwrap();
-        assert_eq!((seal.message_next, seal.event_next), (0, 1));
+        assert_eq!(seal.history.queue_log().unwrap().next, 1);
     }
     view.apply_replicated_queue_batch("q", 0, None, ReplicatedEventBatch {
         epoch: 7, first_offset: 0, events, durability: Some(KDurability::AfterFsync),
@@ -1192,9 +1192,9 @@ async fn combined_reseed_sigkill_preserves_recoverable_payloads_on_either_route(
         let st = open(&dir.root).await;
         let request = RecoverySealRequest { transition: [49; 32], fence_epoch: 8 };
         let seal = st.seal_replica_for_recovery("q", 0, None, request.clone()).await.unwrap();
-        assert_eq!((seal.message_next, seal.event_next), (0, 1), "{boundary}");
+        assert_eq!(seal.history.queue_log().unwrap().next, 1, "{boundary}");
         let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, RecoveryReadRequest {
-            seal: request, history_id: seal.history.id, source: RecoveryReadSource::Events,
+            seal: request, history_id: seal.history.id, source: RecoveryReadSource::Log,
             from: 0, max_records: 8, max_bytes: 65536,
         }).await.unwrap();
         assert_eq!(page.records.len(), 1);
@@ -1591,7 +1591,7 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn combined_root_preserves_stream_preparation_and_seal_layout() {
-    use crate::{QueueLogLayout, RecoverySealRequest, StorageHistoryBinding};
+    use crate::{RecoverySealRequest, StorageHistoryBinding};
     let dir = keratin_log::test_dir!("combined_stream_preparation");
     let st = open(&dir.root).await;
     st.initialize_empty_storage_history(
@@ -1625,10 +1625,11 @@ async fn combined_root_preserves_stream_preparation_and_seal_layout() {
         )
         .await
         .unwrap();
-    assert_eq!(sealed.history.log_layout, QueueLogLayout::Separate);
     assert!(sealed.history.storage_history.as_ref().unwrap().stream);
-    assert_eq!(sealed.message_next, 1);
-    assert_eq!(sealed.event_next, 1);
+    assert!(matches!(
+        sealed.history.logs,
+        crate::RetainedLogs::Stream { records, cursor_events } if records.next == 1 && cursor_events.next == 1
+    ));
     st.shutdown().await.unwrap();
 }
 

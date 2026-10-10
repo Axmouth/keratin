@@ -678,7 +678,7 @@ mod tests {
         admit(stroma).await;
         let ticket = stroma.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
-        assert_eq!(h.message_lane_next(), 0);
+        assert!(h.optional_message_log().is_none());
         assert_eq!(h.event_log().next_offset(), 0);
         assert_eq!(h.full_debug_info().await.state.ready_count, count as usize);
         if count > 0 {
@@ -738,10 +738,10 @@ mod tests {
                 assert_ne!(renewed.storage_instance, receipt.storage_instance);
                 follower(&st).await;
                 assert_eq!(
-                    st.queue_replication_next_offsets("q", 0, None)
+                    st.queue_replication_next_offset("q", 0, None)
                         .await
                         .unwrap(),
-                    (0, 0)
+                    0
                 );
                 if count > 0 {
                     assert!(
@@ -770,10 +770,10 @@ mod tests {
                     .await
                     .unwrap();
                 assert_eq!(
-                    st.queue_replication_next_offsets("q", 0, None)
+                    st.queue_replication_next_offset("q", 0, None)
                         .await
                         .unwrap(),
-                    (0, count)
+                    count
                 );
                 st.shutdown().await.unwrap();
             }

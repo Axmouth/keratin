@@ -861,17 +861,15 @@ fn build_capsule(
     // This private replay input is not a sealed-recovery receipt. Its output is
     // used only to construct a checkpoint capsule after both physical scans.
     let history = RetainedHistoryIdentity {
-        log_layout: QueueLogLayout::Combined,
         version: 2,
         storage_history: Some(base.pin.storage.clone()),
         id: base.pin.attempt,
-        message_digest: recovery_history::empty_log_digest(),
-        event_digest: [0; 32],
         snapshot_digest: Some(*blake3::hash(&envelope).as_bytes()),
-        message_head: 0,
-        message_next: 0,
-        event_head: base.pin.applied_next.min(target.payload_head),
-        event_next: target.next,
+        logs: RetainedLogs::Queue(RetainedLog {
+            head: base.pin.applied_next.min(target.payload_head),
+            next: target.next,
+            digest: [0; 32],
+        }),
     };
     let mut replay = QueueReplay::from_checkpoint(
         &base.pin.storage.topic,

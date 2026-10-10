@@ -59,7 +59,7 @@ fn inspection_journal_reopens_tentative_pages_and_preserves_full_validation() {
     }
     assert_eq!(fetched, 2); // live verification reuses the same sealed pages
     let restored = check.finish_with_queue_artifacts(4096).unwrap();
-    let direct = drive_checkpoints(make_check(), [[&[], &records], [&[], &records]], [&[], &[]])
+    let direct = drive_checkpoints(make_check(), [&records, &records], [&[], &[]])
         .unwrap()
         .finish_with_queue_artifacts(4096)
         .unwrap();

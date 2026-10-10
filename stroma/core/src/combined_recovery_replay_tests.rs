@@ -1,21 +1,6 @@
 // Uses the same sealed-page helpers as the ordinary recovery inspector tests.
 fn combined_seal(head: u64, records: &[RecoveryRecord]) -> SealedReplicaFrontiers {
-    let mut source = seal(0, &[], head, records);
-    source.history.log_layout = QueueLogLayout::Combined;
-    source.history.version = 2;
-    source.history.storage_history = Some(crate::PreparedStorageHistory {
-        topic: "q".into(), partition: 0, group: None, stream: false,
-        binding: crate::StorageHistoryBinding {
-            resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16],
-        },
-        storage_instance: [4; 16],
-    });
-    source.history.id = [0; 32];
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"fibril-retained-history-v1\0");
-    hash.update(&rmp_serde::to_vec_named(&("q", 0u32, None::<&str>, false, &source.history)).unwrap());
-    source.history.id = *hash.finalize().as_bytes();
-    source
+    seal(head, records)
 }
 fn payload_event(not_before: Option<u64>) -> StromaEvent {
     StromaEvent::PayloadEnqueue {
@@ -53,14 +38,14 @@ fn combined_recovery_replays_sparse_payloads_timers_and_settlement() {
     expected.enqueue(0, 1, Some(1000));
     for off in [2, 3, 4, 5, 7, 8] { expected.ack(off); }
     let check = combined_inspector(&ev, RecoveryInspectionLimits { page_records: 2, ..Default::default() });
-    let done = drive_checkpoints(check, [[&[], &ev], [&[], &ev]], [&[], &[]]).unwrap();
+    let done = drive_checkpoints(check, [&ev, &ev], [&[], &[]]).unwrap();
     let (report, [a, b]) = done.finish_with_queue_artifacts(4096).unwrap();
     assert_eq!(a, b);
     assert_eq!(report.messages.left_range, (0, 0));
     assert_eq!(report.records, 4 * ev.len() as u64); // two bounded passes per replica
-    assert_eq!(a.evidence().log_layout, QueueLogLayout::Combined);
+    assert_eq!(a.evidence().log_layout, crate::QueueLogLayout::Combined);
     assert_eq!(a.evidence().message_next, 0); // physical compatibility lane
-    assert_eq!(a.evidence().payload_log.source, RecoveryReadSource::Events);
+    assert_eq!(a.evidence().payload_log.source, RecoveryReadSource::Log);
     assert_eq!(a.evidence().payload_log.next, ev.len() as u64);
     assert_eq!(a.evidence().state_digest, expected.recovery_state_digest());
     let mut hash = blake3::Hasher::new();
@@ -84,7 +69,7 @@ fn combined_recovery_keeps_old_live_payload_across_compacted_checkpoints() {
     let sources = [checkpoint_seal(combined_seal(0, &ev), &snapshots[0]), checkpoint_seal(combined_seal(2, &ev[2..]), &snapshots[1])];
     let check = inspector(sources[0].clone(), sources[1].clone(), Default::default())
         .with_queue_checkpoint_replay(7, Default::default(), 4096).unwrap();
-    let report = run_checkpoints(check, [[&[], &ev], [&[], &ev[2..]]], [&snapshots[0], &snapshots[1]]).unwrap();
+    let report = run_checkpoints(check, [&ev, &ev[2..]], [&snapshots[0], &snapshots[1]]).unwrap();
     let [left, right] = report.queue_replay.unwrap();
     assert_eq!(left.state_digest, right.state_digest);
     assert_eq!(left.live_payload_digest, right.live_payload_digest);
@@ -97,7 +82,7 @@ fn combined_recovery_keeps_old_live_payload_across_compacted_checkpoints() {
 fn combined_recovery_rejects_forward_references_and_nonpayload_live_positions() {
     for forward in [StromaEvent::Ack { off: 2 }, StromaEvent::CancelEnqueueMany { offs: vec![2] }] {
         let ev = events(vec![payload_event(None), forward, payload_event(None)]);
-        let error = drive_checkpoints(combined_inspector(&ev, Default::default()), [[&[], &ev], [&[], &ev]], [&[], &[]]).err().unwrap();
+        let error = drive_checkpoints(combined_inspector(&ev, Default::default()), [&ev, &ev], [&[], &[]]).err().unwrap();
         assert!(error.contains("forward payload reference"));
     }
     let ev = events(vec![payload_event(None), StromaEvent::Ack { off: 0 }]);
@@ -106,7 +91,7 @@ fn combined_recovery_rejects_forward_references_and_nonpayload_live_positions() 
     let snap = checkpoint_envelope(&bad, 2);
     let source = checkpoint_seal(combined_seal(0, &ev), &snap);
     let check = inspector(source.clone(), source, Default::default()).with_queue_checkpoint_replay(2, Default::default(), 4096).unwrap();
-    let error = drive_checkpoints(check, [[&[], &ev], [&[], &ev]], [&snap, &snap]).err().unwrap();
+    let error = drive_checkpoints(check, [&ev, &ev], [&snap, &snap]).err().unwrap();
     assert!(error.contains("non-payload combined record"));
 }
 
@@ -114,13 +99,13 @@ fn combined_recovery_rejects_forward_references_and_nonpayload_live_positions() 
 fn combined_recovery_payload_pass_is_budgeted_and_digest_checked() {
     let ev = events(vec![payload_event(None)]);
     let check = combined_inspector(&ev, RecoveryInspectionLimits { total_records: 2, ..Default::default() });
-    assert!(drive_checkpoints(check, [[&[], &ev], [&[], &ev]], [&[], &[]]).is_err());
+    assert!(drive_checkpoints(check, [&ev, &ev], [&[], &[]]).is_err());
     let mut check = combined_inspector(&ev, Default::default());
     let mut corrupted = false;
     while let Some((side, request)) = check.next_read().unwrap() {
-        assert_eq!(request.source, RecoveryReadSource::Events);
+        assert_eq!(request.source, RecoveryReadSource::Log);
         let mut reply = page(&request, &ev, 1);
-        if check.logs.iter().all(|l| l.next_side().is_none()) && !corrupted {
+        if check.log.next_side().is_none() && !corrupted {
             let mut changed = payload_event(None);
             if let StromaEvent::PayloadEnqueue { payload, .. } = &mut changed { payload[0] ^= 1; }
             reply.records[0].payload = changed.encode().unwrap(); corrupted = true;
@@ -220,11 +205,11 @@ fn incremental_inspection_separates_historical_work_from_retained_state() {
     let source = combined_seal(0, &records);
     let make = || inspector(source.clone(), source.clone(), limits)
         .with_queue_checkpoint_replay(records.len() as u64, RecoveryReplayLimits { operations_per_replica: 2 }, 4096).unwrap();
-    assert!(drive_checkpoints(make().with_single_source().unwrap(), [[&[], &records], [&[], &records]], [&[], &[]]).is_err());
+    assert!(drive_checkpoints(make().with_single_source().unwrap(), [&records, &records], [&[], &[]]).is_err());
     let incremental = drive_checkpoints(make().with_incremental_work(4).unwrap().with_single_source().unwrap(),
-        [[&[], &records], [&[], &records]], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
+        [&records, &records], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
     let direct = drive_checkpoints(combined_inspector(&records, Default::default()).with_single_source().unwrap(),
-        [[&[], &records], [&[], &records]], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
+        [&records, &records], [&[], &[]]).unwrap().finish_with_queue_artifacts(4096).unwrap();
     assert_eq!(incremental.1, direct.1);
     assert_eq!(incremental.0.records, direct.0.records);
     assert_eq!(incremental.0.bytes, direct.0.bytes);
@@ -232,7 +217,7 @@ fn incremental_inspection_separates_historical_work_from_retained_state() {
 
     let growing = events((0..20).map(|_| payload_event(Some(1000))).collect());
     let check = combined_inspector(&growing, Default::default()).with_incremental_work(4).unwrap().with_single_source().unwrap();
-    let error = drive_checkpoints(check, [[&[], &growing], [&[], &growing]], [&[], &[]]).err().unwrap();
+    let error = drive_checkpoints(check, [&growing, &growing], [&[], &[]]).err().unwrap();
     assert_eq!(crate::recovery_budget::RecoveryBudgetExceeded::from_message(&error).unwrap().budget,
         crate::recovery_budget::RecoveryBudget::ReplayStateEntries);
 }
@@ -247,14 +232,10 @@ fn incremental_inspection_crosses_legacy_history_budgets() {
         StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![42; 256] }
     } else { StromaEvent::Ack { off: offset - 1 } }.encode().unwrap() };
     let mut source = combined_seal(0, &[]);
-    source.event_next = count; source.history.event_next = count;
     let mut hash = Cursor::new(0, count, [0; 32]).hash;
     for offset in 0..count { hash_record(&mut hash, &record(offset)); }
-    source.history.event_digest = *hash.finalize().as_bytes();
-    source.history.id = [0; 32];
-    let mut hash = blake3::Hasher::new(); hash.update(b"fibril-retained-history-v1\0");
-    hash.update(&rmp_serde::to_vec_named(&("q", 0u32, None::<&str>, false, &source.history)).unwrap());
-    source.history.id = *hash.finalize().as_bytes();
+    source.history.logs = crate::RetainedLogs::Queue(RetainedLog { head: 0, next: count, digest: *hash.finalize().as_bytes() });
+    source.history.id = source.history.compute_id("q", 0, None, false).unwrap();
     let make = || inspector(source.clone(), source.clone(), RecoveryInspectionLimits {
         page_records: 4096, page_bytes: 16*1024*1024, ..Default::default()
     }).with_queue_checkpoint_replay(count, Default::default(), 4096).unwrap();

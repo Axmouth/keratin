@@ -11,6 +11,18 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- Recovery evidence names its physical logs by resource kind.
+  `RetainedHistoryIdentity` carries `logs: RetainedLogs`, either one queue
+  log or a stream record log plus a cursor event log, and the variant is part
+  of the history id. The id tag moves to `fibril-retained-history-v2`.
+  `SealedReplicaFrontiers` is `{ request, history }` and bounds come from the
+  history. The seal intent records one fencing epoch for a queue and two for
+  a stream. `RecoveryReadSource` is `StreamRecords`, `Log` or `Snapshot`, and
+  a queue history refuses `StreamRecords` instead of returning an empty page.
+  Recovery inspection and replay accept queue histories only. History receipt
+  and seal intent files use new headers, so seals from earlier builds are
+  refused.
+
 - Agreed queue checkpoints describe one log. Pins carry one epoch, the
   applied boundary, the payload floor and the physical log tail. Targets and
   contents carry `next` and `payload_head`, and the payload digest replaces

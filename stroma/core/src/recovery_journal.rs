@@ -170,11 +170,11 @@ impl RecoveryInspectionJournal {
                 page.snapshot_bytes.len() as u64
             }
             source => {
-                let (head, end) = if source == RecoveryReadSource::Events {
-                    (h.event_head, h.event_next)
-                } else {
-                    (h.message_head, h.message_next)
-                };
+                let log = h
+                    .logs
+                    .for_source(source)
+                    .ok_or_else(|| invalid("inspection journal source names no sealed log"))?;
+                let (head, end) = (log.head, log.next);
                 if page.from < head
                     || page.end != end
                     || !page.snapshot_bytes.is_empty()

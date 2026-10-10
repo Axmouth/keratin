@@ -9,9 +9,21 @@ const MAX_PAGE_RECORDS: u32 = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RecoveryReadSource {
-    Messages,
-    Events,
+    /// Stream record log. Refused for queue histories, so a caller bug can
+    /// never mistake an empty page for verified payload coverage.
+    StreamRecords,
+    /// The queue log, or the stream cursor-commit event log.
+    Log,
     Snapshot,
+}
+impl RecoveryReadSource {
+    /// Index into `[record log root, event log root]` for a log source.
+    fn root_index(self) -> usize {
+        match self {
+            Self::StreamRecords => 0,
+            Self::Log | Self::Snapshot => 1,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -71,28 +83,20 @@ impl RecoverySequentialRead {
         request: &RecoveryReadRequest,
         page: &mut RecoveryReadPage,
     ) -> Result<()> {
-        let (head, end, digest) = match request.source {
-            RecoveryReadSource::Messages => (
-                self.history.message_head,
-                self.history.message_next,
-                self.history.message_digest,
-            ),
-            RecoveryReadSource::Events => (
-                self.history.event_head,
-                self.history.event_next,
-                self.history.event_digest,
-            ),
-            RecoveryReadSource::Snapshot => {
-                return Err(invalid("snapshot is not a sequential log"));
-            }
-        };
-        // A completed combined event scan can restart at its retained head for
+        if request.source == RecoveryReadSource::Snapshot {
+            return Err(invalid("snapshot is not a sequential log"));
+        }
+        let RetainedLog { head, next: end, digest } = *self
+            .history
+            .logs
+            .for_source(request.source)
+            .ok_or_else(|| invalid("read source names no log in this history"))?;
+        // A completed queue log scan can restart at its retained head for
         // live-payload verification. No incomplete scan may rewind.
-        let repeat_combined = self.history.log_layout == QueueLogLayout::Combined
-            && request.source == RecoveryReadSource::Events
+        let repeat_queue = self.history.queue_log().is_some()
             && self.next == self.end
             && request.from == head;
-        if self.source != Some(request.source) || repeat_combined {
+        if self.source != Some(request.source) || repeat_queue {
             if self.source.is_some() && self.next != self.end {
                 return Err(invalid("previous sequential log is incomplete"));
             }
@@ -306,11 +310,9 @@ impl Stroma {
                     }
                     Some(logs)
                 } else {
-                    for (index, root) in roots.iter().enumerate() {
-                        if index == 0 && history.log_layout == QueueLogLayout::Combined {
-                            continue;
-                        }
-                        cold_locks.push(lock_existing_log(root).map_err(io_err)?);
+                    for (source, _) in history.logs.sources() {
+                        cold_locks
+                            .push(lock_existing_log(&roots[source.root_index()]).map_err(io_err)?);
                     }
                     None
                 };
@@ -358,39 +360,22 @@ impl Stroma {
                     records: vec![],
                     snapshot_bytes: vec![],
                 };
+                if request.source != RecoveryReadSource::Snapshot
+                    && history.logs.for_source(request.source).is_none()
+                {
+                    return Err(invalid("read source names no log in this history"));
+                }
                 if sequential {
-                    if request.source == RecoveryReadSource::Messages
-                        && history.log_layout == QueueLogLayout::Combined
-                    {
-                        if request.from != 0 {
-                            return Err(invalid("combined message lane cursor must be zero"));
-                        }
-                    } else if request.source != RecoveryReadSource::Snapshot {
-                        let index = if request.source == RecoveryReadSource::Messages {
-                            0
-                        } else {
-                            1
-                        };
-                        cursor
-                            .as_mut()
-                            .unwrap()
-                            .read_log(&roots[index], &request, &mut page)?;
+                    if request.source != RecoveryReadSource::Snapshot {
+                        cursor.as_mut().unwrap().read_log(
+                            &roots[request.source.root_index()],
+                            &request,
+                            &mut page,
+                        )?;
                     }
                 } else {
-                    for (index, (head, end, digest)) in [
-                        (
-                            history.message_head,
-                            history.message_next,
-                            history.message_digest,
-                        ),
-                        (history.event_head, history.event_next, history.event_digest),
-                    ]
-                    .into_iter()
-                    .enumerate()
-                    {
-                        let selected = (index == 0
-                            && request.source == RecoveryReadSource::Messages)
-                            || (index == 1 && request.source == RecoveryReadSource::Events);
+                    for (source, &RetainedLog { head, next: end, digest }) in history.logs.sources() {
+                        let selected = source == request.source;
                         if selected {
                             if request.from < head || request.from > end {
                                 return Err(invalid(
@@ -399,11 +384,8 @@ impl Stroma {
                             }
                             page.end = end;
                         }
-                        if index == 0 && history.log_layout == QueueLogLayout::Combined {
-                            continue;
-                        }
                         let reader = FrozenLogReader::open(
-                            &roots[index],
+                            &roots[source.root_index()],
                             request.seal.fence_epoch,
                             head,
                             end,
@@ -648,7 +630,7 @@ mod tests {
         RecoveryReadRequest {
             seal,
             history_id: sealed.history.id,
-            source: RecoveryReadSource::Events,
+            source: RecoveryReadSource::Log,
             from: 0,
             max_records: 2,
             max_bytes: 300,
@@ -692,7 +674,7 @@ mod tests {
         request.max_bytes = 150; // one message fits; the next becomes bounded pending scratch
         let mut cursor = None;
         let before = files(&dir.root);
-        for source in [RecoveryReadSource::Messages, RecoveryReadSource::Events] {
+        for source in [RecoveryReadSource::Log] {
             request.source = source;
             request.from = 0;
             loop {
@@ -711,6 +693,26 @@ mod tests {
         assert_eq!(files(&dir.root), before);
         drop(cursor);
         assert_eq!(s.recovery_stream_slots.available_permits(), 2);
+        s.shutdown().await.unwrap();
+    }
+
+    /// A queue history has no stream record log. Asking for one is an error,
+    /// never an empty page that could pass as verified payload coverage.
+    #[tokio::test]
+    async fn queue_history_refuses_stream_record_reads() {
+        let dir = test_dir!("queue_refuses_stream_records");
+        let s = populate(&dir.root).await;
+        let mut request = seal(&s).await;
+        request.source = RecoveryReadSource::StreamRecords;
+        assert!(read(&s, request.clone()).await.is_err());
+        assert!(sequential(&s, request.clone(), None).await.is_err());
+        request.source = RecoveryReadSource::Log;
+        let (page, cursor) = sequential(&s, request.clone(), None).await.unwrap();
+        let mut bad = request.clone();
+        bad.source = RecoveryReadSource::StreamRecords;
+        bad.from = 0;
+        assert!(sequential(&s, bad, cursor).await.is_err());
+        assert!(page.next > 0);
         s.shutdown().await.unwrap();
     }
 
@@ -734,7 +736,7 @@ mod tests {
                 0 => bad.from = request.from,
                 1 => bad.from += 1,
                 2 => {
-                    bad.source = RecoveryReadSource::Messages;
+                    bad.source = RecoveryReadSource::StreamRecords;
                     bad.from = 0;
                 }
                 3 => bad.history_id[0] ^= 1,
@@ -955,7 +957,7 @@ mod tests {
                 fence_epoch: 8,
             },
             history_id: [0; 32],
-            source: RecoveryReadSource::Events,
+            source: RecoveryReadSource::Log,
             from: 0,
             max_records: 1,
             max_bytes: 300,
@@ -1184,7 +1186,7 @@ mod tests {
         let request = RecoveryReadRequest {
             seal,
             history_id: sealed.history.id,
-            source: RecoveryReadSource::Messages,
+            source: RecoveryReadSource::StreamRecords,
             from: 0,
             max_records: 2,
             max_bytes: 1024,

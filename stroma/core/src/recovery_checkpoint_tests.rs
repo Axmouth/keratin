@@ -11,12 +11,8 @@ fn checkpoint_envelope(state: &crate::QueueInternalState, next: u64) -> Vec<u8> 
 
 #[test]
 fn delayed_timer_history_replays_from_different_checkpoints_without_local_clock() {
-    let msg = messages(0, 1);
-    let ev = events(vec![
-        StromaEvent::EnqueueDelayed {
-            off: 0,
-            not_before: 100,
-        },
+    let log = events(vec![
+        payload(Some(100), None, 1),
         StromaEvent::ActivateDelayed { now: 100, max: 10 },
         StromaEvent::NackMany {
             reqs: vec![crate::NackEventMeta {
@@ -31,29 +27,29 @@ fn delayed_timer_history_replays_from_different_checkpoints_without_local_clock(
     a.enqueue_delayed(0, 100);
     let mut b = a.clone();
     b.activate_delayed(100, 10);
+    b.ack(1);
     b.mark_inflight(0, 300); // owner-local delivery
     b.nack_at(0, true, Some(500));
+    b.ack(2);
     let snapshots = [checkpoint_envelope(&a, 1), checkpoint_envelope(&b, 3)];
     for target in [3, 4] {
+        // The delayed payload at offset zero stays live, so neither side can
+        // compact past it. The two sides differ only in their checkpoints.
         let seals = [
-            checkpoint_seal(seal(0, &msg, 1, &ev[1..]), &snapshots[0]),
-            checkpoint_seal(seal(0, &msg, 3, &ev[3..]), &snapshots[1]),
+            checkpoint_seal(seal(0, &log), &snapshots[0]),
+            checkpoint_seal(seal(0, &log), &snapshots[1]),
         ];
         let pair = inspector(seals[0].clone(), seals[1].clone(), Default::default())
             .with_queue_checkpoint_replay(target, Default::default(), 4096)
             .unwrap();
-        let report = run_checkpoints(
-            pair,
-            [[&msg, &ev[1..]], [&msg, &ev[3..]]],
-            [&snapshots[0], &snapshots[1]],
-        )
-        .unwrap();
+        let report = run_checkpoints(pair, [&log, &log], [&snapshots[0], &snapshots[1]]).unwrap();
         let [left, right] = report.queue_replay.unwrap();
         assert_eq!(left.state_digest, right.state_digest);
         assert_eq!(left.live_payload_digest, right.live_payload_digest);
         let mut expected = b.clone();
         if target == 4 {
             expected.activate_delayed(500, 10);
+            expected.ack(3);
         }
         assert_eq!(left.state_digest, expected.recovery_state_digest());
         assert_eq!(expected.get_retries(0), 1);
@@ -64,19 +60,13 @@ fn delayed_timer_history_replays_from_different_checkpoints_without_local_clock(
 
 fn checkpoint_seal(mut seal: SealedReplicaFrontiers, snapshot: &[u8]) -> SealedReplicaFrontiers {
     seal.history.snapshot_digest = Some(*blake3::hash(snapshot).as_bytes());
-    seal.history.id = [0; 32];
-    let mut hash = blake3::Hasher::new();
-    hash.update(b"fibril-retained-history-v1\0");
-    hash.update(
-        &rmp_serde::to_vec_named(&("q", 0u32, None::<&str>, false, &seal.history)).unwrap(),
-    );
-    seal.history.id = *hash.finalize().as_bytes();
+    seal.history.id = seal.history.compute_id("q", 0, None, false).unwrap();
     seal
 }
 
 fn drive_checkpoints(
     mut inspector: RecoveryPairInspector,
-    data: [[&[RecoveryRecord]; 2]; 2],
+    data: [&[RecoveryRecord]; 2],
     snapshots: [&[u8]; 2],
 ) -> Result<RecoveryPairInspector, String> {
     while let Some((side, request)) = inspector.next_read()? {
@@ -95,8 +85,8 @@ fn drive_checkpoints(
                 snapshot_bytes: bytes[request.from as usize..next as usize].to_vec(),
             }
         } else {
-            let log = usize::from(request.source == RecoveryReadSource::Events);
-            page(&request, data[i][log], inspector.logs[log].cursors[i].end)
+            assert_eq!(request.source, RecoveryReadSource::Log);
+            page(&request, data[i], inspector.log.cursors[i].end)
         };
         inspector.accept_page(side, response)?;
     }
@@ -105,7 +95,7 @@ fn drive_checkpoints(
 
 fn run_checkpoints(
     inspector: RecoveryPairInspector,
-    data: [[&[RecoveryRecord]; 2]; 2],
+    data: [&[RecoveryRecord]; 2],
     snapshots: [&[u8]; 2],
 ) -> Result<RecoveryPairInspection, String> {
     drive_checkpoints(inspector, data, snapshots)?.finish()
@@ -118,12 +108,19 @@ fn verified_queue_artifact_preserves_state_and_is_bound_to_complete_payload_evid
     state.mark_inflight(0, 300);
     state.enqueue_delayed(1, 500);
     let snapshot = checkpoint_envelope(&state, 4);
-    let msg = messages(0, 2);
-    let source = checkpoint_seal(seal(0, &msg, 4, &[]), &snapshot);
+    // Live payloads 0 and 1 must be payload records. The checkpoint covers
+    // the two state records after them.
+    let msg = events(vec![
+        payload(None, Some(900), 1),
+        payload(Some(500), None, 2),
+        StromaEvent::MarkInflight { off: 0, deadline: 300 },
+        StromaEvent::Ack { off: 0 },
+    ]);
+    let source = checkpoint_seal(seal(0, &msg), &snapshot);
     let build = || inspector(source.clone(), source.clone(), Default::default())
         .with_queue_checkpoint_replay(4, Default::default(), 4096).unwrap();
     assert!(build().finish_with_queue_artifacts(4096).is_err()); // incomplete reads
-    let transferred = || drive_checkpoints(build(), [[&msg, &[]], [&msg, &[]]], [&snapshot, &snapshot]).unwrap();
+    let transferred = || drive_checkpoints(build(), [&msg, &msg], [&snapshot, &snapshot]).unwrap();
     assert!(transferred().finish_with_queue_artifacts(0).is_err());
     assert!(transferred().finish_with_queue_artifacts(1).is_err());
     let (report, [left, right]) = transferred().finish_with_queue_artifacts(4096).unwrap();
@@ -146,12 +143,12 @@ fn verified_queue_artifact_preserves_state_and_is_bound_to_complete_payload_evid
 
 #[test]
 fn artifacts_require_live_payload_verification_even_when_plain_replay_succeeds() {
-    let build = || inspector(seal(0, &[], 0, &[]), seal(0, &[], 0, &[]), Default::default());
+    let build = || inspector(seal(0, &[]), seal(0, &[]), Default::default());
     let unchecked = build().with_queue_replay(0, Default::default()).unwrap();
-    let unchecked = drive_checkpoints(unchecked, [[&[], &[]], [&[], &[]]], [&[], &[]]).unwrap();
+    let unchecked = drive_checkpoints(unchecked, [&[], &[]], [&[], &[]]).unwrap();
     assert!(unchecked.finish_with_queue_artifacts(4096).is_err());
     let checked = build().with_queue_checkpoint_replay(0, Default::default(), 4096).unwrap();
-    let checked = drive_checkpoints(checked, [[&[], &[]], [&[], &[]]], [&[], &[]]).unwrap();
+    let checked = drive_checkpoints(checked, [&[], &[]], [&[], &[]]).unwrap();
     let (_, [artifact, _]) = checked.finish_with_queue_artifacts(4096).unwrap();
     assert_eq!(artifact.evidence().event_next, 0);
     assert_eq!(artifact.evidence().required_message_next, 0);
@@ -159,60 +156,45 @@ fn artifacts_require_live_payload_verification_even_when_plain_replay_succeeds()
 
 #[test]
 fn unequal_checkpoints_preserve_retry_count_and_compare_live_payloads_and_lease_projection() {
-    let msg = messages(0, 3);
-    let events = events(vec![
-        StromaEvent::Enqueue {
-            off: 0,
-            retries: 0,
-            expire_at: None,
-        },
-        StromaEvent::Enqueue {
-            off: 1,
-            retries: 0,
-            expire_at: Some(900),
-        },
+    let log = events(vec![
+        payload(None, None, 1),
+        payload(None, Some(900), 2),
         StromaEvent::Ack { off: 0 },
         StromaEvent::Nack {
             off: 1,
             requeue: true,
         },
-        StromaEvent::Enqueue {
-            off: 2,
-            retries: 0,
-            expire_at: None,
-        },
+        payload(None, None, 3),
     ]);
     let mut a = crate::QueueInternalState::new("q".into(), 0);
     a.enqueue(0, 0, None);
     a.enqueue(1, 0, Some(900));
     a.ack(0);
+    a.ack(2);
     a.mark_inflight(1, 500);
     let mut b = a.clone();
     b.nack(1, true);
-    b.enqueue(2, 0, None);
-    b.mark_inflight(2, 700);
+    b.ack(3);
+    b.enqueue(4, 0, None);
+    b.mark_inflight(4, 700);
     let snapshots = [checkpoint_envelope(&a, 3), checkpoint_envelope(&b, 5)];
+    // The right side compacted the settled payload at offset zero.
     let seals = [
-        checkpoint_seal(seal(0, &msg, 3, &events[3..]), &snapshots[0]),
-        checkpoint_seal(seal(1, &msg[1..], 5, &[]), &snapshots[1]),
+        checkpoint_seal(seal(0, &log), &snapshots[0]),
+        checkpoint_seal(seal(1, &log[1..]), &snapshots[1]),
     ];
     let pair = inspector(
         seals[0].clone(),
         seals[1].clone(),
         RecoveryInspectionLimits {
             page_records: 1,
-            page_bytes: 45,
+            page_bytes: 128,
             ..Default::default()
         },
     )
     .with_queue_checkpoint_replay(5, Default::default(), 4096)
     .unwrap();
-    let report = run_checkpoints(
-        pair,
-        [[&msg, &events[3..]], [&msg[1..], &[]]],
-        [&snapshots[0], &snapshots[1]],
-    )
-    .unwrap();
+    let report = run_checkpoints(pair, [&log, &log[1..]], [&snapshots[0], &snapshots[1]]).unwrap();
     assert!(
         report
             .remaining_proofs
@@ -227,26 +209,27 @@ fn unequal_checkpoints_preserve_retry_count_and_compare_live_payloads_and_lease_
         right.lease_normalized_state_digest
     );
     assert_eq!(left.live_payload_digest, right.live_payload_digest);
-    assert_ne!(left.message_digest, right.message_digest); // obsolete payload zero
+    assert_ne!(left.payload_log.digest, right.payload_log.digest); // obsolete payload zero
+    assert_eq!((left.payload_log.head, right.payload_log.head), (0, 1));
     assert_ne!(left.event_prefix_digest, right.event_prefix_digest); // different starts
 }
 
 #[test]
 fn same_checkpoint_state_does_not_hide_changed_live_payload_or_missing_payload() {
     let mut state = crate::QueueInternalState::new("q".into(), 0);
+    state.ack(0);
     state.enqueue(1, 0, None);
-    let snapshot = checkpoint_envelope(&state, 1);
-    let msg = messages(1, 2);
-    let mut changed = msg.clone();
-    changed[0].payload.push(9);
+    let snapshot = checkpoint_envelope(&state, 2);
+    let log = events_at(1, vec![payload(None, None, 1)]);
+    let changed = events_at(1, vec![payload(None, None, 2)]);
     for right in [&changed[..], &[][..]] {
         let right_head = if right.is_empty() { 2 } else { 1 };
-        let a = checkpoint_seal(seal(1, &msg, 1, &[]), &snapshot);
-        let b = checkpoint_seal(seal(right_head, right, 1, &[]), &snapshot);
+        let a = checkpoint_seal(seal(1, &log), &snapshot);
+        let b = checkpoint_seal(seal(right_head, right), &snapshot);
         let pair = inspector(a, b, Default::default())
-            .with_queue_checkpoint_replay(1, Default::default(), 4096)
+            .with_queue_checkpoint_replay(2, Default::default(), 4096)
             .unwrap();
-        let report = run_checkpoints(pair, [[&msg, &[]], [right, &[]]], [&snapshot, &snapshot]);
+        let report = run_checkpoints(pair, [&log, right], [&snapshot, &snapshot]);
         if right.is_empty() {
             assert!(report.unwrap_err().contains("coverage"));
         } else {
@@ -291,7 +274,7 @@ fn checkpoint_replay_rejects_legacy_boundary_tampering_missing_suffix_and_budget
         if case == 4 {
             max_bytes = 28;
         }
-        let sealed = checkpoint_seal(seal(0, &[], target, &[]), &snapshot);
+        let sealed = checkpoint_seal(seal(target, &[]), &snapshot);
         if case == 5 {
             snapshot[24] ^= 1;
         } // tampered bytes after sealing
@@ -299,7 +282,7 @@ fn checkpoint_replay_rejects_legacy_boundary_tampering_missing_suffix_and_budget
             .with_queue_checkpoint_replay(target, replay_limits, max_bytes)
             .unwrap();
         assert!(
-            run_checkpoints(pair, [[&[], &[]], [&[], &[]]], [&snapshot, &snapshot]).is_err(),
+            run_checkpoints(pair, [&[], &[]], [&snapshot, &snapshot]).is_err(),
             "case {case}"
         );
     }

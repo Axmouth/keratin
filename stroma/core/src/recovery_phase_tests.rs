@@ -22,7 +22,7 @@ fn completed_phase_fixture() -> (
     };
     let mut inspector = recipe.inspector().unwrap();
     while let Some((side, request)) = inspector.next_read().unwrap() {
-        let records = if request.source == RecoveryReadSource::Events {
+        let records = if request.source == RecoveryReadSource::Log {
             records[request.from as usize..].to_vec()
         } else {
             vec![]
@@ -35,7 +35,7 @@ fn completed_phase_fixture() -> (
                     source: request.source,
                     from: request.from,
                     next: request.from + records.len() as u64,
-                    end: if request.source == RecoveryReadSource::Events {
+                    end: if request.source == RecoveryReadSource::Log {
                         3
                     } else {
                         0
@@ -150,7 +150,7 @@ fn completed_comparison_persists_without_granting_state_artifact() {
     ]);
     let mut inspector = recipe.inspector().unwrap();
     while let Some((side, request)) = inspector.next_read().unwrap() {
-        let rs = if request.source == RecoveryReadSource::Events {
+        let rs = if request.source == RecoveryReadSource::Log {
             records[request.from as usize..].to_vec()
         } else {
             vec![]
@@ -163,7 +163,7 @@ fn completed_comparison_persists_without_granting_state_artifact() {
                     source: request.source,
                     from: request.from,
                     next: request.from + rs.len() as u64,
-                    end: if request.source == RecoveryReadSource::Events {
+                    end: if request.source == RecoveryReadSource::Log {
                         3
                     } else {
                         0

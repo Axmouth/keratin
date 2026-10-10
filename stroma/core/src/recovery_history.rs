@@ -5,7 +5,10 @@
 use super::*;
 use std::io::Write;
 
-const MAGIC: &[u8; 8] = b"RHIST\0\0\x01";
+const MAGIC: &[u8; 8] = b"RHIST\0\0\x02";
+/// Domain tag of the retained history id. Bump it whenever the identity
+/// layout changes so an old id never verifies under a new meaning.
+const HISTORY_ID_TAG: &[u8] = b"fibril-retained-history-v2\0";
 
 /// Physical queue layout bound into recovery evidence. Empty separate queues
 /// remain distinct from a queue whose payloads live in the event records.
@@ -22,24 +25,75 @@ impl QueueLogLayout {
     }
 }
 
+/// Retained bounds and content digest of one physical log.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct RetainedLog {
+    pub head: u64,
+    pub next: u64,
+    pub digest: [u8; 32],
+}
+
+/// Physical logs bound into recovery evidence. The variant is part of the
+/// history identity, so a queue history can never be read as a stream one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RetainedLogs {
+    /// One log carrying payloads and state events.
+    Queue(RetainedLog),
+    /// Record log and cursor-commit event log.
+    Stream {
+        records: RetainedLog,
+        cursor_events: RetainedLog,
+    },
+}
+impl RetainedLogs {
+    pub fn is_stream(&self) -> bool {
+        matches!(self, Self::Stream { .. })
+    }
+
+    /// Log answering a read source. `StreamRecords` names no log in a queue
+    /// history and `Snapshot` is not a log.
+    pub fn for_source(&self, source: RecoveryReadSource) -> Option<&RetainedLog> {
+        match (self, source) {
+            (Self::Queue(log), RecoveryReadSource::Log) => Some(log),
+            (Self::Stream { records, .. }, RecoveryReadSource::StreamRecords) => Some(records),
+            (Self::Stream { cursor_events, .. }, RecoveryReadSource::Log) => Some(cursor_events),
+            _ => None,
+        }
+    }
+
+    /// Every retained log with its read source, record log first.
+    pub fn sources(&self) -> Vec<(RecoveryReadSource, &RetainedLog)> {
+        match self {
+            Self::Queue(log) => vec![(RecoveryReadSource::Log, log)],
+            Self::Stream { records, cursor_events } => vec![
+                (RecoveryReadSource::StreamRecords, records),
+                (RecoveryReadSource::Log, cursor_events),
+            ],
+        }
+    }
+
+    fn well_formed(&self) -> bool {
+        match self {
+            Self::Queue(log) => log.head <= log.next,
+            Self::Stream { records, cursor_events } => {
+                records.head <= records.next && cursor_events.head <= cursor_events.next
+            }
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct RetainedHistoryIdentity {
-    // Omitting the default preserves existing separate-history identity bytes.
-    #[serde(default, skip_serializing_if = "QueueLogLayout::is_separate")]
-    pub log_layout: QueueLogLayout,
     pub version: u32,
     /// Present for version two: original receipt, included in the content ID.
     /// Its storage instance remains the original instance after a cold reopen.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub storage_history: Option<PreparedStorageHistory>,
     pub id: [u8; 32],
-    pub message_digest: [u8; 32],
-    pub event_digest: [u8; 32],
     pub snapshot_digest: Option<[u8; 32]>,
-    pub message_head: u64,
-    pub message_next: u64,
-    pub event_head: u64,
-    pub event_next: u64,
+    pub logs: RetainedLogs,
 }
 
 #[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
@@ -55,38 +109,69 @@ struct Receipt {
 }
 
 impl RetainedHistoryIdentity {
+    /// Version one has no storage receipt and version two must have one. A
+    /// queue history needs version two with a queue receipt. A stream history
+    /// with a receipt needs a stream receipt. Log bounds must be ordered.
     pub fn valid_version(&self) -> bool {
         matches!(
             (self.version, self.storage_history.is_some()),
             (1, false) | (2, true)
-        ) && match self.log_layout {
-            QueueLogLayout::Separate => true,
-            QueueLogLayout::Combined => {
-                self.version == 2
-                    && self.message_head == 0
-                    && self.message_next == 0
-                    && self.message_digest == empty_log_digest()
-                    && self.storage_history.as_ref().is_some_and(|h| !h.stream)
+        ) && self.logs.well_formed()
+            && match &self.logs {
+                RetainedLogs::Queue(_) => {
+                    self.version == 2 && self.storage_history.as_ref().is_some_and(|h| !h.stream)
+                }
+                RetainedLogs::Stream { .. } => self.storage_history.as_ref().is_none_or(|h| h.stream),
             }
+    }
+
+    /// The single queue log, or None for a stream history.
+    pub fn queue_log(&self) -> Option<&RetainedLog> {
+        match &self.logs {
+            RetainedLogs::Queue(log) => Some(log),
+            RetainedLogs::Stream { .. } => None,
         }
     }
 
-    /// Bounds of the physical records carrying payloads, including non-payload
-    /// positions in the combined layout. This is not a count of live messages.
-    pub fn payload_bounds(&self) -> (u64, u64) {
-        match self.log_layout {
-            QueueLogLayout::Separate => (self.message_head, self.message_next),
-            QueueLogLayout::Combined => (self.event_head, self.event_next),
-        }
+    /// True when any retained log starts above offset zero.
+    pub fn compacted(&self) -> bool {
+        self.logs.sources().iter().any(|(_, log)| log.head > 0)
+    }
+
+    /// Content id over the resource and this identity with a zero id field.
+    pub fn compute_id(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        stream: bool,
+    ) -> Result<[u8; 32]> {
+        let mut identity = self.clone();
+        identity.id = [0; 32];
+        let mut hash = blake3::Hasher::new();
+        hash.update(HISTORY_ID_TAG);
+        hash.update(
+            &rmp_serde::to_vec_named(&(topic, part, group, stream, &identity))
+                .map_err(encode_err)?,
+        );
+        Ok(*hash.finalize().as_bytes())
     }
 }
 
-pub(super) fn empty_log_digest() -> [u8; 32] {
+pub(crate) fn empty_log_digest() -> [u8; 32] {
     let mut hash = blake3::Hasher::new();
     hash.update(b"fibril-retained-log-v1\0");
     hash.update(&0u64.to_be_bytes());
     hash.update(&0u64.to_be_bytes());
     *hash.finalize().as_bytes()
+}
+
+fn retained_log(log: &Keratin) -> Result<RetainedLog> {
+    Ok(RetainedLog {
+        head: log.head_offset(),
+        next: log.next_offset(),
+        digest: log_digest(log)?,
+    })
 }
 
 fn log_digest(log: &Keratin) -> Result<[u8; 32]> {
@@ -168,8 +253,7 @@ impl Stroma {
         // Complete a visible publication barrier left by an interrupted caller.
         fs::File::open(&path).and_then(|file| file.sync_all()).map_err(io_err)?;
         recovery_seal::sync_directories(path.parent().unwrap())?;
-        Ok(Some(SealedReplicaFrontiers { request: request.clone(), message_head: history.message_head,
-            message_next: history.message_next, event_head: history.event_head, event_next: history.event_next, history }))
+        Ok(Some(SealedReplicaFrontiers { request: request.clone(), history }))
     }
 
     pub(super) fn recovery_snapshot_path(
@@ -210,31 +294,20 @@ impl Stroma {
             || &receipt.request != request
             || receipt.history.id != expected_id
             || !receipt.history.valid_version()
-            || (receipt.history.log_layout == QueueLogLayout::Combined) != !stream
+            || receipt.history.logs.is_stream() != stream
             || receipt.history.storage_history
                 != self.durable_storage_history_receipt(topic, part, group)?
-            || receipt.history.message_head > receipt.history.message_next
-            || receipt.history.event_head > receipt.history.event_next
         {
             return Err(StromaError::InvalidArgument(
                 "recovery read does not match history receipt".into(),
             ));
         }
-        let mut history = receipt.history;
-        history.id = [0; 32];
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"fibril-retained-history-v1\0");
-        hash.update(
-            &rmp_serde::to_vec_named(&(topic, part, group, stream, &history))
-                .map_err(encode_err)?,
-        );
-        if hash.finalize().as_bytes() != &expected_id {
+        if receipt.history.compute_id(topic, part, group, stream)? != expected_id {
             return Err(StromaError::Corruption(
                 "retained-history identity mismatch".into(),
             ));
         }
-        history.id = expected_id;
-        Ok(history)
+        Ok(receipt.history)
     }
 
     pub(super) fn persist_retained_history(
@@ -285,38 +358,33 @@ impl Stroma {
             Some(_) => Some(*blake3::hash(&fs::read(snapshot).map_err(io_err)?).as_bytes()),
             None => None,
         };
-        let mut history = RetainedHistoryIdentity {
-            log_layout: if messages.is_some() {
-                QueueLogLayout::Separate
-            } else {
-                QueueLogLayout::Combined
+        // The partition kind decides the variant. A queue never has a record
+        // log and a stream always has one.
+        let logs = match (stream, messages) {
+            (false, None) => RetainedLogs::Queue(retained_log(events)?),
+            (true, Some(records)) => RetainedLogs::Stream {
+                records: retained_log(records)?,
+                cursor_events: retained_log(events)?,
             },
+            _ => {
+                return Err(StromaError::InvalidArgument(
+                    "retained logs do not match the partition kind".into(),
+                ));
+            }
+        };
+        let mut history = RetainedHistoryIdentity {
             version: if storage_history.is_some() { 2 } else { 1 },
             storage_history,
             id: [0; 32],
-            message_digest: messages
-                .map(log_digest)
-                .transpose()?
-                .unwrap_or_else(empty_log_digest),
-            event_digest: log_digest(events)?,
             snapshot_digest,
-            message_head: messages.map_or(0, Keratin::head_offset),
-            message_next: messages.map_or(0, Keratin::next_offset),
-            event_head: events.head_offset(),
-            event_next: events.next_offset(),
+            logs,
         };
         if !history.valid_version() {
             return Err(StromaError::InvalidArgument(
                 "unsupported retained history layout or binding".into(),
             ));
         }
-        let mut hash = blake3::Hasher::new();
-        hash.update(b"fibril-retained-history-v1\0");
-        hash.update(
-            &rmp_serde::to_vec_named(&(topic, part, group, stream, &history))
-                .map_err(encode_err)?,
-        );
-        history.id = *hash.finalize().as_bytes();
+        history.id = history.compute_id(topic, part, group, stream)?;
         let receipt = Receipt {
             topic: topic.into(),
             partition: part,
@@ -368,68 +436,83 @@ mod tests {
     use super::*;
     use keratin_log::test_dir;
 
+    fn storage(stream: bool) -> PreparedStorageHistory {
+        PreparedStorageHistory {
+            topic: "q".into(),
+            partition: 0,
+            group: None,
+            stream,
+            binding: StorageHistoryBinding {
+                resource_incarnation: [1; 16],
+                accepted_history: [2; 16],
+                writer_session: [3; 16],
+            },
+            storage_instance: [4; 16],
+        }
+    }
+
     #[test]
-    fn recovery_layout_is_explicit_and_bound_to_serialized_identity() {
-        let mut history = RetainedHistoryIdentity {
-            log_layout: QueueLogLayout::Separate,
+    fn retained_logs_variant_is_explicit_and_bound_to_identity() {
+        let log = RetainedLog { head: 2, next: 9, digest: [5; 32] };
+        let mut queue = RetainedHistoryIdentity {
             version: 2,
-            storage_history: Some(PreparedStorageHistory {
-                topic: "q".into(),
-                partition: 0,
-                group: None,
-                stream: false,
-                binding: StorageHistoryBinding {
-                    resource_incarnation: [1; 16],
-                    accepted_history: [2; 16],
-                    writer_session: [3; 16],
-                },
-                storage_instance: [4; 16],
-            }),
+            storage_history: Some(storage(false)),
             id: [0; 32],
-            message_digest: empty_log_digest(),
-            event_digest: [5; 32],
             snapshot_digest: None,
-            message_head: 0,
-            message_next: 0,
-            event_head: 2,
-            event_next: 9,
+            logs: RetainedLogs::Queue(log),
         };
-        let separate = rmp_serde::to_vec_named(&history).unwrap();
-        let keys: std::collections::BTreeMap<String, serde::de::IgnoredAny> =
-            rmp_serde::from_slice(&separate).unwrap();
-        assert!(!keys.contains_key("log_layout"));
-        assert_eq!(
-            rmp_serde::from_slice::<RetainedHistoryIdentity>(&separate).unwrap(),
-            history
-        );
-        assert!(history.valid_version());
-        assert_eq!(history.payload_bounds(), (0, 0));
+        assert!(queue.valid_version());
+        assert_eq!(queue.queue_log(), Some(&log));
+        assert_eq!(queue.logs.for_source(RecoveryReadSource::Log), Some(&log));
+        assert_eq!(queue.logs.for_source(RecoveryReadSource::StreamRecords), None);
+        assert_eq!(queue.logs.for_source(RecoveryReadSource::Snapshot), None);
+        let encoded = rmp_serde::to_vec_named(&queue).unwrap();
+        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&encoded).unwrap(), queue);
 
-        history.log_layout = QueueLogLayout::Combined;
-        let combined = rmp_serde::to_vec_named(&history).unwrap();
-        assert_ne!(separate, combined);
-        assert_eq!(
-            rmp_serde::from_slice::<RetainedHistoryIdentity>(&combined).unwrap(),
-            history
+        // The same bounds as a stream history never share a queue id.
+        let mut stream = queue.clone();
+        stream.storage_history = Some(storage(true));
+        stream.logs = RetainedLogs::Stream { records: log, cursor_events: log };
+        assert!(stream.valid_version());
+        assert_eq!(stream.queue_log(), None);
+        assert_ne!(
+            queue.compute_id("q", 0, None, false).unwrap(),
+            stream.compute_id("q", 0, None, false).unwrap()
         );
-        assert_eq!(history.payload_bounds(), (2, 9));
-        assert!(history.valid_version());
-        let mut unknown = combined;
-        let start = unknown.windows(8).position(|b| b == b"combined").unwrap();
-        unknown[start..start + 8].copy_from_slice(b"unknown!");
+        assert_ne!(
+            queue.compute_id("q", 0, None, false).unwrap(),
+            queue.compute_id("q", 0, None, true).unwrap()
+        );
+
+        // A queue needs version two with a queue receipt.
+        queue.storage_history.as_mut().unwrap().stream = true;
+        assert!(!queue.valid_version());
+        queue.storage_history = None;
+        queue.version = 1;
+        assert!(!queue.valid_version());
+        // A stream receipt must say stream.
+        stream.storage_history.as_mut().unwrap().stream = false;
+        assert!(!stream.valid_version());
+        stream.storage_history = None;
+        stream.version = 1;
+        assert!(stream.valid_version());
+        // Inverted bounds are refused for either kind.
+        let inverted = RetainedLog { head: 9, next: 2, digest: [5; 32] };
+        stream.logs = RetainedLogs::Stream { records: log, cursor_events: inverted };
+        assert!(!stream.valid_version());
+        let mut queue = RetainedHistoryIdentity {
+            version: 2,
+            storage_history: Some(storage(false)),
+            id: [0; 32],
+            snapshot_digest: None,
+            logs: RetainedLogs::Queue(inverted),
+        };
+        assert!(!queue.valid_version());
+        queue.logs = RetainedLogs::Queue(log);
+        let mut unknown = rmp_serde::to_vec_named(&queue).unwrap();
+        let start = unknown.windows(5).position(|b| b == b"queue").unwrap();
+        unknown[start..start + 5].copy_from_slice(b"other");
         assert!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&unknown).is_err());
-
-        history.message_next = 1;
-        assert!(!history.valid_version());
-        history.message_next = 0;
-        history.message_digest = [8; 32];
-        assert!(!history.valid_version());
-        history.message_digest = empty_log_digest();
-        history.storage_history.as_mut().unwrap().stream = true;
-        assert!(!history.valid_version());
-        history.storage_history = None;
-        history.version = 1;
-        assert!(!history.valid_version());
     }
 
     async fn populated(root: &Path, payload: &[u8]) -> Stroma {
@@ -506,11 +589,11 @@ mod tests {
             .unwrap();
         assert_ne!(x.history.id, y.history.id);
         assert_ne!(x.history.storage_history.as_ref().unwrap().storage_instance, y.history.storage_history.as_ref().unwrap().storage_instance);
-        assert_eq!(x.history.event_digest, y.history.event_digest);
-        assert_eq!((x.history.event_head, x.history.event_next), (y.history.event_head, y.history.event_next));
+        let log = |s: &SealedReplicaFrontiers| *s.history.queue_log().unwrap();
+        assert_eq!(log(&x), log(&y));
         assert_ne!(x.history.id, z.history.id);
-        assert_ne!(x.history.event_digest, z.history.event_digest);
-        assert_eq!(x.history.message_digest, z.history.message_digest);
+        assert_ne!(log(&x).digest, log(&z).digest);
+        assert_eq!((log(&x).head, log(&x).next), (log(&z).head, log(&z).next));
         first.shutdown().await.unwrap();
         second.shutdown().await.unwrap();
         different.shutdown().await.unwrap();

@@ -573,8 +573,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             )
             .await
             .unwrap();
-        assert_eq!(sealed.history.event_head, capsule.contents.payload_head);
-        assert_eq!(sealed.history.message_next, 0);
+        assert_eq!(sealed.history.queue_log().unwrap().head, capsule.contents.payload_head);
         st.shutdown().await.unwrap();
     }
 }
@@ -677,20 +676,14 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                 )
                 .await
                 .unwrap();
-            assert_eq!(seal.history.message_next, 0, "{boundary}");
-            assert_eq!(seal.history.event_next, 20, "{boundary}");
-            assert!(
-                seal.history.payload_bounds().0 <= 8,
-                "old live payloads must survive {boundary}"
-            );
+            let log = *seal.history.queue_log().unwrap();
+            assert_eq!(log.next, 20, "{boundary}");
+            assert!(log.head <= 8, "old live payloads must survive {boundary}");
             let snapshot = st
                 .read_queue_snapshot(&st.recovery_snapshot_path("q", 0, None).unwrap())
                 .unwrap();
-            if seal.history.event_head > 0 {
-                assert_eq!(
-                    snapshot.as_ref().unwrap().0.event_next(),
-                    seal.history.event_next
-                );
+            if log.head > 0 {
+                assert_eq!(snapshot.as_ref().unwrap().0.event_next(), log.next);
             }
             let mut inspector = crate::recovery_inspection::RecoveryPairInspector::new(
                 "q", 0, None, false, seal.clone(), seal, Default::default(),
@@ -758,8 +751,7 @@ async fn missing_agreed_capsule_falls_back_but_corruption_cannot_authorize_recov
             .await;
         if missing {
             let seal = seal.unwrap();
-            assert_eq!(seal.history.message_next, 0);
-            assert_eq!(seal.history.event_head, 0);
+            assert_eq!(seal.history.queue_log().unwrap().head, 0);
             assert_eq!(
                 st.recovery_snapshot_path("q", 0, None).unwrap(),
                 st.snap_file("q", 0, None)

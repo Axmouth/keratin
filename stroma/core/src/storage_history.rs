@@ -1025,10 +1025,10 @@ mod tests {
             "an empty replacement must not erase old confirmed data"
         );
         assert_eq!(
-            st.queue_replication_next_offsets("q", 0, None)
+            st.queue_replication_next_offset("q", 0, None)
                 .await
                 .unwrap(),
-            (0, 1)
+            1
         );
         learner_message(&view).await;
         st.install_queue_reseed_storage(receipt.clone(), [41; 32], 7, 1)
@@ -1083,7 +1083,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, seal.clone())
             .await
             .unwrap();
-        assert_eq!((evidence.message_next, evidence.event_next), (0, 1));
+        assert_eq!(evidence.history.queue_log().unwrap().next, 1);
         let page = st
             .read_sealed_replica(
                 "q",
@@ -1093,7 +1093,7 @@ mod tests {
                 RecoveryReadRequest {
                     seal,
                     history_id: evidence.history.id,
-                    source: RecoveryReadSource::Events,
+                    source: RecoveryReadSource::Log,
                     from: 0,
                     max_records: 8,
                     max_bytes: 65536,
@@ -1168,8 +1168,8 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                (evidence.message_next, evidence.event_next),
-                (0, 1),
+                evidence.history.queue_log().unwrap().next,
+                1,
                 "{boundary}"
             );
             let page = st
@@ -1181,7 +1181,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal,
                         history_id: evidence.history.id,
-                        source: RecoveryReadSource::Events,
+                        source: RecoveryReadSource::Log,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1260,10 +1260,10 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                st.queue_replication_next_offsets("q", 0, None)
+                st.queue_replication_next_offset("q", 0, None)
                     .await
                     .unwrap(),
-                (0, 0)
+                0
             );
             let seal = RecoverySealRequest {
                 transition: [8; 32],
@@ -1286,7 +1286,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal,
                         history_id: evidence.history.id,
-                        source: RecoveryReadSource::Events,
+                        source: RecoveryReadSource::Log,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1366,10 +1366,10 @@ mod tests {
             .unwrap();
         assert_eq!(
             resumed
-                .queue_replication_next_offsets("q", 0, None)
+                .queue_replication_next_offset("q", 0, None)
                 .await
                 .unwrap(),
-            (0, 1)
+            1
         );
         resumed
             .verify_queue_learner_caught_up("q", 0, None, 7, 1)
@@ -1449,10 +1449,7 @@ mod tests {
             if let Some(evidence) = evidence {
                 assert_eq!(evidence, retained_seal);
             }
-            assert_eq!(
-                (retained_seal.message_next, retained_seal.event_next),
-                (0, 1)
-            );
+            assert_eq!(retained_seal.history.queue_log().unwrap().next, 1);
             let page = stroma
                 .read_sealed_replica(
                     "q",
@@ -1462,7 +1459,7 @@ mod tests {
                     RecoveryReadRequest {
                         seal: seal.clone(),
                         history_id: retained_seal.history.id,
-                        source: RecoveryReadSource::Events,
+                        source: RecoveryReadSource::Log,
                         from: 0,
                         max_records: 8,
                         max_bytes: 65536,
@@ -1487,10 +1484,10 @@ mod tests {
                 .unwrap();
             assert_eq!(
                 reopened
-                    .queue_replication_next_offsets("q", 0, None)
+                    .queue_replication_next_offset("q", 0, None)
                     .await
                     .unwrap(),
-                (0, 0)
+                0
             );
             assert!(
                 reopened
@@ -1693,13 +1690,13 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(sealed.history.queue_log().unwrap().next, 1);
         assert_eq!(sealed.history.version, 2);
         assert_eq!(sealed.history.storage_history, Some(original));
         let request = RecoveryReadRequest {
             seal: sealed.request.clone(),
             history_id: sealed.history.id,
-            source: RecoveryReadSource::Events,
+            source: RecoveryReadSource::Log,
             from: 0,
             max_records: 8,
             max_bytes: 65536,
@@ -2058,8 +2055,7 @@ mod tests {
             )
             .await
             .unwrap();
-        assert_eq!(sealed.message_next, 0);
-        assert_eq!(sealed.event_next, 1);
+        assert_eq!(sealed.history.queue_log().unwrap().next, 1);
         reopened.shutdown().await.unwrap();
     }
 

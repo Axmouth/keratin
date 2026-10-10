@@ -6,7 +6,7 @@
 use super::*;
 use std::io::Write;
 
-const MAGIC: &[u8; 8] = b"RSEAL\0\0\x01";
+const MAGIC: &[u8; 8] = b"RSEAL\0\0\x02";
 
 /// Identifies the exact committed transition requesting a replica seal.
 /// Authentication and old-replica membership validation belong to the caller.
@@ -18,28 +18,42 @@ pub struct RecoverySealRequest {
     pub fence_epoch: u64,
 }
 
+/// Fencing epochs captured in the seal intent. Never used to rank histories.
+/// A stream keeps both log epochs so the fence must advance each of them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum SealedEpochs {
+    Queue(u64),
+    Stream { records: u64, cursor_events: u64 },
+}
+impl SealedEpochs {
+    fn highest(self) -> u64 {
+        match self {
+            Self::Queue(epoch) => epoch,
+            Self::Stream { records, cursor_events } => records.max(cursor_events),
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 struct SealIntent {
     topic: String,
     partition: u32,
     group: Option<String>,
     request: RecoverySealRequest,
-    // These are fencing epochs only. Do not use them to rank data histories.
-    previous_message_epoch: u64,
-    previous_event_epoch: u64,
+    previous: SealedEpochs,
 }
 
-/// Stable local durable log bounds after sealing both writers. These bounds
-/// include potentially incomplete/unconfirmed work. They are not a promotion
-/// certificate: history, checkpoint and payload/event validation must follow.
+/// Stable local durable log state after sealing every writer. The retained
+/// bounds live in `history.logs` and include potentially unconfirmed work. This
+/// is not a promotion certificate: history, checkpoint and payload/event
+/// validation must follow.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
 pub struct SealedReplicaFrontiers {
     pub request: RecoverySealRequest,
     pub history: RetainedHistoryIdentity,
-    pub message_head: u64,
-    pub message_next: u64,
-    pub event_head: u64,
-    pub event_next: u64,
 }
 
 fn read_intent(path: &Path) -> Result<Option<SealIntent>> {
@@ -70,11 +84,9 @@ fn read_intent(path: &Path) -> Result<Option<SealIntent>> {
     }
     let intent: SealIntent = rmp_serde::from_slice(&bytes[8..end])
         .map_err(|err| StromaError::Corruption(format!("invalid recovery seal: {err}")))?;
-    if intent.request.fence_epoch <= intent.previous_message_epoch
-        || intent.request.fence_epoch <= intent.previous_event_epoch
-    {
+    if intent.request.fence_epoch <= intent.previous.highest() {
         return Err(StromaError::Corruption(
-            "recovery seal does not advance both epochs".into(),
+            "recovery seal does not advance every log epoch".into(),
         ));
     }
     Ok(Some(intent))
@@ -330,13 +342,16 @@ impl Stroma {
                 partition: part,
                 group: group.map(str::to_owned),
                 request: request.clone(),
-                previous_message_epoch: messages
-                    .as_ref()
-                    .map_or(events.current_epoch(), |m| m.current_epoch()),
-                previous_event_epoch: events.current_epoch(),
+                previous: match &messages {
+                    Some(records) => SealedEpochs::Stream {
+                        records: records.current_epoch(),
+                        cursor_events: events.current_epoch(),
+                    },
+                    None => SealedEpochs::Queue(events.current_epoch()),
+                },
             });
-            if intent.previous_message_epoch >= request.fence_epoch
-                || intent.previous_event_epoch >= request.fence_epoch
+            if intent.previous.highest() >= request.fence_epoch
+                || matches!(intent.previous, SealedEpochs::Queue(_)) != messages.is_none()
             {
                 return Err(StromaError::InvalidArgument(
                     "recovery fence overtaken while draining".into(),
@@ -393,19 +408,11 @@ impl Stroma {
                 partition = part,
                 group,
                 fence_epoch = request.fence_epoch,
-                message_next = messages.as_ref().map_or(0, |m| m.next_offset()),
-                event_next = events.next_offset(),
+                next = events.next_offset(),
                 history = %blake3::Hash::from_bytes(history.id),
                 "replica sealed; local bounds require recovery history validation"
             );
-            Ok(SealedReplicaFrontiers {
-                request,
-                history,
-                message_head: messages.as_ref().map_or(0, |m| m.head_offset()),
-                message_next: messages.as_ref().map_or(0, |m| m.next_offset()),
-                event_head: events.head_offset(),
-                event_next: events.next_offset(),
-            })
+            Ok(SealedReplicaFrontiers { request, history })
         }
         .await;
         if handle.is_none() {
@@ -499,7 +506,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(sealed.history.queue_log().map(|log| log.next), Some(1));
         assert_eq!(h.event_log().current_epoch(), 8);
         h.become_owner();
         assert_eq!(h.role(), QueueRole::Frozen);
@@ -567,6 +574,35 @@ mod tests {
         reopened.shutdown().await.unwrap();
     }
 
+    /// A stream intent keeps both log epochs. A fence that advances only the
+    /// higher one of them is still accepted, but one at or below either epoch
+    /// is refused on read.
+    #[test]
+    fn intent_fence_must_advance_every_recorded_epoch() {
+        let dir = test_dir!("recovery_seal_epochs");
+        let path = dir.root.join("recovery.seal");
+        for (previous, fence, ok) in [
+            (SealedEpochs::Queue(7), 8, true),
+            (SealedEpochs::Queue(8), 8, false),
+            (SealedEpochs::Stream { records: 3, cursor_events: 7 }, 8, true),
+            (SealedEpochs::Stream { records: 8, cursor_events: 3 }, 8, false),
+            (SealedEpochs::Stream { records: 3, cursor_events: 8 }, 8, false),
+        ] {
+            let intent = SealIntent {
+                topic: "q".into(),
+                partition: 0,
+                group: None,
+                request: RecoverySealRequest { transition: [1; 32], fence_epoch: fence },
+                previous,
+            };
+            let mut bytes = MAGIC.to_vec();
+            bytes.extend(rmp_serde::to_vec_named(&intent).unwrap());
+            bytes.extend(crc32c::crc32c(&bytes).to_be_bytes());
+            fs::write(&path, bytes).unwrap();
+            assert_eq!(read_intent(&path).is_ok(), ok, "{previous:?} fence {fence}");
+        }
+    }
+
     #[tokio::test]
     async fn seal_resumes_after_intent_or_log_fence_persisted() {
         for fence_log in [false, true] {
@@ -581,8 +617,7 @@ mod tests {
                     partition: 0,
                     group: None,
                     request: request(),
-                    previous_message_epoch: 7,
-                    previous_event_epoch: 7,
+                    previous: SealedEpochs::Queue(7),
                 },
             )
             .unwrap();
@@ -599,7 +634,7 @@ mod tests {
                 .seal_replica_for_recovery("q", 0, None, request())
                 .await
                 .unwrap();
-            assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+            assert_eq!(sealed.history.queue_log().map(|log| log.next), Some(1));
             let events = reopened.event_log_init("q", 0, None).await.unwrap();
             assert_eq!(events.current_epoch(), 8);
             events.shutdown().await.unwrap();
@@ -640,7 +675,7 @@ mod tests {
         .await
         .unwrap()
         .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(sealed.history.queue_log().map(|log| log.next), Some(1));
         drop(h);
         stroma.shutdown().await.unwrap();
     }
@@ -673,7 +708,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(sealed.history.queue_log().map(|log| log.next), Some(1));
         reopened.shutdown().await.unwrap();
     }
 
@@ -764,7 +799,7 @@ mod tests {
             .seal_replica_for_recovery("q", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((sealed.message_next, sealed.event_next), (0, 1));
+        assert_eq!(sealed.history.queue_log().map(|log| log.next), Some(1));
         drop(h);
         stroma.shutdown().await.unwrap();
         drop(stroma);
@@ -846,7 +881,10 @@ mod tests {
             .seal_replica_for_recovery("stream", 0, None, request())
             .await
             .unwrap();
-        assert_eq!((stream.message_next, stream.event_next), (1, 0));
+        assert!(matches!(
+            stream.history.logs,
+            RetainedLogs::Stream { records, cursor_events } if records.next == 1 && cursor_events.next == 0
+        ));
         assert!(
             stroma
                 .become_stream_owner_with_epoch("stream", 0, 9)
@@ -878,7 +916,7 @@ mod tests {
             .seal_replica_for_recovery("empty", 0, Some("default"), request())
             .await
             .unwrap();
-        assert_eq!((empty.message_next, empty.event_next), (0, 0));
+        assert_eq!(empty.history.queue_log().map(|log| log.next), Some(0));
         assert_eq!(
             stroma
                 .seal_replica_for_recovery("empty", 0, None, request())

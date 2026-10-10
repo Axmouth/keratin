@@ -81,8 +81,14 @@ impl RecoveryPhaseRecipe {
                 {
                     return Err("invalid source artifact recipe".into());
                 }
+                let next = a
+                    .seal
+                    .history
+                    .queue_log()
+                    .ok_or("source artifact requires a queue history")?
+                    .next;
                 inspector = inspector.with_queue_checkpoint_replay(
-                    a.seal.event_next,
+                    next,
                     replay,
                     checkpoint_bytes,
                 )?;
@@ -225,12 +231,15 @@ impl RecoveryPhaseStore {
                 "comparison phase contains unexpected replay evidence",
             ));
         }
+        let range = |seal: &crate::SealedReplicaFrontiers| {
+            seal.history.queue_log().map(|log| (log.head, log.next))
+        };
         if report.transition != a.seal.request.transition
             || report.history_ids != [a.seal.history.id, b.seal.history.id]
-            || report.events.left_range != (a.seal.event_head, a.seal.event_next)
-            || report.events.right_range != (b.seal.event_head, b.seal.event_next)
-            || report.messages.left_range != (a.seal.message_head, a.seal.message_next)
-            || report.messages.right_range != (b.seal.message_head, b.seal.message_next)
+            || Some(report.events.left_range) != range(&a.seal)
+            || Some(report.events.right_range) != range(&b.seal)
+            || report.messages.left_range != (0, 0)
+            || report.messages.right_range != (0, 0)
             || report.snapshot_digests
                 != [
                     a.seal.history.snapshot_digest,
@@ -251,15 +260,20 @@ impl RecoveryPhaseStore {
         };
         let source = &self.recipe.sources[0];
         let e = artifact.evidence();
+        let log = source
+            .seal
+            .history
+            .queue_log()
+            .ok_or_else(|| invalid("source artifact requires a queue history"))?;
         if artifact.state_snapshot().is_empty()
             || artifact.state_snapshot().len() > artifact_bytes
-            || artifact.message_head() != source.seal.message_head
+            || artifact.message_head() != 0
             || e.version != 2
-            || e.log_layout != source.seal.history.log_layout
+            || e.log_layout != crate::QueueLogLayout::Combined
             || e.history_id != source.seal.history.id
-            || e.payload_log != source.seal.history.payload_log()
-            || e.event_next != source.seal.event_next
-            || e.message_next != source.seal.message_next
+            || Some(&e.payload_log) != source.seal.history.payload_log().as_ref()
+            || e.event_next != log.next
+            || e.message_next != 0
             || e.live_payload_digest.is_none()
             || report.queue_replay.as_ref() != Some(&[e.clone(), e.clone()])
             || blake3::hash(artifact.state_snapshot()).as_bytes() != &artifact.snapshot_digest()

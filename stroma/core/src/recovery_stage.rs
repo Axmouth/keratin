@@ -300,7 +300,7 @@ pub(super) fn scan_parts(
             };
             hash_record(&mut hash);
             if live.contains(&record.offset) {
-                if s.payload_log.source == RecoveryReadSource::Events {
+                if s.payload_log.source == RecoveryReadSource::Log {
                     let record = RecoveryRecord { offset: record.offset, flags: record.flags,
                         headers: record.headers.to_vec(), payload: record.payload.to_vec() };
                     if !matches!(crate::recovery_inspection::decode_evidence_semantics(&record), Ok(StromaEvent::PayloadEnqueue { .. })) {
@@ -331,10 +331,10 @@ impl QueueRecoveryStageSpec {
     pub(super) fn validate_payload_log(&self) -> Result<()> {
         let p = &self.payload_log;
         let valid = p.head <= p.next && match p.source {
-            RecoveryReadSource::Events => self.message_head == 0 && self.message_next == 0
+            RecoveryReadSource::Log => self.message_head == 0 && self.message_next == 0
                 && self.message_digest == recovery_history::empty_log_digest()
                 && p.next == self.event_next,
-            RecoveryReadSource::Messages | RecoveryReadSource::Snapshot => false,
+            RecoveryReadSource::StreamRecords | RecoveryReadSource::Snapshot => false,
         };
         if !valid { return Err(invalid("recovery payload source differs from exact selected baseline")); }
         Ok(())
@@ -374,7 +374,7 @@ impl Stroma {
 
     pub(super) fn validate_recovery_payload_layout(&self, spec: &QueueRecoveryStageSpec) -> Result<()> {
         spec.validate_payload_log()?;
-        if spec.payload_log.source != RecoveryReadSource::Events {
+        if spec.payload_log.source != RecoveryReadSource::Log {
             return Err(invalid("recovery staging layout differs from local queue format"));
         }
         Ok(())

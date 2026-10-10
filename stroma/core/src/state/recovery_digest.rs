@@ -468,7 +468,7 @@ async fn large_recovery_state_transfers_in_bounded_chunks() {
         plan: [7; 32], topic: "q".into(), partition: 0, group: None,
         binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] },
         fence_epoch: 8, source_history: [4; 32],
-        payload_log: crate::recovery_replay::RecoveryPayloadLog { source: RecoveryReadSource::Events, head: 0, next: count, digest: *digest.finalize().as_bytes() },
+        payload_log: crate::recovery_replay::RecoveryPayloadLog { source: RecoveryReadSource::Log, head: 0, next: count, digest: *digest.finalize().as_bytes() },
         message_head: 0, message_next: 0, event_next: count, message_digest: empty,
         snapshot_digest: *blake3::hash(&snapshot).as_bytes(), snapshot_bytes: snapshot.len() as u64,
         state_digest, live_payload_digest: *live.finalize().as_bytes(),
@@ -480,7 +480,7 @@ async fn large_recovery_state_transfers_in_bounded_chunks() {
     let stage = st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), crate::RecoverySealRequest { transition: [5; 32], fence_epoch: 8 }).await.unwrap();
     for from in (0..count).step_by(4096) {
         let next = (from + 4096).min(count);
-        stage.append(crate::RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Events, from, next, end: count, records: (from..next).map(record).collect(), snapshot_bytes: vec![] }).await.unwrap();
+        stage.append(crate::RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Log, from, next, end: count, records: (from..next).map(record).collect(), snapshot_bytes: vec![] }).await.unwrap();
     }
     stage.finish().await.unwrap();
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
