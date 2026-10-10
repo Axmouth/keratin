@@ -193,6 +193,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- `stream_offset_at_or_after_time` no longer starts past staged stream records
+  that are not written yet. A missing probe at or above the durable frontier
+  counts as newer, so a by-time start at the live edge cannot skip records a
+  broker already delivers from memory. The `io-fault-injection` feature gains
+  `Fault::WritePause` to hold a segment write in tests.
+
 - Log, recovery and cache directory locks are POSIX record locks owned by the
   process, managed by the new `keratin_log::lock` module. A child process
   spawned while a lock was held could keep it looking held after release,

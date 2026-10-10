@@ -4514,13 +4514,20 @@ impl Stroma {
         let msg_log = h.msg_log()?;
         let reader = msg_log.reader();
         let mut lo = msg_log.head_offset();
+        // Read the durable frontier before the tail so every offset below it was
+        // durable when the search started.
+        let durable = msg_log.durable_next();
         let mut hi = msg_log.next_offset();
-        // Invariant: the answer is in [lo, hi]. A probe that is missing (a gap from
-        // retention) or older than the target moves the lower bound up.
+        // Invariant: the answer is in [lo, hi]. A probe that is missing below the
+        // durable frontier is a retention gap and counts as older. A missing probe
+        // at or above it is a staged record not written yet. Staged records form
+        // a suffix and are the newest, so they count as newer and are never
+        // skipped.
         while lo < hi {
             let mid = lo + (hi - lo) / 2;
             match reader.fetch(mid).map_err(io_err)? {
                 Some(record) if record.timestamp_ms >= ts_ms => hi = mid,
+                None if mid >= durable => hi = mid,
                 _ => lo = mid + 1,
             }
         }
@@ -8724,5 +8731,57 @@ mod open_batch_fault_tests {
             drop(armed);
             let _ = st.shutdown().await;
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn by_time_start_does_not_skip_staged_records_at_the_live_edge() {
+        use keratin_log::io_fault_injection::arm_gated;
+        let dir = keratin_log::test_dir!("by_time_live_edge");
+        let st = Stroma::open(&dir.root,
+            crate::StromaKeratinConfig::from_message_log(keratin_log::KeratinConfig::test_default()),
+            crate::SnapshotConfig::default()).await.unwrap();
+        st.create_stream("s", 0, None).await.unwrap();
+        let headers = MessageHeaders {
+            published: 0, publish_received: 0, content_type: None, extra: Default::default(),
+        };
+        for _ in 0..3 {
+            st.append_stream_record("s", 0, &headers, vec![1; 16]).await.unwrap();
+        }
+        tokio::time::sleep(Duration::from_millis(5)).await;
+        let ts = unix_millis();
+        tokio::time::sleep(Duration::from_millis(5)).await;
+
+        // Hold the next segment write so the new records are staged (offsets
+        // assigned) but not readable yet.
+        let path = st.msg_tp_part_dir("s", 0, None).join("segments/00000000000000000000.log");
+        let armed = arm_gated(&path, Fault::WritePause).unwrap();
+        let enqueued = st
+            .append_stream_records_enqueue("s", 0, vec![(headers.clone(), vec![2; 16]); 2], None)
+            .await
+            .unwrap();
+        assert_eq!(enqueued.offset.await.unwrap(), 3);
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while armed.hits() == 0 {
+                tokio::time::sleep(Duration::from_millis(1)).await;
+            }
+        })
+        .await
+        .unwrap();
+        let msg_log = st.queue_handle("s", 0, None).await.unwrap().resolve().unwrap().msg_log().unwrap();
+        assert_eq!(msg_log.next_offset(), 5);
+        assert_eq!(msg_log.durable_next(), 3);
+        assert_eq!(st.stream_durable_next("s", 0).await.unwrap(), 3);
+
+        // The staged records are newer than `ts`, so the start must be the
+        // first of them, not the staged tail.
+        assert_eq!(st.stream_offset_at_or_after_time("s", 0, ts).await.unwrap(), 3);
+        assert_eq!(st.stream_offset_at_or_after_time("s", 0, 0).await.unwrap(), 0);
+
+        armed.release();
+        enqueued.durable.await.unwrap().unwrap();
+        assert_eq!(st.stream_offset_at_or_after_time("s", 0, ts).await.unwrap(), 3);
+        assert_eq!(st.stream_offset_at_or_after_time("s", 0, u64::MAX).await.unwrap(), 5);
+        drop(armed);
+        let _ = st.shutdown().await;
     }
 }
