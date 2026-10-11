@@ -1909,10 +1909,14 @@ impl Log {
             reader.scan_from(readable_first_offset, payloads.len())?
         };
         if got.len() != payloads.len() {
-            return Err(io::Error::new(
-                io::ErrorKind::InvalidData,
-                "replicated overlap prefix is not fully readable",
-            ));
+            // Durable-only scans stop at the frontier. Say so, so a retry that
+            // raced a pending sync does not read like diverged content.
+            let message = if self.durable_end_exclusive().covers(requested_end - 1) {
+                "replicated overlap prefix is not fully readable"
+            } else {
+                "replicated overlap prefix is not durable yet, retry after it syncs"
+            };
+            return Err(io::Error::new(io::ErrorKind::InvalidData, message));
         }
 
         for (idx, (existing, incoming)) in got.iter().zip(payloads).enumerate() {
