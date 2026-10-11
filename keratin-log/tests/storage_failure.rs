@@ -191,7 +191,7 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
             segment_max_bytes: 4096,
             ..KeratinConfig::test_default()
         };
-        let log = Keratin::open(&dir.root, cfg.clone()).await.unwrap();
+        let log = Keratin::open(&dir.root, cfg).await.unwrap();
         log.become_follower();
         let epoch = log.current_epoch();
         log.append_replicated_batch(epoch, 0, messages(0..2), Some(KDurability::AfterWrite))

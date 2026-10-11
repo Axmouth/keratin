@@ -117,10 +117,9 @@ async fn failed_reopen_sync_fails_the_open() {
             crash_with_unsynced_tail(&dir.root);
 
             let armed = arm(&target(&dir.root), Fault::Fsync).unwrap();
-            let error = open(&dir.root, preserve_history)
-                .await
-                .err()
-                .expect("open must fail when its tail sync fails");
+            let Err(error) = open(&dir.root, preserve_history).await else {
+                panic!("open must fail when its tail sync fails");
+            };
             assert!(error.to_string().contains("injected"), "{error}");
             assert_eq!(armed.hits(), 1);
             drop(armed);
