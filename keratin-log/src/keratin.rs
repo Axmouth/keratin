@@ -320,6 +320,7 @@ impl Keratin {
         durability: Option<KDurability>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
@@ -345,6 +346,7 @@ impl Keratin {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
         staged_offset_tx: oneshot::Sender<u64>,
     ) -> Result<(), IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
@@ -363,6 +365,7 @@ impl Keratin {
         payload: Message,
         durability: Option<KDurability>,
     ) -> Result<oneshot::Receiver<Result<AppendResult, IoError>>, IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append")?;
         let (result_tx, rx) = oneshot::channel();
         self.tx
@@ -393,6 +396,7 @@ impl Keratin {
         durability: Option<KDurability>,
         completion: Box<dyn AppendCompletion<IoError> + Send>,
     ) -> Result<(), IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append_batch")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
@@ -415,6 +419,7 @@ impl Keratin {
         completion: Box<dyn AppendCompletion<IoError> + Send>,
         staged_offset_tx: oneshot::Sender<u64>,
     ) -> Result<(), IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append_batch")?;
         self.tx
             .send(WriterCmd::Append(AppendReq {
@@ -433,6 +438,7 @@ impl Keratin {
         payloads: Vec<Message>,
         durability: Option<KDurability>,
     ) -> Result<oneshot::Receiver<Result<AppendResult, IoError>>, IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Owner, "append_batch")?;
         let (result_tx, rx) = oneshot::channel();
         self.tx
@@ -579,6 +585,7 @@ impl Keratin {
         head: u64,
         next: u64,
     ) -> io::Result<crate::FrozenForkStats> {
+        self.ensure_running()?;
         if self.role() != KeratinRole::Frozen {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -600,6 +607,7 @@ impl Keratin {
     }
 
     pub async fn advance_epoch(&self, epoch: u64) -> std::io::Result<u64> {
+        self.ensure_running()?;
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::AdvanceEpoch { epoch, respond_to })
@@ -672,6 +680,7 @@ impl Keratin {
     // worker, so a full send moves to a blocking thread. Once that send has
     // started, cancelling the caller may still deliver the command.
     async fn enqueue_settings_command(&self, command: WriterCmd) -> io::Result<()> {
+        self.ensure_running()?;
         match self.tx.try_send(command) {
             Ok(()) => Ok(()),
             Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
@@ -690,6 +699,7 @@ impl Keratin {
     /// Make everything staged so far durable (fsync). Pair with `AfterWrite`
     /// appends to fsync separately (e.g. two logs concurrently).
     pub async fn sync(&self) -> std::io::Result<()> {
+        self.ensure_running()?;
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::Sync { respond_to })
@@ -702,6 +712,7 @@ impl Keratin {
     /// Unlike segment-granular retention this can advance inside an active file.
     /// Cancellation does not retract an already queued command.
     pub async fn advance_retained_head(&self, before: u64, epoch: u64) -> io::Result<u64> {
+        self.ensure_running()?;
         let (respond_to, rx) = oneshot::channel();
         self.tx.send(WriterCmd::AdvanceRetainedHead { before, epoch, respond_to })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
@@ -709,6 +720,7 @@ impl Keratin {
     }
 
     pub async fn truncate_before(&self, before: u64) -> std::io::Result<u64> {
+        self.ensure_running()?;
         let (tx, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::Truncate {
@@ -750,6 +762,16 @@ impl Keratin {
             .record(kind, self.current_epoch(), offset);
     }
 
+    /// Fail fast once shutdown has begun, so callers get an error without a
+    /// trip through the writer. The writer still refuses commands that race
+    /// past this check.
+    fn ensure_running(&self) -> io::Result<()> {
+        if self.shutdown_started.load(Ordering::Acquire) {
+            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "log is shut down"));
+        }
+        Ok(())
+    }
+
     fn ensure_role(&self, expected: KeratinRole, op: &str) -> Result<(), IoError> {
         let actual = self.role();
         if actual == expected {
@@ -781,6 +803,7 @@ impl Keratin {
     }
 
     pub async fn estimate_disk_used(&self) -> std::io::Result<u64> {
+        self.ensure_running()?;
         let (respond_to, rx) = oneshot::channel();
         self.tx
             .send(WriterCmd::SizeEstimate { respond_to })
@@ -794,6 +817,7 @@ impl Keratin {
     /// The epoch is checked in writer order before mutation. A repair I/O failure
     /// stops this writer; reopen resumes the durable journal before normal access.
     pub async fn repair_suffix_at_epoch(&self, next_offset: u64, expected_epoch: u64) -> io::Result<()> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Follower, "repair_suffix_at_epoch")
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
         let (respond_to, rx) = oneshot::channel();
@@ -807,6 +831,7 @@ impl Keratin {
         next_offset: u64,
         expected_epoch: Option<u64>,
     ) -> io::Result<()> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Follower, "destructive_reset_to_checkpoint")
             .map_err(|err| io::Error::new(io::ErrorKind::PermissionDenied, err))?;
         let (respond_to, rx) = oneshot::channel();
@@ -860,6 +885,7 @@ impl KeratinReplicaExt for Keratin {
         mode: ReplicatedAppendMode,
         durability: Option<KDurability>,
     ) -> Result<ReplicatedAppendOutcome, IoError> {
+        self.ensure_running()?;
         self.ensure_role(KeratinRole::Follower, "append_replicated_batch")?;
         let (respond_to, rx) = oneshot::channel();
         self.tx
@@ -1207,3 +1233,7 @@ async fn durable_next_trails_next_offset_until_sync() {
 #[cfg(test)]
 #[path = "writer_settings_tests.rs"]
 mod writer_settings_tests;
+
+#[cfg(test)]
+#[path = "shutdown_tests.rs"]
+mod shutdown_tests;

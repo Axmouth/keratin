@@ -384,10 +384,14 @@ pub fn spawn_writer(
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(channel_capacity);
 
     std::thread::spawn(move || {
-        writer_loop(
+        #[cfg(test)]
+        let root = log.root().to_path_buf();
+        // The notify and fsync senders move into the loop and drop when it
+        // returns, so those helper threads finish on their own.
+        let refusal = writer_loop(
             &mut log,
             cfg,
-            rx,
+            &rx,
             state,
             notify_tx,
             fsync_tx,
@@ -395,7 +399,19 @@ pub fn spawn_writer(
             #[cfg(feature = "writer-stage-trace")]
             tracer,
         );
-        tracing::info!("Writer loop exited")
+        // Close the files now. A reopen of the same root may follow while
+        // this handle still exists.
+        drop(log);
+        tracing::info!("Writer loop exited");
+        // A bounded crossbeam channel keeps buffered commands alive while any
+        // sender exists, even after the receiver drops, so a reply sender in
+        // one would never be answered or dropped. Keep receiving and refuse
+        // everything until the last sender is gone.
+        while let Ok(cmd) = rx.recv() {
+            reject_command(cmd, &refusal, None);
+        }
+        #[cfg(test)]
+        test_hooks::writer_exited(&root);
     });
 
     WriterHandle { tx }
@@ -557,13 +573,13 @@ fn fsync_loop_with(
 fn writer_loop(
     log: &mut Log,
     mut cfg: KeratinConfig,
-    writes_rx: Receiver<WriterCmd>,
+    writes_rx: &Receiver<WriterCmd>,
     state: Arc<LogState>,
     notify_tx: Sender<NotifyMsg>,
     fsync_tx: Sender<FsyncReq>,
     fsync_done_rx: Receiver<FsyncDone>,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
-) {
+) -> Refusal {
     let stage_then_commit = std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() == Ok("1");
     let startup_delay = std::env::var("KERATIN_IDLE_COMMIT_WINDOW_US")
         .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(5_000);
@@ -615,20 +631,19 @@ fn writer_loop(
         );
 
         if log.storage_failure().is_some() {
-            serve_after_storage_failure(
+            return serve_after_storage_failure(
                 log,
                 &state,
                 batcher.flush(),
                 &mut pending,
                 deferred_command.take(),
-                &writes_rx,
+                writes_rx,
                 &notify_tx,
                 &fsync_done_rx,
                 &mut inflight_fsyncs,
                 #[cfg(feature = "writer-stage-trace")]
                 &tracer,
             );
-            return;
         }
 
         // Keep linger synced with adaptive tuning.
@@ -761,7 +776,7 @@ fn writer_loop(
         let event = if let Some(command) = deferred_command.take() {
             WriterEvent::Command(command)
         } else {
-            recv_writer_event(&writes_rx, &fsync_done_rx, wait)
+            recv_writer_event(writes_rx, &fsync_done_rx, wait)
         };
 
         let cmd = match event {
@@ -826,11 +841,12 @@ fn writer_loop(
                     #[cfg(feature = "writer-stage-trace")]
                     &tracer,
                 );
-                return;
+                // No sender is left, so nothing can be refused anymore.
+                return Refusal::shut_down();
             }
             WriterEvent::FsyncDisconnected => {
                 fail_all_pending(&mut pending, "fsync worker disconnected", &notify_tx, true);
-                return;
+                return Refusal::stopped(log, "fsync worker disconnected");
             }
         };
 
@@ -936,7 +952,7 @@ fn writer_loop(
                     startup.append(Instant::now());
                     // No wait for additional arrivals. Bound collection by requests,
                     // records, bytes and time. One oversized request remains intact.
-                    let reqs = collect_staging_chunk(r, &writes_rx, &mut deferred_command, &cfg);
+                    let reqs = collect_staging_chunk(r, writes_rx, &mut deferred_command, &cfg);
                     #[cfg(feature = "writer-stage-trace")]
                     let work_id = tracer.next_work_id();
                     stage_reqs(
@@ -979,7 +995,15 @@ fn writer_loop(
                                 #[cfg(feature = "writer-stage-trace")]
                                 &tracer,
                             );
-                            return;
+                            let refusal = Refusal::stopped(
+                                log,
+                                format!("flushing staged data: {error}"),
+                            );
+                            // Staging may have pulled the next command early.
+                            if let Some(cmd) = deferred_command.take() {
+                                reject_command(cmd, &refusal, Some(log));
+                            }
+                            return refusal;
                         }
                     }
                     // Re-enter at the completion drain, then decide commit eligibility
@@ -1187,16 +1211,19 @@ fn writer_loop(
                     &tracer,
                 );
                 let result = log.repair_suffix(next_offset);
-                let failed = result.is_err();
+                let failure = result
+                    .as_ref()
+                    .err()
+                    .map(|error| format!("suffix repair failed: {error}"));
                 let _ = respond_to.send(result);
-                if failed {
+                if let Some(failure) = failure {
                     // Never append to or persist old metadata over a partially
                     // repaired log. The journal owns recovery from this point.
                     tracing::error!(
                         next_offset,
                         "suffix repair failed; writer stopped until reopen"
                     );
-                    return;
+                    return Refusal::stopped(log, failure);
                 }
                 last_fsync = Instant::now();
             }
@@ -1590,7 +1617,9 @@ fn writer_loop(
                 if shutdown_tx.send(()).is_err() {
                     tracing::info!("Error sending shutdown notification");
                 }
-                return;
+                #[cfg(test)]
+                test_hooks::shutdown_acknowledged(log.root());
+                return Refusal::shut_down();
             }
             WriterCmd::SizeEstimate { respond_to } => {
                 let res = log
@@ -2063,6 +2092,90 @@ fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<Notify
     }
 }
 
+/// The answer for commands that reach a writer after it stopped.
+struct Refusal {
+    kind: io::ErrorKind,
+    msg: String,
+}
+
+impl Refusal {
+    fn shut_down() -> Self {
+        Self {
+            kind: io::ErrorKind::BrokenPipe,
+            msg: "log is shut down".to_string(),
+        }
+    }
+
+    /// The writer stopped on an error. A latched storage failure is the more
+    /// useful cause when there is one.
+    fn stopped(log: &Log, cause: impl std::fmt::Display) -> Self {
+        let msg = match log.storage_failure() {
+            Some(failure) => storage_failure_message(failure),
+            None => format!("log writer stopped, reopen required: {cause}"),
+        };
+        Self {
+            kind: io::ErrorKind::Other,
+            msg,
+        }
+    }
+
+    fn io_error(&self) -> io::Error {
+        io::Error::new(self.kind, self.msg.clone())
+    }
+}
+
+fn storage_failure_message(failure: &str) -> String {
+    format!("log stopped after storage failure, reopen required: {failure}")
+}
+
+/// Answer one command on a stopped writer, or drop its reply sender so the
+/// caller sees a closed writer. Runs on the writer thread, so appends are
+/// completed here rather than through the notifier. `log` is present only
+/// while the stopped log is still open.
+fn reject_command(cmd: WriterCmd, refusal: &Refusal, log: Option<&Log>) {
+    match cmd {
+        WriterCmd::Append(req) => req.completion.complete(Err(IoError {
+            msg: refusal.msg.as_str().into(),
+            overlap: None,
+        })),
+        WriterCmd::ReplicatedAppend { respond_to, .. } => {
+            let _ = respond_to.send(Err(IoError {
+                msg: refusal.msg.as_str().into(),
+                overlap: None,
+            }));
+        }
+        WriterCmd::Truncate { respond_to, .. }
+        | WriterCmd::AdvanceRetainedHead { respond_to, .. }
+        | WriterCmd::AdvanceEpoch { respond_to, .. } => {
+            let _ = respond_to.send(Err(refusal.io_error()));
+        }
+        WriterCmd::ResetToCheckpoint { respond_to, .. }
+        | WriterCmd::RepairSuffix { respond_to, .. }
+        | WriterCmd::Sync { respond_to } => {
+            let _ = respond_to.send(Err(refusal.io_error()));
+        }
+        WriterCmd::ForkFrozen { respond_to, .. } => {
+            let _ = respond_to.send(Err(refusal.io_error()));
+        }
+        WriterCmd::ReplaceSettings { respond_to, .. } => {
+            let _ = respond_to.send(Err(refusal.io_error()));
+        }
+        // Dropping the reply reports a closed writer.
+        WriterCmd::ReadSettings { .. } => {}
+        // Read-only, and still useful to disk accounting while the log is open.
+        WriterCmd::SizeEstimate { respond_to } => {
+            let _ = respond_to.send(match log {
+                Some(log) => log.estimate_disk_used(),
+                None => Err(refusal.io_error()),
+            });
+        }
+        // Shutdown work is already done or no longer possible.
+        WriterCmd::Shutdown { notify_tx } => {
+            let _ = notify_tx.send(());
+        }
+    }
+}
+
 /// Answer every request with an error until shutdown. After a storage
 /// failure nothing written since the last good sync can be trusted, so
 /// in-flight fsync completions are failed without publishing a frontier and
@@ -2079,13 +2192,10 @@ fn serve_after_storage_failure(
     fsync_done_rx: &Receiver<FsyncDone>,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
-) {
-    let msg = format!(
-        "log stopped after storage failure, reopen required: {}",
-        log.storage_failure().unwrap_or_default()
-    );
-    shutdown_fail_reqs(unstaged, &msg, notify_tx);
-    fail_all_pending(pending, &msg, notify_tx, true);
+) -> Refusal {
+    let refusal = Refusal::stopped(log, "storage failure");
+    shutdown_fail_reqs(unstaged, &refusal.msg, notify_tx);
+    fail_all_pending(pending, &refusal.msg, notify_tx, true);
     wait_for_inflight_fsyncs(
         log,
         state,
@@ -2095,42 +2205,68 @@ fn serve_after_storage_failure(
         #[cfg(feature = "writer-stage-trace")]
         tracer,
     );
-    let error = || io::Error::other(msg.clone());
     while let Some(cmd) = deferred_command.take().or_else(|| writes_rx.recv().ok()) {
-        match cmd {
-            WriterCmd::Append(req) => shutdown_fail_reqs(vec![req], &msg, notify_tx),
-            WriterCmd::ReplicatedAppend { respond_to, .. } => {
-                let _ = respond_to.send(Err(IoError {
-                    msg: msg.clone().into(),
-                    overlap: None,
-                }));
-            }
-            WriterCmd::Truncate { respond_to, .. }
-            | WriterCmd::AdvanceRetainedHead { respond_to, .. }
-            | WriterCmd::AdvanceEpoch { respond_to, .. } => {
-                let _ = respond_to.send(Err(error()));
-            }
-            WriterCmd::ResetToCheckpoint { respond_to, .. }
-            | WriterCmd::RepairSuffix { respond_to, .. }
-            | WriterCmd::Sync { respond_to } => {
-                let _ = respond_to.send(Err(error()));
-            }
-            WriterCmd::ForkFrozen { respond_to, .. } => {
-                let _ = respond_to.send(Err(error()));
-            }
-            WriterCmd::ReplaceSettings { respond_to, .. } => {
-                let _ = respond_to.send(Err(error()));
-            }
-            // Dropping the reply reports a closed writer.
-            WriterCmd::ReadSettings { .. } => {}
-            // Read-only, and still useful to disk accounting.
-            WriterCmd::SizeEstimate { respond_to } => {
-                let _ = respond_to.send(log.estimate_disk_used());
-            }
-            WriterCmd::Shutdown { notify_tx } => {
-                let _ = notify_tx.send(());
-                return;
-            }
+        let shutdown = matches!(cmd, WriterCmd::Shutdown { .. });
+        reject_command(cmd, &refusal, Some(log));
+        if shutdown {
+            break;
+        }
+    }
+    refusal
+}
+
+/// Test-only hooks keyed by log root, so parallel tests do not see each
+/// other's writers.
+#[cfg(test)]
+pub(crate) mod test_hooks {
+    use crossbeam_channel::{Receiver, Sender};
+    use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
+    use std::sync::{LazyLock, Mutex};
+
+    #[derive(Default)]
+    struct Hooks {
+        // (reached, release) for a writer paused after it acknowledges Shutdown.
+        shutdown_pause: Option<(Sender<()>, Receiver<()>)>,
+        exited: Option<Sender<()>>,
+    }
+
+    static HOOKS: LazyLock<Mutex<HashMap<PathBuf, Hooks>>> = LazyLock::new(Default::default);
+
+    /// Hold the writer for `root` right after it acknowledges Shutdown. The
+    /// first receiver fires when the writer reaches the pause, and sending on
+    /// (or dropping) the returned sender lets it continue.
+    pub(crate) fn pause_after_shutdown(root: &Path) -> (Receiver<()>, Sender<()>) {
+        let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
+        let (release_tx, release_rx) = crossbeam_channel::bounded(1);
+        HOOKS.lock().unwrap().entry(root.to_path_buf()).or_default().shutdown_pause =
+            Some((reached_tx, release_rx));
+        (reached_rx, release_tx)
+    }
+
+    /// Fires (or disconnects) when the writer thread for `root` exits.
+    pub(crate) fn on_writer_exit(root: &Path) -> Receiver<()> {
+        let (tx, rx) = crossbeam_channel::bounded(1);
+        HOOKS.lock().unwrap().entry(root.to_path_buf()).or_default().exited = Some(tx);
+        rx
+    }
+
+    pub(super) fn shutdown_acknowledged(root: &Path) {
+        let pause = HOOKS
+            .lock()
+            .unwrap()
+            .get_mut(root)
+            .and_then(|hooks| hooks.shutdown_pause.take());
+        if let Some((reached, release)) = pause {
+            let _ = reached.send(());
+            let _ = release.recv();
+        }
+    }
+
+    pub(super) fn writer_exited(root: &Path) {
+        let exited = HOOKS.lock().unwrap().remove(root).and_then(|hooks| hooks.exited);
+        if let Some(exited) = exited {
+            let _ = exited.send(());
         }
     }
 }
@@ -2787,7 +2923,7 @@ mod held_pipeline_test {
             writer_loop(
                 &mut log,
                 cfg,
-                input,
+                &input,
                 writer_state,
                 notifications,
                 jobs,
@@ -2895,7 +3031,7 @@ mod held_pipeline_test {
             writer_loop(
                 &mut log,
                 cfg,
-                input,
+                &input,
                 writer_state,
                 notifications,
                 jobs,

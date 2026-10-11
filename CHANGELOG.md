@@ -210,6 +210,13 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A command sent to a log while or after it shuts down always gets an
+  answer. One that reached the writer channel after the writer handled
+  `Shutdown` could wait forever, since a bounded crossbeam channel keeps its
+  buffered messages while a sender exists. The writer refuses every later
+  command with "log is shut down" (or the latched storage failure) until the
+  last handle drops, and `Keratin` methods fail at once after `shutdown`.
+
 - A dirty reopen, a forced recovery scan and `open_preserving_history` sync
   the active segment, its index and the segments directory before they
   publish the recovered tail as the durable frontier. Records written but not

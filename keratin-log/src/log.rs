@@ -1073,6 +1073,11 @@ impl Log {
     }
 
     /// The first storage failure recorded by this handle, if any.
+    #[cfg(test)]
+    pub(crate) fn root(&self) -> &Path {
+        &self.root
+    }
+
     pub(crate) fn storage_failure(&self) -> Option<&str> {
         self.storage_failure.as_deref()
     }
