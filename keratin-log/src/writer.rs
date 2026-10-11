@@ -1629,8 +1629,25 @@ fn stage_replicated_req(
         })?;
     state.epoch.store(log.current_epoch(), Ordering::Release);
 
+    // An AfterFsync AlreadyPresent reply tells the leader the range is
+    // durable here. The overlap check only accepts durable records today, but
+    // if a range above the frontier ever gets through, sync it before replying.
+    let end_offset = end_offset.or(match outcome {
+        ReplicatedAppendOutcome::AlreadyPresent {
+            first_offset,
+            count,
+            ..
+        } if durability == KDurability::AfterFsync
+            && count > 0
+            && first_offset + u64::from(count)
+                > log.durable_end_exclusive().first_non_durable() =>
+        {
+            Some(first_offset + u64::from(count) - 1)
+        }
+        _ => None,
+    });
     if let Some(end_offset) = end_offset {
-        state.tail.store(end_offset + 1, Ordering::Release);
+        state.tail.fetch_max(end_offset + 1, Ordering::Release);
 
         match durability {
             // A write failure here is latched by the log.

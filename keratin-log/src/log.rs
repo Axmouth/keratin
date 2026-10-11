@@ -900,17 +900,6 @@ impl Log {
                 ));
             }
 
-            if end_offset == current_next.saturating_sub(1) {
-                return Ok((
-                    ReplicatedAppendOutcome::AlreadyPresent {
-                        first_offset,
-                        count,
-                        next_offset: current_next,
-                    },
-                    None,
-                ));
-            }
-
             if mode == ReplicatedAppendMode::ExactFit {
                 return Ok((
                     ReplicatedAppendOutcome::Overlap {
