@@ -1804,7 +1804,13 @@ impl Log {
         self.flush()?;
         self.fsync()?;
         self.drain_manifest()?;
+        // Once files start changing, a failure leaves the files and the
+        // in-memory state out of step, so the handle must stop.
+        let result = self.replace_files_for_checkpoint(next_offset, now_ms);
+        self.latched(result)
+    }
 
+    fn replace_files_for_checkpoint(&mut self, next_offset: u64, now_ms: u64) -> io::Result<()> {
         let seg_dir = self.root.join("segments");
         for ent in fs::read_dir(&seg_dir)? {
             let ent = ent?;
