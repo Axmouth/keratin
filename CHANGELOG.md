@@ -97,6 +97,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Live writer settings. `Keratin::writer_settings`,
+  `replace_writer_settings` and the closure form `update_writer_settings`
+  read and change one open log's default durability, batch limits, linger
+  ceiling and fsync intervals, checked against a revision. A change applies
+  in order with appends after the writer fsyncs everything written so far. A
+  failed sync stops the log through the storage failure stop. Settings reset
+  on reopen. Logs that never call these behave as before.
+
 - `KDurability::AfterFlush` and Stroma's `Durability::AfterFlush`, an opt-in
   completion mode that acknowledges once a batch is written to the OS,
   without fsync. It is not durable across power loss until a later sync, does

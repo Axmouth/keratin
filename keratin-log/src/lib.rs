@@ -3,6 +3,8 @@ pub mod io_fault_injection;
 mod batcher;
 mod config;
 mod runtime_config;
+mod writer_settings;
+pub use writer_settings::{WriterSettings, WriterSettingsSnapshot};
 mod durability;
 mod diagnostics;
 mod index;

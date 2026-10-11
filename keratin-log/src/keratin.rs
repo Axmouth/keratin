@@ -93,6 +93,14 @@ pub trait KeratinReplicaExt {
 }
 
 pub enum WriterCmd {
+    ReadSettings {
+        respond_to: oneshot::Sender<crate::WriterSettingsSnapshot>,
+    },
+    ReplaceSettings {
+        expected_revision: u64,
+        settings: crate::WriterSettings,
+        respond_to: oneshot::Sender<io::Result<crate::WriterSettingsSnapshot>>,
+    },
     Append(AppendReq),
     ReplicatedAppend {
         epoch: u64,
@@ -598,6 +606,85 @@ impl Keratin {
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer gone"))?;
         rx.await
             .map_err(|_| std::io::Error::new(std::io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    /// Read the writer settings this log is using now, in command order with
+    /// appends. The revision starts at 0 on every open.
+    pub async fn writer_settings(&self) -> io::Result<crate::WriterSettingsSnapshot> {
+        let (respond_to, rx) = oneshot::channel();
+        self.enqueue_settings_command(WriterCmd::ReadSettings { respond_to })
+            .await?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))
+    }
+
+    /// Edit a copy of the current settings and submit it with
+    /// `replace_writer_settings`. The closure runs once, on the caller, and is
+    /// never replayed. If another change lands first this returns `WouldBlock`
+    /// and the other change is kept.
+    pub async fn update_writer_settings<F>(
+        &self,
+        edit: F,
+    ) -> io::Result<crate::WriterSettingsSnapshot>
+    where
+        F: FnOnce(&mut crate::WriterSettings),
+    {
+        let current = self.writer_settings().await?;
+        let mut next = current.settings;
+        edit(&mut next);
+        self.replace_writer_settings(current.revision, next).await
+    }
+
+    /// Replace this log's writer settings if `expected_revision` is still
+    /// current, otherwise fail with `WouldBlock`. Invalid settings fail with
+    /// `InvalidInput` and change nothing.
+    ///
+    /// The change is ordered with appends by when its command enters the
+    /// writer channel. Appends before it keep the old default durability, and
+    /// appends after it use the new one. An explicit per-append durability
+    /// still wins. Before adopting, the writer closes its current batch and
+    /// fsyncs everything written so far, so this pauses the log briefly. If
+    /// that sync fails the log stops like any other storage failure and must
+    /// be reopened.
+    ///
+    /// Settings live only in this open handle and reset on reopen. Cancelling
+    /// the call after the command was sent may still apply it, so read the
+    /// revision again after a lost response. This changes one log only, not
+    /// any policy of a system built on top of it.
+    pub async fn replace_writer_settings(
+        &self,
+        expected_revision: u64,
+        settings: crate::WriterSettings,
+    ) -> io::Result<crate::WriterSettingsSnapshot> {
+        settings.validate()?;
+        let (respond_to, rx) = oneshot::channel();
+        self.enqueue_settings_command(WriterCmd::ReplaceSettings {
+            expected_revision,
+            settings,
+            respond_to,
+        })
+        .await?;
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
+    }
+
+    // Settings changes are rare. A full writer channel must not park a Tokio
+    // worker, so a full send moves to a blocking thread. Once that send has
+    // started, cancelling the caller may still deliver the command.
+    async fn enqueue_settings_command(&self, command: WriterCmd) -> io::Result<()> {
+        match self.tx.try_send(command) {
+            Ok(()) => Ok(()),
+            Err(crossbeam_channel::TrySendError::Disconnected(_)) => {
+                Err(io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))
+            }
+            Err(crossbeam_channel::TrySendError::Full(command)) => {
+                let sender = self.tx.clone();
+                tokio::task::spawn_blocking(move || sender.send(command))
+                    .await
+                    .map_err(io::Error::other)?
+                    .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))
+            }
+        }
     }
 
     /// Make everything staged so far durable (fsync). Pair with `AfterWrite`
@@ -1116,3 +1203,7 @@ async fn durable_next_trails_next_offset_until_sync() {
     assert_eq!(log.reader().scan_from(0, 10).unwrap().len(), 3);
     log.shutdown().await.unwrap();
 }
+
+#[cfg(test)]
+#[path = "writer_settings_tests.rs"]
+mod writer_settings_tests;

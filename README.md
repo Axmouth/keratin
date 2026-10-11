@@ -46,6 +46,29 @@ storage failure. Later commands are refused until the log is reopened, which
 runs the recovery scan. Dropping an append's receiver does not cancel the
 append.
 
+## Live writer settings
+
+`Keratin::writer_settings`, `replace_writer_settings` and
+`update_writer_settings` read and change one open log's default durability,
+batch limits, linger ceiling and fsync intervals without reopening it.
+
+```rust
+let applied = log.update_writer_settings(|next| {
+    next.max_batch_bytes = 512 * 1024;
+    next.max_batch_records = 2048;
+}).await?;
+```
+
+A change is ordered with appends by when it enters the writer channel.
+Appends before it keep the old default durability and appends after it use
+the new one. Before adopting, the writer stages its open batch and fsyncs
+everything written so far, so the log pauses briefly. If that sync fails the
+log stops like any other storage failure and must be reopened. Changes are
+checked against a revision, so a concurrent change makes the later one fail
+with `WouldBlock` instead of overwriting it. Settings are not saved and reset
+on reopen. A system built on Keratin that wants saved or coordinated policy
+should own it and push it to each log, rather than keep a second editable copy.
+
 ## What it is not
 
 Keratin does not attempt to be:
