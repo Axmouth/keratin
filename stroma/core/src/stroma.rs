@@ -5805,7 +5805,7 @@ struct PublishApplyPause {
 #[path = "stroma/event_order_tests.rs"]
 mod event_order_tests;
 
-#[cfg(all(test, feature = "early-replication-experiment"))]
+#[cfg(all(test, feature = "io-fault-injection"))]
 #[path = "early_replication_tests.rs"]
 mod early_replication_tests;
 

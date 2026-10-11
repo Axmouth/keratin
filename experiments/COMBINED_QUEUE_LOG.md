@@ -25,11 +25,10 @@ retain their original profile. No byte/count or durability cap is relaxed.
 
 ## Early replication
 
-Compile the `early-replication-experiment` feature. Fibril forwards it through
-its facade. Set `FIBRIL_EXPERIMENT_EARLY_REPLICATION=1` to
-opt in on admitted, history-bound replicated queues. Leave it unset or zero for
-replication after owner fsync. This is a process-start experiment setting, with
-no dashboard control. It does not enable speculative consumer delivery.
+Every build includes the early read path. Fibril turns it on with the
+`replication.early_replication` runtime setting, off by default, for admitted,
+history-bound replicated queues. With it off, replication follows owner fsync.
+It does not enable speculative consumer delivery.
 
 Early reads may use written-but-not-yet-durable tail-cache bytes. Cache misses
 retain the durable disk path. Owner completion and state application still wait

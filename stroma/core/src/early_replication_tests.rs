@@ -4,7 +4,6 @@
 use super::*;
 use keratin_log::test_dir;
 
-#[cfg(feature = "io-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
     use keratin_log::io_fault_injection::{Fault, arm_repeated};
@@ -129,7 +128,6 @@ async fn owner_write_fault_keeps_partial_bytes_out_of_early_replication() {
     }
 }
 
-#[cfg(feature = "io-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn owner_io_fault_process_exit_preserves_confirmed_prefix() {
     use keratin_log::io_fault_injection::{Fault, arm_repeated};

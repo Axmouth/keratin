@@ -51,7 +51,6 @@ pub(crate) struct TailCache {
     durable: DurableWatermark,
     /// Total cached bytes cap. `0` disables the cache (all reads go to the file).
     byte_budget: usize,
-    #[cfg(feature = "early-replication-experiment")]
     written: tokio::sync::watch::Sender<()>,
 }
 
@@ -64,7 +63,6 @@ impl TailCache {
             }),
             durable,
             byte_budget,
-            #[cfg(feature = "early-replication-experiment")]
             written: tokio::sync::watch::channel(()).0,
         }
     }
@@ -109,11 +107,9 @@ impl TailCache {
             }
         }
         drop(inner);
-        #[cfg(feature = "early-replication-experiment")]
         self.written.send_replace(());
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     pub(crate) fn subscribe_written(&self) -> tokio::sync::watch::Receiver<()> {
         self.written.subscribe()
     }
@@ -125,7 +121,6 @@ impl TailCache {
         inner.batches.clear();
         inner.bytes = 0;
         drop(inner);
-        #[cfg(feature = "early-replication-experiment")]
         self.written.send_replace(());
     }
 
@@ -151,13 +146,12 @@ impl TailCache {
         self.read_bounded(from, max, max_bytes, Some(self.durable_frontier().first_non_durable()))
     }
 
-    #[cfg(all(test, feature = "early-replication-experiment"))]
+    #[cfg(test)]
     pub(crate) fn read_written(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
         self.read_written_with_byte_budget(from, max, usize::MAX)
     }
 
     /// Tentative replication only. Oversized cached flushes miss this path.
-    #[cfg(feature = "early-replication-experiment")]
     pub(crate) fn read_written_with_byte_budget(
         &self,
         from: u64,
@@ -321,7 +315,6 @@ mod tests {
         assert!(c.read_from(0, 10).is_none());
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     #[tokio::test]
     async fn tentative_reads_are_bounded_and_wakes_survive_an_unpolled_read() {
         let (_, _, bytes) = encode_batch(0, 2, 16);
@@ -361,7 +354,6 @@ mod tests {
         assert!(disabled.read_written(0, 1).is_none());
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     #[test]
     fn tentative_byte_budget_keeps_lookahead_and_ordinary_visibility() {
         let c = cache(1 << 20, 0);

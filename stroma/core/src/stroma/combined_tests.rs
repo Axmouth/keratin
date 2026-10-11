@@ -490,10 +490,7 @@ async fn single_log_lifecycle_and_stream_reads_are_explicit() {
     st.shutdown().await.unwrap();
 }
 
-#[cfg(all(
-    feature = "early-replication-experiment",
-    feature = "io-fault-injection"
-))]
+#[cfg(feature = "io-fault-injection")]
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() {
     use crate::{OwnerReplicationRead, ReplicatedEventBatch};

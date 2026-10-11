@@ -11,6 +11,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- The `early-replication-experiment` feature is removed. The written-tail
+  reads for replication (`scan_for_replication*`, `subscribe_written` and the
+  Stroma `*_early` and `subscribe_owner_*written` reads) are always built.
+  Callers decide when to use them.
+
 - The two-lane queue adapters are gone. `read_owner_message_records*`,
   `read_owner_event_records*`, `queue_replication_next_offsets`,
   `partition_payloads_in_event_log`, `QueueLogLayout` and the handle

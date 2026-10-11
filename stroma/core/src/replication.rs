@@ -171,12 +171,9 @@ async fn read_owner_log<T>(
         let read_log = log.clone();
         let raw = tokio::task::spawn_blocking(move || {
             let reader = read_log.reader();
-            #[cfg(feature = "early-replication-experiment")]
             if early {
                 return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
             }
-            #[cfg(not(feature = "early-replication-experiment"))]
-            let _ = early;
             reader.scan_from_with_byte_budget(from, max, max_bytes)
         })
         .await
@@ -687,7 +684,6 @@ impl Stroma {
         Ok(LocalPromotion::Promoted(tails))
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     pub async fn subscribe_owner_written(
         &self,
         topic: &str,
@@ -706,7 +702,6 @@ impl Stroma {
     }
 
     /// Write notifications for the single queue log.
-    #[cfg(feature = "early-replication-experiment")]
     pub async fn subscribe_owner_queue_written(
         &self,
         topic: &str,
@@ -738,7 +733,6 @@ impl Stroma {
 
     /// Tentative bytes for a fenced, enrolled queue history only. The caller
     /// keeps responsibility for authority and confirmation gates.
-    #[cfg(feature = "early-replication-experiment")]
     pub async fn read_owner_queue_records_early(
         &self,
         topic: &str,
@@ -781,7 +775,6 @@ impl Stroma {
             .await
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     pub async fn read_owner_stream_records_early(
         &self,
         topic: &str,
@@ -823,7 +816,6 @@ impl Stroma {
             .await
     }
 
-    #[cfg(feature = "early-replication-experiment")]
     pub async fn read_owner_stream_cursor_events_early(
         &self,
         topic: &str,

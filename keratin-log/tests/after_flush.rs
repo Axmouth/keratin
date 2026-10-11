@@ -54,7 +54,6 @@ async fn small_idle_flush_writes_without_publishing_durability() {
         );
         assert_eq!(log.durable_offset(), 0);
         assert!(log.reader().scan_from(0, 1).unwrap().is_empty());
-        #[cfg(feature = "early-replication-experiment")]
         if cache > 0 {
             let records = log.reader().scan_for_replication(0, 1).unwrap();
             assert_eq!(records.len(), 1);

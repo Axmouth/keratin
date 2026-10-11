@@ -131,13 +131,11 @@ impl LogReader {
     /// callers must fence the history and independently gate confirmation on
     /// owner durability. Never use this for ordinary delivery or recovery proof.
     /// Misses (including oversized batches) retain durable-only disk behavior.
-    #[cfg(feature = "early-replication-experiment")]
     pub fn scan_for_replication(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
         self.scan_for_replication_with_byte_budget(from, max, usize::MAX)
     }
 
     /// Same tentative visibility, with the ordinary byte-budget lookahead contract.
-    #[cfg(feature = "early-replication-experiment")]
     pub fn scan_for_replication_with_byte_budget(
         &self,
         from: u64,

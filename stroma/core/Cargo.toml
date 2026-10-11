@@ -6,7 +6,6 @@ edition = "2024"
 [features]
 writer-stage-trace = ["keratin-log/writer-stage-trace"]
 io-fault-injection = ["keratin-log/io-fault-injection"]
-early-replication-experiment = ["keratin-log/early-replication-experiment"]
 # Queue application is always ordered so checkpoints have an exact boundary.
 
 # tokio_unstable is an opt-in tokio flag (set via RUSTFLAGS="--cfg tokio_unstable")
