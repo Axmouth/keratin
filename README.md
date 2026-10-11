@@ -46,6 +46,15 @@ storage failure. Later commands are refused until the log is reopened, which
 runs the recovery scan. Dropping an append's receiver does not cancel the
 append.
 
+A reopen that runs the recovery scan syncs the recovered tail before it
+counts as durable, so records written but not synced before a crash become
+durable at that point or the open fails. This does not heal a reopen after a
+latched sync failure. Linux reports a writeback error only once, so the
+reopen sync can succeed over pages that never reached disk. Fully healing
+that case needs the unsynced range rewritten into a fresh segment, or a cut
+back to the frontier the manifest recorded as durable. Neither is
+implemented yet.
+
 ## Live writer settings
 
 `Keratin::writer_settings`, `replace_writer_settings` and

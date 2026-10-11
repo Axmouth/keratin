@@ -644,6 +644,7 @@ impl Log {
         let (active_base, _active_base_path) = bases.last().expect("Already checked empty").clone();
         let (mut active, index, seg_path) =
             open_or_create_segment_pair(&root, active_base, now_ms)?;
+        sync_recovered_tail(&root, &active, &index)?;
         active.enable_prealloc(prealloc_chunk);
 
         segment_mapping.write().insert(active_base, seg_path);
@@ -2225,6 +2226,28 @@ fn create_segment_pair(
     let seg = Segment::create(logf, base, now_ms)?;
     let idx = Index::create(idxf, base, now_ms)?;
     Ok((seg, idx, log_path))
+}
+
+/// Sync the active segment, its index and the segments directory before a
+/// scanned or preserved tail becomes the durable frontier.
+///
+/// The scan reads through the page cache, which can hold records that were
+/// written but never synced: AfterWrite or AfterFlush appends, or a follower
+/// batch that died before its sync. Publishing them unsynced would let a
+/// follower resume past them or answer an AfterFsync retry with
+/// AlreadyPresent, and power loss would then drop acknowledged data. Sealed
+/// segments need no sync here because roll syncs a segment before sealing it.
+///
+/// This is not enough after a latched sync failure. Linux reports a writeback
+/// error once, so the failed sync already consumed it and this one can succeed
+/// over pages that never reached disk. It only catches an error nobody has
+/// seen yet, such as one from background writeback after a crash. Healing the
+/// latched case needs the range rewritten into a fresh segment or a cut back
+/// to the frontier the manifest recorded.
+fn sync_recovered_tail(root: &Path, active: &Segment, index: &Index) -> io::Result<()> {
+    active.fsync()?;
+    index.fsync()?;
+    fsync_dir(&root.join("segments"))
 }
 
 fn open_or_create_segment_pair(

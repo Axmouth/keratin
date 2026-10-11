@@ -210,6 +210,16 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A dirty reopen, a forced recovery scan and `open_preserving_history` sync
+  the active segment, its index and the segments directory before they
+  publish the recovered tail as the durable frontier. Records written but not
+  synced before a crash were treated as durable after reopen, so a follower
+  could resume past them and an `AfterFsync` retry could return
+  `AlreadyPresent` for data that power loss would still drop. If that sync
+  fails the open fails. A clean reopen is unchanged. A reopen after a latched
+  sync failure is still not fully healed, see the storage failure notes in
+  the README.
+
 - `stream_offset_at_or_after_time` no longer starts past staged stream records
   that are not written yet. A missing probe at or above the durable frontier
   counts as newer, so a by-time start at the live edge cannot skip records a
