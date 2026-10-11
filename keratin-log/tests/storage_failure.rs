@@ -228,9 +228,61 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
         assert!(!manifest_clean_flag(&dir.root));
         drop(log);
 
+        // The failed sync covered both records, so the reopen drops them
+        // rather than trusting pages it cannot prove reached the disk. A
+        // follower fetches them again from its owner.
         let reopened = Keratin::open(&dir.root, cfg).await.unwrap();
         assert_eq!(reopened.head_offset(), 0);
-        assert_eq!(reopened.reader().scan_from(0, 10).unwrap().len(), 2);
+        assert!(reopened.reader().scan_from(0, 10).unwrap().is_empty());
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+// Records written to the OS but never synced sit past the durable end. After a
+// failed sync their pages may be gone while a later sync or read still
+// succeeds, so the next open must cut back to the last successful sync instead
+// of trusting what the recovery scan finds.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
+    for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
+        let dir = test_dir!("latched_fsync_cut");
+        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        for payload in [2u8, 3] {
+            log.append(message(vec![payload; 64]), Some(KDurability::AfterFlush))
+                .await
+                .unwrap();
+        }
+        let armed = arm(&dir.root.join("segments/00000000000000000000.log"), fault).unwrap();
+        assert!(
+            log.append(message(vec![4; 64]), Some(KDurability::AfterFsync))
+                .await
+                .is_err()
+        );
+        drop(armed);
+        log.shutdown().await.unwrap();
+        drop(log);
+        assert!(
+            dir.root.join("suffix-repair.pending").exists(),
+            "{fault:?}: the latch must journal the cut"
+        );
+
+        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        assert!(!dir.root.join("suffix-repair.pending").exists());
+        let kept = reopened.reader().scan_from(0, 10).unwrap();
+        assert_eq!(kept.len(), 1, "{fault:?}: only the synced record survives");
+        assert_eq!(kept[0].payload, vec![1; 64]);
+        let next = reopened
+            .append(message(vec![5; 64]), Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        assert_eq!(next.base_offset, 1, "{fault:?}");
         reopened.shutdown().await.unwrap();
     }
 }

@@ -215,6 +215,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A log that stops after a failed sync now journals a cut back to the end of
+  its last successful sync, and the next open carries it out before scanning.
+  Linux reports a writeback error once, so the reopen scan or a later sync
+  could otherwise accept records whose pages never reached the disk. Only
+  records that were never confirmed as durable are dropped, which matches a
+  crash for every durability tier. Logs bound to a replicated history keep
+  their tail for coordinated recovery and are not cut automatically.
+
 - A command sent to a log while or after it shuts down always gets an
   answer. One that reached the writer channel after the writer handled
   `Shutdown` could wait forever, since a bounded crossbeam channel keeps its

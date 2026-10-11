@@ -220,6 +220,10 @@ pub struct Log {
     /// trusted. Once set, the handle refuses further writes, syncs, frontier
     /// advances and the clean-shutdown mark. Reopening rescans the files.
     storage_failure: Option<String>,
+    // Journal a cut back to the durable end when this handle latches, so the
+    // next open drops the range a failed sync may have lost. Bound histories
+    // keep their tail for coordinated recovery instead.
+    cut_on_latch: bool,
 
     pub flush_target_bytes: usize, // e.g. 16MB
 
@@ -524,6 +528,7 @@ impl Log {
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     storage_failure: None,
+                    cut_on_latch: !preserve_history,
                     staged_end_offset: initial,
                     durable_end: next_offset,
                     flush_target_bytes,
@@ -592,6 +597,7 @@ impl Log {
                     manifest_flush_interval: Duration::from_millis(500),
                     last_manifest_flush: Instant::now(),
                     storage_failure: None,
+                    cut_on_latch: !preserve_history,
                     staged_end_offset: initial,
                     durable_end: next_offset,
                     flush_target_bytes,
@@ -695,6 +701,7 @@ impl Log {
                 manifest_flush_interval: Duration::from_millis(500),
                 last_manifest_flush: Instant::now(),
                 storage_failure: None,
+                cut_on_latch: !preserve_history,
                 staged_end_offset: initial,
                 durable_end: next_offset,
                 flush_target_bytes,
@@ -1091,7 +1098,39 @@ impl Log {
                 "log stopped after storage failure, reopen required"
             );
             self.storage_failure = Some(error);
+            if self.cut_on_latch {
+                match self.journal_latched_cut() {
+                    Ok(cut) => tracing::warn!(
+                        root = %self.root.display(),
+                        durable_end = cut,
+                        "next open cuts the log back to its last successful sync"
+                    ),
+                    Err(error) => tracing::error!(
+                        root = %self.root.display(),
+                        %error,
+                        "could not journal a cut to the durable end, the next open trusts its scan"
+                    ),
+                }
+            }
         }
+    }
+
+    /// Record a cut to the end of the last successful sync. Linux reports a
+    /// writeback error once, so after a failed sync a later sync or read can
+    /// succeed over pages that never reached disk. Nothing past the durable
+    /// end was confirmed as durable, so dropping it matches a crash for every
+    /// durability tier. `Log::open` carries out the journaled cut.
+    fn journal_latched_cut(&mut self) -> io::Result<u64> {
+        // A background write of an older manifest must not land after this one.
+        if let Err(error) = self.drain_manifest() {
+            tracing::warn!(%error, "background manifest write failed before the latched cut");
+        }
+        let cut = self.durable_end;
+        self.manifest.next_offset = self.manifest.next_offset.max(self.next_offset).max(cut);
+        self.manifest.clean_shutdown = false;
+        self.manifest.store_atomic(&self.root)?;
+        crate::suffix_repair::prepare(&self.root, &self.manifest, cut)?;
+        Ok(cut)
     }
 
     fn check_storage(&self) -> io::Result<()> {
