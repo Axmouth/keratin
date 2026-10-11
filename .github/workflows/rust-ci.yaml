@@ -66,6 +66,27 @@ jobs:
           ulimit -n 4096
           cargo test --workspace --locked
 
+  fault-injection-tests:
+    name: Fault injection tests
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@v4
+
+      - name: Install Rust toolchain
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Cache Rust dependencies
+        uses: Swatinem/rust-cache@v2
+
+      # The feature compiles in test-only file operation faults, so it gets its
+      # own build instead of joining the workspace run.
+      - name: Run tests with injected I/O faults
+        run: |
+          ulimit -n 4096
+          cargo test --locked -p keratin-log -p stroma-core --features io-fault-injection
+
   release-build:
     name: Release build
     runs-on: ubuntu-latest
