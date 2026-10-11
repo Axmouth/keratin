@@ -60,6 +60,24 @@ impl Drop for TempDir {
     }
 }
 
+/// Sync a segment or index file's data. Fault-injection builds route every
+/// such sync through the test hooks, so any path that syncs log data can be
+/// made to fail on purpose.
+pub(crate) fn sync_file_data(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(feature = "io-fault-injection")]
+    return crate::io_fault_injection::sync_data(file);
+    #[cfg(not(feature = "io-fault-injection"))]
+    file.sync_data()
+}
+
+/// Like `sync_file_data`, but also syncs metadata such as timestamps.
+pub(crate) fn sync_file_all(file: &std::fs::File) -> io::Result<()> {
+    #[cfg(feature = "io-fault-injection")]
+    return crate::io_fault_injection::sync_all(file);
+    #[cfg(not(feature = "io-fault-injection"))]
+    file.sync_all()
+}
+
 /// Make the entries of a directory durable, so a file created, renamed or
 /// removed inside it survives power loss.
 #[cfg(unix)]

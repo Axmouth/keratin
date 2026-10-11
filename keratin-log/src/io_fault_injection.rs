@@ -155,6 +155,16 @@ pub(crate) fn sync_data(file: &File) -> io::Result<()> {
         _ => file.sync_data(),
     }
 }
+pub(crate) fn sync_all(file: &File) -> io::Result<()> {
+    match take(file, false)? {
+        Some(Fault::Fsync) => Err(failure()),
+        Some(Fault::FsyncAfterSuccess) => {
+            file.sync_all()?;
+            Err(failure())
+        }
+        _ => file.sync_all(),
+    }
+}
 
 #[cfg(test)]
 mod tests {

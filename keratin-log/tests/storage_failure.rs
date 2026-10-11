@@ -116,3 +116,121 @@ async fn failed_after_flush_write_stops_the_log_until_reopen() {
         reopened.shutdown().await.unwrap();
     }
 }
+
+fn messages(range: std::ops::Range<u8>) -> Vec<Message> {
+    range.map(|value| message(vec![value; 64])).collect()
+}
+
+// A replicated AfterFsync append syncs on the writer thread instead of the
+// fsync worker. Its failure must stop the log the same way, so a retry over
+// the failed range cannot come back as AlreadyPresent and count as durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_replicated_fsync_stops_the_log_until_reopen() {
+    for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
+        let dir = test_dir!("failed_replicated_fsync_stops_log");
+        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        log.become_follower();
+        let epoch = log.current_epoch();
+        log.append_replicated_batch(epoch, 0, messages(0..2), Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        let durable = log.durable_next();
+        assert_eq!(durable, 2);
+
+        let armed = arm(&dir.root.join("segments/00000000000000000000.log"), fault).unwrap();
+        assert!(
+            log.append_replicated_batch(epoch, 2, messages(2..4), Some(KDurability::AfterFsync))
+                .await
+                .is_err()
+        );
+        assert_eq!(armed.hits(), 1, "{fault:?}");
+        drop(armed);
+        assert_eq!(log.durable_next(), durable);
+
+        for (first, batch, durability) in [
+            (2, messages(2..4), KDurability::AfterFsync),
+            (0, messages(0..2), KDurability::AfterFsync),
+            (4, messages(4..5), KDurability::AfterFsync),
+            (2, messages(2..4), KDurability::AfterWrite),
+            (2, messages(2..4), KDurability::AfterFlush),
+            (3, vec![], KDurability::AfterFsync),
+        ] {
+            let error = log
+                .append_replicated_batch(epoch, first, batch, Some(durability))
+                .await
+                .expect_err("replicated append after failure must fail");
+            assert!(
+                error.to_string().contains("reopen required"),
+                "{fault:?} {durability:?} at {first}: {error}"
+            );
+        }
+        assert!(log.sync().await.is_err());
+        assert_eq!(log.durable_next(), durable);
+
+        log.shutdown().await.unwrap();
+        assert!(!manifest_clean_flag(&dir.root));
+        drop(log);
+
+        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        assert!(reopened.durable_next() >= durable);
+        reopened.shutdown().await.unwrap();
+    }
+}
+
+// Segment roll and checkpoint reset sync the outgoing segment before they
+// change any files. A failure there must stop the log like any other sync.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
+    for reset in [false, true] {
+        let dir = test_dir!("failed_roll_or_reset_fsync_stops_log");
+        let cfg = KeratinConfig {
+            segment_max_bytes: 4096,
+            ..KeratinConfig::test_default()
+        };
+        let log = Keratin::open(&dir.root, cfg.clone()).await.unwrap();
+        log.become_follower();
+        let epoch = log.current_epoch();
+        log.append_replicated_batch(epoch, 0, messages(0..2), Some(KDurability::AfterWrite))
+            .await
+            .unwrap();
+
+        let armed = arm(
+            &dir.root.join("segments/00000000000000000000.log"),
+            Fault::Fsync,
+        )
+        .unwrap();
+        if reset {
+            assert!(log.destructive_reset_to_checkpoint(10).await.is_err());
+        } else {
+            // Large enough to force a roll before staging.
+            let big = vec![message(vec![7; 8192])];
+            assert!(
+                log.append_replicated_batch(epoch, 2, big, Some(KDurability::AfterWrite))
+                    .await
+                    .is_err()
+            );
+        }
+        assert_eq!(armed.hits(), 1, "reset={reset}");
+        drop(armed);
+
+        let error = log
+            .append_replicated_batch(epoch, 2, messages(2..3), Some(KDurability::AfterWrite))
+            .await
+            .expect_err("replicated append after failure must fail");
+        assert!(error.to_string().contains("reopen required"), "{error}");
+        assert!(log.sync().await.is_err());
+
+        log.shutdown().await.unwrap();
+        assert!(!manifest_clean_flag(&dir.root));
+        drop(log);
+
+        let reopened = Keratin::open(&dir.root, cfg).await.unwrap();
+        assert_eq!(reopened.head_offset(), 0);
+        assert_eq!(reopened.reader().scan_from(0, 10).unwrap().len(), 2);
+        reopened.shutdown().await.unwrap();
+    }
+}

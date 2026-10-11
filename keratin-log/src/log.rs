@@ -129,13 +129,11 @@ impl FsyncJob {
         crate::drain_diagnostics::fsync(false);
         let started = Instant::now();
         observe_stage!(tracer, "log_fsync", (0, 0), {
-            #[cfg(feature = "io-fault-injection")]
-            let result = crate::io_fault_injection::sync_data(&self.active);
-            #[cfg(not(feature = "io-fault-injection"))]
-            let result = self.active.sync_data();
-            result
+            crate::util::sync_file_data(&self.active)
         })?;
-        observe_stage!(tracer, "index_fsync", (0, 0), { self.index.sync_data() })?;
+        observe_stage!(tracer, "index_fsync", (0, 0), {
+            crate::util::sync_file_data(&self.index)
+        })?;
         Ok(started.elapsed())
     }
 }
@@ -1624,7 +1622,7 @@ impl Log {
             }
             let target = seg_log_path(destination, base);
             let file = File::open(source)?;
-            file.sync_all()?;
+            crate::util::sync_file_all(&file)?;
             let length = file.metadata()?.len();
             #[cfg(unix)]
             let shared = std::fs::hard_link(source, &target).is_ok();
@@ -1636,12 +1634,12 @@ impl Log {
                 crate::shared_segment::boundary("linked");
             } else {
                 std::fs::copy(source, &target)?;
-                File::open(&target)?.sync_all()?;
+                crate::util::sync_file_all(&File::open(&target)?)?;
                 stats.copied_bytes += length;
             }
             let target_index = seg_idx_path(destination, base);
             stats.copied_bytes += std::fs::copy(seg_idx_path(&self.root, base), &target_index)?;
-            File::open(target_index)?.sync_all()?;
+            crate::util::sync_file_all(&File::open(target_index)?)?;
         }
         create_segment_pair(destination, next, crate::util::unix_millis())?;
         crate::shared_segment::boundary("target-tail");

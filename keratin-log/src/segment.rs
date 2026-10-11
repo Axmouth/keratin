@@ -41,7 +41,7 @@ impl Segment {
         file.seek(SeekFrom::Start(0))?;
         file.write_all(&hdr)?;
         file.flush()?;
-        file.sync_all()?;
+        crate::util::sync_file_all(&file)?;
 
         Ok(Self {
             base_offset,
@@ -180,7 +180,7 @@ impl Segment {
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        crate::util::sync_file_data(&self.file)
     }
 
     pub fn try_clone_file(&self) -> io::Result<File> {

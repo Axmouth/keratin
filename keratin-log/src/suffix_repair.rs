@@ -184,7 +184,7 @@ fn resume_with_hook(root: &Path, mut after: impl FnMut(u8) -> io::Result<()>) ->
     crate::shared_segment::make_private(&boundary_path)?;
     let boundary = OpenOptions::new().write(true).open(boundary_path)?;
     boundary.set_len(repair.pos)?;
-    boundary.sync_all()?;
+    crate::util::sync_file_all(&boundary)?;
     after(1)?;
     // An empty sparse index safely falls back to scanning the retained segment.
     // Replace it atomically so an interrupted header write cannot poison reopen.

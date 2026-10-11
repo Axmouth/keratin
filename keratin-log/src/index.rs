@@ -34,7 +34,7 @@ impl Index {
 
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
-        file.sync_all()?;
+        crate::util::sync_file_all(&file)?;
 
         Ok(Self { file })
     }
@@ -69,7 +69,7 @@ impl Index {
     }
 
     pub fn fsync(&self) -> io::Result<()> {
-        self.file.sync_data()
+        crate::util::sync_file_data(&self.file)
     }
 
     pub fn try_clone_file(&self) -> io::Result<File> {
