@@ -819,6 +819,9 @@ impl Log {
         ))
     }
 
+    /// `written_overlap` lets an `AfterFlush` retry verify an overlap against
+    /// records that are written but not yet durable. Other modes keep the
+    /// durable-only check.
     pub fn stage_replicated_append_batch(
         &mut self,
         epoch: u64,
@@ -826,6 +829,7 @@ impl Log {
         payloads: &[Message],
         mode: ReplicatedAppendMode,
         now_ms: u64,
+        written_overlap: bool,
     ) -> io::Result<(ReplicatedAppendOutcome, Option<u64>)> {
         let current_epoch = self.manifest.epoch;
         if epoch < current_epoch {
@@ -886,7 +890,7 @@ impl Log {
 
         if first_offset < current_next {
             if end_offset < current_next {
-                self.verify_existing_prefix(first_offset, payloads)?;
+                self.verify_existing_prefix(first_offset, payloads, written_overlap)?;
                 return Ok((
                     ReplicatedAppendOutcome::AlreadyPresent {
                         first_offset,
@@ -925,7 +929,7 @@ impl Log {
                     "replicated suffix skip overflow",
                 )
             })?;
-            self.verify_existing_prefix(first_offset, &payloads[..skip])?;
+            self.verify_existing_prefix(first_offset, &payloads[..skip], written_overlap)?;
             let suffix = &payloads[skip..];
             let (outcome, end_offset) = self.stage_replicated_append_batch(
                 epoch,
@@ -933,6 +937,7 @@ impl Log {
                 suffix,
                 ReplicatedAppendMode::ExactFit,
                 now_ms,
+                written_overlap,
             )?;
 
             return Ok((
@@ -1857,7 +1862,12 @@ impl Log {
         Ok(())
     }
 
-    fn verify_existing_prefix(&self, first_offset: u64, payloads: &[Message]) -> io::Result<()> {
+    fn verify_existing_prefix(
+        &self,
+        first_offset: u64,
+        payloads: &[Message],
+        written_overlap: bool,
+    ) -> io::Result<()> {
         if payloads.is_empty() {
             return Ok(());
         }
@@ -1881,7 +1891,29 @@ impl Log {
             self.segment_mapping.clone(),
             self.tail_cache.clone(),
         );
-        let got = reader.scan_from(readable_first_offset, payloads.len())?;
+        let requested_end = readable_first_offset
+            .checked_add(payloads.len() as u64)
+            .ok_or_else(|| io::Error::other("replicated overlap range overflow"))?;
+        let got = if written_overlap
+            && !self.durable_end_exclusive().covers(requested_end - 1)
+        {
+            // An AfterFlush retry can overlap a written prefix that is not yet
+            // durable. Raw reads under this writer's exclusive access check the
+            // exact bytes. This does not advance durability or count as
+            // recovery evidence.
+            (readable_first_offset..requested_end)
+                .map(|offset| {
+                    reader.fetch(offset)?.ok_or_else(|| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidData,
+                            "replicated written overlap is not fully readable",
+                        )
+                    })
+                })
+                .collect::<io::Result<Vec<_>>>()?
+        } else {
+            reader.scan_from(readable_first_offset, payloads.len())?
+        };
         if got.len() != payloads.len() {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidData,

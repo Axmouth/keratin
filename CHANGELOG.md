@@ -97,6 +97,15 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- `KDurability::AfterFlush` and Stroma's `Durability::AfterFlush`, an opt-in
+  completion mode that acknowledges once a batch is written to the OS,
+  without fsync. It is not durable across power loss until a later sync, does
+  not advance the durable frontier, and ordinary scans do not see the record
+  until then. A failed write stops the log through the same storage failure
+  stop as a failed fsync. Follower retries under `AfterFlush` verify an
+  overlap against written records byte for byte. The default stays
+  `AfterFsync` and the other modes are unchanged.
+
 - `Keratin::durable_next` returns the exclusive durable frontier, which is
   unambiguous where the inclusive `durable_offset` is not. `next_offset` is
   documented as counting staged records that may not be durable or readable

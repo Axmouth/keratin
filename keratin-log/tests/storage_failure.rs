@@ -65,3 +65,54 @@ async fn failed_fsync_stops_the_log_until_reopen() {
         reopened.shutdown().await.unwrap();
     }
 }
+
+// An AfterFlush write failure goes through the same stop as a failed fsync:
+// later appends and syncs are refused, the durable frontier stays put, and the
+// log stays dirty until a reopen runs the recovery scan.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn failed_after_flush_write_stops_the_log_until_reopen() {
+    for fault in [Fault::Write, Fault::PartialWrite] {
+        let dir = test_dir!("failed_after_flush_stops_log");
+        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        let durable = log.durable_offset();
+        let armed = arm(&dir.root.join("segments/00000000000000000000.log"), fault).unwrap();
+        assert!(
+            log.append(message(vec![2; 64]), Some(KDurability::AfterFlush))
+                .await
+                .is_err()
+        );
+        assert_eq!(armed.hits(), 1);
+        drop(armed);
+
+        let later = log
+            .append(message(vec![3; 64]), Some(KDurability::AfterFlush))
+            .await
+            .expect_err("append after failure must fail");
+        assert!(
+            later.to_string().contains("reopen required"),
+            "{fault:?}: {later}"
+        );
+        assert!(log.sync().await.is_err());
+        assert!(log.truncate_before(1).await.is_err());
+        assert_eq!(log.durable_offset(), durable);
+
+        log.shutdown().await.unwrap();
+        assert!(!manifest_clean_flag(&dir.root));
+        drop(log);
+
+        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+            .await
+            .unwrap();
+        let next = reopened
+            .append(message(vec![4; 64]), Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
+        assert!(next.base_offset >= 1);
+        reopened.shutdown().await.unwrap();
+    }
+}

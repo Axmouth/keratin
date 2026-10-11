@@ -230,6 +230,7 @@ fn messages_for_producer(total: usize, producers: usize, producer_idx: usize) ->
 fn parse_durability(value: &str) -> KDurability {
     match value {
         "write" | "after-write" => KDurability::AfterWrite,
+        "flush" | "after-flush" => KDurability::AfterFlush,
         "fsync" | "after-fsync" => KDurability::AfterFsync,
         other => panic!("unsupported durability: {other}"),
     }

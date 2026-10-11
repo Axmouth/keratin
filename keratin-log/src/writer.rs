@@ -861,7 +861,10 @@ fn writer_loop(
                     // occupied, including explicit-sync AfterWrite callers.
                     // Keep early replication's write/tail-cache visibility
                     // immediate even while the first durability cutoff waits.
-                    if startup.deadline().is_some() || log.should_flush() {
+                    // A log stopped during staging is handled at the loop top.
+                    if log.storage_failure().is_none()
+                        && (startup.deadline().is_some() || log.should_flush())
+                    {
                         #[cfg(feature = "writer-stage-trace")]
                         let flushed = log.flush_buffers_traced(&tracer, work_id);
                         #[cfg(not(feature = "writer-stage-trace"))]
@@ -1521,7 +1524,14 @@ fn stage_replicated_req(
     let now_ms = crate::util::unix_millis();
     let (outcome, end_offset) =
         trace_writer_stage!(tracer, work_id, "replicated_stage", (records.len(), 0), {
-            log.stage_replicated_append_batch(epoch, first_offset, records, mode, now_ms)
+            log.stage_replicated_append_batch(
+                epoch,
+                first_offset,
+                records,
+                mode,
+                now_ms,
+                durability == KDurability::AfterFlush,
+            )
         })?;
     state.epoch.store(log.current_epoch(), Ordering::Release);
 
@@ -1529,7 +1539,8 @@ fn stage_replicated_req(
         state.tail.store(end_offset + 1, Ordering::Release);
 
         match durability {
-            KDurability::AfterWrite => {
+            // A write failure here is latched by the log.
+            KDurability::AfterWrite | KDurability::AfterFlush => {
                 #[cfg(feature = "writer-stage-trace")]
                 log.flush_buffers_traced(tracer, work_id)?;
                 #[cfg(not(feature = "writer-stage-trace"))]
@@ -1641,6 +1652,7 @@ fn stage_reqs(
 
     let mut total_bytes: usize = 0;
     let mut successful_bytes = 0u64;
+    let mut flush_waiters = Vec::new();
 
     for r in reqs {
         let request_bytes = r.records.bytes_len();
@@ -1649,6 +1661,19 @@ fn stage_reqs(
         let dur = r.durability.unwrap_or(cfg.default_durability);
         let completion = r.completion;
         let staged_offset_tx = r.staged_offset_tx;
+        // Staging only fills memory buffers, so it would still succeed after
+        // an earlier write in this pass stopped the log.
+        if let Some(failure) = log.storage_failure() {
+            let _ = notify_tx.send(NotifyMsg::One {
+                item: NotifyItem {
+                    completion,
+                    result: Err(IoError::new(format!(
+                        "log stopped after storage failure, reopen required: {failure}"
+                    ))),
+                },
+            });
+            continue;
+        }
         let result = match r.records {
             AppendPayload::One(message) => {
                 #[cfg(feature = "writer-stage-trace")]
@@ -1685,6 +1710,11 @@ fn stage_reqs(
                             },
                         })
                         .ok();
+                } else if dur == KDurability::AfterFlush {
+                    flush_waiters.push(NotifyItem {
+                        completion,
+                        result: Ok(ar),
+                    });
                 } else {
                     pending.push_back(PendingAck {
                         end_offset,
@@ -1706,6 +1736,26 @@ fn stage_reqs(
                 });
             }
         }
+    }
+
+    if !flush_waiters.is_empty() {
+        // One write covers the whole staging group, including any fsync
+        // waiters in it. Their persistence wait stays separate. A failure
+        // latches the log, so the writer stops on its next pass.
+        #[cfg(feature = "writer-stage-trace")]
+        let flushed = log
+            .flush_buffers_traced(tracer, work_id)
+            .and_then(|_| log.flush());
+        #[cfg(not(feature = "writer-stage-trace"))]
+        let flushed = log.flush_buffers().and_then(|_| log.flush());
+        let items = match flushed {
+            Ok(()) => flush_waiters,
+            Err(error) => {
+                log.record_storage_failure(format!("flush failed: {error}"));
+                fail_notify_items(flush_waiters, error.to_string())
+            }
+        };
+        let _ = notify_tx.send(NotifyMsg::Batch(items));
     }
 
     state

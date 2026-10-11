@@ -3,7 +3,17 @@ use std::sync::atomic::{AtomicU64, Ordering};
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord)]
 pub enum KDurability {
+    /// Local appends may complete while still staged in Keratin's buffers.
+    /// Replicated appends write to the OS before completing. Pair with
+    /// `sync()` for persistence.
     AfterWrite,
+    /// Opt-in. Completes once the batch is written through Keratin's buffers
+    /// to the OS, without waiting for fsync. The record survives a process
+    /// crash but not power loss or an OS crash until a later sync. It does not
+    /// advance the durable frontier, so ordinary scans do not see it yet.
+    /// A failed write stops the log like any other storage failure.
+    AfterFlush,
+    /// Completes after the record crosses the persistence boundary (fsync).
     AfterFsync,
 }
 

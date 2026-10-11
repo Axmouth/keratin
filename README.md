@@ -22,6 +22,30 @@ At its core, Keratin is:
 
 The goal is to keep the design minimal and predictable, while still being fast enough for practical use.
 
+## Append completion
+
+`KDurability` picks when an append completes:
+
+| Mode | Completes when |
+| --- | --- |
+| `AfterWrite` | Local appends may complete while still staged in Keratin's buffers. Replicated appends write to the OS first. |
+| `AfterFlush` | Opt-in. The batch is written through Keratin's buffers to the OS. No fsync. |
+| `AfterFsync` | The append has been fsynced. This is the default. |
+
+`AfterFlush` acknowledges after the write reaches the OS, not after fsync. An
+acknowledged record survives a process crash but is not durable across power
+loss or an OS crash until a later sync. It writes once per staging batch and
+does not request an fsync of its own, though segment rollover or other durable
+work in the same log may still sync. It does not advance the durable frontier,
+so ordinary scans still see only durable records. Raw `reader().fetch(offset)`
+can read the record back. Call `sync()` when persistence is needed. Setting
+`AfterFlush` does not schedule periodic syncs.
+
+A failed `AfterFlush` write fails its waiters and stops the log like any other
+storage failure. Later commands are refused until the log is reopened, which
+runs the recovery scan. Dropping an append's receiver does not cancel the
+append.
+
 ## What it is not
 
 Keratin does not attempt to be:
