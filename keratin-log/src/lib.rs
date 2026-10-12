@@ -22,6 +22,7 @@ mod segment;
 mod shared_segment;
 pub use shared_segment::FrozenForkStats;
 mod suffix_repair;
+mod latched_cut;
 mod tail_cache;
 pub mod util;
 mod writer;

@@ -215,13 +215,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
-- A log that stops after a failed sync now journals a cut back to the end of
-  its last successful sync, and the next open carries it out before scanning.
-  Linux reports a writeback error once, so the reopen scan or a later sync
-  could otherwise accept records whose pages never reached the disk. Only
-  records that were never confirmed as durable are dropped, which matches a
-  crash for every durability tier. Logs bound to a replicated history keep
-  their tail for coordinated recovery and are not cut automatically.
+- A log that stops after a failed sync records a cut back to the end of its
+  last successful sync (`latched-cut.pending`), and the next open carries it
+  out before anything reads the tail. Linux reports a writeback error once,
+  so the reopen scan or a later sync could otherwise accept records whose
+  pages never reached the disk. Only records that were never confirmed as
+  durable are dropped, which matches a crash for every durability tier. Logs
+  bound to a replicated history are cut the same way: confirms, follower
+  progress and recovery seals all lie at or below the last successful sync.
 
 - A command sent to a log while or after it shuts down always gets an
   answer. One that reached the writer channel after the writer handled

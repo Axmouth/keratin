@@ -134,6 +134,28 @@ pub(crate) fn prepare(root: &Path, manifest: &Manifest, next: u64) -> io::Result
     fsync_dir(root)
 }
 
+/// The cut offset of a pending journal, if any, after the same checks resume uses.
+pub(crate) fn pending_cut(root: &Path) -> io::Result<Option<u64>> {
+    let mut file = match File::open(root.join(JOURNAL)) {
+        Ok(file) => file,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(e) => return Err(e),
+    };
+    if file.metadata()?.len() != SIZE as u64 {
+        return Err(invalid("invalid suffix repair journal size"));
+    }
+    let mut bytes = [0; SIZE];
+    file.read_exact(&mut bytes)?;
+    if &bytes[..8] != MAGIC
+        || crc32c::crc32c(&bytes[..SIZE - 4])
+            != u32::from_be_bytes(bytes[SIZE - 4..].try_into().unwrap())
+    {
+        return Err(invalid("invalid suffix repair journal checksum or version"));
+    }
+    // Field order: epoch, head, old_next, next.
+    Ok(Some(u64::from_be_bytes(bytes[8 + 3 * 8..16 + 3 * 8].try_into().unwrap())))
+}
+
 pub(crate) fn resume(root: &Path) -> io::Result<bool> {
     resume_with_hook(root, |_| Ok(()))
 }

@@ -267,13 +267,14 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
         log.shutdown().await.unwrap();
         drop(log);
         assert!(
-            dir.root.join("suffix-repair.pending").exists(),
-            "{fault:?}: the latch must journal the cut"
+            dir.root.join("latched-cut.pending").exists(),
+            "{fault:?}: the latch must record the cut"
         );
 
         let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
             .await
             .unwrap();
+        assert!(!dir.root.join("latched-cut.pending").exists());
         assert!(!dir.root.join("suffix-repair.pending").exists());
         let kept = reopened.reader().scan_from(0, 10).unwrap();
         assert_eq!(kept.len(), 1, "{fault:?}: only the synced record survives");
@@ -285,4 +286,44 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
         assert_eq!(next.base_offset, 1, "{fault:?}");
         reopened.shutdown().await.unwrap();
     }
+}
+
+// A log bound to a replicated history gets the same cut. Everything it
+// confirmed, reported or sealed lies at or below its last successful sync, so
+// reopening with its history guard succeeds and only unsynced records go.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn bound_history_reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
+    let dir = test_dir!("latched_fsync_cut_bound");
+    let created = Keratin::open(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    created.shutdown().await.unwrap();
+    drop(created);
+
+    let log = Keratin::open_preserving_history(&dir.root, KeratinConfig::test_default())
+        .await
+        .unwrap();
+    log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+    log.append(message(vec![2; 64]), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    let armed = arm(&dir.root.join("segments/00000000000000000000.log"), Fault::Fsync).unwrap();
+    assert!(
+        log.append(message(vec![3; 64]), Some(KDurability::AfterFsync))
+            .await
+            .is_err()
+    );
+    drop(armed);
+    log.shutdown().await.unwrap();
+    drop(log);
+
+    let reopened = Keratin::open_preserving_history(&dir.root, KeratinConfig::test_default())
+        .await
+        .expect("a latched cut must not strand a bound history");
+    let kept = reopened.reader().scan_from(0, 10).unwrap();
+    assert_eq!(kept.len(), 1);
+    assert_eq!(kept[0].payload, vec![1; 64]);
+    reopened.shutdown().await.unwrap();
 }
