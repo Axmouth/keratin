@@ -83,6 +83,9 @@ mod checkpoint_capture;
 mod combined;
 #[path = "stroma/layout.rs"]
 pub(crate) mod layout;
+#[path = "stroma/empty_queue_removal.rs"]
+mod empty_queue_removal;
+pub use empty_queue_removal::EmptyQueueRemoval;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "replication_retention.rs"]
@@ -1925,7 +1928,17 @@ impl Stroma {
         // Serialize against concurrent build/evict of this partition so the
         // shutdown + rename below cannot overlap an in-flight open of the same dir.
         let _lifecycle = self.lock_partition_lifecycle(topic, part, group).await;
+        self.destroy_partition_locked(topic, part, group).await
+    }
 
+    /// Body of [`Self::destroy_partition`]. The caller holds the partition
+    /// lifecycle lock and passes a normalized group.
+    async fn destroy_partition_locked(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<DestroyOutcome> {
         self.ensure_partition_not_sealed(topic, part, group)?;
         self.ensure_checkpoint_not_pending(topic, part, group)?;
 

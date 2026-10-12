@@ -45,7 +45,7 @@ pub use stream_state::RetentionConfig;
 pub use stroma::{
     QueueReplicationRetention,
     QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits,
-    DestroyOutcome, DiskUsedBreakdownEntry, RecoveryDiskUsage, EnqueuedStreamAppend, EvictOutcome,
+    DestroyOutcome, DiskUsedBreakdownEntry, EmptyQueueRemoval, RecoveryDiskUsage, EnqueuedStreamAppend, EvictOutcome,
     GlobalDLQ,
     GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
