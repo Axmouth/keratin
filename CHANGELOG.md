@@ -11,6 +11,9 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- `QueuePublishCommit` gains `buffered`, true when the publication completed
+  once written rather than once synced. Struct literals need the field.
+
 - A queue partition declared buffered holds a `buffered` marker file, which
   earlier builds refuse as an unexpected entry. Turn the mode off before
   downgrading.
@@ -148,6 +151,14 @@ tagged releases yet. Earlier history predates this changelog.
   the log before reads and writes move back to the durable frontier. Queues
   on the two-log layout and stream partitions are refused. Queues not
   declared buffered behave as before.
+
+- Stroma `set_queue_background_sync_default` sets the background sync
+  interval of every open queue log and of queue logs opened later, so an
+  embedder can drive it from a runtime setting.
+
+- The Stroma debug snapshot reports per queue whether it is buffered and,
+  for open queue logs, the written and durable frontiers, durable lag, time
+  since the last sync and the background sync interval.
 
 - Unexpected background sync warning. A log with the new
   `expect_every_write_synced` setting declares that every append waits for
@@ -303,6 +314,12 @@ tagged releases yet. Earlier history predates this changelog.
   by regression tests.
 
 ### Fixed
+
+- An epoch advance, a frozen fork and a retained head advance sync every
+  written record before they proceed, also when no append waits for an
+  fsync. Records written by `AfterFlush` appends were left unsynced, so a
+  recovery seal of a log holding them refused with "retained scan exceeds
+  durable history".
 
 - A log that stops after a failed sync records a cut back to the end of its
   last successful sync (`latched-cut.pending`), and the next open carries it

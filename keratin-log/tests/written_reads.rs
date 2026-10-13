@@ -89,3 +89,22 @@ async fn written_reads_cross_a_segment_roll() {
     assert!(records.iter().enumerate().all(|(i, r)| r.offset == i as u64));
     log.shutdown().await.unwrap();
 }
+
+// Controls that need the whole log durable sync records written without a
+// waiting append, which is how every AfterFlush append ends up. A recovery
+// seal fences the epoch and then reads the log up to its durable end.
+#[tokio::test]
+async fn epoch_fence_syncs_unwaited_written_records() {
+    let dir = test_dir!("written_fence_sync");
+    let log = Keratin::open(&dir.root, config(64 * 1024 * 1024)).await.unwrap();
+    for value in 0..4 {
+        log.append(message(value), Some(KDurability::AfterFlush))
+            .await
+            .unwrap();
+    }
+    assert_eq!(log.durable_next(), 0);
+    log.advance_epoch(1).await.unwrap();
+    assert_eq!(log.durable_next(), 4, "the fence must cover the written records");
+    assert_eq!(log.reader().scan_from(0, 10).unwrap().len(), 4);
+    log.shutdown().await.unwrap();
+}

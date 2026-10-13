@@ -131,6 +131,9 @@ pub(crate) fn event_msg(ev: &StromaEvent) -> Result<Message> {
 pub struct QueuePublishCommit {
     pub next: Offset,
     pub epoch: u64,
+    /// The queue was buffered when this publication was admitted, so it
+    /// completed once written rather than once synced.
+    pub buffered: bool,
 }
 
 /// Called once, before individual successful completions, after log durability
@@ -865,6 +868,10 @@ pub struct Stroma {
     /// Streams declared to sync every record. See `set_stream_writes_synced`.
     synced_streams: Arc<DashMap<(Box<str>, u32), ()>>,
 
+    /// Background sync interval for queue logs set at runtime. See
+    /// `set_queue_background_sync_default`.
+    queue_background_sync: Arc<std::sync::Mutex<Option<std::time::Duration>>>,
+
     /// Queues declared buffered. See `set_queue_buffered`.
     buffered_queues: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), ()>>,
 
@@ -967,6 +974,7 @@ impl Stroma {
             lifecycle_locks: Arc::new(DashMap::new()),
             synced_streams: Arc::new(DashMap::new()),
             buffered_queues: Arc::new(DashMap::new()),
+            queue_background_sync: Arc::new(std::sync::Mutex::new(None)),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
             recovery_stream_slots: Arc::new(Semaphore::new(2)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
@@ -1411,6 +1419,7 @@ impl Stroma {
                 .max(self.keratin_cfg_event.default_durability),
             expect_every_write_synced: self.keratin_cfg_msg.expect_every_write_synced
                 || self.queue_writes_all_synced(),
+            background_sync_interval: self.queue_background_sync_interval(),
             ..self.keratin_cfg_msg
         }
     }
@@ -3979,8 +3988,10 @@ impl Stroma {
             let group = group.clone();
             if let Some(qh) = materialized {
                 materialized_queue_count += 1;
+                let buffered = self.queue_is_buffered(&tp, *part, group.as_deref());
                 futs.push(async move {
                     let mut info = qh.full_debug_info().await;
+                    info.buffered = buffered;
                     info.materialized = true;
                     info.exists_on_disk = exists_on_disk;
                     info.evicting = evicting;
@@ -4005,6 +4016,8 @@ impl Stroma {
                 last_snapshot_event_offset: 0,
                 dirty_since_snapshot: false,
                 creating_snapshot: false,
+                buffered: false,
+                log_sync: None,
                 role: if sealed {
                     QueueRole::Frozen
                 } else {

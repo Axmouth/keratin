@@ -1338,7 +1338,7 @@ fn writer_loop(
                 }
                 #[cfg(feature = "writer-stage-trace")]
                 let work_id = tracer.next_work_id();
-                let res = commit(
+                let res = commit_all(
                     log,
                     &state,
                     &mut pending,
@@ -1398,7 +1398,7 @@ fn writer_loop(
                 }
                 #[cfg(feature = "writer-stage-trace")]
                 let work_id = tracer.next_work_id();
-                let res = commit(
+                let res = commit_all(
                     log,
                     &state,
                     &mut pending,
@@ -1462,7 +1462,7 @@ fn writer_loop(
                 }
                 #[cfg(feature = "writer-stage-trace")]
                 let work_id = tracer.next_work_id();
-                let res = commit(
+                let res = commit_all(
                     log,
                     &state,
                     &mut pending,
@@ -2719,6 +2719,8 @@ fn maybe_start_background_sync(
 }
 
 #[allow(clippy::too_many_arguments)]
+/// Sync staged records for the appends waiting on an fsync. Skips the fsync
+/// when none waits, so written records nobody waits for stay unsynced.
 fn commit(
     log: &mut Log,
     state: &Arc<LogState>,
@@ -2729,6 +2731,74 @@ fn commit(
     fsync_done_rx: &Receiver<FsyncDone>,
     inflight_fsyncs: &mut usize,
     max_inflight: usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
+) -> Result<(), io::Error> {
+    commit_inner(
+        log,
+        state,
+        pending,
+        last_fsync,
+        notify_tx,
+        fsync_tx,
+        fsync_done_rx,
+        inflight_fsyncs,
+        max_inflight,
+        false,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
+    )
+}
+
+/// Like `commit`, but syncs everything written or staged even when no append
+/// waits, as `AfterFlush` appends never do. For controls that must see the
+/// whole log durable: epoch fences, frozen forks and retained head moves.
+/// Shutdown syncs the files itself.
+fn commit_all(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    pending: &mut PendingAcks,
+    last_fsync: &mut Instant,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    inflight_fsyncs: &mut usize,
+    max_inflight: usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+    #[cfg(feature = "writer-stage-trace")] work_id: u64,
+) -> Result<(), io::Error> {
+    commit_inner(
+        log,
+        state,
+        pending,
+        last_fsync,
+        notify_tx,
+        fsync_tx,
+        fsync_done_rx,
+        inflight_fsyncs,
+        max_inflight,
+        true,
+        #[cfg(feature = "writer-stage-trace")]
+        tracer,
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
+    )
+}
+
+#[allow(clippy::too_many_arguments)]
+fn commit_inner(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    pending: &mut PendingAcks,
+    last_fsync: &mut Instant,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    fsync_done_rx: &Receiver<FsyncDone>,
+    inflight_fsyncs: &mut usize,
+    max_inflight: usize,
+    all: bool,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> Result<(), io::Error> {
@@ -2776,7 +2846,7 @@ fn commit(
 
     let ready = take_covered_acks(pending, durable_end);
 
-    if ready.is_empty() {
+    if ready.is_empty() && !(all && durable_end > log.durable_end_exclusive().first_non_durable()) {
         return Ok(());
     }
 

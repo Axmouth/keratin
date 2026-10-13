@@ -325,8 +325,9 @@ impl Stroma {
         let bytes: usize = records.iter().map(Message::bytes_len).sum();
         // One log carries the batch, so one epoch describes it.
         let epoch = event_log.current_epoch();
-        let receiver = event_log
-            .append_batch_enqueue_receiver(records, Some(self.queue_publish_durability(&h)));
+        let durability = self.queue_publish_durability(&h);
+        let buffered = durability < KDurability::AfterFsync;
+        let receiver = event_log.append_batch_enqueue_receiver(records, Some(durability));
         let stroma = self.clone();
         self.task_group
             .spawn("combined publish completion", async move {
@@ -368,6 +369,7 @@ impl Stroma {
                             observer(QueuePublishCommit {
                                 next: ar.base_offset + ar.count as u64,
                                 epoch,
+                                buffered,
                             });
                         }
                         for (i, item) in items.into_iter().enumerate() {

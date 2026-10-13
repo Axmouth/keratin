@@ -433,6 +433,7 @@ impl Stroma {
         Ok(crate::QueuePublishCommit {
             next: log.next_offset(),
             epoch: log.current_epoch(),
+            buffered: self.handle_is_buffered(&h),
         })
     }
 
@@ -583,7 +584,7 @@ impl Stroma {
             ));
         }
         log.sync().await.map_err(io_err)?;
-        Ok(crate::QueuePublishCommit { next, epoch })
+        Ok(crate::QueuePublishCommit { next, epoch, buffered: false })
     }
 
     /// Promote a follower whose single queue log ends exactly at

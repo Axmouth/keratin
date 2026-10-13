@@ -1413,6 +1413,8 @@ impl QueueHandleInner {
             last_snapshot_event_offset: self.last_snapshot_event_offset(),
             dirty_since_snapshot: self.dirty_snapshot(),
             creating_snapshot: self.creating_snapshot(),
+            buffered: false,
+            log_sync: Some(self.event_log.sync_status().into()),
             state,
         }
     }
@@ -4470,8 +4472,35 @@ pub struct QueueDebugInfo {
     pub last_snapshot_event_offset: u64,
     pub dirty_since_snapshot: bool,
     pub creating_snapshot: bool,
+    /// Declared buffered. See `Stroma::set_queue_buffered`.
+    pub buffered: bool,
+    /// Written and durable progress of the queue log, when it is open.
+    pub log_sync: Option<LogSyncDebugInfo>,
 
     pub state: QueueInternalDebugInfo,
+}
+
+/// How far a queue log is written and synced.
+#[derive(Debug, Clone, Serialize)]
+pub struct LogSyncDebugInfo {
+    pub written_next: u64,
+    pub durable_next: u64,
+    /// Records written but not synced, which a power loss could drop.
+    pub durable_lag_records: u64,
+    pub since_last_sync_ms: u64,
+    pub background_sync_interval_ms: u64,
+}
+
+impl From<keratin_log::SyncStatus> for LogSyncDebugInfo {
+    fn from(status: keratin_log::SyncStatus) -> Self {
+        Self {
+            written_next: status.written_next,
+            durable_next: status.durable_next,
+            durable_lag_records: status.durable_lag_records,
+            since_last_sync_ms: status.since_last_sync.as_millis() as u64,
+            background_sync_interval_ms: status.background_sync_interval.as_millis() as u64,
+        }
+    }
 }
 
 #[derive(Debug, Clone, Default, Serialize)]

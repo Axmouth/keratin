@@ -1759,7 +1759,7 @@ async fn queue_commits_name_one_offset_and_one_epoch_in_the_single_log() {
         st.queue_durable_commit("s", 0, None).await,
         Err(StromaError::WrongPartitionKind { .. })
     ));
-    assert_eq!(st.queue_durable_commit("q", 0, None).await.unwrap(), QueuePublishCommit { next: 0, epoch: 5 });
+    assert_eq!(st.queue_durable_commit("q", 0, None).await.unwrap(), QueuePublishCommit { next: 0, epoch: 5, buffered: false });
     assert_eq!(publish(&st, false).await, 0);
 
     // A two-record publish commits once, at the end of its last record.
@@ -1787,7 +1787,7 @@ async fn queue_commits_name_one_offset_and_one_epoch_in_the_single_log() {
     for done in completions {
         done.await.unwrap().unwrap();
     }
-    assert_eq!(commit, QueuePublishCommit { next: 3, epoch: 5 });
+    assert_eq!(commit, QueuePublishCommit { next: 3, epoch: 5, buffered: false });
     let durable = st.queue_durable_commit("q", 0, None).await.unwrap();
     assert_eq!(durable, commit);
     st.shutdown().await.unwrap();

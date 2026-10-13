@@ -61,6 +61,49 @@ impl Stroma {
         }
         Ok(())
     }
+
+    /// Background sync interval for every queue log, replacing the configured
+    /// one. Open queue logs take it through their live writer settings, and
+    /// queue logs opened later start with it. Zero turns it off. A log that
+    /// fails to take it keeps its interval and is logged, the rest still
+    /// change. Lasts for this Stroma instance.
+    pub async fn set_queue_background_sync_default(&self, interval: std::time::Duration) {
+        *self
+            .queue_background_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(interval);
+        for (topic, part, group) in self.queue_keys_snapshot() {
+            let Ok(qh) = self.queue_handle(&topic, part, group.as_deref()).await else {
+                continue;
+            };
+            let Ok(h) = qh.resolve() else {
+                continue;
+            };
+            if h.work_queue().is_err() {
+                continue;
+            }
+            drop(h);
+            if let Err(error) = self
+                .set_queue_background_sync_interval(&topic, part, group.as_deref(), interval)
+                .await
+            {
+                tracing::warn!(
+                    topic = &*topic,
+                    partition = part,
+                    group = group.as_deref(),
+                    "could not change queue log background sync interval: {error}"
+                );
+            }
+        }
+    }
+
+    /// The background sync interval queue logs open with.
+    pub(crate) fn queue_background_sync_interval(&self) -> std::time::Duration {
+        self.queue_background_sync
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .unwrap_or(self.keratin_cfg_msg.background_sync_interval)
+    }
 }
 
 #[cfg(test)]
@@ -144,6 +187,15 @@ mod tests {
             revision
         );
         drop(qh);
+
+        // A default reaches open queue logs and ones opened later.
+        st.set_queue_background_sync_default(Duration::from_millis(40))
+            .await;
+        let status = st.queue_log_sync_status("q", 0, None).await.unwrap();
+        assert_eq!(status.event_log.background_sync_interval, Duration::from_millis(40));
+        st.evict("q", 0, None).await.unwrap();
+        let status = st.queue_log_sync_status("q", 0, None).await.unwrap();
+        assert_eq!(status.event_log.background_sync_interval, Duration::from_millis(40));
 
         st.create_stream("s", 0, None).await.unwrap();
         assert!(matches!(
