@@ -357,7 +357,8 @@ async fn simulated_power_loss_drops_unsynced_records() {
     }
     let durable = log.durable_next();
     assert_eq!(durable, 1);
-    drop(log);
+    // A killed process leaves its manifest behind the records in the files.
+    log.force_close().await.unwrap();
     keratin_log::io_fault_injection::lose_unsynced_on_next_open(&dir.root, durable).unwrap();
     let reopened = Keratin::open(&dir.root, config()).await.unwrap();
     assert_eq!(reopened.next_offset(), 1);

@@ -224,6 +224,15 @@ mod tests {
 /// `durable_end` on, as a power loss drops writes no fsync covered. Uses the
 /// same pending cut a failed sync leaves behind. The caller passes the log's
 /// durable frontier as it was when the log stopped.
+///
+/// A killed writer leaves a manifest whose next offset can lag the records in
+/// the files, and the cut only applies below it. Raising it first makes the
+/// cut truncate the files at `durable_end`, whatever the manifest said.
 pub fn lose_unsynced_on_next_open(root: &Path, durable_end: u64) -> io::Result<()> {
+    let path = crate::manifest::Manifest::path(root);
+    let mut manifest = crate::manifest::Manifest::read_from(&mut File::open(&path)?)?;
+    manifest.next_offset = manifest.next_offset.max(durable_end.saturating_add(1));
+    manifest.clean_shutdown = false;
+    manifest.store_atomic(root)?;
     crate::latched_cut::write(root, durable_end)
 }
