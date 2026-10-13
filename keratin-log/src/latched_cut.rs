@@ -77,6 +77,12 @@ pub(crate) fn heal(root: &Path) -> io::Result<bool> {
         None => {
             let manifest = Manifest::read_from(&mut File::open(Manifest::path(root))?)?;
             if cut < manifest.next_offset {
+                tracing::warn!(
+                    root = %root.display(),
+                    cut,
+                    next_offset = manifest.next_offset,
+                    "cutting the log back to its last successful sync"
+                );
                 suffix_repair::prepare(root, &manifest, cut)?;
             }
         }
