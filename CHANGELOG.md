@@ -102,6 +102,30 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- Written frontier. `Keratin::written_next` is the exclusive end of the
+  records written through Keratin's buffers to the OS, where an `AfterFlush`
+  append completes, and `watch_written_next` wakes a reader when it moves.
+  Read after `durable_next` it is never lower, and it never passes
+  `next_offset`. `durable_next` and every durable read, scan and recovery
+  path are unchanged.
+
+- Background sync. The log writer syncs records that are written but not
+  durable once `background_sync_interval` has passed since the last sync of
+  the log started. It keeps at most one such sync in flight, skips missed
+  ticks instead of catching up, never runs on an idle or fully synced log,
+  and completes waiting `AfterFsync` appends that it covers. A failure
+  latches the log like any other failed sync. The interval is a target, not
+  a bound on loss.
+
+- `Keratin::sync_status` reports the written and durable frontiers, the
+  durable lag in records, the time since the last successful sync, the
+  applied background sync interval, whether a background sync is in flight,
+  how many have started, and the storage failure that stopped the log.
+
+- Stroma `queue_log_sync_status` reports that status for each log behind a
+  queue partition, and `set_queue_background_sync_interval` changes their
+  cadence through the live writer settings. Queue behavior is unchanged.
+
 - Live writer settings. `Keratin::writer_settings`,
   `replace_writer_settings` and the closure form `update_writer_settings`
   read and change one open log's default durability, batch limits, linger
@@ -207,6 +231,14 @@ tagged releases yet. Earlier history predates this changelog.
   policy or add ordinary append-path history recording.
 
 ### Changed
+
+- `KeratinConfig` and `WriterSettings` gain `background_sync_interval`,
+  100 ms by default and adjustable live. Zero turns the background sync off
+  and leaves written records to the operating system with no bound on how
+  long they stay unsynced. With the default, logs that complete appends at
+  `AfterFlush`, or write `AfterWrite` records to the OS, now become durable
+  about one interval later without an explicit `sync`. Struct literals that
+  list every field need the new one.
 
 - Frozen recovery scans use buffered sequential reads and reuse bounded record
   scratch space while retaining CRC, offset and full-history verification.
