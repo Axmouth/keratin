@@ -11,6 +11,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- A queue partition declared buffered holds a `buffered` marker file, which
+  earlier builds refuse as an unexpected entry. Turn the mode off before
+  downgrading.
+
 - The `early-replication-experiment` feature is removed. The written-tail
   reads for replication (`scan_for_replication*`, `subscribe_written` and the
   Stroma `*_early` and `subscribe_owner_*written` reads) are always built.
@@ -133,7 +137,9 @@ tagged releases yet. Earlier history predates this changelog.
   once, so written reads never serve records the next open cuts.
 
 - Buffered queues in Stroma. `set_queue_buffered` declares a queue partition
-  buffered for the life of the Stroma instance, including logs opened later.
+  buffered. The declaration is stored as a `buffered` marker file in the
+  partition directory, loaded when the queue log opens, and removed with the
+  partition. `queue_is_buffered` reports it once the log is open.
   Owner publishes, acks, nacks, releases, discards and dead-letter markers of
   a buffered queue complete at `AfterFlush`, delivery and dead-letter payload
   reads use the written frontier, and the queue log does not expect every

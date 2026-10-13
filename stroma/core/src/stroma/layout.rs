@@ -34,6 +34,8 @@ pub(super) const TMP: &str = "tmp";
 const NO_GROUP: &str = "@none";
 const EMPTY_NAME: &str = "@empty";
 const KIND: &str = "kind";
+/// Present while a queue partition is declared buffered.
+const BUFFERED: &str = "buffered";
 const CURRENT: &str = "current";
 pub(super) const RECOVERY: &str = "recovery";
 pub(super) const STAGING: &str = "staging";
@@ -362,6 +364,30 @@ pub(super) fn write_kind(part_dir: &Path, kind: PartitionKind) -> Result<()> {
     write_atomic(part_dir, KIND, text)
 }
 
+/// Whether a queue partition is declared buffered.
+pub(super) fn read_buffered(part_dir: &Path) -> Result<bool> {
+    match fs::read(part_dir.join(BUFFERED)) {
+        Ok(bytes) if bytes == b"buffered\n" => Ok(true),
+        Ok(_) => Err(corrupt(format!(
+            "{} has an unreadable buffered marker",
+            part_dir.display()
+        ))),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(false),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
+pub(super) fn write_buffered(part_dir: &Path, buffered: bool) -> Result<()> {
+    if buffered {
+        return write_atomic(part_dir, BUFFERED, b"buffered\n");
+    }
+    match fs::remove_file(part_dir.join(BUFFERED)) {
+        Ok(()) => fsync_dir(part_dir).map_err(io_err),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(io_err(e)),
+    }
+}
+
 /// One partition directory found under `partitions/`.
 pub(super) struct ScannedPartition {
     pub group: Option<String>,
@@ -441,10 +467,12 @@ fn check_partition(part_dir: &Path) -> Result<Option<Generation>> {
         require_dir(&part_dir.join(generation.name()))?;
     }
     let (kind_next, current_next) = (pending_name(KIND), pending_name(CURRENT));
+    let buffered_next = pending_name(BUFFERED);
     for name in entry_names(part_dir)? {
-        let known = [KIND, CURRENT, RECOVERY, STAGING].contains(&name.as_str())
+        let known = [KIND, CURRENT, RECOVERY, STAGING, BUFFERED].contains(&name.as_str())
             || name == kind_next
             || name == current_next
+            || name == buffered_next
             || Generation::parse(&name).is_some();
         if !known {
             return Err(unexpected(&part_dir.join(name)));

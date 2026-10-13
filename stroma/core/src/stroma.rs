@@ -1434,6 +1434,9 @@ impl Stroma {
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
         let kind = self.read_partition_kind(tp, part, group);
+        if kind == PartitionKind::Queue {
+            self.load_queue_buffered(tp, part, group)?;
+        }
         let mut config = self.partition_event_log_config(kind);
         // Only an explicit config flag or the partition's own declaration
         // count, so a buffered queue opens without the expectation.
@@ -2034,6 +2037,9 @@ impl Stroma {
         //    reopen, then drop the tombstone and wake any parked materializers
         //    (they revalidate, find no slot, and recreate a fresh partition).
         let trashed = self.move_partition_to_trash(topic, part, group)?;
+        // The marker went to trash with the partition. A partition recreated
+        // under this name starts durable.
+        self.forget_queue_buffered(topic, part, group);
         self.remove_queue(topic, part, group);
         tombstone.eviction_state.finish_eviction();
 

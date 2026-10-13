@@ -3,10 +3,9 @@
 //! records durable later. Power loss or a failed sync can lose records written
 //! since the last completed sync, confirmed or not, along with their settles.
 //!
-//! The mode is declared per partition by the embedder, which keeps it with the
-//! queue's other declared settings, like `set_stream_writes_synced`. A queue
-//! not declared buffered behaves as durable, so a reopen before the
-//! declaration arrives is only slower, never weaker.
+//! The mode is declared per partition by the embedder. Stroma keeps it in a
+//! `buffered` marker file in the partition directory and loads it when the
+//! queue log opens, so it survives a restart.
 //!
 //! Every owner write of a buffered queue uses at most `AfterFlush`: publishes,
 //! acks, nacks, releases, discards and dead-letter markers. A cut back to the
@@ -19,8 +18,8 @@ use super::write_sync_expectation::set_log_expects_synced;
 
 impl Stroma {
     /// Declare whether a queue partition is buffered. Refuses stream
-    /// partitions and queues on the two-log layout. The declaration lasts for
-    /// this Stroma instance and applies to logs opened later too.
+    /// partitions and queues on the two-log layout. The declaration is stored
+    /// with the partition and lasts until changed.
     ///
     /// Turning it off pauses owner operations and waits for those in flight,
     /// syncs the log, and only then clears the flag. Every applied record is
@@ -43,7 +42,9 @@ impl Stroma {
         }
         let key = buffered_key(topic, part, group);
         let event_log = h.event_log();
+        let part_dir = self.partition_dir(topic, part, group);
         if buffered {
+            layout::write_buffered(&part_dir, true)?;
             self.buffered_queues.insert(key, ());
         } else if self.buffered_queues.contains_key(&key) {
             // Owner operations hold their lease until they have applied, so
@@ -53,6 +54,7 @@ impl Stroma {
                 _ => None,
             };
             event_log.sync().await.map_err(io_err)?;
+            layout::write_buffered(&part_dir, false)?;
             self.buffered_queues.remove(&key);
         }
         set_log_expects_synced(
@@ -63,7 +65,28 @@ impl Stroma {
         .await
     }
 
-    pub(crate) fn queue_is_buffered(&self, topic: &str, part: u32, group: Option<&str>) -> bool {
+    /// Load the stored declaration of a queue partition whose log is opening.
+    pub(crate) fn load_queue_buffered(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<()> {
+        if layout::read_buffered(&self.partition_dir(topic, part, group))? {
+            self.buffered_queues
+                .insert(buffered_key(topic, part, group), ());
+        }
+        Ok(())
+    }
+
+    pub(crate) fn forget_queue_buffered(&self, topic: &str, part: u32, group: Option<&str>) {
+        self.buffered_queues
+            .remove(&buffered_key(topic, part, group));
+    }
+
+    /// Whether a queue partition is declared buffered. Known once its log has
+    /// opened.
+    pub fn queue_is_buffered(&self, topic: &str, part: u32, group: Option<&str>) -> bool {
         !self.buffered_queues.is_empty()
             && self
                 .buffered_queues

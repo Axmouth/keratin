@@ -295,3 +295,49 @@ async fn follower_resume_syncs_written_records() {
     owner.shutdown().await.unwrap();
     follower.shutdown().await.unwrap();
 }
+
+// The declaration is stored with the partition, so it survives a restart,
+// and goes away with the partition.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn declaration_survives_restart_and_ends_with_the_partition() {
+    let dir = keratin_log::test_dir!("buffered_queue_restart");
+    let st = open(&dir.root, 0).await;
+    st.ensure_queue("q", 0, None).await.unwrap();
+    st.set_queue_buffered("q", 0, None, true).await.unwrap();
+    publish(&st, "q", 0..2).await;
+    st.shutdown().await.unwrap();
+    drop(st);
+
+    let st = open(&dir.root, 0).await;
+    let delivered = ready(&st, "q").await;
+    assert_eq!(delivered.len(), 2);
+    assert!(st.queue_is_buffered("q", 0, None));
+    for (off, _) in delivered {
+        settle(&st, off, 0).await;
+    }
+    publish(&st, "q", 2..4).await;
+    let log = event_log(&st, "q").await;
+    assert!(log.durable_next() < log.next_offset());
+    drop(log);
+
+    assert!(matches!(
+        st.destroy_partition("q", 0, None).await.unwrap(),
+        DestroyOutcome::Destroyed
+    ));
+    assert!(!st.queue_is_buffered("q", 0, None));
+    st.ensure_queue("q", 0, None).await.unwrap();
+    publish(&st, "q", 0..1).await;
+    let log = event_log(&st, "q").await;
+    assert_eq!(log.durable_next(), log.next_offset());
+    drop(log);
+
+    // Turning it off removes the marker too.
+    st.set_queue_buffered("q", 0, None, true).await.unwrap();
+    st.set_queue_buffered("q", 0, None, false).await.unwrap();
+    st.shutdown().await.unwrap();
+    drop(st);
+    let st = open(&dir.root, 0).await;
+    event_log(&st, "q").await;
+    assert!(!st.queue_is_buffered("q", 0, None));
+    st.shutdown().await.unwrap();
+}
