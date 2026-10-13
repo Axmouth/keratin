@@ -148,6 +148,42 @@ impl LogReader {
         self.scan_from_with_byte_budget(from, max, max_bytes)
     }
 
+    /// The cached part of `scan_from_with_byte_budget`. `None` on a miss,
+    /// without touching the segment files, so it never blocks on I/O.
+    pub fn try_cached_from_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.tail_cache.read_from_with_byte_budget(from, max, max_bytes)
+    }
+
+    /// The cached part of `scan_written_with_byte_budget`. `None` on a miss,
+    /// without file I/O.
+    pub fn try_cached_written_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.tail_cache
+            .read_written_visible_with_byte_budget(from, max, max_bytes)
+    }
+
+    /// The cached part of `scan_for_replication_with_byte_budget`, with the
+    /// same tentative visibility. `None` on a miss, without file I/O.
+    pub fn try_cached_for_replication_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.tail_cache
+            .read_written_with_byte_budget(from, max, max_bytes)
+            .or_else(|| self.tail_cache.read_from_with_byte_budget(from, max, max_bytes))
+    }
+
     /// Like `scan_from_with_byte_budget`, but bounded by the written frontier
     /// instead of the durable one, so it also returns records written to the
     /// OS whose fsync has not completed. Those survive a process crash but not

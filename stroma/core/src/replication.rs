@@ -166,19 +166,32 @@ async fn read_owner_log<T>(
     let (records, batch_next_offset) = if max == 0 {
         (Vec::new(), from)
     } else {
-        // Keratin readers are synchronous. Keep replica owner scans off
-        // Tokio workers so replication polling cannot starve timers.
-        let read_log = log.clone();
-        let raw = tokio::task::spawn_blocking(move || {
-            let reader = read_log.reader();
-            if early {
-                return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
+        // A tail cache hit needs no file I/O, so it is served inline. A
+        // blocking-pool round trip per read costs two cross-thread wakeups,
+        // which dominated owner CPU at high rates. Misses read the segment
+        // files off the Tokio workers so replication cannot starve timers.
+        let reader = log.reader();
+        let cached = if early {
+            reader.try_cached_for_replication_with_byte_budget(from, max, max_bytes)
+        } else {
+            reader.try_cached_from_with_byte_budget(from, max, max_bytes)
+        };
+        let raw = match cached {
+            Some(raw) => raw,
+            None => {
+                let read_log = log.clone();
+                tokio::task::spawn_blocking(move || {
+                    let reader = read_log.reader();
+                    if early {
+                        return reader.scan_for_replication_with_byte_budget(from, max, max_bytes);
+                    }
+                    reader.scan_from_with_byte_budget(from, max, max_bytes)
+                })
+                .await
+                .map_err(|err| StromaError::Io(err.to_string()))?
+                .map_err(io_err)?
             }
-            reader.scan_from_with_byte_budget(from, max, max_bytes)
-        })
-        .await
-        .map_err(|err| StromaError::Io(err.to_string()))?
-        .map_err(io_err)?;
+        };
         let mut expected = from;
         let mut records = Vec::with_capacity(raw.len());
         let mut used_bytes = 0usize;

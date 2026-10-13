@@ -5240,14 +5240,24 @@ impl Stroma {
 
         let qh = self.queue_handle(tp, part, group).await?;
         let written = self.handle_is_buffered(&qs);
-        let closure = move || {
+        // Tail cache hits are served inline. Only a miss pays the blocking
+        // pool round trip, which costs two cross-thread wakeups per batch.
+        let cached = {
             let h = qh.resolve()?;
-            combined::read_selected(&h, &offs, written)
+            combined::read_selected_cached(&h, &offs, written)?
         };
-
-        let out = tokio::task::spawn_blocking(closure)
-            .await
-            .map_err(|err| StromaError::Io(err.to_string()))??;
+        let out = match cached {
+            Some(out) => out,
+            None => {
+                let closure = move || {
+                    let h = qh.resolve()?;
+                    combined::read_selected(&h, &offs, written)
+                };
+                tokio::task::spawn_blocking(closure)
+                    .await
+                    .map_err(|err| StromaError::Io(err.to_string()))??
+            }
+        };
 
         Ok(out)
     }

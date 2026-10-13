@@ -81,6 +81,49 @@ fn payload_codec_is_bounded_and_offset_is_implicit() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn cached_selected_reads_match_file_reads_and_give_up_on_a_miss() {
+    let dir = keratin_log::test_dir!("combined_cached_selected");
+    let open_cached = |root: std::path::PathBuf| async move {
+        let mut cfg = KeratinConfig::test_default();
+        cfg.tail_cache_bytes = 1024 * 1024;
+        Stroma::open_with_options(
+            root,
+            StromaKeratinConfig::from_message_log(cfg),
+            SnapshotConfig { every_events: u64::MAX },
+            StromaOptions::default(),
+        )
+        .await
+        .unwrap()
+    };
+    let st = open_cached(dir.root.clone()).await;
+    assert_eq!(publish(&st, false).await, 0);
+    assert_eq!(publish(&st, true).await, 1);
+    ack(&st, 0).await;
+    assert_eq!(publish(&st, false).await, 3);
+    let key = |m: &(u64, MessageHeaders, Vec<u8>, u32)| (m.0, m.2.clone(), m.3);
+    {
+        let q = st.queue_handle("q", 0, None).await.unwrap();
+        let h = q.resolve().unwrap();
+        for written in [false, true] {
+            let cached = read_selected_cached(&h, &[(0, 0), (3, 1)], written).unwrap().unwrap();
+            let read = read_selected(&h, &[(0, 0), (3, 1)], written).unwrap();
+            assert_eq!(cached.iter().map(key).collect::<Vec<_>>(), read.iter().map(key).collect::<Vec<_>>());
+            // Identity checks still apply: offset 2 is an ack, not a payload.
+            assert!(read_selected_cached(&h, &[(2, 0)], written).is_err());
+        }
+    }
+    st.shutdown().await.unwrap();
+    drop(st);
+    // A reopened log starts with an empty tail cache, so the cached read gives
+    // up and the file read still finds the record.
+    let st = open_cached(dir.root.clone()).await;
+    let q = st.queue_handle("q", 0, None).await.unwrap();
+    let h = q.resolve().unwrap();
+    assert!(read_selected_cached(&h, &[(0, 0)], false).unwrap().is_none());
+    assert_eq!(read_selected(&h, &[(0, 0)], false).unwrap().len(), 1);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn sparse_payloads_and_metadata_frontier_survive_replay() {
     let dir = keratin_log::test_dir!("combined_sparse_replay");
     let st = open(&dir.root).await;
@@ -113,6 +156,8 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
             }
         }
         assert!(read_selected(&h, &[(2, 0)], false).is_err());
+        // This store has no tail cache, so the cached read always gives up.
+        assert!(read_selected_cached(&h, &[(0, 0)], false).unwrap().is_none());
         assert!(fetch_payload(&h, 2, false).unwrap().is_none());
         assert_eq!(scan_payloads(&h, 0, 10).unwrap().len(), 4);
     }
@@ -123,6 +168,7 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
     let q = st.queue_handle("q", 0, None).await.unwrap();
     let h = q.resolve().unwrap();
     assert_eq!(h.work_queue().unwrap().settled_until().await, 1);
+
     assert_eq!(h.work_queue().unwrap().lowest_not_settled_offset().await, 1);
     assert_eq!(
         st.poll_ready("q", 0, None, 10, u64::MAX - 1, u64::MAX)

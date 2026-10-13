@@ -83,6 +83,28 @@ pub(super) fn read_selected(
     read_selected_with_budget(qh, offsets, scan_bytes, written)
 }
 
+/// `read_selected` from the tail cache alone. `None` as soon as one scan
+/// misses the cache, so it never touches the segment files and can run on a
+/// Tokio worker.
+pub(super) fn read_selected_cached(
+    qh: &QueueHandleInner,
+    offsets: &[(u64, u32)],
+    written: bool,
+) -> Result<Option<Vec<(u64, MessageHeaders, Vec<u8>, u32)>>> {
+    let reader = qh.event_log().reader();
+    select_records(offsets, SELECTED_SCAN_GAP, |from, count| {
+        Ok(if written {
+            reader.try_cached_written_with_byte_budget(from, count, DELIVERY_CACHED_SCAN_BYTES)
+        } else {
+            reader.try_cached_from_with_byte_budget(from, count, DELIVERY_CACHED_SCAN_BYTES)
+        })
+    })
+}
+
+/// Scan budget for cached selected reads. Cache hits copy bytes already in
+/// memory, so the default file budget applies.
+const DELIVERY_CACHED_SCAN_BYTES: usize = 1024 * 1024;
+
 /// Selected offsets at most this many records apart are read by scanning the
 /// records between them. Wider gaps are skipped with a fresh positioned read.
 /// Scanning a short run is cheaper than a positioned read, but scanning a long
@@ -108,8 +130,28 @@ fn read_selected_with_limits(
     scan_gap: u64,
     written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
+    let reader = qh.event_log().reader();
+    let selected = select_records(offsets, scan_gap, |from, count| {
+        if written {
+            reader.scan_written_with_byte_budget(from, count, scan_bytes)
+        } else {
+            reader.scan_from_with_byte_budget(from, count, scan_bytes)
+        }
+        .map(Some)
+        .map_err(io_err)
+    })?;
+    Ok(selected.expect("file scans always return records"))
+}
+
+/// Walk the selected offsets in runs, reading each run with `scan`. `None`
+/// when `scan` returns `None`.
+fn select_records(
+    offsets: &[(u64, u32)],
+    scan_gap: u64,
+    mut scan: impl FnMut(u64, usize) -> Result<Option<Vec<keratin_log::OwnedRecord>>>,
+) -> Result<Option<Vec<(u64, MessageHeaders, Vec<u8>, u32)>>> {
     if offsets.is_empty() {
-        return Ok(Vec::new());
+        return Ok(Some(Vec::new()));
     }
     if offsets.windows(2).any(|v| v[0].0 >= v[1].0) {
         return Err(StromaError::InvalidArgument(
@@ -122,7 +164,6 @@ fn read_selected_with_limits(
         .0
         .checked_add(1)
         .ok_or_else(|| io_err("offset exhausted"))?;
-    let reader = qh.event_log().reader();
     let mut next = offsets[0].0;
     let mut i = 0;
     let mut out = Vec::with_capacity(offsets.len());
@@ -141,12 +182,9 @@ fn read_selected_with_limits(
             run_end = offset;
         }
         let count = (run_end + 1 - next).min(4096) as usize;
-        let records = if written {
-            reader.scan_written_with_byte_budget(next, count, scan_bytes)
-        } else {
-            reader.scan_from_with_byte_budget(next, count, scan_bytes)
-        }
-        .map_err(io_err)?;
+        let Some(records) = scan(next, count)? else {
+            return Ok(None);
+        };
         if records.is_empty() {
             return Err(StromaError::Corruption(
                 "selected payload missing from combined log".into(),
@@ -175,7 +213,7 @@ fn read_selected_with_limits(
             "combined selection incomplete".into(),
         ));
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 impl Stroma {
