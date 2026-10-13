@@ -88,6 +88,8 @@ mod empty_queue_removal;
 pub use empty_queue_removal::EmptyQueueRemoval;
 #[path = "stroma/queue_log_sync.rs"]
 mod queue_log_sync;
+#[path = "stroma/write_sync_expectation.rs"]
+mod write_sync_expectation;
 pub use queue_log_sync::QueueLogSyncStatus;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
@@ -858,6 +860,9 @@ pub struct Stroma {
     /// partition set is bounded.
     lifecycle_locks: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), Arc<AsyncMutex<()>>>>,
 
+    /// Streams declared to sync every record. See `set_stream_writes_synced`.
+    synced_streams: Arc<DashMap<(Box<str>, u32), ()>>,
+
     // TODO: Consider using parking lot
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
@@ -955,6 +960,7 @@ impl Stroma {
             task_group: Arc::new(TaskGroup::new()),
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
+            synced_streams: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
             recovery_stream_slots: Arc::new(Semaphore::new(2)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
@@ -1397,6 +1403,8 @@ impl Stroma {
             // The stronger of the two. Variants are ordered weakest first.
             default_durability: self.keratin_cfg_msg.default_durability
                 .max(self.keratin_cfg_event.default_durability),
+            expect_every_write_synced: self.keratin_cfg_msg.expect_every_write_synced
+                || self.queue_writes_all_synced(),
             ..self.keratin_cfg_msg
         }
     }
@@ -1419,10 +1427,13 @@ impl Stroma {
         self.create_generation_dir(tp, part, group, &dir)?;
 
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
+        let kind = self.read_partition_kind(tp, part, group);
+        let mut config = self.partition_event_log_config(kind);
+        config.expect_every_write_synced |= self.event_log_expects_synced(kind, tp, part);
         let k = self
             .open_keratin(
                 dir,
-                self.partition_event_log_config(self.read_partition_kind(tp, part, group)),
+                config,
                 self.storage_history_binding(tp, part, group)?.is_some(),
             )
             .await
@@ -1438,10 +1449,12 @@ impl Stroma {
         self.create_generation_dir(tp, part, group, &dir)?;
 
         tracing::info!("Initializing message log: (`{tp}` `{part}` `{group:?}`)");
+        let mut config = self.keratin_cfg_msg;
+        config.expect_every_write_synced |= self.stream_record_log_expects_synced(tp, part);
         let k = self
             .open_keratin(
                 dir,
-                self.keratin_cfg_msg,
+                config,
                 self.storage_history_binding(tp, part, group)?.is_some(),
             )
             .await
