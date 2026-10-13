@@ -86,6 +86,9 @@ pub(crate) mod layout;
 #[path = "stroma/empty_queue_removal.rs"]
 mod empty_queue_removal;
 pub use empty_queue_removal::EmptyQueueRemoval;
+#[path = "stroma/queue_log_sync.rs"]
+mod queue_log_sync;
+pub use queue_log_sync::QueueLogSyncStatus;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
 #[path = "replication_retention.rs"]

@@ -32,7 +32,8 @@ pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
     AdaptiveStagingConfig, reusable_buffer::EmptyBufferResize,
     AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, test_dir, util::TempDir,
+    KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, SyncStatus, WriterSettings,
+    WriterSettingsSnapshot, test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
 pub use state::{
@@ -51,7 +52,7 @@ pub use stroma::{
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
     PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome, QueueStateCheckpoint,
     QueueStateCheckpointInstallOutcome, StreamPromotionOutcome,
-    QueuePublishCommit, QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageSpec,
+    QueueLogSyncStatus, QueuePublishCommit, QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageSpec,
     QueueRecoveryStageReceipt, RecoveryStageLimits, RecoveryReadPage, RecoveryReadRequest,
     RecoveryReadSource, RecoveryRecord, RecoverySequentialRead, RecoverySealRequest, ReplicatedEventBatch,
     ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, RetainedHistoryIdentity, RetainedLog, RetainedLogs,
