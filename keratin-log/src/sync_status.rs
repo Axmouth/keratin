@@ -25,6 +25,14 @@ pub struct SyncStatus {
     pub background_sync_pending: bool,
     /// Background syncs started since open.
     pub background_syncs_started: u64,
+    /// Whether this log expects every write to be synced by the append that
+    /// made it: the `expect_every_write_synced` setting is on and the log is
+    /// in the owner role.
+    pub every_write_sync_expected: bool,
+    /// Background syncs since open that covered records no waiting append
+    /// claimed while every write was expected to be synced. Each one means
+    /// some write path skipped its sync.
+    pub unexpected_background_syncs: u64,
     /// The storage failure that stopped this log, if any. A stopped log stays
     /// stopped until reopened.
     pub storage_failure: Option<String>,
@@ -38,8 +46,16 @@ pub(crate) struct SyncTracker {
     interval_nanos: AtomicU64,
     background_pending: AtomicBool,
     background_started: AtomicU64,
+    expect_every_write_synced: AtomicBool,
+    // Mirrors the Keratin role, so the writer can tell owner writes apart.
+    owner: AtomicBool,
+    unexpected_background: AtomicU64,
+    last_unexpected_warning: Mutex<Option<Instant>>,
     storage_failure: Mutex<Option<String>>,
 }
+
+/// Unexpected background syncs on one log are logged at most this often.
+const UNEXPECTED_WARNING_INTERVAL: Duration = Duration::from_secs(60);
 
 impl SyncTracker {
     pub(crate) fn new() -> Self {
@@ -49,6 +65,10 @@ impl SyncTracker {
             interval_nanos: AtomicU64::new(0),
             background_pending: AtomicBool::new(false),
             background_started: AtomicU64::new(0),
+            expect_every_write_synced: AtomicBool::new(false),
+            owner: AtomicBool::new(true),
+            unexpected_background: AtomicU64::new(0),
+            last_unexpected_warning: Mutex::new(None),
             storage_failure: Mutex::new(None),
         }
     }
@@ -68,26 +88,62 @@ impl SyncTracker {
         self.background_pending.store(true, Ordering::Relaxed);
     }
 
+    pub(crate) fn set_expect_every_write_synced(&self, expect: bool) {
+        self.expect_every_write_synced
+            .store(expect, Ordering::Relaxed);
+    }
+
+    pub(crate) fn set_owner(&self, owner: bool) {
+        self.owner.store(owner, Ordering::Release);
+    }
+
+    pub(crate) fn is_owner(&self) -> bool {
+        self.owner.load(Ordering::Acquire)
+    }
+
+    /// Count an unexpected background sync. Returns true when it should be
+    /// logged: the first one, then at most once per warning interval.
+    pub(crate) fn note_unexpected_background_sync(&self) -> bool {
+        self.unexpected_background.fetch_add(1, Ordering::Relaxed);
+        let mut last = self.last_unexpected_warning.lock();
+        let now = Instant::now();
+        if last.is_some_and(|at| now.duration_since(at) < UNEXPECTED_WARNING_INTERVAL) {
+            return false;
+        }
+        *last = Some(now);
+        true
+    }
+
+    /// Time since the last successful sync, or since open when none has run.
+    pub(crate) fn since_last_sync(&self) -> Duration {
+        let last = Duration::from_nanos(self.last_success.load(Ordering::Relaxed));
+        self.opened.elapsed().saturating_sub(last)
+    }
+
     pub(crate) fn background_finished(&self) {
         self.background_pending.store(false, Ordering::Relaxed);
     }
 
     pub(crate) fn record_storage_failure(&self, error: &str) {
-        self.storage_failure.lock().get_or_insert_with(|| error.to_string());
+        self.storage_failure
+            .lock()
+            .get_or_insert_with(|| error.to_string());
     }
 
     pub(crate) fn status(&self, written_next: u64, durable_next: u64) -> SyncStatus {
-        let last = Duration::from_nanos(self.last_success.load(Ordering::Relaxed));
         SyncStatus {
             written_next,
             durable_next,
             durable_lag_records: written_next.saturating_sub(durable_next),
-            since_last_sync: self.opened.elapsed().saturating_sub(last),
+            since_last_sync: self.since_last_sync(),
             background_sync_interval: Duration::from_nanos(
                 self.interval_nanos.load(Ordering::Relaxed),
             ),
             background_sync_pending: self.background_pending.load(Ordering::Relaxed),
             background_syncs_started: self.background_started.load(Ordering::Relaxed),
+            every_write_sync_expected: self.expect_every_write_synced.load(Ordering::Relaxed)
+                && self.is_owner(),
+            unexpected_background_syncs: self.unexpected_background.load(Ordering::Relaxed),
             storage_failure: self.storage_failure.lock().clone(),
         }
     }

@@ -15,6 +15,7 @@ pub struct WriterSettings {
     pub min_fsync_interval_ms: u64,
     /// Zero disables the background sync.
     pub background_sync_interval: std::time::Duration,
+    pub expect_every_write_synced: bool,
 }
 
 /// Settings in use and the revision that installed them. The revision
@@ -35,6 +36,7 @@ impl From<KeratinConfig> for WriterSettings {
             fsync_interval_ms: cfg.fsync_interval_ms,
             min_fsync_interval_ms: cfg.min_fsync_interval_ms,
             background_sync_interval: cfg.background_sync_interval,
+            expect_every_write_synced: cfg.expect_every_write_synced,
         }
     }
 }
@@ -74,5 +76,6 @@ impl WriterSettings {
         cfg.fsync_interval_ms = self.fsync_interval_ms;
         cfg.min_fsync_interval_ms = self.min_fsync_interval_ms;
         cfg.background_sync_interval = self.background_sync_interval;
+        cfg.expect_every_write_synced = self.expect_every_write_synced;
     }
 }

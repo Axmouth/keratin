@@ -276,6 +276,9 @@ impl Keratin {
         log_state.durable.reset(log.durable_end_exclusive());
         log_state.sync.set_interval(cfg.background_sync_interval);
         log_state
+            .sync
+            .set_expect_every_write_synced(cfg.expect_every_write_synced);
+        log_state
             .head
             .store(log.manifest.head_offset, Ordering::SeqCst);
         log_state.epoch.store(log.current_epoch(), Ordering::SeqCst);
@@ -774,6 +777,7 @@ impl Keratin {
     }
 
     fn set_role(&self, role: KeratinRole, kind: crate::LogControlKind) {
+        self.log_state.sync.set_owner(role == KeratinRole::Owner);
         if self.role.swap(role.as_u8(), Ordering::AcqRel) != role.as_u8() {
             self.record_control_event(kind, self.next_offset());
         }

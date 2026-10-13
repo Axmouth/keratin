@@ -718,6 +718,7 @@ fn writer_loop(
             &mut pending,
             &mut last_fsync,
             cfg.background_sync_interval,
+            cfg.expect_every_write_synced,
             &notify_tx,
             &fsync_tx,
             &mut inflight_fsyncs,
@@ -959,6 +960,9 @@ fn writer_loop(
                 linger_max = Duration::from_millis(cfg.batch_linger_ms.max(1));
                 linger = linger.min(linger_max);
                 state.sync.set_interval(cfg.background_sync_interval);
+                state
+                    .sync
+                    .set_expect_every_write_synced(cfg.expect_every_write_synced);
                 batcher.replace_empty_config(BatcherConfig {
                     max_items: cfg.max_batch_records,
                     max_records: cfg.max_batch_records,
@@ -1706,6 +1710,10 @@ fn stage_replicated_req(
         match durability {
             // A write failure here is latched by the log.
             KDurability::AfterWrite | KDurability::AfterFlush => {
+                let records = (end_offset + 1)
+                    .saturating_sub(first_offset)
+                    .min(records.len() as u64);
+                note_unclaimed_write(log, state, end_offset + 1, records);
                 #[cfg(feature = "writer-stage-trace")]
                 log.flush_buffers_traced(tracer, work_id)?;
                 #[cfg(not(feature = "writer-stage-trace"))]
@@ -1866,6 +1874,9 @@ fn stage_reqs(
                     let _ = tx.send(ar.base_offset);
                 }
                 state.tail.store(end_offset + 1, Ordering::Release);
+                if dur != KDurability::AfterFsync {
+                    note_unclaimed_write(log, state, end_offset + 1, u64::from(ar.count));
+                }
                 if dur == KDurability::AfterWrite {
                     notify_tx
                         .send(NotifyMsg::One {
@@ -2594,6 +2605,15 @@ fn fail_notify_items(items: Vec<NotifyItem>, err_msg: impl AsRef<str>) -> Vec<No
         .collect()
 }
 
+/// Track records an owner wrote without anyone waiting for their sync.
+/// Records written in the follower role, as replicated appends always are,
+/// are left out, so they never count against the log after a promotion.
+fn note_unclaimed_write(log: &mut Log, state: &LogState, end: u64, records: u64) {
+    if state.sync.is_owner() {
+        log.note_unclaimed_write(end, records);
+    }
+}
+
 /// When the next background sync may start, or `None` when none is wanted.
 /// One is wanted when records are written to the OS but not durable, no sync
 /// of any kind is in flight and the interval is not zero. Any in-flight sync
@@ -2630,6 +2650,7 @@ fn maybe_start_background_sync(
     pending: &mut PendingAcks,
     last_fsync: &mut Instant,
     interval: Duration,
+    expect_every_write_synced: bool,
     notify_tx: &Sender<NotifyMsg>,
     fsync_tx: &Sender<FsyncReq>,
     inflight_fsyncs: &mut usize,
@@ -2651,6 +2672,19 @@ fn maybe_start_background_sync(
     let Ok(job) = job else {
         return;
     };
+    // The job covers everything staged, so it covers every unclaimed record.
+    if expect_every_write_synced && state.sync.is_owner() {
+        let unclaimed = log.unclaimed_unsynced_records();
+        if unclaimed > 0 && state.sync.note_unexpected_background_sync() {
+            tracing::warn!(
+                log = %log.root().display(),
+                unclaimed_records = unclaimed,
+                since_last_sync_ms = state.sync.since_last_sync().as_millis() as u64,
+                "background sync covered records that no append waited to sync on a log \
+                 that expects every write synced, so some write path skipped its sync"
+            );
+        }
+    }
     let ready = take_covered_acks(pending, job.durable_end());
     if !ready.is_empty() {
         *last_fsync = Instant::now();

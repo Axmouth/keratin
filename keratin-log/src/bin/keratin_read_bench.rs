@@ -47,6 +47,7 @@ async fn main() {
         writer_buffer_factor: 128,
         force_recovery_scan: false,
         background_sync_interval: KeratinConfig::default().background_sync_interval,
+        expect_every_write_synced: false,
         tail_cache_bytes: 0,
         segment_preallocate_bytes: 0,
         max_inflight_fsyncs: 8,

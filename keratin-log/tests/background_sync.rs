@@ -400,6 +400,170 @@ async fn background_sync_covers_records_across_rollover() {
     log.shutdown().await.unwrap();
 }
 
+fn flagged(interval: Duration) -> KeratinConfig {
+    KeratinConfig {
+        expect_every_write_synced: true,
+        ..config(interval)
+    }
+}
+
+// AfterFsync appends wait for their sync, so a background sync that covers
+// them is expected. Small flush targets write each record to the OS before
+// its commit, and commits that would wait a minute leave the background sync
+// to complete them, the same merge that happens on the first write after an
+// idle stretch.
+#[tokio::test]
+async fn after_fsync_traffic_never_counts_as_unexpected() {
+    let dir = test_dir!("unexpected_sync_after_fsync");
+    let log = Keratin::open(
+        &dir.root,
+        KeratinConfig {
+            fsync_interval_ms: 60_000,
+            min_fsync_interval_ms: 60_000,
+            flush_target_bytes: 64,
+            ..flagged(Duration::from_millis(5))
+        },
+    )
+    .await
+    .unwrap();
+    assert!(log.sync_status().every_write_sync_expected);
+    for value in 0..3u8 {
+        let receipt = log
+            .append_enqueue_receiver(message(value), Some(KDurability::AfterFsync))
+            .unwrap();
+        tokio::time::timeout(Duration::from_secs(10), receipt)
+            .await
+            .expect("the background sync must complete the waiting append")
+            .unwrap()
+            .unwrap();
+        // Let the log go idle before the next write.
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    let status = log.sync_status();
+    assert!(status.background_syncs_started >= 1, "{status:?}");
+    assert_eq!(status.unexpected_background_syncs, 0);
+
+    // Normal commit cadence with a busy background sync timer.
+    log.update_writer_settings(|s| {
+        s.fsync_interval_ms = 5;
+        s.min_fsync_interval_ms = 0;
+    })
+    .await
+    .unwrap();
+    let mut receipts = Vec::new();
+    for value in 0..200u32 {
+        receipts.push(
+            log.append_enqueue_receiver(message(value as u8), Some(KDurability::AfterFsync))
+                .unwrap(),
+        );
+        if value % 50 == 0 {
+            tokio::time::sleep(Duration::from_millis(15)).await;
+        }
+    }
+    for receipt in receipts {
+        receipt.await.unwrap().unwrap();
+    }
+    tokio::time::sleep(Duration::from_millis(30)).await;
+    assert_eq!(frontiers(&log), (203, 203, 203));
+    assert_eq!(log.sync_status().unexpected_background_syncs, 0);
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn after_flush_append_on_a_flagged_log_counts_as_unexpected() {
+    let dir = test_dir!("unexpected_sync_after_flush");
+    let log = Keratin::open(&dir.root, flagged(Duration::from_millis(10)))
+        .await
+        .unwrap();
+    log.append(message(0), Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+    log.append(message(1), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    wait_until("background sync", || log.durable_next() == 2).await;
+    let status = log.sync_status();
+    assert_eq!(status.background_syncs_started, 1);
+    assert_eq!(status.unexpected_background_syncs, 1);
+
+    // Every occurrence counts, even when the warning itself is rate limited.
+    log.append(message(2), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    wait_until("second background sync", || log.durable_next() == 3).await;
+    assert_eq!(log.sync_status().unexpected_background_syncs, 2);
+
+    // A sync that covers the record first leaves nothing to report.
+    log.append(message(3), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    log.sync().await.unwrap();
+    tokio::time::sleep(Duration::from_millis(50)).await;
+    assert_eq!(log.sync_status().unexpected_background_syncs, 2);
+
+    // Clearing the flag live stops the reports.
+    log.update_writer_settings(|s| s.expect_every_write_synced = false)
+        .await
+        .unwrap();
+    assert!(!log.sync_status().every_write_sync_expected);
+    log.append(message(4), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    wait_until("unflagged background sync", || log.durable_next() == 5).await;
+    assert_eq!(log.sync_status().unexpected_background_syncs, 2);
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
+async fn unflagged_log_never_counts_unexpected_syncs() {
+    let dir = test_dir!("unexpected_sync_unflagged");
+    let log = Keratin::open(&dir.root, config(Duration::from_millis(5)))
+        .await
+        .unwrap();
+    assert!(!log.sync_status().every_write_sync_expected);
+    for value in 0..5u8 {
+        log.append(message(value), Some(KDurability::AfterFlush))
+            .await
+            .unwrap();
+        wait_until("background sync", || {
+            log.durable_next() == u64::from(value) + 1
+        })
+        .await;
+    }
+    let status = log.sync_status();
+    assert!(status.background_syncs_started >= 1);
+    assert_eq!(status.unexpected_background_syncs, 0);
+    log.shutdown().await.unwrap();
+}
+
+// Followers write replicated records and sync them separately, so the flag
+// only applies to the owner. Records a follower wrote do not count after a
+// promotion either.
+#[tokio::test]
+async fn follower_writes_never_count_as_unexpected() {
+    let dir = test_dir!("unexpected_sync_follower");
+    let log = Keratin::open(&dir.root, flagged(Duration::from_millis(10)))
+        .await
+        .unwrap();
+    log.become_follower();
+    assert!(!log.sync_status().every_write_sync_expected);
+    let epoch = log.current_epoch();
+    log.append_replicated_batch(epoch, 0, vec![message(0)], Some(KDurability::AfterWrite))
+        .await
+        .unwrap();
+    wait_until("follower background sync", || log.durable_next() == 1).await;
+    log.append_replicated_batch(epoch, 1, vec![message(1)], Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    log.become_owner();
+    assert!(log.sync_status().every_write_sync_expected);
+    wait_until("owner background sync", || log.durable_next() == 2).await;
+    let status = log.sync_status();
+    assert_eq!(status.background_syncs_started, 2);
+    assert_eq!(status.unexpected_background_syncs, 0);
+    log.shutdown().await.unwrap();
+}
+
 #[cfg(feature = "io-fault-injection")]
 mod faults {
     use super::*;

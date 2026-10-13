@@ -102,6 +102,13 @@ pub struct KeratinConfig {
     /// leaves those records to the operating system, with no bound on how long
     /// they stay unsynced. The interval is a target, not a bound on loss.
     pub background_sync_interval: Duration,
+    /// Declares that every append on this log waits for an fsync, so the
+    /// background sync should never be the first to cover a record. When set,
+    /// a background sync that covers records written by an `AfterWrite` or
+    /// `AfterFlush` append logs a rate limited warning and counts in
+    /// `SyncStatus::unexpected_background_syncs`. Only applies while the log
+    /// is in the owner role. Reporting only, sync behavior is unchanged.
+    pub expect_every_write_synced: bool,
 }
 
 impl Default for KeratinConfig {
@@ -124,6 +131,7 @@ impl Default for KeratinConfig {
             adaptive_staging: None,
             force_recovery_scan: false,
             background_sync_interval: Duration::from_millis(100),
+            expect_every_write_synced: false,
         }
     }
 }

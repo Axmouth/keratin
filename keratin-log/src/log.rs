@@ -187,6 +187,8 @@ pub struct Log {
     /// When the last sync of this log started, inline or through the fsync
     /// worker. Paces the writer's background sync.
     pub(crate) last_sync_started: Instant,
+    /// Owner records written by appends that did not wait for a sync.
+    pub(crate) unclaimed_writes: UnclaimedWrites,
 
     root: PathBuf,
     pub manifest: Manifest,
@@ -237,6 +239,39 @@ pub struct Log {
     pub flush_target_bytes: usize, // e.g. 16MB
 
     segment_mapping: Arc<RwLock<BTreeMap<u64, PathBuf>>>,
+}
+
+/// Records an owner wrote with `AfterWrite` or `AfterFlush`, which no append
+/// waits to see synced. Only a high-water end and a count are kept, so the
+/// count is exact when one sync covers them all, which a background sync
+/// always does.
+#[derive(Debug, Default, Clone, Copy)]
+pub(crate) struct UnclaimedWrites {
+    /// Exclusive end of the highest such record.
+    end: u64,
+    /// Such records since a sync last covered them all.
+    records: u64,
+}
+
+impl Log {
+    pub(crate) fn note_unclaimed_write(&mut self, end: u64, records: u64) {
+        if self.durable_end >= self.unclaimed_writes.end {
+            self.unclaimed_writes.records = 0;
+        }
+        let unclaimed = &mut self.unclaimed_writes;
+        unclaimed.end = unclaimed.end.max(end);
+        unclaimed.records = unclaimed.records.saturating_add(records);
+    }
+
+    /// Unclaimed records not yet covered by any sync. Every sync path moves
+    /// `durable_end`, so none of them needs to clear this itself.
+    pub(crate) fn unclaimed_unsynced_records(&self) -> u64 {
+        if self.durable_end >= self.unclaimed_writes.end {
+            0
+        } else {
+            self.unclaimed_writes.records
+        }
+    }
 }
 
 struct AppendPlanState {
@@ -544,6 +579,7 @@ impl Log {
                     durable_end: next_offset,
                     written_end: next_offset,
                     last_sync_started: Instant::now(),
+                    unclaimed_writes: UnclaimedWrites::default(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -614,6 +650,7 @@ impl Log {
                     durable_end: next_offset,
                     written_end: next_offset,
                     last_sync_started: Instant::now(),
+                    unclaimed_writes: UnclaimedWrites::default(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -719,6 +756,7 @@ impl Log {
                 durable_end: next_offset,
                 written_end: next_offset,
                 last_sync_started: Instant::now(),
+                unclaimed_writes: UnclaimedWrites::default(),
                 flush_target_bytes,
                 segment_mapping: segment_mapping.clone(),
             },
@@ -1094,12 +1132,11 @@ impl Log {
         ))
     }
 
-    /// The first storage failure recorded by this handle, if any.
-    #[cfg(test)]
     pub(crate) fn root(&self) -> &Path {
         &self.root
     }
 
+    /// The first storage failure recorded by this handle, if any.
     pub(crate) fn storage_failure(&self) -> Option<&str> {
         self.storage_failure.as_deref()
     }
@@ -1866,6 +1903,8 @@ impl Log {
         self.staged_end_offset = next_offset.saturating_sub(1);
         self.durable_end = self.next_offset;
         self.written_end = self.next_offset;
+        // The fsync above covered every unclaimed record.
+        self.unclaimed_writes = UnclaimedWrites::default();
         self.flushed_through = next_offset;
         self.last_commit_through = next_offset;
         self.recent_commit_records = 0;
@@ -1923,6 +1962,8 @@ impl Log {
         self.staged_end_offset = next_offset.saturating_sub(1);
         self.durable_end = self.next_offset;
         self.written_end = self.next_offset;
+        // The fsync above covered every unclaimed record.
+        self.unclaimed_writes = UnclaimedWrites::default();
         self.flushed_through = next_offset;
         // The log rewound past everything the cache held; drop it so no stale
         // (rewound-away) offset is ever served from memory.
