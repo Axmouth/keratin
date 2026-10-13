@@ -23,6 +23,7 @@ fn main() {
         flush_target_bytes: 32 * 1024 * 1024,
         writer_buffer_factor: 128,
         force_recovery_scan: false,
+        background_sync_interval: KeratinConfig::default().background_sync_interval,
         tail_cache_bytes: 0,
         segment_preallocate_bytes: 0,
         max_inflight_fsyncs: 8,

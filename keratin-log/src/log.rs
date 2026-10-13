@@ -96,6 +96,11 @@ pub struct LogState {
     // empty-vs-"offset 0 durable" encoding lives in one place. See
     // `DurableWatermark` and `Log::durable_end_exclusive`.
     pub durable: DurableWatermark,
+    /// Exclusive written frontier. Published by the log at each write to the
+    /// OS, before any fsync job can cover those records, so readers that load
+    /// `durable` first and `written` second always see durable <= written.
+    pub written: crate::WrittenWatermark,
+    pub(crate) sync: Arc<crate::sync_status::SyncTracker>,
     pub epoch: Arc<AtomicU64>,
 }
 
@@ -146,6 +151,8 @@ impl LogState {
             tail: Arc::new(AtomicU64::new(tail)),
             local_append_bytes: Arc::new(AtomicU64::new(0)),
             durable: DurableWatermark::new(durable),
+            written: crate::WrittenWatermark::new(durable.first_non_durable()),
+            sync: Arc::new(crate::sync_status::SyncTracker::new()),
             epoch: Arc::new(AtomicU64::new(0)),
         }
     }
@@ -174,6 +181,12 @@ pub struct Log {
     // Staging uses an inclusive offset; durability uses an exclusive boundary.
     staged_end_offset: u64, // last offset staged into buffers
     durable_end: u64,       // exclusive durable frontier; zero means empty
+    /// Exclusive end of the records written to the OS through the staging
+    /// buffers. Always `durable_end <= written_end <= next_offset`.
+    written_end: u64,
+    /// When the last sync of this log started, inline or through the fsync
+    /// worker. Paces the writer's background sync.
+    pub(crate) last_sync_started: Instant,
 
     root: PathBuf,
     pub manifest: Manifest,
@@ -529,6 +542,8 @@ impl Log {
                     storage_failure: None,
                     staged_end_offset: initial,
                     durable_end: next_offset,
+                    written_end: next_offset,
+                    last_sync_started: Instant::now(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -597,6 +612,8 @@ impl Log {
                     storage_failure: None,
                     staged_end_offset: initial,
                     durable_end: next_offset,
+                    written_end: next_offset,
+                    last_sync_started: Instant::now(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -700,6 +717,8 @@ impl Log {
                 storage_failure: None,
                 staged_end_offset: initial,
                 durable_end: next_offset,
+                written_end: next_offset,
+                last_sync_started: Instant::now(),
                 flush_target_bytes,
                 segment_mapping: segment_mapping.clone(),
             },
@@ -1093,6 +1112,7 @@ impl Log {
                 %error,
                 "log stopped after storage failure, reopen required"
             );
+            self.log_state.sync.record_storage_failure(&error);
             self.storage_failure = Some(error);
             match self.mark_latched_cut() {
                 Ok(cut) => tracing::warn!(
@@ -1208,6 +1228,10 @@ impl Log {
             self.stats.idx_write += t.elapsed();
             self.idx_buf.clear();
         }
+        // Everything staged so far is now with the OS.
+        self.written_end = self.next_offset;
+        self.log_state.written.advance(self.written_end);
+        self.debug_check_frontiers();
 
         // Periodic stat line (kept here so it measures real IO). A tracing
         // event rather than a raw print so embedders can filter it: one line
@@ -1275,6 +1299,7 @@ impl Log {
             tracer,
         )?;
 
+        self.last_sync_started = Instant::now();
         Ok(FsyncJob {
             durable_end: self.next_offset,
             active: self.active.try_clone_file()?,
@@ -1332,6 +1357,8 @@ impl Log {
         self.poll_manifest()?;
         self.stats.fsync += elapsed;
         self.durable_end = self.durable_end.max(durable_end);
+        self.log_state.sync.record_success();
+        self.debug_check_frontiers();
         self.manifest.next_offset = self.manifest.next_offset.max(durable_end);
         self.manifest.active_base_offset = self.active.base_offset;
 
@@ -1417,6 +1444,13 @@ impl Log {
         #[cfg(feature = "writer-stage-trace")] tracer: Option<(&WriterStageTracer, u64)>,
     ) -> io::Result<()> {
         let t = Instant::now();
+        self.last_sync_started = t;
+        // Records still in the staging buffers are not covered by this sync,
+        // so every caller writes them out first.
+        debug_assert!(
+            self.write_buf.is_empty(),
+            "inline fsync with records still staged"
+        );
 
         observe_stage!(tracer, "log_fsync", (0, 0), { self.active.fsync() })?;
         observe_stage!(tracer, "index_fsync", (0, 0), { self.index.fsync() })?;
@@ -1425,6 +1459,8 @@ impl Log {
 
         // mark durable
         self.durable_end = self.next_offset;
+        self.log_state.sync.record_success();
+        self.debug_check_frontiers();
 
         self.manifest.next_offset = self.next_offset;
         self.manifest.active_base_offset = self.active.base_offset;
@@ -1473,6 +1509,22 @@ impl Log {
 
     pub fn next_offset(&self) -> u64 {
         self.next_offset
+    }
+
+    /// Exclusive end of the records written to the OS.
+    pub(crate) fn written_end(&self) -> u64 {
+        self.written_end
+    }
+
+    #[inline]
+    fn debug_check_frontiers(&self) {
+        debug_assert!(
+            self.durable_end <= self.written_end && self.written_end <= self.next_offset,
+            "frontiers out of order: durable {} written {} next {}",
+            self.durable_end,
+            self.written_end,
+            self.next_offset
+        );
     }
 
     /// The shared tail cache, for handing to `LogReader`s (they read it, the
@@ -1813,12 +1865,16 @@ impl Log {
         self.next_offset = next_offset;
         self.staged_end_offset = next_offset.saturating_sub(1);
         self.durable_end = self.next_offset;
+        self.written_end = self.next_offset;
         self.flushed_through = next_offset;
         self.last_commit_through = next_offset;
         self.recent_commit_records = 0;
         self.last_index_at_log_pos = self.active.bytes_written;
-        self.log_state.tail.store(next_offset, Ordering::Release);
+        // Lower the frontiers before the tail so readers never see
+        // durable > written > tail while the log moves back.
         self.log_state.durable.reset(self.durable_end_exclusive());
+        self.log_state.written.reset(self.written_end);
+        self.log_state.tail.store(next_offset, Ordering::Release);
         self.log_state.diagnostics.lock().record(
             LogControlKind::SuffixTruncated,
             self.manifest.epoch,
@@ -1866,6 +1922,7 @@ impl Log {
         self.next_offset = next_offset;
         self.staged_end_offset = next_offset.saturating_sub(1);
         self.durable_end = self.next_offset;
+        self.written_end = self.next_offset;
         self.flushed_through = next_offset;
         // The log rewound past everything the cache held; drop it so no stale
         // (rewound-away) offset is ever served from memory.
@@ -1881,10 +1938,12 @@ impl Log {
         self.manifest.store_atomic(&self.root)?;
 
         self.publish_segment_policy(policy);
+        // Truncation/checkpoint reset: the durable set can legitimately shrink.
+        // Lower the frontiers before the tail, as in `repair_suffix`.
+        self.log_state.durable.reset(self.durable_end_exclusive());
+        self.log_state.written.reset(self.written_end);
         self.log_state.head.store(next_offset, Ordering::Release);
         self.log_state.tail.store(next_offset, Ordering::Release);
-        // Truncation/checkpoint reset: the durable set can legitimately shrink.
-        self.log_state.durable.reset(self.durable_end_exclusive());
 
         self.log_state.diagnostics.lock().record(
             LogControlKind::CheckpointReset,

@@ -79,3 +79,63 @@ impl DurableWatermark {
         self.0.store(frontier.0, Ordering::Release);
     }
 }
+
+/// A shared publication of the exclusive written frontier: every offset below
+/// it has been written through Keratin's buffers to the OS (the point where an
+/// `AfterFlush` append completes), whether or not an fsync has covered it yet.
+/// The writer publishes and readers observe, like `DurableWatermark`. It never
+/// falls below the durable frontier and never passes the next offset to assign.
+///
+/// Changes are also sent on a watch channel so a reader can wait for progress
+/// without polling. The channel carries the latest frontier, so a slow reader
+/// only sees the newest value.
+#[derive(Debug, Clone)]
+pub struct WrittenWatermark {
+    next: Arc<AtomicU64>,
+    changed: Arc<tokio::sync::watch::Sender<u64>>,
+}
+
+impl WrittenWatermark {
+    pub fn new(next: u64) -> Self {
+        Self {
+            next: Arc::new(AtomicU64::new(next)),
+            changed: Arc::new(tokio::sync::watch::channel(next).0),
+        }
+    }
+
+    /// The first offset not yet written to the OS.
+    pub fn load(&self) -> u64 {
+        self.next.load(Ordering::Acquire)
+    }
+
+    /// Watch the frontier. The receiver starts at the current value.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
+    }
+
+    /// Publish forward progress after a write. Monotonic, like
+    /// `DurableWatermark::advance`.
+    pub(crate) fn advance(&self, next: u64) {
+        if self.next.fetch_max(next, Ordering::Release) < next {
+            self.changed.send_if_modified(|current| {
+                if *current < next {
+                    *current = next;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
+    }
+
+    /// Set the frontier, including moving it backward. Only for open and for
+    /// resets that rewrite the log tail.
+    pub(crate) fn reset(&self, next: u64) {
+        self.next.store(next, Ordering::Release);
+        self.changed.send_if_modified(|current| {
+            let modified = *current != next;
+            *current = next;
+            modified
+        });
+    }
+}

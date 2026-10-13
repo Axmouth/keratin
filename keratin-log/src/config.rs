@@ -95,6 +95,13 @@ pub struct KeratinConfig {
     /// Some enables lazy growth, empty-buffer decay and full idle release.
     pub adaptive_staging: Option<AdaptiveStagingConfig>,
     pub force_recovery_scan: bool,
+    /// How often the writer syncs records that were written to the OS but not
+    /// yet covered by an fsync, for example `AfterFlush` appends. A sync starts
+    /// only when such records exist and this long has passed since the last
+    /// sync of the log started. Idle logs never sync. Zero disables it and
+    /// leaves those records to the operating system, with no bound on how long
+    /// they stay unsynced. The interval is a target, not a bound on loss.
+    pub background_sync_interval: Duration,
 }
 
 impl Default for KeratinConfig {
@@ -116,6 +123,7 @@ impl Default for KeratinConfig {
             writer_buffer_factor: 128,
             adaptive_staging: None,
             force_recovery_scan: false,
+            background_sync_interval: Duration::from_millis(100),
         }
     }
 }

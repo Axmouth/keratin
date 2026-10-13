@@ -272,7 +272,9 @@ impl Keratin {
 
         log_state.tail.store(log.next_offset(), Ordering::SeqCst); // add getter or read field
         // Recovery baseline: authoritatively establish the frontier at startup.
+        log_state.written.reset(log.written_end());
         log_state.durable.reset(log.durable_end_exclusive());
+        log_state.sync.set_interval(cfg.background_sync_interval);
         log_state
             .head
             .store(log.manifest.head_offset, Ordering::SeqCst);
@@ -508,6 +510,30 @@ impl Keratin {
     /// readable through durable reads. `0` means nothing is durable yet.
     pub fn durable_next(&self) -> u64 {
         self.log_state.durable.load().first_non_durable()
+    }
+
+    /// The exclusive written frontier: every offset below it has been written
+    /// through Keratin's buffers to the OS, which is where an `AfterFlush`
+    /// append completes. Records between `durable_next` and this survive a
+    /// process crash but not power loss or a failed sync. Ordinary scans stay
+    /// bounded by `durable_next`. Always `durable_next() <= written_next() <=
+    /// next_offset()` when read in that order.
+    pub fn written_next(&self) -> u64 {
+        self.log_state.written.load()
+    }
+
+    /// Watch `written_next`. The receiver holds the latest frontier and is
+    /// marked changed whenever it moves, including backward after a reset.
+    pub fn watch_written_next(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.log_state.written.subscribe()
+    }
+
+    /// Durability lag and background sync state of this log, for reporting.
+    pub fn sync_status(&self) -> crate::SyncStatus {
+        // Durable first, so the written frontier read after it is never lower.
+        let durable = self.durable_next();
+        let written = self.written_next();
+        self.log_state.sync.status(written, durable)
     }
 
     /// Inclusive form of `durable_next`. Ambiguous at `0` (empty log or only

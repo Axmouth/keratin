@@ -13,6 +13,8 @@ pub struct WriterSettings {
     pub batch_linger_ms: u64,
     pub fsync_interval_ms: u64,
     pub min_fsync_interval_ms: u64,
+    /// Zero disables the background sync.
+    pub background_sync_interval: std::time::Duration,
 }
 
 /// Settings in use and the revision that installed them. The revision
@@ -32,6 +34,7 @@ impl From<KeratinConfig> for WriterSettings {
             batch_linger_ms: cfg.batch_linger_ms,
             fsync_interval_ms: cfg.fsync_interval_ms,
             min_fsync_interval_ms: cfg.min_fsync_interval_ms,
+            background_sync_interval: cfg.background_sync_interval,
         }
     }
 }
@@ -51,11 +54,9 @@ impl WriterSettings {
                 self.min_fsync_interval_ms,
             ]
             .into_iter()
-            .any(|ms| {
-                std::time::Instant::now()
-                    .checked_add(std::time::Duration::from_millis(ms))
-                    .is_none()
-            })
+            .map(std::time::Duration::from_millis)
+            .chain([self.background_sync_interval])
+            .any(|delay| std::time::Instant::now().checked_add(delay).is_none())
         {
             return Err(io::Error::new(
                 io::ErrorKind::InvalidInput,
@@ -72,5 +73,6 @@ impl WriterSettings {
         cfg.batch_linger_ms = self.batch_linger_ms;
         cfg.fsync_interval_ms = self.fsync_interval_ms;
         cfg.min_fsync_interval_ms = self.min_fsync_interval_ms;
+        cfg.background_sync_interval = self.background_sync_interval;
     }
 }
