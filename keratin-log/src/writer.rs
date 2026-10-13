@@ -344,6 +344,17 @@ enum WriterEvent {
     FsyncDisconnected,
 }
 
+fn spawn_named<F, T>(name: &str, f: F) -> std::thread::JoinHandle<T>
+where
+    F: FnOnce() -> T + Send + 'static,
+    T: Send + 'static,
+{
+    std::thread::Builder::new()
+        .name(name.to_string())
+        .spawn(f)
+        .expect("failed to spawn a log thread")
+}
+
 pub fn spawn_writer(
     mut log: Log,
     cfg: KeratinConfig,
@@ -359,7 +370,9 @@ pub fn spawn_writer(
     #[cfg(feature = "writer-stage-trace")]
     let fsync_tracer = tracer.clone();
 
-    std::thread::spawn(move || {
+    // Named so profiles and per-thread counters can tell a log's threads
+    // from the runtime's. Linux keeps the first 15 bytes.
+    spawn_named("keratin-notify", move || {
         notifier_loop(
             notify_rx,
             #[cfg(feature = "writer-stage-trace")]
@@ -374,7 +387,7 @@ pub fn spawn_writer(
     let (fsync_tx, fsync_rx) = crossbeam_channel::bounded::<FsyncReq>(fsync_channel_cap);
     let (fsync_done_tx, fsync_done_rx) = crossbeam_channel::bounded::<FsyncDone>(fsync_channel_cap);
 
-    std::thread::spawn(move || {
+    spawn_named("keratin-fsync", move || {
         fsync_loop(
             fsync_rx,
             fsync_done_tx,
@@ -386,7 +399,7 @@ pub fn spawn_writer(
 
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(channel_capacity);
 
-    std::thread::spawn(move || {
+    spawn_named("keratin-writer", move || {
         #[cfg(test)]
         let root = log.root().to_path_buf();
         // The notify and fsync senders move into the loop and drop when it
