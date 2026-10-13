@@ -380,6 +380,10 @@ impl Stroma {
                 let events = h.event_log();
                 events.sync().await.map_err(io_err)?;
                 let captured = h.capture_exact_checkpoint(false).await?;
+                // A buffered queue can apply a write between that sync and
+                // the capture without syncing it.
+                crate::stroma::checkpoint_capture::sync_through(&events, captured.event_next)
+                    .await?;
                 let pin = QueueCheckpointPin {
                     attempt,
                     storage: storage.clone(),

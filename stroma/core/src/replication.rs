@@ -440,10 +440,10 @@ impl Stroma {
     /// one whose installed checkpoint still needs payload backfill. The cursor
     /// alone does not prove readiness. Refuses stream partitions.
     ///
-    /// The cursor is the durable frontier, and the call refuses while any local
-    /// record is not durable yet, so a caller may report it as durable progress.
-    /// Follower appends wait for fsync and the dirty-apply fence covers an
-    /// append in flight, so the refusal is not expected in practice.
+    /// The cursor is the durable frontier, so a caller may report it as
+    /// durable progress. Records a follower wrote without syncing, as on a
+    /// buffered queue, are synced first. The dirty-apply fence keeps an append
+    /// in flight from landing in between.
     pub async fn queue_replication_next_offset(
         &self,
         topic: &str,
@@ -461,13 +461,9 @@ impl Stroma {
             ));
         }
         let log = handle.event_log();
-        let durable = log.durable_next();
-        if durable != log.next_offset() {
-            return Err(StromaError::InvalidArgument(
-                "follower log has records that are not durable yet".into(),
-            ));
-        }
-        Ok(durable)
+        let next = log.next_offset();
+        crate::stroma::checkpoint_capture::sync_through(&log, next).await?;
+        Ok(next)
     }
 
     /// A stream follower's next offsets for both logs: `(record_next,
@@ -868,6 +864,9 @@ impl Stroma {
 
         let log = qh.event_log();
         let next_offset = log.next_offset();
+        // A learner installs this as recovery authority. On a buffered queue
+        // the owner may not have synced all of it yet.
+        crate::stroma::checkpoint_capture::sync_through(&log, next_offset).await?;
         let state_checkpoint = if qh.has_ordered_apply() {
             let captured = qh.capture_exact_checkpoint(false).await?;
             if captured.event_next != next_offset {

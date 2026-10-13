@@ -1,6 +1,7 @@
 //! Written and durable progress of the logs behind a queue partition, and the
-//! cadence of their background sync. Reporting and tuning only. Queue reads,
-//! confirms and apply still follow the durable frontier.
+//! cadence of their background sync. Reporting and tuning only. Whether a
+//! queue reads and confirms at the written frontier is its buffered
+//! declaration, see `buffered_queue`.
 use super::*;
 
 /// Sync status of each log behind a queue partition. See

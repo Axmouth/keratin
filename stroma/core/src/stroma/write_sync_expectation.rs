@@ -31,9 +31,12 @@ impl Stroma {
         kind: PartitionKind,
         topic: &str,
         part: u32,
+        group: Option<&str>,
     ) -> bool {
         match kind {
-            PartitionKind::Queue => self.queue_writes_all_synced(),
+            PartitionKind::Queue => {
+                self.queue_writes_all_synced() && !self.queue_is_buffered(topic, part, group)
+            }
             PartitionKind::Stream => {
                 self.stream_declared_synced(topic, part)
                     && self.keratin_cfg_event.default_durability == KDurability::AfterFsync
@@ -78,7 +81,7 @@ impl Stroma {
         set_log_expects_synced(
             &h.event_log(),
             self.keratin_cfg_event.expect_every_write_synced
-                || self.event_log_expects_synced(PartitionKind::Stream, topic, part),
+                || self.event_log_expects_synced(PartitionKind::Stream, topic, part, None),
         )
         .await
     }
@@ -86,7 +89,7 @@ impl Stroma {
 
 /// Change one log's declaration through its live writer settings, retrying
 /// when another settings change lands first.
-async fn set_log_expects_synced(log: &Keratin, expect: bool) -> Result<()> {
+pub(super) async fn set_log_expects_synced(log: &Keratin, expect: bool) -> Result<()> {
     loop {
         let current = log.writer_settings().await.map_err(io_err)?;
         if current.settings.expect_every_write_synced == expect {

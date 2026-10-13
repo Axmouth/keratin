@@ -100,7 +100,7 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
             // skips every unselected record and u64::MAX scans all of them.
             for gap in [0, 1, SELECTED_SCAN_GAP, u64::MAX] {
                 let read =
-                    |offsets: &[(u64, u32)]| read_selected_with_limits(&h, offsets, budget, gap);
+                    |offsets: &[(u64, u32)]| read_selected_with_limits(&h, offsets, budget, gap, false);
                 let selected = read(&[(0, 0), (3, 1)]).unwrap();
                 assert_eq!(selected.iter().map(|m| m.0).collect::<Vec<_>>(), [0, 3]);
                 assert_eq!(selected[1].2, vec![42; 2048]);
@@ -112,8 +112,8 @@ async fn sparse_payloads_and_metadata_frontier_survive_replay() {
                 assert!(read(&[(0, 0), (5, 0)]).is_err());
             }
         }
-        assert!(read_selected(&h, &[(2, 0)]).is_err());
-        assert!(fetch_payload(&h, 2).unwrap().is_none());
+        assert!(read_selected(&h, &[(2, 0)], false).is_err());
+        assert!(fetch_payload(&h, 2, false).unwrap().is_none());
         assert_eq!(scan_payloads(&h, 0, 10).unwrap().len(), 4);
     }
     st.shutdown().await.unwrap();
@@ -168,7 +168,7 @@ async fn delayed_payload_pins_retention_below_snapshot_replay_boundary() {
             .unwrap(),
         0
     );
-    assert!(fetch_payload(&q.resolve().unwrap(), 0).unwrap().is_some());
+    assert!(fetch_payload(&q.resolve().unwrap(), 0, false).unwrap().is_some());
     assert!(q.resolve().unwrap().optional_message_log().is_none());
     assert_eq!(q.resolve().unwrap().physical_logs().count(), 1);
     st.shutdown().await.unwrap();
@@ -182,7 +182,7 @@ async fn delayed_payload_pins_retention_below_snapshot_replay_boundary() {
             .unwrap()
             .contains(&snapshot_next)
     );
-    assert!(fetch_payload(&q.resolve().unwrap(), 0).unwrap().is_some());
+    assert!(fetch_payload(&q.resolve().unwrap(), 0, false).unwrap().is_some());
     assert_eq!(
         q.resolve()
             .unwrap()
@@ -252,7 +252,7 @@ async fn event_only_follower_keeps_payloads_and_overlap_does_not_repeat_nack() {
     let q = st.queue_handle("q", 0, None).await.unwrap();
     let h = q.resolve().unwrap();
     assert_eq!(h.work_queue().unwrap().retries(0).await, 1);
-    assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, [42]);
+    assert_eq!(fetch_payload(&h, 0, false).unwrap().unwrap().payload, [42]);
     assert_eq!(
         st.queue_replication_next_offset("q", 0, None)
             .await
@@ -483,7 +483,7 @@ async fn single_log_lifecycle_and_stream_reads_are_explicit() {
     assert!(h.optional_message_log().is_none());
     assert_eq!(h.event_log().current_epoch(), 8);
     assert_eq!(
-        fetch_payload(&h, 0).unwrap().unwrap().payload,
+        fetch_payload(&h, 0, false).unwrap().unwrap().payload,
         vec![42; 2048]
     );
     drop(h);
@@ -619,7 +619,7 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
             let fh = fq.resolve().unwrap();
             assert_eq!(fh.event_log().next_offset(), prefix + 1);
             assert_eq!(
-                fetch_payload(&fh, prefix).unwrap().unwrap().payload,
+                fetch_payload(&fh, prefix, false).unwrap().unwrap().payload,
                 vec![73; 4096]
             );
             assert!(matches!(
@@ -822,9 +822,9 @@ async fn combined_recovery_stage_install_preserves_payloads_and_retry_progress()
         let q = target.queue_handle("q", 0, None).await.unwrap();
         let h = q.resolve().unwrap();
         assert_eq!((h.event_log().head_offset(), h.event_log().next_offset()), (0, 4));
-        assert_eq!(fetch_payload(&h, 1).unwrap().unwrap().payload, vec![42; 2048]);
-        assert_eq!(fetch_payload(&h, 3).unwrap().unwrap().payload, vec![42; 2048]);
-        assert!(fetch_payload(&h, 2).unwrap().is_none());
+        assert_eq!(fetch_payload(&h, 1, false).unwrap().unwrap().payload, vec![42; 2048]);
+        assert_eq!(fetch_payload(&h, 3, false).unwrap().unwrap().payload, vec![42; 2048]);
+        assert!(fetch_payload(&h, 2, false).unwrap().is_none());
         let mut state = crate::QueueInternalState::new("q".into(), 0);
         state.load_snapshot(&h.force_encode_snapshot(3).await.unwrap()).unwrap();
         assert_eq!(state.recovery_state_digest(), spec.state_digest);
@@ -888,7 +888,7 @@ async fn combined_agreed_checkpoint_preserves_old_payload_until_replacement() {
     let ticket = st.queue_handle("q", 0, None).await.unwrap();
     let h = ticket.resolve().unwrap();
     assert_eq!(h.event_log().head_offset(), 0);
-    assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+    assert_eq!(fetch_payload(&h, 0, false).unwrap().unwrap().payload, vec![42; 2048]);
     assert!(h.optional_message_log().is_none());
     assert_eq!(st.queue_checkpoint_activity("q", 0, None).unwrap().next, 6);
     st.release_queue_checkpoint_pin(b.pin).await.unwrap();
@@ -1024,8 +1024,8 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
             let ticket = st.queue_handle("q", 0, None).await.unwrap();
             let h = ticket.resolve().unwrap();
             assert_eq!(h.work_queue().unwrap().retries(1).await, 1);
-            assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
-            assert_eq!(fetch_payload(&h, 1).unwrap().unwrap().payload, vec![42; 2048]);
+            assert_eq!(fetch_payload(&h, 0, false).unwrap().unwrap().payload, vec![42; 2048]);
+            assert_eq!(fetch_payload(&h, 1, false).unwrap().unwrap().payload, vec![42; 2048]);
             let mut state = crate::QueueInternalState::new("q".into(), 0);
             state.load_snapshot(&h.force_encode_snapshot(2).await.unwrap()).unwrap();
             let mut expected = crate::QueueInternalState::new("q".into(), 0);
@@ -1130,7 +1130,7 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
         let ticket = st.queue_handle("q", 0, None).await.unwrap();
         let h = ticket.resolve().unwrap();
         assert!(h.optional_message_log().is_none());
-        assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42; 2048]);
+        assert_eq!(fetch_payload(&h, 0, false).unwrap().unwrap().payload, vec![42; 2048]);
     }
     st.shutdown().await.unwrap();
 
@@ -1335,7 +1335,7 @@ async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
     assert_eq!(h.event_log().next_offset(), 2);
     assert_eq!(h.ordered_applied_next().unwrap(), Some(2));
     assert_eq!(h.work_queue().unwrap().retries(0).await, 1);
-    assert_eq!(fetch_payload(&h, 0).unwrap().unwrap().payload, vec![42]);
+    assert_eq!(fetch_payload(&h, 0, false).unwrap().unwrap().payload, vec![42]);
     st.shutdown().await.unwrap();
 }
 
@@ -1668,7 +1668,7 @@ async fn sparse_live_retention_probe() {
         assert_eq!(h.work_queue().unwrap().lowest_not_settled_offset().await, held);
         assert_eq!(h.event_log().head_offset(), 0);
         let retained_records = h.event_log().next_offset();
-        assert_eq!(fetch_payload(&h, held).unwrap().unwrap().payload, vec![42; 2048]);
+        assert_eq!(fetch_payload(&h, held, false).unwrap().unwrap().payload, vec![42; 2048]);
         let pinned_bytes = file_bytes(&dir.root);
         drop(h);
         ack(&st, held).await;

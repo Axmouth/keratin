@@ -78,7 +78,7 @@ pub use recovery_stage::{
 #[path = "agreed_checkpoint.rs"]
 mod agreed_checkpoint;
 #[path = "stroma/checkpoint_capture.rs"]
-mod checkpoint_capture;
+pub(crate) mod checkpoint_capture;
 #[path = "stroma/combined.rs"]
 mod combined;
 #[path = "stroma/layout.rs"]
@@ -90,6 +90,8 @@ pub use empty_queue_removal::EmptyQueueRemoval;
 mod queue_log_sync;
 #[path = "stroma/write_sync_expectation.rs"]
 mod write_sync_expectation;
+#[path = "stroma/buffered_queue.rs"]
+mod buffered_queue;
 pub use queue_log_sync::QueueLogSyncStatus;
 #[path = "checkpoint_install.rs"]
 mod checkpoint_install;
@@ -863,6 +865,9 @@ pub struct Stroma {
     /// Streams declared to sync every record. See `set_stream_writes_synced`.
     synced_streams: Arc<DashMap<(Box<str>, u32), ()>>,
 
+    /// Queues declared buffered. See `set_queue_buffered`.
+    buffered_queues: Arc<DashMap<(Box<str>, u32, Option<Box<str>>), ()>>,
+
     // TODO: Consider using parking lot
     // Global DLQ topic
     pub(crate) global_dlq: Arc<RwLock<Option<GlobalDLQ>>>,
@@ -961,6 +966,7 @@ impl Stroma {
             queue_handles: Arc::new(ArcSwap::new(Arc::new(hashbrown::HashMap::new()))),
             lifecycle_locks: Arc::new(DashMap::new()),
             synced_streams: Arc::new(DashMap::new()),
+            buffered_queues: Arc::new(DashMap::new()),
             recovery_read_slots: Arc::new(Semaphore::new(1)),
             recovery_stream_slots: Arc::new(Semaphore::new(2)),
             recovery_stage_slots: Arc::new(Semaphore::new(1)),
@@ -1429,7 +1435,14 @@ impl Stroma {
         tracing::info!("Initializing event log: (`{tp}` `{part}` `{group:?}`)");
         let kind = self.read_partition_kind(tp, part, group);
         let mut config = self.partition_event_log_config(kind);
-        config.expect_every_write_synced |= self.event_log_expects_synced(kind, tp, part);
+        // Only an explicit config flag or the partition's own declaration
+        // count, so a buffered queue opens without the expectation.
+        let explicit = match kind {
+            PartitionKind::Queue => self.keratin_cfg_msg.expect_every_write_synced,
+            PartitionKind::Stream => self.keratin_cfg_event.expect_every_write_synced,
+        };
+        config.expect_every_write_synced =
+            explicit || self.event_log_expects_synced(kind, tp, part, group);
         let k = self
             .open_keratin(
                 dir,
@@ -4633,16 +4646,16 @@ impl Stroma {
         let ev = StromaEvent::Ack { off: offset };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, event_log, event_msg) = {
+        let (owner_operation, event_log, event_msg, durability) = {
             let h = qh.resolve()?;
             let lease = h.begin_owner_operation().await?;
             let message = self.owner_event_msg(&h, &ev)?;
-            (lease, h.event_log(), message)
+            (lease, h.event_log(), message, self.queue_publish_durability(&h))
         };
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
-            .append_enqueue(event_msg, None, outter_completion)
+            .append_enqueue(event_msg, Some(durability), outter_completion)
             .map_err(io_err)?;
 
         // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
@@ -4662,16 +4675,16 @@ impl Stroma {
         let ev = StromaEvent::AckMany { reqs };
 
         let qh = self.queue_handle(tp, part, group).await?;
-        let (owner_operation, event_log, event_msg) = {
+        let (owner_operation, event_log, event_msg, durability) = {
             let h = qh.resolve()?;
             let lease = h.begin_owner_operation().await?;
             let message = self.owner_event_msg(&h, &ev)?;
-            (lease, h.event_log(), message)
+            (lease, h.event_log(), message, self.queue_publish_durability(&h))
         };
         let outter_completion =
             ApplyThenComplete::new(self.clone(), ev, qh, owner_operation, completion);
         event_log
-            .append_enqueue(event_msg, None, outter_completion)
+            .append_enqueue(event_msg, Some(durability), outter_completion)
             .map_err(io_err)?;
 
         // let applied_up_to = qh.applied_upto().load(Ordering::Relaxed);
@@ -4720,7 +4733,7 @@ impl Stroma {
         let m = self.owner_event_msg(&qh, &event)?;
         let ordered_scope = qh.ordered_apply_scope();
         let ar = event_log
-            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .append_batch(vec![m], Some(self.queue_settle_durability(&qh)))
             .await
             .map_err(io_err)?;
         if ordered_scope.is_none() {
@@ -4779,7 +4792,7 @@ impl Stroma {
         let m = self.owner_event_msg(&h, &nack_event)?;
         let ordered_scope = h.ordered_apply_scope();
         let ar = event_log
-            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .append_batch(vec![m], Some(self.queue_settle_durability(&h)))
             .await
             .map_err(io_err)?;
         if ordered_scope.is_none() {
@@ -4833,7 +4846,7 @@ impl Stroma {
             let m = self.owner_event_msg(&h, &ev)?;
             let ordered_scope = h.ordered_apply_scope();
             let discard_ar = event_log
-                .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+                .append_batch(vec![m], Some(self.queue_settle_durability(&h)))
                 .await
                 .map_err(io_err)?;
             let turn = crate::ordered_apply::enter(&ordered_scope, discard_ar.base_offset, discard_ar.count as u64).await?;
@@ -4853,10 +4866,7 @@ impl Stroma {
             let event_msg = self.owner_event_msg(&h, &ev)?;
             let ordered_scope = h.ordered_apply_scope();
             let dlq_ar = event_log
-                .append_batch(
-                    vec![event_msg],
-                    Some(self.keratin_cfg_event.default_durability),
-                )
+                .append_batch(vec![event_msg], Some(self.queue_settle_durability(&h)))
                 .await
                 .map_err(io_err)?;
             // (Apply already done at phase-1 nack, which moved them to pending_dlq.
@@ -5158,7 +5168,7 @@ impl Stroma {
         let ordered_scope = qh.ordered_apply_scope();
         let ar = qh
             .event_log()
-            .append_batch(vec![m], Some(self.keratin_cfg_event.default_durability))
+            .append_batch(vec![m], Some(self.queue_settle_durability(qh)))
             .await
             .map_err(io_err)?;
         let turn = crate::ordered_apply::enter(&ordered_scope, ar.base_offset, ar.count as u64).await?;
@@ -5177,7 +5187,7 @@ impl Stroma {
         off: Offset,
     ) -> Result<Option<Message>> {
         if qh.has_combined_log() {
-            return combined::fetch_payload(qh, off);
+            return combined::fetch_payload(qh, off, self.handle_is_buffered(qh));
         }
         let log = qh.msg_log()?;
         let reader = log.reader();
@@ -5210,9 +5220,10 @@ impl Stroma {
         }
 
         let qh = self.queue_handle(tp, part, group).await?;
+        let written = self.handle_is_buffered(&qs);
         let closure = move || {
             let h = qh.resolve()?;
-            combined::read_selected(&h, &offs)
+            combined::read_selected(&h, &offs, written)
         };
 
         let out = tokio::task::spawn_blocking(closure)

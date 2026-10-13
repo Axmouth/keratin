@@ -899,7 +899,7 @@ async fn compaction_stops_at_unsettled_payload_below_applied_boundary() {
     assert!(boundary.event_next() > 3);
     assert!(h.event_log().head_offset() <= 3);
     assert_eq!(
-        crate::stroma::combined::fetch_payload(&h, 3).unwrap().unwrap().payload,
+        crate::stroma::combined::fetch_payload(&h, 3, false).unwrap().unwrap().payload,
         vec![3; 512]
     );
     drop(h);

@@ -126,6 +126,23 @@ tagged releases yet. Earlier history predates this changelog.
   queue partition, and `set_queue_background_sync_interval` changes their
   cadence through the live writer settings. Queue behavior is unchanged.
 
+- `LogReader::scan_written_with_byte_budget` reads up to the written
+  frontier instead of the durable one, from the tail cache or the segment
+  files, with the usual offset, CRC and byte budget checks. A log that stops
+  after a failed sync moves its written frontier back to the durable end at
+  once, so written reads never serve records the next open cuts.
+
+- Buffered queues in Stroma. `set_queue_buffered` declares a queue partition
+  buffered for the life of the Stroma instance, including logs opened later.
+  Owner publishes, acks, nacks, releases, discards and dead-letter markers of
+  a buffered queue complete at `AfterFlush`, delivery and dead-letter payload
+  reads use the written frontier, and the queue log does not expect every
+  write synced. Writes that request `AfterFsync` explicitly keep it. Turning
+  the mode off pauses owner operations, waits for those in flight and syncs
+  the log before reads and writes move back to the durable frontier. Queues
+  on the two-log layout and stream partitions are refused. Queues not
+  declared buffered behave as before.
+
 - Unexpected background sync warning. A log with the new
   `expect_every_write_synced` setting declares that every append waits for
   an fsync. When a background sync on such a log covers records written by
@@ -263,6 +280,16 @@ tagged releases yet. Earlier history predates this changelog.
   by default and adjustable live, and `SyncStatus` gains
   `every_write_sync_expected` and `unexpected_background_syncs`. Struct
   literals that list every field need the new ones.
+
+- Queue checkpoints sync the log up to the captured boundary before the
+  snapshot becomes recovery authority: the local periodic checkpoint, the
+  agreed checkpoint pin and the owner checkpoint exported to learners. This
+  only costs a sync when applied records are not durable yet, as on a
+  buffered queue.
+
+- `queue_replication_next_offset` syncs a follower log that holds records
+  not yet durable and then answers, instead of refusing. The answer is still
+  durable progress.
 
 - Frozen recovery scans use buffered sequential reads and reuse bounded record
   scratch space while retaining CRC, offset and full-history verification.

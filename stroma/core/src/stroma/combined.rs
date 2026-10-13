@@ -15,8 +15,19 @@ fn payload(record: keratin_log::OwnedRecord) -> Result<Option<(u64, Message)>> {
         _ => Ok(None),
     }
 }
-pub(super) fn fetch_payload(qh: &QueueHandleInner, off: u64) -> Result<Option<Message>> {
-    let rs = qh.event_log().reader().scan_from(off, 1).map_err(io_err)?;
+/// `written` also serves records not yet synced, for buffered queues.
+pub(super) fn fetch_payload(
+    qh: &QueueHandleInner,
+    off: u64,
+    written: bool,
+) -> Result<Option<Message>> {
+    let reader = qh.event_log().reader();
+    let rs = if written {
+        reader.scan_written_with_byte_budget(off, 1, usize::MAX)
+    } else {
+        reader.scan_from(off, 1)
+    }
+    .map_err(io_err)?;
     match rs.into_iter().next() {
         Some(rec) if rec.offset == off => Ok(payload(rec)?.map(|(_, message)| message)),
         _ => Ok(None),
@@ -50,9 +61,14 @@ pub(super) fn scan_payloads(
     }
     Ok(out)
 }
+/// Read the selected payloads. `written` reads up to the written frontier
+/// instead of the durable one, for buffered queues, whose state applies a
+/// record once it is written. The selection and the read must use the same
+/// frontier, or a selected record can be missing from the read.
 pub(super) fn read_selected(
     qh: &QueueHandleInner,
     offsets: &[(u64, u32)],
+    written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
     // Experimental process-wide knob, sampled once rather than per record.
     // Preserve the existing 1 MiB default and the independent 4096-record cap.
@@ -64,7 +80,7 @@ pub(super) fn read_selected(
             .filter(|v| (1..=8 * 1024 * 1024).contains(v))
             .unwrap_or(1024 * 1024)
     });
-    read_selected_with_budget(qh, offsets, scan_bytes)
+    read_selected_with_budget(qh, offsets, scan_bytes, written)
 }
 
 /// Selected offsets at most this many records apart are read by scanning the
@@ -80,8 +96,9 @@ fn read_selected_with_budget(
     qh: &QueueHandleInner,
     offsets: &[(u64, u32)],
     scan_bytes: usize,
+    written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
-    read_selected_with_limits(qh, offsets, scan_bytes, SELECTED_SCAN_GAP)
+    read_selected_with_limits(qh, offsets, scan_bytes, SELECTED_SCAN_GAP, written)
 }
 
 fn read_selected_with_limits(
@@ -89,6 +106,7 @@ fn read_selected_with_limits(
     offsets: &[(u64, u32)],
     scan_bytes: usize,
     scan_gap: u64,
+    written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
     if offsets.is_empty() {
         return Ok(Vec::new());
@@ -122,9 +140,13 @@ fn read_selected_with_limits(
             }
             run_end = offset;
         }
-        let records = reader
-            .scan_from_with_byte_budget(next, (run_end + 1 - next).min(4096) as usize, scan_bytes)
-            .map_err(io_err)?;
+        let count = (run_end + 1 - next).min(4096) as usize;
+        let records = if written {
+            reader.scan_written_with_byte_budget(next, count, scan_bytes)
+        } else {
+            reader.scan_from_with_byte_budget(next, count, scan_bytes)
+        }
+        .map_err(io_err)?;
         if records.is_empty() {
             return Err(StromaError::Corruption(
                 "selected payload missing from combined log".into(),
@@ -303,10 +325,8 @@ impl Stroma {
         let bytes: usize = records.iter().map(Message::bytes_len).sum();
         // One log carries the batch, so one epoch describes it.
         let epoch = event_log.current_epoch();
-        let receiver = event_log.append_batch_enqueue_receiver(
-            records,
-            Some(self.queue_event_log_config().default_durability),
-        );
+        let receiver = event_log
+            .append_batch_enqueue_receiver(records, Some(self.queue_publish_durability(&h)));
         let stroma = self.clone();
         self.task_group
             .spawn("combined publish completion", async move {

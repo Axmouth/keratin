@@ -69,6 +69,10 @@ impl Stroma {
             };
             let captured = qh.capture_exact_checkpoint(true).await?;
             let event_next = captured.event_next;
+            // A buffered queue applies records before they are synced. The
+            // snapshot becomes recovery authority, so it must not cover
+            // records a power loss could still take.
+            sync_through(&qh.event_log(), event_next).await?;
             let message_floor = captured.message_floor;
             let timestamp = captured.state.last_snapshot_timestamp();
             let (topic, part, group) = (
@@ -110,6 +114,22 @@ impl Stroma {
         .await
         .map_err(|err| StromaError::Io(err.to_string()))?
     }
+}
+
+/// Sync `log` if its durable frontier is below `next`, then check it covers
+/// `next`. Free when the log is already durable that far.
+pub(crate) async fn sync_through(log: &Keratin, next: u64) -> Result<()> {
+    if log.durable_next() >= next {
+        return Ok(());
+    }
+    log.sync().await.map_err(io_err)?;
+    if log.durable_next() < next {
+        return Err(StromaError::Io(format!(
+            "log is durable to {} after a sync, short of {next}",
+            log.durable_next()
+        )));
+    }
+    Ok(())
 }
 
 /// Failed persistence leaves the queue eligible for a fresh snapshot. Never
