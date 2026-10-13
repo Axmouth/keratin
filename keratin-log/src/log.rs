@@ -549,6 +549,7 @@ impl Log {
                     next_offset,
                     tail_cache: Arc::new(TailCache::new(
                         log_state.durable.clone(),
+                        log_state.written.clone(),
                         tail_cache_bytes,
                     )),
                     flushed_through: next_offset,
@@ -620,6 +621,7 @@ impl Log {
                     next_offset,
                     tail_cache: Arc::new(TailCache::new(
                         log_state.durable.clone(),
+                        log_state.written.clone(),
                         tail_cache_bytes,
                     )),
                     flushed_through: next_offset,
@@ -727,7 +729,11 @@ impl Log {
                 active,
                 index,
                 next_offset,
-                tail_cache: Arc::new(TailCache::new(log_state.durable.clone(), tail_cache_bytes)),
+                tail_cache: Arc::new(TailCache::new(
+                    log_state.durable.clone(),
+                    log_state.written.clone(),
+                    tail_cache_bytes,
+                )),
                 flushed_through: next_offset,
                 last_commit_through: next_offset,
                 recent_commit_records: 0,
@@ -1151,6 +1157,10 @@ impl Log {
             );
             self.log_state.sync.record_storage_failure(&error);
             self.storage_failure = Some(error);
+            // Records past the durable end may never reach disk and the next
+            // open cuts them, so reads that see written records stop there.
+            self.written_end = self.durable_end;
+            self.log_state.written.reset(self.written_end);
             match self.mark_latched_cut() {
                 Ok(cut) => tracing::warn!(
                     root = %self.root.display(),

@@ -148,6 +148,29 @@ impl LogReader {
         self.scan_from_with_byte_budget(from, max, max_bytes)
     }
 
+    /// Like `scan_from_with_byte_budget`, but bounded by the written frontier
+    /// instead of the durable one, so it also returns records written to the
+    /// OS whose fsync has not completed. Those survive a process crash but not
+    /// power loss or a failed sync. For logs whose readers accept that, such
+    /// as buffered queues. Never use it for recovery proof.
+    pub fn scan_written_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> io::Result<Vec<OwnedRecord>> {
+        if let Some(records) = self
+            .tail_cache
+            .read_written_visible_with_byte_budget(from, max, max_bytes)
+        {
+            return Ok(records);
+        }
+        // The written frontier is published after the bytes reach the file, so
+        // the file holds every record below it.
+        let written = DurableFrontier::from_exclusive(self.tail_cache.written_frontier());
+        self.scan_disk_below(from, max, max_bytes, written)
+    }
+
     /// Verify retained durable records without trusting cached record contents.
     pub fn scan_from_disk(&self, from: u64, max: usize) -> io::Result<Vec<OwnedRecord>> {
         self.scan_from_disk_with_byte_budget(from, max, usize::MAX)
@@ -164,7 +187,18 @@ impl LogReader {
         // the preallocated zero padding beyond it. An empty / nothing-durable log
         // (frontier `0`) covers no offset, so the scan never enters the zero-padded
         // segment.
-        let durable = self.tail_cache.durable_frontier();
+        self.scan_disk_below(from, max, max_bytes, self.tail_cache.durable_frontier())
+    }
+
+    /// File scan of records below `durable`, which callers may set to the
+    /// written frontier. Never past what has reached the file.
+    fn scan_disk_below(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+        durable: DurableFrontier,
+    ) -> io::Result<Vec<OwnedRecord>> {
 
         let mut out = Vec::with_capacity(max);
         let mut cur = from;

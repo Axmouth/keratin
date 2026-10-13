@@ -21,7 +21,7 @@ use std::sync::Arc;
 
 use parking_lot::RwLock;
 
-use crate::durability::{DurableFrontier, DurableWatermark};
+use crate::durability::{DurableFrontier, DurableWatermark, WrittenWatermark};
 use crate::reader::{OwnedRecord, ScanByteBudget, to_owned};
 use crate::record::{decode_record_prefix, peek_record_prefix};
 
@@ -49,19 +49,27 @@ pub(crate) struct TailCache {
     /// The durable frontier (a clone of `LogState.durable`). Ordinary reads never
     /// serve an offset at or above it; tentative replication opts in separately.
     durable: DurableWatermark,
+    /// The written frontier (a clone of `LogState.written`). Bounds reads that
+    /// opt into records not yet covered by an fsync.
+    written_next: WrittenWatermark,
     /// Total cached bytes cap. `0` disables the cache (all reads go to the file).
     byte_budget: usize,
     written: tokio::sync::watch::Sender<()>,
 }
 
 impl TailCache {
-    pub(crate) fn new(durable: DurableWatermark, byte_budget: usize) -> Self {
+    pub(crate) fn new(
+        durable: DurableWatermark,
+        written_next: WrittenWatermark,
+        byte_budget: usize,
+    ) -> Self {
         Self {
             inner: RwLock::new(Inner {
                 batches: VecDeque::new(),
                 bytes: 0,
             }),
             durable,
+            written_next,
             byte_budget,
             written: tokio::sync::watch::channel(()).0,
         }
@@ -76,6 +84,11 @@ impl TailCache {
     /// preallocated zero padding past the durable data.
     pub(crate) fn durable_frontier(&self) -> DurableFrontier {
         self.durable.load()
+    }
+
+    /// The exclusive written frontier, for reads that serve written records.
+    pub(crate) fn written_frontier(&self) -> u64 {
+        self.written_next.load()
     }
 
     /// Append a just-flushed batch. Called once per flush (~fsync rate). Evicts
@@ -149,6 +162,17 @@ impl TailCache {
     #[cfg(test)]
     pub(crate) fn read_written(&self, from: u64, max: usize) -> Option<Vec<OwnedRecord>> {
         self.read_written_with_byte_budget(from, max, usize::MAX)
+    }
+
+    /// Records below the written frontier, durable or not. Same hit and miss
+    /// contract as `read_from_with_byte_budget`.
+    pub(crate) fn read_written_visible_with_byte_budget(
+        &self,
+        from: u64,
+        max: usize,
+        max_bytes: usize,
+    ) -> Option<Vec<OwnedRecord>> {
+        self.read_bounded(from, max, max_bytes, Some(self.written_frontier()))
     }
 
     /// Tentative replication only. Oversized cached flushes miss this path.
@@ -274,6 +298,7 @@ mod tests {
     fn cache(budget: usize, durable_excl: u64) -> TailCache {
         TailCache::new(
             DurableWatermark::new(DurableFrontier::from_exclusive(durable_excl)),
+            WrittenWatermark::new(durable_excl),
             budget,
         )
     }

@@ -266,6 +266,7 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
                 .await
                 .unwrap();
         }
+        assert_eq!(log.reader().scan_written_with_byte_budget(0, 10, usize::MAX).unwrap().len(), 3);
         let armed = arm(&dir.root.join("segments/00000000000000000000.log"), fault).unwrap();
         assert!(
             log.append(message(vec![4; 64]), Some(KDurability::AfterFsync))
@@ -273,6 +274,9 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
                 .is_err()
         );
         drop(armed);
+        // The cut records stop being readable as soon as the log latches.
+        assert_eq!(log.written_next(), 1, "{fault:?}");
+        assert_eq!(log.reader().scan_written_with_byte_budget(0, 10, usize::MAX).unwrap().len(), 1);
         log.shutdown().await.unwrap();
         drop(log);
         assert!(
