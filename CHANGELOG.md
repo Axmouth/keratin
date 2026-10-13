@@ -126,6 +126,25 @@ tagged releases yet. Earlier history predates this changelog.
   queue partition, and `set_queue_background_sync_interval` changes their
   cadence through the live writer settings. Queue behavior is unchanged.
 
+- Unexpected background sync warning. A log with the new
+  `expect_every_write_synced` setting declares that every append waits for
+  an fsync. When a background sync on such a log covers records written by
+  an `AfterWrite` or `AfterFlush` append that no sync had covered yet, the
+  writer logs a warning with the log root, the number of those records and
+  the time since the last sync, at most once a minute per log, and counts it
+  in `SyncStatus::unexpected_background_syncs`. Waiting `AfterFsync`
+  appends that the background sync covers do not count. The setting only
+  applies while the log is in the owner role, records written as a follower
+  never count, and sync behavior is unchanged. `SyncStatus` also reports
+  `every_write_sync_expected`.
+
+- Stroma sets `expect_every_write_synced` on queue logs whenever the event
+  log default durability is `AfterFsync`, which makes every owner publish
+  and settlement wait for an fsync. Streams opt in with
+  `set_stream_writes_synced`, meant for tiers whose every append waits for
+  an fsync. Role changes need no extra step, since Stroma already moves each
+  physical log to the follower role with its partition.
+
 - Live writer settings. `Keratin::writer_settings`,
   `replace_writer_settings` and the closure form `update_writer_settings`
   read and change one open log's default durability, batch limits, linger
@@ -239,6 +258,11 @@ tagged releases yet. Earlier history predates this changelog.
   `AfterFlush`, or write `AfterWrite` records to the OS, now become durable
   about one interval later without an explicit `sync`. Struct literals that
   list every field need the new one.
+
+- `KeratinConfig` and `WriterSettings` gain `expect_every_write_synced`, off
+  by default and adjustable live, and `SyncStatus` gains
+  `every_write_sync_expected` and `unexpected_background_syncs`. Struct
+  literals that list every field need the new ones.
 
 - Frozen recovery scans use buffered sequential reads and reuse bounded record
   scratch space while retaining CRC, offset and full-history verification.
