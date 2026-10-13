@@ -10,6 +10,15 @@ fn message(payload: impl Into<Vec<u8>>) -> Message {
     }
 }
 
+// These tests arm faults around records that are written but not synced, so
+// a background sync must not cover them first.
+fn config() -> KeratinConfig {
+    KeratinConfig {
+        background_sync_interval: std::time::Duration::ZERO,
+        ..KeratinConfig::test_default()
+    }
+}
+
 fn manifest_clean_flag(root: &std::path::Path) -> bool {
     let bytes = std::fs::read(root.join("manifest.bin")).unwrap();
     let flags = u16::from_be_bytes(bytes[10..12].try_into().unwrap());
@@ -23,7 +32,7 @@ fn manifest_clean_flag(root: &std::path::Path) -> bool {
 async fn failed_fsync_stops_the_log_until_reopen() {
     for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
         let dir = test_dir!("failed_fsync_stops_log");
-        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let log = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
@@ -54,7 +63,7 @@ async fn failed_fsync_stops_the_log_until_reopen() {
         assert!(!manifest_clean_flag(&dir.root));
         drop(log);
 
-        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let reopened = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         let next = reopened
@@ -73,7 +82,7 @@ async fn failed_fsync_stops_the_log_until_reopen() {
 async fn failed_after_flush_write_stops_the_log_until_reopen() {
     for fault in [Fault::Write, Fault::PartialWrite] {
         let dir = test_dir!("failed_after_flush_stops_log");
-        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let log = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
@@ -105,7 +114,7 @@ async fn failed_after_flush_write_stops_the_log_until_reopen() {
         assert!(!manifest_clean_flag(&dir.root));
         drop(log);
 
-        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let reopened = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         let next = reopened
@@ -128,7 +137,7 @@ fn messages(range: std::ops::Range<u8>) -> Vec<Message> {
 async fn failed_replicated_fsync_stops_the_log_until_reopen() {
     for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
         let dir = test_dir!("failed_replicated_fsync_stops_log");
-        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let log = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         log.become_follower();
@@ -173,7 +182,7 @@ async fn failed_replicated_fsync_stops_the_log_until_reopen() {
         assert!(!manifest_clean_flag(&dir.root));
         drop(log);
 
-        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let reopened = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         assert!(reopened.durable_next() >= durable);
@@ -189,7 +198,7 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
         let dir = test_dir!("failed_roll_or_reset_fsync_stops_log");
         let cfg = KeratinConfig {
             segment_max_bytes: 4096,
-            ..KeratinConfig::test_default()
+            ..config()
         };
         let log = Keratin::open(&dir.root, cfg).await.unwrap();
         log.become_follower();
@@ -246,7 +255,7 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
 async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
     for fault in [Fault::Fsync, Fault::FsyncAfterSuccess] {
         let dir = test_dir!("latched_fsync_cut");
-        let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let log = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
@@ -271,7 +280,7 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
             "{fault:?}: the latch must record the cut"
         );
 
-        let reopened = Keratin::open(&dir.root, KeratinConfig::test_default())
+        let reopened = Keratin::open(&dir.root, config())
             .await
             .unwrap();
         assert!(!dir.root.join("latched-cut.pending").exists());
@@ -294,13 +303,13 @@ async fn reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn bound_history_reopen_after_failed_fsync_cuts_back_to_the_durable_end() {
     let dir = test_dir!("latched_fsync_cut_bound");
-    let created = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let created = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     created.shutdown().await.unwrap();
     drop(created);
 
-    let log = Keratin::open_preserving_history(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open_preserving_history(&dir.root, config())
         .await
         .unwrap();
     log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
@@ -319,7 +328,7 @@ async fn bound_history_reopen_after_failed_fsync_cuts_back_to_the_durable_end() 
     log.shutdown().await.unwrap();
     drop(log);
 
-    let reopened = Keratin::open_preserving_history(&dir.root, KeratinConfig::test_default())
+    let reopened = Keratin::open_preserving_history(&dir.root, config())
         .await
         .expect("a latched cut must not strand a bound history");
     let kept = reopened.reader().scan_from(0, 10).unwrap();

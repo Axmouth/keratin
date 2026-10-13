@@ -12,6 +12,8 @@ fn config() -> KeratinConfig {
     KeratinConfig {
         tail_cache_bytes: 1024 * 1024,
         default_durability: KDurability::AfterFlush,
+        // These tests look at written records before any sync covers them.
+        background_sync_interval: Duration::ZERO,
         ..KeratinConfig::test_default()
     }
 }

@@ -42,9 +42,12 @@ async fn crash_child_writes_unsynced_records() {
     let Some(root) = std::env::var_os(CHILD_ROOT) else {
         return;
     };
-    let log = Keratin::open(&root, KeratinConfig::test_default())
-        .await
-        .unwrap();
+    // The parent checks that a dirty reopen syncs these records itself.
+    let cfg = KeratinConfig {
+        background_sync_interval: std::time::Duration::ZERO,
+        ..KeratinConfig::test_default()
+    };
+    let log = Keratin::open(&root, cfg).await.unwrap();
     log.become_follower();
     let epoch = log.current_epoch();
     log.append_replicated_batch(epoch, 0, messages(0..1), Some(KDurability::AfterFsync))

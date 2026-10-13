@@ -319,6 +319,8 @@ struct FsyncReq {
     /// thread hands the fsync to the worker stage and the worker carries these back
     /// in the `FsyncDone`, so a Sync never blocks staging. Empty for normal commits.
     sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
+    /// Started by the writer's background sync rather than a caller.
+    background: bool,
     #[cfg(feature = "writer-stage-trace")]
     work_id: u64,
 }
@@ -329,6 +331,7 @@ struct FsyncDone {
     ready: Vec<NotifyItem>,
     sync_acks: Vec<tokio::sync::oneshot::Sender<io::Result<()>>>,
     error: Option<String>,
+    background: bool,
     #[cfg(feature = "writer-stage-trace")]
     work_id: u64,
 }
@@ -540,6 +543,7 @@ fn fsync_loop_with(
                         ready: req.ready,
                         sync_acks: req.sync_acks,
                         error: None,
+                        background: req.background,
                         #[cfg(feature = "writer-stage-trace")]
                         work_id: req.work_id,
                     };
@@ -558,6 +562,7 @@ fn fsync_loop_with(
                         ready: fail_notify_items(req.ready, &msg),
                         sync_acks: req.sync_acks,
                         error: Some(msg.clone()),
+                        background: req.background,
                         #[cfg(feature = "writer-stage-trace")]
                         work_id: req.work_id,
                     };
@@ -707,6 +712,18 @@ fn writer_loop(
                 &tracer,
             );
         }
+        maybe_start_background_sync(
+            log,
+            &state,
+            &mut pending,
+            &mut last_fsync,
+            cfg.background_sync_interval,
+            &notify_tx,
+            &fsync_tx,
+            &mut inflight_fsyncs,
+            #[cfg(feature = "writer-stage-trace")]
+            &tracer,
+        );
 
         // (C) Compute how long we may wait for the next cmd.
         let now = Instant::now();
@@ -714,6 +731,12 @@ fn writer_loop(
         let mut wait = Duration::MAX;
         if let Some(deadline) = log.staging_maintenance_deadline() {
             wait = wait.min(deadline.saturating_duration_since(now));
+        }
+        // An idle log has nothing unsynced and never sets this timer.
+        if let Some(due) =
+            background_sync_due(log, &state, cfg.background_sync_interval, inflight_fsyncs)
+        {
+            wait = wait.min(due.saturating_duration_since(now));
         }
 
         // Cap by the commit deadline when durability acks are pending. With no
@@ -935,6 +958,7 @@ fn writer_loop(
                 min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
                 linger_max = Duration::from_millis(cfg.batch_linger_ms.max(1));
                 linger = linger.min(linger_max);
+                state.sync.set_interval(cfg.background_sync_interval);
                 batcher.replace_empty_config(BatcherConfig {
                     max_items: cfg.max_batch_records,
                     max_records: cfg.max_batch_records,
@@ -1509,6 +1533,7 @@ fn writer_loop(
                             job,
                             ready,
                             sync_acks: vec![respond_to],
+                            background: false,
                             #[cfg(feature = "writer-stage-trace")]
                             work_id,
                         };
@@ -2368,6 +2393,7 @@ fn settings_sync_boundary(
         job,
         ready,
         sync_acks: vec![respond_to],
+        background: false,
         #[cfg(feature = "writer-stage-trace")]
         work_id,
     };
@@ -2471,6 +2497,9 @@ fn handle_fsync_done(
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
     *inflight_fsyncs = inflight_fsyncs.saturating_sub(1);
+    if done.background {
+        state.sync.background_finished();
+    }
     #[cfg(feature = "writer-stage-trace")]
     tracer.event(
         done.work_id,
@@ -2565,6 +2594,96 @@ fn fail_notify_items(items: Vec<NotifyItem>, err_msg: impl AsRef<str>) -> Vec<No
         .collect()
 }
 
+/// When the next background sync may start, or `None` when none is wanted.
+/// One is wanted when records are written to the OS but not durable, no sync
+/// of any kind is in flight and the interval is not zero. Any in-flight sync
+/// already moves the durable frontier, and its completion wakes the writer to
+/// look again, so at most one background sync is ever outstanding. The time
+/// counts from the start of the last sync of any kind, so a commit fsync
+/// pushes the next tick back and a slow sync never leaves missed ticks to
+/// catch up on.
+fn background_sync_due(
+    log: &Log,
+    state: &LogState,
+    interval: Duration,
+    inflight_fsyncs: usize,
+) -> Option<Instant> {
+    if interval.is_zero() || inflight_fsyncs > 0 || log.storage_failure().is_some() {
+        return None;
+    }
+    // The published frontiers, so a durable frontier that an inline sync
+    // moved without publishing still gets published by the next tick.
+    if state.written.load() <= state.durable.load().first_non_durable() {
+        return None;
+    }
+    log.last_sync_started.checked_add(interval)
+}
+
+/// Start a background sync through the fsync worker when one is due. It
+/// covers everything written so far, and `AfterFsync` appends still waiting
+/// for a commit that it covers complete with it. A failure latches the log in
+/// `handle_fsync_done` like any other failed sync.
+#[allow(clippy::too_many_arguments)]
+fn maybe_start_background_sync(
+    log: &mut Log,
+    state: &Arc<LogState>,
+    pending: &mut PendingAcks,
+    last_fsync: &mut Instant,
+    interval: Duration,
+    notify_tx: &Sender<NotifyMsg>,
+    fsync_tx: &Sender<FsyncReq>,
+    inflight_fsyncs: &mut usize,
+    #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
+) {
+    let Some(due) = background_sync_due(log, state, interval, *inflight_fsyncs) else {
+        return;
+    };
+    if Instant::now() < due {
+        return;
+    }
+    #[cfg(feature = "writer-stage-trace")]
+    let work_id = tracer.next_work_id();
+    #[cfg(feature = "writer-stage-trace")]
+    let job = log.prepare_fsync_job_traced(tracer, work_id);
+    #[cfg(not(feature = "writer-stage-trace"))]
+    let job = log.prepare_fsync_job();
+    // A failed write latches the log and the loop stops on its next pass.
+    let Ok(job) = job else {
+        return;
+    };
+    let ready = take_covered_acks(pending, job.durable_end());
+    if !ready.is_empty() {
+        *last_fsync = Instant::now();
+    }
+    let req = FsyncReq {
+        job,
+        ready,
+        sync_acks: Vec::new(),
+        background: true,
+        #[cfg(feature = "writer-stage-trace")]
+        work_id,
+    };
+    #[cfg(feature = "writer-stage-trace")]
+    tracer.event(
+        work_id,
+        "background_sync_queued",
+        None,
+        req.ready.len(),
+        0,
+        None,
+        Some((0, req.job.durable_end())),
+    );
+    // Nothing is in flight, so the channel has a free slot and this send
+    // cannot park (see `ensure_fsync_slot`).
+    if let Err(err) = fsync_tx.send(req) {
+        let FsyncReq { ready, .. } = err.into_inner();
+        send_notify_items(notify_tx, fail_notify_items(ready, "fsync worker disconnected"));
+        return;
+    }
+    *inflight_fsyncs += 1;
+    state.sync.background_started();
+}
+
 #[allow(clippy::too_many_arguments)]
 fn commit(
     log: &mut Log,
@@ -2631,6 +2750,7 @@ fn commit(
         job,
         ready,
         sync_acks: Vec::new(),
+        background: false,
         #[cfg(feature = "writer-stage-trace")]
         work_id,
     };
@@ -2953,6 +3073,7 @@ mod held_pipeline_test {
                 ready: request.ready,
                 sync_acks: request.sync_acks,
                 error: None,
+                background: request.background,
             })
             .unwrap();
         };
@@ -3062,6 +3183,7 @@ mod held_pipeline_test {
                 ready: request.ready,
                 sync_acks: request.sync_acks,
                 error: None,
+                background: request.background,
             })
             .unwrap();
         };
@@ -3097,6 +3219,159 @@ mod held_pipeline_test {
             timeouts < 100,
             "writer timed out {timeouts} times while waiting for a held fsync"
         );
+    }
+    // The worker below holds every fsync until the test completes it, so the
+    // writer's background sync can be watched one request at a time.
+    #[test]
+    fn background_sync_keeps_one_outstanding_and_merges_waiting_acks() {
+        let dir = crate::test_dir!("held_background_sync");
+        let cfg = KeratinConfig {
+            // Commits would wait a minute on their own, so only the background
+            // sync can complete the AfterFsync append below.
+            fsync_interval_ms: 60_000,
+            min_fsync_interval_ms: 60_000,
+            background_sync_interval: Duration::from_millis(5),
+            tail_cache_bytes: 0,
+            ..KeratinConfig::test_default()
+        };
+        let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+        let (mut log, _) = Log::open(
+            &dir.root,
+            crate::util::unix_millis(),
+            cfg.segment_max_bytes,
+            cfg.index_stride_bytes,
+            cfg.flush_target_bytes,
+            0,
+            0,
+            false,
+            false,
+            state.clone(),
+            None,
+        )
+        .unwrap();
+        let (writes, input) = crossbeam_channel::bounded(8);
+        let (notifications, notified) = crossbeam_channel::unbounded();
+        let (jobs, requests) = crossbeam_channel::bounded::<FsyncReq>(8);
+        let (done, completed) = crossbeam_channel::bounded(8);
+        let writer_state = state.clone();
+        let worker = std::thread::spawn(move || {
+            writer_loop(
+                &mut log,
+                cfg,
+                &input,
+                writer_state,
+                notifications,
+                jobs,
+                completed,
+            );
+        });
+        let append = |id, durability| {
+            let (reply, receipt) = tokio::sync::oneshot::channel();
+            writes
+                .send(WriterCmd::Append(AppendReq {
+                    records: AppendPayload::One(Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload: vec![id],
+                    }),
+                    durability: Some(durability),
+                    completion: AppendCompletionTarget::Oneshot(reply),
+                    staged_offset_tx: None,
+                }))
+                .unwrap();
+            receipt
+        };
+        let complete = |request: FsyncReq| {
+            let elapsed = request.job.sync().unwrap();
+            done.send(FsyncDone {
+                durable_end: request.job.durable_end(),
+                elapsed,
+                ready: request.ready,
+                sync_acks: request.sync_acks,
+                error: None,
+                background: request.background,
+            })
+            .unwrap();
+        };
+        let wait_for = |what: &str, check: &dyn Fn() -> bool| {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            while !check() {
+                assert!(Instant::now() < deadline, "timed out waiting for {what}");
+                std::thread::sleep(Duration::from_millis(1));
+            }
+        };
+        let deliver = |count: usize| {
+            for _ in 0..count {
+                match notified.recv_timeout(Duration::from_secs(5)).unwrap() {
+                    NotifyMsg::One { item } => item.completion.complete(item.result),
+                    NotifyMsg::Batch(items) => {
+                        for item in items {
+                            item.completion.complete(item.result);
+                        }
+                    }
+                }
+            }
+        };
+
+        // A waiting AfterFsync append is staged but not written. The AfterFlush
+        // append behind it writes both to the OS.
+        let mut fsync_ack = append(0, KDurability::AfterFsync);
+        let _ = append(1, KDurability::AfterFlush);
+        let first = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(first.background);
+        assert_eq!(first.job.durable_end(), 2);
+        assert_eq!(first.ready.len(), 1, "the waiting AfterFsync ack rides along");
+        assert_eq!(state.written.load(), 2);
+        assert!(state.sync.status(2, 0).background_sync_pending);
+
+        // More written records arrive while the first sync is held. Many
+        // intervals pass, but no second sync starts and nothing turns durable
+        // that a sync has not covered.
+        let _ = append(2, KDurability::AfterFlush);
+        wait_for("third record written", &|| state.written.load() == 3);
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(requests.try_recv().is_err(), "one background sync at a time");
+        assert_eq!(state.durable.load().first_non_durable(), 0);
+        assert!(matches!(
+            fsync_ack.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
+
+        // Completing it publishes only what it covered and releases the ack.
+        complete(first);
+        let second = requests.recv_timeout(Duration::from_secs(5)).unwrap();
+        assert!(state.durable.load().covers(1));
+        assert!(second.background);
+        assert_eq!(second.job.durable_end(), 3);
+        deliver(1);
+        loop {
+            match fsync_ack.try_recv() {
+                Ok(result) => {
+                    assert_eq!(result.unwrap().base_offset, 0);
+                    break;
+                }
+                Err(tokio::sync::oneshot::error::TryRecvError::Empty) => deliver(1),
+                Err(error) => panic!("{error}"),
+            }
+        }
+        complete(second);
+        wait_for("durable catches up", &|| {
+            state.durable.load().first_non_durable() == 3
+        });
+
+        // Caught up and idle: missed ticks are not replayed.
+        std::thread::sleep(Duration::from_millis(100));
+        assert!(requests.try_recv().is_err(), "an idle log does not sync");
+        let status = state.sync.status(3, 3);
+        assert_eq!(status.background_syncs_started, 2);
+        assert!(!status.background_sync_pending);
+
+        let (reply, finished) = tokio::sync::oneshot::channel();
+        writes
+            .send(WriterCmd::Shutdown { notify_tx: reply })
+            .unwrap();
+        finished.blocking_recv().unwrap();
+        worker.join().unwrap();
     }
 }
 
@@ -3162,6 +3437,7 @@ mod batch_trace_tests {
                     result: Ok(result),
                 }],
                 sync_acks: vec![sync_reply],
+                background: false,
                 #[cfg(feature = "writer-stage-trace")]
                 work_id: tracer.next_work_id(),
             })

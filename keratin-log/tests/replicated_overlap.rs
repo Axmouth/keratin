@@ -16,6 +16,8 @@ fn messages(range: std::ops::Range<u8>) -> Vec<Message> {
 async fn follower(dir: &util::TempDir, tail_cache_bytes: usize) -> Keratin {
     let cfg = KeratinConfig {
         tail_cache_bytes,
+        // Several cases check that written overlaps stay non-durable.
+        background_sync_interval: std::time::Duration::ZERO,
         ..KeratinConfig::test_default()
     };
     let log = Keratin::open(&dir.root, cfg).await.unwrap();

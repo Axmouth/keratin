@@ -10,6 +10,14 @@ fn message(n: u8) -> Message {
         payload: vec![n; 64],
     }
 }
+// Most cases check written records that no sync has covered yet.
+fn config() -> KeratinConfig {
+    KeratinConfig {
+        background_sync_interval: std::time::Duration::ZERO,
+        ..KeratinConfig::test_default()
+    }
+}
+
 fn enqueue_update(
     log: &Keratin,
     expected: u64,
@@ -31,7 +39,7 @@ async fn live_settings_upgrade_persists_prefix_and_keeps_explicit_overrides() {
     let dir = crate::test_dir!("live_settings_upgrade");
     let cfg = KeratinConfig {
         default_durability: KDurability::AfterFlush,
-        ..KeratinConfig::test_default()
+        ..config()
     };
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
     log.append_batch(vec![message(0)], None).await.unwrap();
@@ -71,7 +79,7 @@ async fn live_settings_upgrade_persists_prefix_and_keeps_explicit_overrides() {
 #[tokio::test]
 async fn live_settings_cas_invalid_updates_and_lost_response() {
     let dir = crate::test_dir!("live_settings_cas");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     let initial = log.writer_settings().await.unwrap();
@@ -115,7 +123,7 @@ async fn live_settings_cas_invalid_updates_and_lost_response() {
 #[tokio::test]
 async fn live_settings_apply_to_follower_default_and_preserve_override() {
     let dir = crate::test_dir!("live_settings_follower");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     log.become_follower();
@@ -139,7 +147,7 @@ async fn live_settings_apply_to_follower_default_and_preserve_override() {
 async fn live_settings_fifo_downgrade_never_releases_old_durable_ack_early() {
     use crate::io_fault_injection::{Fault, arm_gated};
     let dir = crate::test_dir!("live_settings_fifo");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     let original = log.writer_settings().await.unwrap();
@@ -198,7 +206,7 @@ async fn live_settings_sync_failure_latches_the_log() {
     let dir = crate::test_dir!("live_settings_failed_sync");
     let cfg = KeratinConfig {
         default_durability: KDurability::AfterFlush,
-        ..KeratinConfig::test_default()
+        ..config()
     };
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
     log.append_batch(vec![message(0)], None).await.unwrap();
@@ -229,7 +237,7 @@ async fn live_settings_full_mailbox_does_not_block_async_runtime() {
     let dir = crate::test_dir!("live_settings_backpressure");
     let cfg = KeratinConfig {
         writer_buffer_factor: 1,
-        ..KeratinConfig::test_default()
+        ..config()
     };
     let log = Keratin::open(&dir.root, cfg).await.unwrap();
     let old = log.writer_settings().await.unwrap();
@@ -267,7 +275,7 @@ async fn live_settings_full_mailbox_does_not_block_async_runtime() {
 #[tokio::test]
 async fn live_settings_closure_edits_copy_and_validates_before_adoption() {
     let dir = crate::test_dir!("live_settings_closure");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     let original = log.writer_settings().await.unwrap();
@@ -300,7 +308,7 @@ async fn live_settings_closure_edits_copy_and_validates_before_adoption() {
 #[tokio::test]
 async fn live_settings_closure_conflict_does_not_replay_or_overwrite() {
     let dir = crate::test_dir!("live_settings_closure_conflict");
-    let log = Keratin::open(&dir.root, KeratinConfig::test_default())
+    let log = Keratin::open(&dir.root, config())
         .await
         .unwrap();
     let original = log.writer_settings().await.unwrap();
