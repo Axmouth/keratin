@@ -341,3 +341,127 @@ async fn declaration_survives_restart_and_ends_with_the_partition() {
     assert!(!st.queue_is_buffered("q", 0, None));
     st.shutdown().await.unwrap();
 }
+
+#[cfg(all(unix, feature = "io-fault-injection"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn buffered_power_loss_child() {
+    let Some(root) = std::env::var_os("STROMA_BUFFERED_POWER_ROOT") else {
+        return;
+    };
+    let root = Path::new(&root);
+    let st = open(&root.join("store"), 0).await;
+    st.ensure_queue("q", 0, None).await.unwrap();
+    st.set_queue_buffered("q", 0, None, true).await.unwrap();
+    let first = publish(&st, "q", 0..3).await;
+    // Leases that have already run out, so a restart can requeue them.
+    let leased = st.poll_ready("q", 0, None, 100, 1, u64::MAX).await.unwrap();
+    assert_eq!(leased.len(), 3);
+    settle(&st, first[0], 0).await;
+    // The checkpoint syncs everything above, so a power loss keeps it.
+    st.snapshot_partition("q", 0, None).await.unwrap();
+    publish(&st, "q", 3..6).await;
+    settle(&st, first[1], 0).await;
+    let log = event_log(&st, "q").await;
+    assert!(log.durable_next() < log.next_offset());
+    let state = format!(
+        "{}\n{}\n{}",
+        log.durable_next(),
+        log.next_offset(),
+        st.tp_part_dir("q", 0, None).display()
+    );
+    std::fs::write(root.join("handoff/child-state"), state).unwrap();
+    std::fs::write(root.join("handoff/child-ready"), b"").unwrap();
+    std::future::pending::<()>().await;
+}
+
+/// A single-node buffered queue loses power after a checkpoint. What the
+/// checkpoint covered survives exactly, the unsynced publishes and ack after
+/// it are gone, and new publishes reuse the lost offsets without mixing in
+/// old bytes.
+#[cfg(all(unix, feature = "io-fault-injection"))]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn power_loss_keeps_what_the_checkpoint_synced() {
+    struct KillOnDrop(std::process::Child);
+    impl Drop for KillOnDrop {
+        fn drop(&mut self) {
+            let _ = self.0.kill();
+            let _ = self.0.wait();
+        }
+    }
+    let dir = keratin_log::test_dir!("buffered_power_loss");
+    std::fs::create_dir_all(dir.root.join("handoff")).unwrap();
+    let ready_file = dir.root.join("handoff/child-ready");
+    let mut child = KillOnDrop(
+        std::process::Command::new(std::env::current_exe().unwrap())
+            .args([
+                "--exact",
+                "stroma::buffered_queue::tests::buffered_power_loss_child",
+                "--nocapture",
+            ])
+            .env("STROMA_BUFFERED_POWER_ROOT", &dir.root)
+            .stdout(std::process::Stdio::null())
+            .spawn()
+            .unwrap(),
+    );
+    tokio::time::timeout(Duration::from_secs(30), async {
+        while !ready_file.exists() {
+            assert!(child.0.try_wait().unwrap().is_none(), "child exited early");
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+    })
+    .await
+    .unwrap();
+    child.0.kill().unwrap();
+    child.0.wait().unwrap();
+    let state = std::fs::read_to_string(dir.root.join("handoff/child-state")).unwrap();
+    let mut lines = state.lines();
+    let durable: u64 = lines.next().unwrap().parse().unwrap();
+    let next: u64 = lines.next().unwrap().parse().unwrap();
+    let part_dir = std::path::PathBuf::from(lines.next().unwrap());
+    let log_root = find_log_root(&part_dir);
+    keratin_log::io_fault_injection::lose_unsynced_on_next_open(&log_root, durable).unwrap();
+
+    let st = open(&dir.root.join("store"), 0).await;
+    let log = event_log(&st, "q").await;
+    assert_eq!(log.next_offset(), durable, "unsynced records must be gone");
+    assert!(durable < next);
+    assert!(st.queue_is_buffered("q", 0, None));
+    // Offset 0 was acked before the checkpoint. The ack of offset 1 came
+    // after it and was lost, so 1 and 2 are delivered again once their
+    // leases expire.
+    st.requeue_expired(u64::MAX - 1, 100).await.unwrap();
+    let again: Vec<(u64, Vec<u8>)> = ready(&st, "q").await;
+    assert_eq!(
+        again,
+        vec![(1, vec![1; 512]), (2, vec![2; 512])],
+        "the checkpoint state must come back exactly"
+    );
+    // New records take the lost offsets (the requeue record first), and
+    // new publishes carry their own bytes.
+    let fresh = publish(&st, "q", 9..11).await;
+    assert!(fresh[0] >= durable && fresh[0] < next, "{fresh:?} {durable} {next}");
+    let delivered = ready(&st, "q").await;
+    assert_eq!(
+        delivered,
+        vec![(fresh[0], vec![9; 512]), (fresh[1], vec![10; 512])]
+    );
+    st.shutdown().await.unwrap();
+}
+
+/// The directory holding a log's `segments`, at or below `dir`.
+#[cfg(all(unix, feature = "io-fault-injection"))]
+fn find_log_root(dir: &Path) -> std::path::PathBuf {
+    if dir.join("segments").is_dir() {
+        return dir.to_path_buf();
+    }
+    for entry in std::fs::read_dir(dir).unwrap().flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            let found = find_log_root(&path);
+            if found.join("segments").is_dir() {
+                return found;
+            }
+        }
+    }
+    dir.to_path_buf()
+}
