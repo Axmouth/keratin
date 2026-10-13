@@ -340,3 +340,27 @@ async fn bound_history_reopen_after_failed_fsync_cuts_back_to_the_durable_end() 
     assert_eq!(kept[0].payload, vec![1; 64]);
     reopened.shutdown().await.unwrap();
 }
+
+// The power loss simulation drops what no sync covered, through the same cut
+// a failed sync leaves.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn simulated_power_loss_drops_unsynced_records() {
+    let dir = test_dir!("simulated_power_loss");
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
+    log.append(message(vec![1; 64]), Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+    for payload in [2u8, 3] {
+        log.append(message(vec![payload; 64]), Some(KDurability::AfterFlush))
+            .await
+            .unwrap();
+    }
+    let durable = log.durable_next();
+    assert_eq!(durable, 1);
+    drop(log);
+    keratin_log::io_fault_injection::lose_unsynced_on_next_open(&dir.root, durable).unwrap();
+    let reopened = Keratin::open(&dir.root, config()).await.unwrap();
+    assert_eq!(reopened.next_offset(), 1);
+    assert_eq!(reopened.reader().scan_from(0, 10).unwrap().len(), 1);
+    reopened.shutdown().await.unwrap();
+}

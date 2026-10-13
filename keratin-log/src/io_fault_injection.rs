@@ -1,6 +1,7 @@
 //! Isolated experiment support. Inject at the file operation boundary while
 //! retaining the real staging, fsync worker, receipts, cache and recovery paths.
-//! This models returned I/O errors, not a device failure or power loss.
+//! This models returned I/O errors, not a device failure or power loss, except
+//! for `lose_unsynced_on_next_open`, which models the loss of unsynced writes.
 use std::{
     collections::HashMap,
     fs::File,
@@ -217,4 +218,12 @@ mod tests {
         assert_eq!(bytes, b"abcdefgh");
         assert_eq!(armed.hits(), 1);
     }
+}
+
+/// Make the next open of the closed log at `root` drop every record from
+/// `durable_end` on, as a power loss drops writes no fsync covered. Uses the
+/// same pending cut a failed sync leaves behind. The caller passes the log's
+/// durable frontier as it was when the log stopped.
+pub fn lose_unsynced_on_next_open(root: &Path, durable_end: u64) -> io::Result<()> {
+    crate::latched_cut::write(root, durable_end)
 }
