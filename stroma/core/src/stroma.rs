@@ -472,6 +472,9 @@ impl TaskGroup {
 
     /// Spawn with automatic cancellation on shutdown.
     /// Future is dropped at its current await point when shutdown fires.
+    /// Tasks report the caller as their spawn site, in panics and in Tokio's
+    /// task hooks.
+    #[track_caller]
     pub fn spawn<F>(&self, name: &'static str, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
@@ -490,6 +493,7 @@ impl TaskGroup {
 
     /// Spawn with the cancellation token exposed.
     /// Use when the task needs to clean up at a safe point on shutdown.
+    #[track_caller]
     pub fn spawn_with_cancel<F, Fut>(&self, name: &'static str, make_fut: F)
     where
         F: FnOnce(CancellationToken) -> Fut,
@@ -502,17 +506,13 @@ impl TaskGroup {
         self.spawn_raw(name, make_fut(cancel));
     }
 
+    #[track_caller]
     fn spawn_raw<F>(&self, _name: &'static str, fut: F)
     where
         F: Future<Output = ()> + Send + 'static,
     {
-        #[cfg(tokio_unstable)]
-        let _ = self.tracker.build_task().name(_name).spawn(fut);
-        #[cfg(not(tokio_unstable))]
-        {
-            let _ = _name;
-            self.tracker.spawn(fut);
-        }
+        let _ = _name;
+        self.tracker.spawn(fut);
     }
 
     pub async fn shutdown(&self) {
