@@ -120,6 +120,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- The manifest records a log layout number in what was its first padding
+  byte. Layout 0, segments named by base offset, is the only one today, and
+  manifests written before the field read as 0. A build refuses a layout
+  newer than it knows. The first nonzero layout must also bump the manifest
+  version so builds older than the field refuse it too.
+
 - `EncodedEvent`, `Stroma::read_owner_queue_encoded(_early)` and
   `ReplicatedEventBatch::from_encoded`. Owner queue reads return records as
   their stored bytes without decoding them, and a follower appends those same

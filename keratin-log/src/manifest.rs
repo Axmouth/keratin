@@ -10,6 +10,8 @@ const MAN_MAGIC: &[u8; 8] = b"KERATIN\0";
 const MAN_VERSION: u16 = 2;
 const SHARED_MARKER: &[u8; 8] = b"SHARED\0\0";
 const MAN_FLAG_CLEAN_SHUTDOWN: u16 = 0x0001;
+/// Highest log layout this build reads. See `Manifest::layout`.
+pub(crate) const MAX_LAYOUT: u8 = 0;
 
 #[derive(Debug, Clone)]
 pub struct Manifest {
@@ -23,6 +25,12 @@ pub struct Manifest {
     pub clean_shutdown: bool,
     // Version 3 fences older binaries that lack shared-segment mutation barriers.
     pub shared_segments: bool,
+    /// How the log directory is laid out. 0 names segments by base offset.
+    /// Stored in the first padding byte, so manifests written before the
+    /// field existed read as 0. Builds older than the field ignore it, so
+    /// the first nonzero layout must also bump the manifest version to fence
+    /// them.
+    pub layout: u8,
 }
 
 impl Manifest {
@@ -37,6 +45,7 @@ impl Manifest {
             epoch: 0,
             clean_shutdown: true,
             shared_segments: false,
+            layout: 0,
         }
     }
 
@@ -118,7 +127,7 @@ impl Manifest {
         }
 
         // payload v2:
-        // created_ts(8) segment_max(8) index_stride(4) pad(4)
+        // created_ts(8) segment_max(8) index_stride(4) layout(1) pad(3)
         // active_base(8) next_offset(8) head_offset(8) epoch(8)
         let expected_len = if ver == 3 { 64 } else { 56 };
         if payload.len() != expected_len {
@@ -149,6 +158,15 @@ impl Manifest {
         let head_offset =
             u64::from_be_bytes(payload[40..48].try_into().expect("exact-length slice"));
         let epoch = u64::from_be_bytes(payload[48..56].try_into().expect("exact-length slice"));
+        let layout = payload[20];
+        if layout > MAX_LAYOUT {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                format!(
+                    "unsupported Keratin log layout {layout}, this build reads up to {MAX_LAYOUT}"
+                ),
+            ));
+        }
 
         Ok(Self {
             created_ts_ms,
@@ -160,6 +178,7 @@ impl Manifest {
             epoch,
             clean_shutdown: flags & MAN_FLAG_CLEAN_SHUTDOWN != 0,
             shared_segments: ver == 3,
+            layout,
         })
     }
 
@@ -206,7 +225,8 @@ impl Manifest {
         payload.extend_from_slice(&self.created_ts_ms.to_be_bytes());
         payload.extend_from_slice(&self.segment_max_bytes.to_be_bytes());
         payload.extend_from_slice(&self.index_stride_bytes.to_be_bytes());
-        payload.extend_from_slice(&0u32.to_be_bytes()); // pad
+        payload.push(self.layout);
+        payload.extend_from_slice(&[0u8; 3]); // pad
         payload.extend_from_slice(&self.active_base_offset.to_be_bytes());
         payload.extend_from_slice(&self.next_offset.to_be_bytes());
         payload.extend_from_slice(&self.head_offset.to_be_bytes());
@@ -234,6 +254,29 @@ impl Manifest {
 
         Ok(())
     }
+}
+
+#[test]
+fn manifest_layout_defaults_to_zero_and_refuses_unknown_layouts() {
+    use crate::test_dir;
+
+    let dir = test_dir!("test_data/manifest_layout");
+    let m = Manifest::default_new(1, 4096, 128);
+    m.store_atomic(&dir.root).unwrap();
+    assert_eq!(Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap().layout, 0);
+
+    // A manifest from a build before the field has zeros there.
+    let path = Manifest::path(&dir.root);
+    let mut bytes = fs::read(&path).unwrap();
+    assert_eq!(bytes[20 + 20..20 + 24], [0, 0, 0, 0]);
+
+    // An unknown layout is refused rather than misread.
+    bytes[20 + 20] = MAX_LAYOUT + 1;
+    let crc = crc32c(&bytes[20..]);
+    bytes[16..20].copy_from_slice(&crc.to_be_bytes());
+    fs::write(&path, &bytes).unwrap();
+    let error = Manifest::load_or_create(&dir.root, 0, 0, 0).unwrap_err();
+    assert_eq!(error.kind(), io::ErrorKind::InvalidData);
 }
 
 #[test]
