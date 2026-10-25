@@ -285,12 +285,15 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- Periodic manifest stores run on the background manifest worker by default.
+  `KERATIN_BACKGROUND_MANIFEST=0` keeps them inline for comparison.
+
 - Segment rollover syncs only the outgoing segment's log data on the writer.
   The new segment's header, its directory entry and the sealed index sync
   with the next fsync, before any record in the new segment counts as
   durable. At 10k msg/s with three replicas on one drive, durable p99 went
-  from about 75 ms to 28-33 ms with `KERATIN_BACKGROUND_MANIFEST=1` and to
-  45-47 ms without it, and p50 from about 30 ms to 9 ms.
+  from about 75 ms to 28-33 ms with background manifest stores and to 45-47 ms
+  with inline ones, and p50 from about 30 ms to 9 ms.
 
 - Truncation moves the head in memory and removes the files on the manifest
   worker, after that log's outstanding manifest store. The caller hears back

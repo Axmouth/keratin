@@ -414,11 +414,10 @@ impl Log {
             .min()
     }
 
-    /// Retain ownership until outstanding periodic checkpoints have drained.
+    /// Retain ownership until outstanding manifest work has drained. Truncation
+    /// always runs there, so this holds even with periodic background stores off.
     pub(crate) fn retain_directory_lock(&mut self, lock: Arc<crate::lock::FileLock>) {
-        if self.manifest_worker.enabled {
-            self._directory_lock = Some(lock);
-        }
+        self._directory_lock = Some(lock);
     }
 
     /// Complete a reset authorized by an external durable installation journal,
