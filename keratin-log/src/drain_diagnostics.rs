@@ -7,11 +7,6 @@ use std::time::Duration;
 
 #[derive(Default)]
 struct Counters {
-    drain_batches: AtomicU64,
-    commit_drain: AtomicU64,
-    commit_size: AtomicU64,
-    commit_deadline: AtomicU64,
-    drain_records: AtomicU64,
     staged_batches: AtomicU64,
     staged_records: AtomicU64,
     staged_bytes: AtomicU64,
@@ -31,11 +26,6 @@ pub(crate) fn init() {
             .spawn(move || {
                 loop {
                     let fields = [
-                        ("drain_batches", &c.drain_batches),
-                        ("commit_drain", &c.commit_drain),
-                        ("commit_size", &c.commit_size),
-                        ("commit_deadline", &c.commit_deadline),
-                        ("drain_records", &c.drain_records),
                         ("staged_batches", &c.staged_batches),
                         ("staged_records", &c.staged_records),
                         ("staged_bytes", &c.staged_bytes),
@@ -56,12 +46,6 @@ pub(crate) fn init() {
             .expect("start optional drain counters");
     });
 }
-pub(crate) fn drain(records: u64) {
-    if let Some(c) = COUNTERS.get() {
-        c.drain_batches.fetch_add(1, Ordering::Relaxed);
-        c.drain_records.fetch_add(records, Ordering::Relaxed);
-    }
-}
 pub(crate) fn stage(records: u64, bytes: u64) {
     if let Some(c) = COUNTERS.get() {
         c.staged_batches.fetch_add(1, Ordering::Relaxed);
@@ -80,13 +64,3 @@ pub(crate) fn fsync(direct: bool) {
     }
 }
 
-pub(crate) fn commit_trigger(trigger: crate::commit_policy::Trigger) {
-    if let Some(c) = COUNTERS.get() {
-        let counter = match trigger {
-            crate::commit_policy::Trigger::Drain => &c.commit_drain,
-            crate::commit_policy::Trigger::Size => &c.commit_size,
-            crate::commit_policy::Trigger::Deadline => &c.commit_deadline,
-        };
-        counter.fetch_add(1, Ordering::Relaxed);
-    }
-}

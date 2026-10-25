@@ -1,7 +1,6 @@
 //! Bounded background persistence of periodic, dirty manifests, and the
 //! truncation work that follows a manifest store. Critical metadata stores
-//! drain the outstanding job before writing. Periodic stores run here unless
-//! `KERATIN_BACKGROUND_MANIFEST=0`.
+//! drain the outstanding job before writing. Periodic stores always run here.
 use crate::manifest::Manifest;
 use crossbeam_channel::{Receiver, Sender, TryRecvError, TrySendError, bounded};
 use std::{
@@ -33,19 +32,9 @@ fn pool() -> &'static Sender<Job> {
     })
 }
 
+#[derive(Default)]
 pub(crate) struct ManifestWorker {
-    pub(crate) enabled: bool,
     pub(crate) pending: Option<Receiver<io::Result<Duration>>>,
-}
-
-impl Default for ManifestWorker {
-    fn default() -> Self {
-        Self {
-            // Diagnostic off switch for comparing against inline stores.
-            enabled: std::env::var("KERATIN_BACKGROUND_MANIFEST").as_deref() != Ok("0"),
-            pending: None,
-        }
-    }
 }
 
 impl ManifestWorker {

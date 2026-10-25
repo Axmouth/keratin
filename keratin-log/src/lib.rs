@@ -24,7 +24,6 @@ mod segment;
 mod shared_segment;
 mod zero_ahead;
 pub use shared_segment::FrozenForkStats;
-mod commit_policy;
 mod drain_diagnostics;
 mod latched_cut;
 mod suffix_repair;

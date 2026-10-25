@@ -70,17 +70,9 @@ pub(super) fn read_selected(
     offsets: &[(u64, u32)],
     written: bool,
 ) -> Result<Vec<(u64, MessageHeaders, Vec<u8>, u32)>> {
-    // Experimental process-wide knob, sampled once rather than per record.
-    // Preserve the existing 1 MiB default and the independent 4096-record cap.
-    static SCAN_BYTES: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    let scan_bytes = *SCAN_BYTES.get_or_init(|| {
-        std::env::var("STROMA_COMBINED_DELIVERY_SCAN_BYTES")
-            .ok()
-            .and_then(|v| v.parse::<usize>().ok())
-            .filter(|v| (1..=8 * 1024 * 1024).contains(v))
-            .unwrap_or(1024 * 1024)
-    });
-    read_selected_with_budget(qh, offsets, scan_bytes, written)
+    // Scan budget per read. Records are also capped at 4096 per scan.
+    const SCAN_BYTES: usize = 1024 * 1024;
+    read_selected_with_budget(qh, offsets, SCAN_BYTES, written)
 }
 
 /// `read_selected` from the tail cache alone. `None` as soon as one scan

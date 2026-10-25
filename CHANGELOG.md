@@ -11,6 +11,13 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- The writer experiment switches are removed: `KERATIN_STAGE_THEN_COMMIT`,
+  `KERATIN_IDLE_COMMIT_WINDOW_US`, `KERATIN_FLUSH_ON_DRAIN`,
+  `KERATIN_BACKGROUND_MANIFEST` and `STROMA_COMBINED_DELIVERY_SCAN_BYTES`.
+  Periodic manifests always store on the manifest worker. On current main,
+  stage-then-commit used 2.2 times the CPU per message at 1k and 10k msg/s for
+  no latency gain.
+
 - `QueuePublishCommit` gains `buffered`, true when the publication completed
   once written rather than once synced. Struct literals need the field.
 
@@ -299,8 +306,7 @@ tagged releases yet. Earlier history predates this changelog.
   and p99 from 28-30 ms to 13-16 ms. A writer that outruns its zeros stops
   zeroing for that segment. Reused segments only get zeros past their old end.
 
-- Periodic manifest stores run on the background manifest worker by default.
-  `KERATIN_BACKGROUND_MANIFEST=0` keeps them inline for comparison.
+- Periodic manifest stores run on the background manifest worker.
 
 - Segment rollover syncs only the outgoing segment's log data on the writer.
   The new segment's header, its directory entry and the sealed index sync

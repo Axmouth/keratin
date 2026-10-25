@@ -1600,9 +1600,6 @@ impl Log {
     }
 
     fn store_periodic_manifest(&mut self) -> io::Result<()> {
-        if !self.manifest_worker.enabled {
-            return self.store_manifest();
-        }
         if self.manifest_worker.submit(&self.root, &self.manifest)? {
             self.last_manifest_flush = Instant::now();
         }
@@ -2712,7 +2709,6 @@ mod background_manifest_tests {
             None,
         )
         .unwrap();
-        log.manifest_worker.enabled = true;
         log
     }
 
