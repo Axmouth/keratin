@@ -21,7 +21,7 @@ use crate::{
     manifest::Manifest,
     reader::LogReader,
     record::{Message, Record, encode_record},
-    recovery::scan_last_good,
+    recovery::scan_segment,
     reusable_buffer::ReusableBuffer,
     segment::Segment,
     tail_cache::TailCache,
@@ -107,7 +107,31 @@ pub struct LogState {
 pub(crate) struct FsyncJob {
     durable_end: u64,
     active: File,
-    index: File,
+    /// Present when the active index is due its lazy sync.
+    index: Option<File>,
+    /// Work a roll left for the next sync. See `PendingSync`.
+    pending: PendingSync,
+}
+
+/// Syncs a roll hands to the next fsync, so the writer is not held for them.
+/// The sealed segment's index syncs here, and the new segment's directory
+/// entry syncs after its data, before any record in it counts as durable.
+#[derive(Default)]
+pub(crate) struct PendingSync {
+    files: Vec<File>,
+    dir: Option<PathBuf>,
+}
+
+impl PendingSync {
+    fn sync(&self) -> io::Result<()> {
+        for file in &self.files {
+            crate::util::sync_file_data(file)?;
+        }
+        if let Some(dir) = &self.dir {
+            fsync_dir(dir)?;
+        }
+        Ok(())
+    }
 }
 
 impl FsyncJob {
@@ -136,9 +160,12 @@ impl FsyncJob {
         observe_stage!(tracer, "log_fsync", (0, 0), {
             crate::util::sync_file_data(&self.active)
         })?;
-        observe_stage!(tracer, "index_fsync", (0, 0), {
-            crate::util::sync_file_data(&self.index)
-        })?;
+        if let Some(index) = &self.index {
+            observe_stage!(tracer, "index_fsync", (0, 0), {
+                crate::util::sync_file_data(index)
+            })?;
+        }
+        observe_stage!(tracer, "roll_sync", (0, 0), { self.pending.sync() })?;
         Ok(started.elapsed())
     }
 }
@@ -189,6 +216,8 @@ pub struct Log {
     pub(crate) last_sync_started: Instant,
     /// Owner records written by appends that did not wait for a sync.
     pub(crate) unclaimed_writes: UnclaimedWrites,
+    /// Syncs left by the last roll for the next fsync to take.
+    pending_sync: PendingSync,
 
     root: PathBuf,
     pub manifest: Manifest,
@@ -581,6 +610,7 @@ impl Log {
                     written_end: next_offset,
                     last_sync_started: Instant::now(),
                     unclaimed_writes: UnclaimedWrites::default(),
+                    pending_sync: PendingSync::default(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
@@ -653,11 +683,26 @@ impl Log {
                     written_end: next_offset,
                     last_sync_started: Instant::now(),
                     unclaimed_writes: UnclaimedWrites::default(),
+                    pending_sync: PendingSync::default(),
                     flush_target_bytes,
                     segment_mapping: segment_mapping.clone(),
                 },
                 segment_mapping,
             ));
+        }
+
+        // A segment starts as a renamed spare whose new header is synced with
+        // its first records. A crash before that sync can leave the newest
+        // files named for a base their header does not carry yet. They hold no
+        // acknowledged record, so they go.
+        if !preserve_history {
+            drop_unstarted_segments(&root, &mut bases)?;
+            if bases.is_empty() {
+                return Err(io::Error::new(
+                    io::ErrorKind::InvalidData,
+                    "log has no started segment",
+                ));
+            }
         }
 
         // Repair/scan all segments, compute true next_offset.
@@ -672,7 +717,7 @@ impl Log {
             let header_len = (8 + 2 + 2 + 4 + 8 + 8 + 32 + 4) as u64;
             let scan = match verified_scans.next() {
                 Some(scan) => scan,
-                None => scan_last_good(seg.file_ref(), header_len, 64 * 1024)?,
+                None => scan_segment(seg.file_ref(), header_len, 64 * 1024, *base)?,
             };
             if scan.last_good_pos < seg.bytes_written {
                 // No writable descriptor to a shared inode may survive this barrier.
@@ -688,13 +733,18 @@ impl Log {
                 computed_next = computed_next.max(*base);
             }
 
-            // Repair idx length too (best-effort).
+            // The index syncs lazily and may lag the log or be missing.
             let idx_path = seg_idx_path(&root, *base);
-            if idx_path.exists() {
-                let idxf = OpenOptions::new().read(true).write(true).open(&idx_path)?;
-                let mut idx = Index::open(idxf, *base)?;
-                idx.repair_truncate_to_entries()?;
-            }
+            let idxf = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&idx_path)?;
+            let mut idx = match Index::open(idxf.try_clone()?, *base) {
+                Ok(idx) => idx,
+                Err(_) => {
+                    idxf.set_len(0)?;
+                    Index::create(idxf, *base, now_ms)?
+                }
+            };
+            idx.repair_against_log(seg.file_ref(), *base, scan.last_good_pos, index_stride_bytes)?;
+            idx.fsync()?;
         }
 
         let segment_mapping = Arc::new(RwLock::new(BTreeMap::from_iter(bases.clone())));
@@ -763,6 +813,7 @@ impl Log {
                 written_end: next_offset,
                 last_sync_started: Instant::now(),
                 unclaimed_writes: UnclaimedWrites::default(),
+                pending_sync: PendingSync::default(),
                 flush_target_bytes,
                 segment_mapping: segment_mapping.clone(),
             },
@@ -1350,7 +1401,8 @@ impl Log {
         Ok(FsyncJob {
             durable_end: self.next_offset,
             active: self.active.try_clone_file()?,
-            index: self.index.try_clone_file()?,
+            index: if self.index.sync_due() { Some(self.index.try_clone_file()?) } else { None },
+            pending: std::mem::take(&mut self.pending_sync),
         })
     }
 
@@ -1500,7 +1552,12 @@ impl Log {
         );
 
         observe_stage!(tracer, "log_fsync", (0, 0), { self.active.fsync() })?;
-        observe_stage!(tracer, "index_fsync", (0, 0), { self.index.fsync() })?;
+        if self.index.sync_due() {
+            observe_stage!(tracer, "index_fsync", (0, 0), { self.index.fsync() })?;
+        }
+        observe_stage!(tracer, "roll_sync", (0, 0), {
+            std::mem::take(&mut self.pending_sync).sync()
+        })?;
 
         self.stats.fsync += t.elapsed();
 
@@ -1658,23 +1715,22 @@ impl Log {
     }
 
     fn roll(&mut self, now_ms: u64) -> io::Result<()> {
-        // 1) flush current buffers to current segment files
         self.flush_buffers()?;
+        self.seal_active()?;
 
-        // 2) fsync to seal it durably (conservative)
-        self.fsync()?;
-        self.drain_manifest()?;
-
-        // The outgoing segment is sealed: reclaim any preallocated padding so it
-        // is not left on disk for the segment's lifetime.
+        // Reclaim preallocated padding so it does not stay on disk for the
+        // segment's lifetime.
         self.active.trim_to_written()?;
+        let sealed_index = self.index.try_clone_file()?;
 
+        // The next segment is not synced here. Its header goes with its first
+        // data sync and its directory entry right after, both before any of its
+        // records count as durable. Recovery drops a segment a crash caught
+        // before that.
         let new_base = self.next_offset;
-        let (mut seg, idx, new_seg_path) = create_segment_pair(&self.root, new_base, now_ms)?;
-        // Records in the new files are acknowledged once their file sync lands,
-        // so the directory entries must already be durable by then.
-        let synced = fsync_dir(&self.root.join("segments"));
-        self.latched(synced)?;
+        let (mut seg, idx, new_seg_path) = start_segment_pair(&self.root, new_base, now_ms)?;
+        self.pending_sync.files.push(sealed_index);
+        self.pending_sync.dir = Some(self.root.join("segments"));
         let policy = self.prepare_segment_policy(&mut seg);
         self.active = seg;
         self.index = idx;
@@ -1683,13 +1739,32 @@ impl Log {
 
         self.last_index_at_log_pos = self.active.bytes_written;
 
+        // The periodic store records the new active base. Recovery does not
+        // depend on it.
         self.manifest.active_base_offset = new_base;
-        let t = Instant::now();
-        self.manifest.store_atomic(&self.root)?;
-        self.stats.manifest += t.elapsed();
-        self.last_manifest_flush = Instant::now();
         self.publish_segment_policy(policy);
 
+        Ok(())
+    }
+
+    /// Make the active segment's records durable before it is sealed. Recovery
+    /// takes every segment before the last as complete. Only the log data and
+    /// the syncs an earlier roll left pending are needed here: the index is
+    /// rebuilt after a crash. On a recycled file the log sync is an in-place
+    /// overwrite, which skips the journal commit an extending write pays.
+    fn seal_active(&mut self) -> io::Result<()> {
+        self.check_storage()?;
+        let started = Instant::now();
+        let result = self
+            .active
+            .fsync()
+            .and_then(|()| std::mem::take(&mut self.pending_sync).sync());
+        self.latched(result)?;
+        self.stats.fsync += started.elapsed();
+        self.durable_end = self.next_offset;
+        self.log_state.sync.record_success();
+        self.debug_check_frontiers();
+        self.manifest.next_offset = self.next_offset;
         Ok(())
     }
 
@@ -1807,15 +1882,58 @@ impl Log {
         self.truncate_before_inner(before, true)
     }
 
+    #[cfg(test)]
     pub fn truncate_before(&mut self, before: u64) -> io::Result<u64> {
         self.truncate_before_inner(before, false)
     }
 
     fn truncate_before_inner(&mut self, before: u64, reclaim: bool) -> io::Result<u64> {
-        // Nothing to do
-        let cur_head = self.manifest.head_offset; // add this to manifest
+        let Some(job) = self.plan_truncate(before, reclaim)? else {
+            return Ok(self.manifest.head_offset);
+        };
+        // Make everything written so far durable before removing history.
+        self.flush_buffers()?;
+        self.fsync()?;
+        self.drain_manifest()?;
+        job.run()?;
+        Ok(job.manifest.head_offset)
+    }
+
+    /// `truncate_before` with the file removal on a background job, so the
+    /// writer is not held for its metadata syncs. `done` gets the new head once
+    /// the files are gone. Readers stop at the new head straight away. A crash
+    /// before the job lands only keeps more history.
+    pub(crate) fn truncate_before_deferred(
+        &mut self,
+        before: u64,
+        done: impl FnOnce(io::Result<u64>) + Send + 'static,
+    ) -> io::Result<()> {
+        let job = match self.plan_truncate(before, false) {
+            Ok(Some(job)) => job,
+            Ok(None) => {
+                done(Ok(self.manifest.head_offset));
+                return Ok(());
+            }
+            Err(e) => {
+                done(Err(e));
+                return Ok(());
+            }
+        };
+        self.manifest_worker.submit_after(move || {
+            let result = job.run().map(|()| job.manifest.head_offset);
+            if let Err(error) = &result {
+                tracing::error!(log_root = %job.root.display(), %error, "removing truncated segments failed");
+            }
+            done(result);
+        })
+    }
+
+    /// Move the head past every sealed segment below `before` in memory, and
+    /// return the file work that leaves. None when no segment can go.
+    fn plan_truncate(&mut self, before: u64, reclaim: bool) -> io::Result<Option<Reclaim>> {
+        let cur_head = self.manifest.head_offset;
         if before <= cur_head && !reclaim {
-            return Ok(cur_head);
+            return Ok(None);
         }
 
         let mut bases = self
@@ -1829,8 +1947,9 @@ impl Log {
         if bases.is_empty() {
             // degenerate; keep head consistent
             self.manifest.head_offset = before;
+            self.drain_manifest()?;
             self.manifest.store_atomic(&self.root)?;
-            return Ok(before);
+            return Ok(None);
         }
 
         // Only sealed segments whose last offset is below `before` can go. The
@@ -1843,44 +1962,28 @@ impl Log {
             .collect::<Vec<u64>>();
         // Without a deletion the first readable offset does not change.
         if deletable.is_empty() {
-            return Ok(cur_head);
+            return Ok(None);
         }
 
-        // Make everything written so far durable before removing history.
-        self.flush_buffers()?;
-        self.fsync()?;
-        self.drain_manifest()?;
-
-        // Persist the new floor before unlinking, so a crash part way through
-        // never reopens with a head that points at a missing segment.
         let new_head = bases[deletable.len()].0.max(cur_head);
         self.manifest.head_offset = new_head;
-        self.manifest.store_atomic(&self.root)?;
         self.log_state.head.store(new_head, Ordering::Release);
-
-        // Delete files (ignore NotFound so an interrupted truncate can finish)
-        for base in &deletable {
-            let lp = seg_log_path(&self.root, *base);
-            let ip = seg_idx_path(&self.root, *base);
-            self.segment_mapping.write().remove(base);
-            for path in [&ip, &lp] {
-                match fs::remove_file(path) {
-                    Ok(()) => tracing::info!("{} removed", path.display()),
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
-                        tracing::warn!("{} not found during truncating", path.display());
-                    }
-                    Err(e) => return Err(e),
-                }
+        {
+            let mut mapping = self.segment_mapping.write();
+            for base in &deletable {
+                mapping.remove(base);
             }
         }
-        fsync_dir(&self.root.join("segments"))?;
-
         self.log_state.diagnostics.lock().record(
             LogControlKind::Truncated,
             self.manifest.epoch,
             new_head,
         );
-        Ok(new_head)
+        Ok(Some(Reclaim {
+            root: self.root.clone(),
+            manifest: self.manifest.clone(),
+            bases: deletable,
+        }))
     }
 
     /// Preserve all retained records below `next_offset`, with restartable
@@ -2117,6 +2220,8 @@ impl Log {
         // crash in between just falls back to the recovery scan.
         self.active.trim_to_written()?;
         self.active.fsync()?;
+        // A clean open trusts the index without rebuilding it.
+        self.index.fsync()?;
         self.manifest.clean_shutdown = true;
         self.store_manifest()?;
         Ok(())
@@ -2342,6 +2447,107 @@ fn list_segment_bases(dir: &Path) -> io::Result<Vec<(u64, PathBuf)>> {
     Ok(out)
 }
 
+/// Freed segment files kept per log for reuse. Writing over a file's existing
+/// blocks needs no allocation, so its data syncs skip the journal commit an
+/// extending write pays, and nothing has to zero-fill ahead.
+const MAX_SPARE_SEGMENTS: usize = 4;
+
+fn spare_path(root: &Path, base: u64) -> PathBuf {
+    root.join("segments").join(format!("{base:020}.spare"))
+}
+
+fn list_spares(root: &Path) -> io::Result<Vec<PathBuf>> {
+    let mut out = Vec::new();
+    for ent in fs::read_dir(root.join("segments"))? {
+        let path = ent?.path();
+        if path.extension().is_some_and(|ext| ext == "spare") {
+            out.push(path);
+        }
+    }
+    Ok(out)
+}
+
+/// Keep a freed segment as a spare when the pool has room. A file still
+/// linked from a frozen fork is never reused, since writing over it would
+/// change the fork's copy too. The caller syncs the directory.
+fn keep_as_spare(root: &Path, base: u64, log_path: &Path) -> io::Result<bool> {
+    use std::os::unix::fs::MetadataExt;
+    let metadata = match fs::metadata(log_path) {
+        Ok(metadata) => metadata,
+        Err(e) if e.kind() == io::ErrorKind::NotFound => return Ok(false),
+        Err(e) => return Err(e),
+    };
+    if metadata.nlink() > 1 || list_spares(root)?.len() >= MAX_SPARE_SEGMENTS {
+        return Ok(false);
+    }
+    fs::rename(log_path, spare_path(root, base))?;
+    Ok(true)
+}
+
+/// Open the next active segment pair without syncing, in a spare file when
+/// one is free. See `Log::roll` for how it becomes durable.
+fn start_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segment, Index, PathBuf)> {
+    let log_path = seg_log_path(root, base);
+    let idx_path = seg_idx_path(root, base);
+    crate::shared_segment::make_private(&log_path)?;
+    let seg = match list_spares(root)?.into_iter().next() {
+        Some(spare) => {
+            fs::rename(&spare, &log_path)?;
+            let file = OpenOptions::new().read(true).write(true).open(&log_path)?;
+            Segment::create_recycled(file, base, now_ms)?
+        }
+        None => {
+            let file = OpenOptions::new()
+                .create(true)
+                .truncate(true)
+                .read(true)
+                .write(true)
+                .open(&log_path)?;
+            Segment::create_unsynced(file, base, now_ms)?
+        }
+    };
+    let idxf = OpenOptions::new()
+        .create(true)
+        .truncate(true)
+        .read(true)
+        .write(true)
+        .open(&idx_path)?;
+    let idx = Index::create_unsynced(idxf, base, now_ms)?;
+    Ok((seg, idx, log_path))
+}
+
+/// Removal of the segments below a new head. The manifest with that head is
+/// stored first, so an interrupted reclaim never reopens with a head that
+/// points at a missing segment. Removal tolerates files already gone, so an
+/// interrupted reclaim can finish.
+struct Reclaim {
+    root: PathBuf,
+    manifest: Manifest,
+    bases: Vec<u64>,
+}
+
+impl Reclaim {
+    fn run(&self) -> io::Result<()> {
+        self.manifest.store_atomic(&self.root)?;
+        for base in &self.bases {
+            remove_if_present(&seg_idx_path(&self.root, *base))?;
+            let log_path = seg_log_path(&self.root, *base);
+            if !keep_as_spare(&self.root, *base, &log_path)? {
+                remove_if_present(&log_path)?;
+            }
+        }
+        fsync_dir(&self.root.join("segments"))
+    }
+}
+
+fn remove_if_present(path: &Path) -> io::Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => Ok(()),
+        Err(e) if e.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(e) => Err(e),
+    }
+}
+
 fn create_segment_pair(
     root: &Path,
     base: u64,
@@ -2389,6 +2595,36 @@ fn sync_recovered_tail(root: &Path, active: &Segment, index: &Index) -> io::Resu
     active.fsync()?;
     index.fsync()?;
     fsync_dir(&root.join("segments"))
+}
+
+/// Remove trailing segment files whose header was never written: a new file
+/// still empty or zero at its start, or a recycled one still carrying an older
+/// segment's header. A damaged header still fails the open, since it could
+/// hide acknowledged records.
+fn drop_unstarted_segments(root: &Path, bases: &mut Vec<(u64, PathBuf)>) -> io::Result<()> {
+    use std::os::unix::fs::FileExt;
+    let mut dropped = false;
+    while let Some((base, _)) = bases.last() {
+        let base = *base;
+        let log_path = seg_log_path(root, base);
+        let file = File::open(&log_path)?;
+        let mut start = vec![0u8; crate::segment::LOG_HEADER_LEN as usize];
+        let n = file.read_at(&mut start, 0)?;
+        let unwritten = start[..n].iter().all(|b| *b == 0);
+        let older = crate::segment::read_header_base(&file)?.is_some_and(|old| old < base);
+        if !unwritten && !older {
+            break;
+        }
+        tracing::warn!(base, "removing a segment that never started");
+        let _ = fs::remove_file(seg_idx_path(root, base));
+        fs::remove_file(&log_path)?;
+        bases.pop();
+        dropped = true;
+    }
+    if dropped {
+        fsync_dir(&root.join("segments"))?;
+    }
+    Ok(())
 }
 
 fn open_or_create_segment_pair(
@@ -2541,7 +2777,7 @@ mod background_manifest_tests {
     #[test]
     fn critical_metadata_and_drop_wait_for_old_snapshot() {
         for action in [
-            "epoch", "reset", "roll", "truncate", "head", "repair", "fork", "shutdown", "drop",
+            "epoch", "reset", "truncate", "head", "repair", "fork", "shutdown", "drop",
         ] {
             let dir = crate::test_dir!(action);
             let mut log = open(&dir.root);
@@ -2567,7 +2803,6 @@ mod background_manifest_tests {
                         log.advance_epoch(3).unwrap();
                     }
                     "reset" => log.reset_to_checkpoint(0, 2).unwrap(),
-                    "roll" => log.roll(2).unwrap(),
                     "truncate" => {
                         log.truncate_before(1).unwrap();
                     }
@@ -2599,7 +2834,6 @@ mod background_manifest_tests {
             match action {
                 "epoch" => assert_eq!(m.epoch, 3),
                 "reset" | "repair" => assert_eq!(m.next_offset, 0),
-                "roll" => assert_eq!(m.active_base_offset, 1),
                 "truncate" | "head" => assert_eq!(m.head_offset, 1),
                 "shutdown" => assert!(m.clean_shutdown),
                 _ => assert!(!m.clean_shutdown),

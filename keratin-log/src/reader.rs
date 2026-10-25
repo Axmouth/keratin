@@ -400,6 +400,12 @@ impl LogReader {
                         consumed += used;
                         continue;
                     }
+                    // Offsets within a segment are contiguous. A jump means the
+                    // file was freed and reused as a later segment while this
+                    // handle was open, so the rest of it is not this segment.
+                    if rec.offset > *cur {
+                        return Ok(());
+                    }
 
                     *cur = rec.offset + 1;
 

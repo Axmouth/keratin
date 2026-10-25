@@ -7,12 +7,29 @@ use crate::record::{RecordError, decode_record_prefix};
 pub struct ScanResult {
     pub last_good_pos: u64,
     pub last_offset: Option<u64>,
+    /// The scan stopped at a complete record from below the segment base. A
+    /// recycled segment file still holds its previous records past the new
+    /// data, and they always sit below the new base.
+    pub stale_tail: bool,
 }
 
 /// Sequentially scan the log file from `start_pos` and find last valid record boundary.
-/// This is used on startup to repair after crash.
+/// Records are not checked against a base.
+#[cfg(test)]
 pub fn scan_last_good(file: &File, start_pos: u64, buf_size: usize) -> io::Result<ScanResult> {
-    scan_last_good_inner(file, start_pos, buf_size, None)
+    scan_last_good_inner(file, start_pos, buf_size, None, false)
+}
+
+/// Like `scan_last_good` for a segment with records starting at `base`. A
+/// record whose offset goes backwards ends the segment: either an older
+/// record left in a recycled file or damage.
+pub(crate) fn scan_segment(
+    file: &File,
+    start_pos: u64,
+    buf_size: usize,
+    base: u64,
+) -> io::Result<ScanResult> {
+    scan_last_good_inner(file, start_pos, buf_size, Some(base), false)
 }
 
 /// Validate a bound history without discarding partial/corrupt nonzero bytes.
@@ -23,7 +40,10 @@ pub(crate) fn scan_preserving_history(
     buf_size: usize,
     base: u64,
 ) -> io::Result<ScanResult> {
-    let scan = scan_last_good_inner(file, start_pos, buf_size, Some(base))?;
+    let scan = scan_last_good_inner(file, start_pos, buf_size, Some(base), true)?;
+    if scan.stale_tail {
+        return Ok(scan);
+    }
     let mut file = file;
     file.seek(SeekFrom::Start(scan.last_good_pos))?;
     let mut buffer = vec![0; buf_size.max(1)];
@@ -46,7 +66,8 @@ fn scan_last_good_inner(
     mut file: &File,
     start_pos: u64,
     buf_size: usize,
-    mut expected: Option<u64>,
+    base: Option<u64>,
+    strict: bool,
 ) -> io::Result<ScanResult> {
     // NOTE: simple implementation: read chunks and decode record-by-record.
     // For v0 correctness, easiest is to read progressively and maintain a window buffer.
@@ -54,6 +75,7 @@ fn scan_last_good_inner(
     let mut pos = start_pos;
     let mut last_good_pos = start_pos;
     let mut last_offset = None;
+    let mut expected = base;
 
     let mut buf = vec![0u8; buf_size];
     let mut window: Vec<u8> = Vec::new();
@@ -78,14 +100,28 @@ fn scan_last_good_inner(
             }
             match decode_record_prefix(slice) {
                 Ok((rec, used)) => {
-                    if let Some(offset) = expected {
-                        if rec.offset != offset {
+                    if let (Some(base), Some(offset)) = (base, expected) {
+                        if rec.offset < base {
+                            return Ok(ScanResult {
+                                last_good_pos,
+                                last_offset,
+                                stale_tail: true,
+                            });
+                        }
+                        if rec.offset < offset || (strict && rec.offset != offset) {
+                            if !strict {
+                                return Ok(ScanResult {
+                                    last_good_pos,
+                                    last_offset,
+                                    stale_tail: false,
+                                });
+                            }
                             return Err(io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "bound history has noncontiguous record offsets",
                             ));
                         }
-                        expected = Some(offset.checked_add(1).ok_or_else(|| {
+                        expected = Some(rec.offset.checked_add(1).ok_or_else(|| {
                             io::Error::new(
                                 io::ErrorKind::InvalidData,
                                 "bound history offset overflow",
@@ -105,6 +141,7 @@ fn scan_last_good_inner(
                     return Ok(ScanResult {
                         last_good_pos,
                         last_offset,
+                        stale_tail: false,
                     });
                 }
             }
@@ -123,6 +160,7 @@ fn scan_last_good_inner(
     Ok(ScanResult {
         last_good_pos,
         last_offset,
+        stale_tail: false,
     })
 }
 

@@ -1208,13 +1208,14 @@ fn writer_loop(
                 }
             }
             WriterCmd::Truncate { before, respond_to } => {
-                tracing::info!("Truncate before {before}..");
-                if let Err(e) = respond_to.send(log.truncate_before(before)).map_err(|_| {
-                    io::Error::new(io::ErrorKind::BrokenPipe, "could not notify truncate")
-                }) {
-                    tracing::info!("Internal Error in processing truncate command: {e}");
-                } else {
-                    tracing::info!("Truncate successful, before {before}");
+                tracing::debug!(before, "truncate");
+                let done = move |result| {
+                    if respond_to.send(result).is_err() {
+                        tracing::debug!(before, "truncate caller went away");
+                    }
+                };
+                if let Err(error) = log.truncate_before_deferred(before, done) {
+                    tracing::error!(before, %error, "truncate failed");
                 }
             }
             WriterCmd::RepairSuffix {

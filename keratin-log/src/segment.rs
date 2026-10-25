@@ -5,6 +5,38 @@ pub const LOG_MAGIC: &[u8; 8] = b"KLOG\0\0\0\0";
 pub const LOG_VERSION: u16 = 1;
 pub const LOG_HEADER_LEN: u32 = 8 + 2 + 2 + 4 + 8 + 8 + 32 + 4;
 
+fn encode_header(base_offset: u64, created_ts_ms: u64) -> Vec<u8> {
+    let mut hdr = Vec::with_capacity(LOG_HEADER_LEN as usize);
+    hdr.extend_from_slice(LOG_MAGIC);
+    hdr.extend_from_slice(&LOG_VERSION.to_be_bytes());
+    hdr.extend_from_slice(&0u16.to_be_bytes()); // flags
+    hdr.extend_from_slice(&LOG_HEADER_LEN.to_be_bytes());
+    hdr.extend_from_slice(&base_offset.to_be_bytes());
+    hdr.extend_from_slice(&created_ts_ms.to_be_bytes());
+    hdr.extend_from_slice(&[0u8; 32]); // reserved
+    let crc = crc32c::crc32c(&hdr);
+    hdr.extend_from_slice(&crc.to_be_bytes());
+    hdr
+}
+
+/// The base offset in a segment file's header, or None when the header is
+/// short, damaged or not a segment header.
+pub(crate) fn read_header_base(mut file: &File) -> io::Result<Option<u64>> {
+    let mut hdr = [0u8; LOG_HEADER_LEN as usize];
+    file.seek(SeekFrom::Start(0))?;
+    match file.read_exact(&mut hdr) {
+        Ok(()) => {}
+        Err(e) if e.kind() == io::ErrorKind::UnexpectedEof => return Ok(None),
+        Err(e) => return Err(e),
+    }
+    let body = LOG_HEADER_LEN as usize - 4;
+    let crc = u32::from_be_bytes(hdr[body..].try_into().expect("exact-length slice"));
+    if &hdr[0..8] != LOG_MAGIC || crc32c::crc32c(&hdr[..body]) != crc {
+        return Ok(None);
+    }
+    Ok(Some(u64::from_be_bytes(hdr[16..24].try_into().expect("exact-length slice"))))
+}
+
 pub struct Segment {
     pub base_offset: u64,
     file: File,
@@ -24,30 +56,52 @@ pub struct Segment {
 }
 
 impl Segment {
-    pub fn create(mut file: File, base_offset: u64, created_ts_ms: u64) -> io::Result<Self> {
-        let header_len: u32 = LOG_HEADER_LEN;
+    pub fn create(file: File, base_offset: u64, created_ts_ms: u64) -> io::Result<Self> {
+        let seg = Self::create_unsynced(file, base_offset, created_ts_ms)?;
+        crate::util::sync_file_all(&seg.file)?;
+        Ok(seg)
+    }
 
-        let mut hdr = Vec::with_capacity(header_len as usize);
-        hdr.extend_from_slice(LOG_MAGIC);
-        hdr.extend_from_slice(&LOG_VERSION.to_be_bytes());
-        hdr.extend_from_slice(&0u16.to_be_bytes()); // flags
-        hdr.extend_from_slice(&header_len.to_be_bytes());
-        hdr.extend_from_slice(&base_offset.to_be_bytes());
-        hdr.extend_from_slice(&created_ts_ms.to_be_bytes());
-        hdr.extend_from_slice(&[0u8; 32]); // reserved
-        let crc = crc32c::crc32c(&hdr);
-        hdr.extend_from_slice(&crc.to_be_bytes());
-
+    /// Start an empty segment without syncing it. The caller makes the header
+    /// and the directory entry durable before acknowledging any record in it.
+    pub(crate) fn create_unsynced(
+        mut file: File,
+        base_offset: u64,
+        created_ts_ms: u64,
+    ) -> io::Result<Self> {
         file.seek(SeekFrom::Start(0))?;
-        file.write_all(&hdr)?;
+        file.write_all(&encode_header(base_offset, created_ts_ms))?;
         file.flush()?;
-        crate::util::sync_file_all(&file)?;
-
         Ok(Self {
             base_offset,
             file,
-            bytes_written: header_len as u64,
-            alloc_end: header_len as u64,
+            bytes_written: LOG_HEADER_LEN as u64,
+            alloc_end: LOG_HEADER_LEN as u64,
+            prealloc_chunk: 0,
+            allocation_error: None,
+            runtime_status: None,
+        })
+    }
+
+    /// Start a segment inside a recycled file without syncing it. Only the
+    /// header is rewritten. The old records stay past the write cursor until new
+    /// ones replace them, and recovery and readers stop at the first record from
+    /// below `base_offset`. The whole file counts as allocated, so appends
+    /// overwrite blocks that already exist and a data sync needs no metadata.
+    pub(crate) fn create_recycled(
+        mut file: File,
+        base_offset: u64,
+        created_ts_ms: u64,
+    ) -> io::Result<Self> {
+        file.seek(SeekFrom::Start(0))?;
+        file.write_all(&encode_header(base_offset, created_ts_ms))?;
+        file.flush()?;
+        let len = file.metadata()?.len().max(LOG_HEADER_LEN as u64);
+        Ok(Self {
+            base_offset,
+            file,
+            bytes_written: LOG_HEADER_LEN as u64,
+            alloc_end: len,
             prealloc_chunk: 0,
             allocation_error: None,
             runtime_status: None,

@@ -107,6 +107,46 @@ impl ManifestWorker {
     }
 }
 
+impl ManifestWorker {
+    /// Run `job` on the pool after this log's outstanding snapshot, and track
+    /// it as the outstanding work, so metadata writes for one log never
+    /// overlap. Runs inline when the pool is full. The snapshot's result is
+    /// passed on, since the job takes its place.
+    pub(crate) fn submit_after(
+        &mut self,
+        job: impl FnOnce() + Send + 'static,
+    ) -> io::Result<()> {
+        let previous = self.pending.take();
+        let (tx, rx) = bounded(1);
+        let chained: Job = Box::new(move || {
+            let start = Instant::now();
+            let earlier = match previous {
+                Some(rx) => rx
+                    .recv()
+                    .unwrap_or_else(|_| Err(io::Error::other("manifest worker disconnected"))),
+                None => Ok(Duration::ZERO),
+            };
+            job();
+            let _ = tx.send(earlier.map(|d| d + start.elapsed()));
+        });
+        match pool().try_send(chained) {
+            Ok(()) => {
+                self.pending = Some(rx);
+                Ok(())
+            }
+            Err(TrySendError::Full(chained)) => {
+                chained();
+                rx.recv()
+                    .map_err(|_| io::Error::other("manifest worker disconnected"))?
+                    .map(|_| ())
+            }
+            Err(TrySendError::Disconnected(_)) => {
+                Err(io::Error::other("manifest pool disconnected"))
+            }
+        }
+    }
+}
+
 impl Drop for ManifestWorker {
     fn drop(&mut self) {
         // No file writer may outlive ownership of its Log, even on error paths.
