@@ -912,6 +912,14 @@ pub struct Stroma {
     publish_apply_pause: Arc<std::sync::Mutex<Option<Arc<PublishApplyPause>>>>,
 }
 
+/// Wait before each periodic snapshot: 10 s give or take 20%. Replicas of a
+/// partition start their tasks together, and a snapshot compacts the log with
+/// several syncs on the writer. In lockstep every replica stalls at once and no
+/// quorum can confirm meanwhile, so the jitter lets their phases drift apart.
+fn snapshot_tick_wait() -> Duration {
+    Duration::from_millis(8_000 + fastrand::u64(..4_000))
+}
+
 impl Stroma {
     pub async fn open(
         root: impl AsRef<Path>,
@@ -3257,13 +3265,10 @@ impl Stroma {
                 qh.group().unwrap_or("Default")
             );
 
-            let mut ticker = tokio::time::interval(tokio::time::Duration::from_secs(10));
-            ticker.tick().await;
-
             loop {
                 tokio::select! {
                     _ = background_tasks.cancelled() => break,
-                    _ = ticker.tick() => {}
+                    _ = tokio::time::sleep(snapshot_tick_wait()) => {}
                 }
 
                 // Self-exit if the incarnation is gone (orphaned task): we hold
