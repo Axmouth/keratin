@@ -6344,6 +6344,7 @@ mod tests {
                         first_offset: offset,
                         events: vec![event],
                         durability: Some(KDurability::AfterFsync),
+                        encoded: None,
                     },
                 )
                 .await
@@ -6828,6 +6829,7 @@ mod tests {
                     first_offset: 0,
                     events: vec![test_payload(b"payload")],
                     durability: None,
+                    encoded: None,
                 },
             )
             .await
@@ -7401,6 +7403,7 @@ mod tests {
                     first_offset: read.records[0].0,
                     events: read.records.into_iter().map(|(_, event)| event).collect(),
                     durability: None,
+                    encoded: None,
                 },
             )
             .await
@@ -7444,6 +7447,7 @@ mod tests {
                     first_offset: 0,
                     events: vec![test_payload(b"payload")],
                     durability: Some(KDurability::AfterFsync),
+                    encoded: None,
                 },
             )
             .await
@@ -7515,6 +7519,7 @@ mod tests {
                     first_offset: 0,
                     events: vec![test_payload(b"first")],
                     durability: None,
+                    encoded: None,
                 },
             )
             .await
@@ -7568,6 +7573,7 @@ mod tests {
                     first_offset: next,
                     events: vec![test_payload(&[next as u8])],
                     durability: Some(KDurability::AfterFsync),
+                    encoded: None,
                 },
             )
             .await
@@ -9274,6 +9280,7 @@ mod open_batch_fault_tests {
                     payload: vec![42; 1024],
                 }],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             };
             let result = st
                 .apply_open_replicated_queue_batch(

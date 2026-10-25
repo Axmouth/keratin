@@ -324,6 +324,7 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
             first_offset: 0,
             events: replay.clone(),
             durability: None,
+            encoded: None,
         },
     )
     .await
@@ -351,6 +352,7 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
                 first_offset: 0,
                 events: suffix,
                 durability: None,
+                encoded: None,
             },
         )
         .await
@@ -369,6 +371,7 @@ async fn repeated_follower_batch_skips_nack_and_rejected_overlap_does_not_advanc
             first_offset: 2,
             events: vec![StromaEvent::Ack { off: 0 }],
             durability: None,
+            encoded: None,
         },
     )
     .await

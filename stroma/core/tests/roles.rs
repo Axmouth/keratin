@@ -274,6 +274,7 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
             first_offset: 1,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         },
     )
     .await
@@ -431,6 +432,7 @@ async fn follower_ingest_applies_replicated_messages_and_events() {
                 first_offset: 0,
                 events: vec![payload(b"one"), payload(b"two")],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -469,6 +471,7 @@ async fn follower_ingest_rejected_append_does_not_apply_events_in_memory() {
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -499,6 +502,7 @@ async fn replicated_ingest_rejects_owner_queue() {
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await;
@@ -541,6 +545,7 @@ async fn source_follower_ingests_dlq_events_without_writing_target_queue() {
                 },
             ],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         },
     )
     .await
@@ -570,6 +575,7 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
             first_offset: 0,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         },
     )
     .await
@@ -641,6 +647,7 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
             first_offset: 0,
             events: vec![payload(b"replicated")],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         },
     )
     .await
@@ -678,6 +685,7 @@ async fn independent_declaration_prefix_is_rejected_by_replication() {
                 first_offset: 0,
                 events: vec![payload(b"replicated")],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -708,6 +716,7 @@ fn open_frame(offset: u64) -> stroma_core::Result<ReplicatedEventBatch> {
         first_offset: offset,
         events: vec![payload(b"replicated")],
         durability: Some(KDurability::AfterFsync),
+        encoded: None,
     })
 }
 

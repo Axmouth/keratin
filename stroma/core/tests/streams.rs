@@ -125,6 +125,7 @@ async fn follower_apply_replicated_stream_batch_advances_tail_and_cursor() {
                 offset: 2,
             }],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         }),
     )
     .await

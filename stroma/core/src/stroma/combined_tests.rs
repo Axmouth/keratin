@@ -313,6 +313,7 @@ async fn event_only_follower_keeps_payloads_and_overlap_does_not_repeat_nack() {
                 first_offset: 0,
                 events: events.clone(),
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -531,6 +532,7 @@ async fn single_log_lifecycle_and_stream_reads_are_explicit() {
                 first_offset: 1,
                 events: vec![],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -678,6 +680,7 @@ async fn early_combined_follower_durability_never_substitutes_for_owner_fsync() 
                             .map(|(_, event)| event)
                             .collect(),
                         durability: Some(KDurability::AfterFsync),
+                        encoded: None,
                     })])),
                 )
                 .await
@@ -1447,6 +1450,7 @@ async fn combined_learner_checkpoint_resumes_old_payload_backfill_without_reappl
                         first_offset: offset as u64,
                         events: vec![event.clone()],
                         durability: Some(KDurability::AfterFsync),
+                        encoded: None,
                     };
                     st.apply_replicated_queue_batch("q", 0, None, batch)
                         .await
@@ -1550,6 +1554,7 @@ async fn combined_learner_requires_exact_backfill_receipt_and_real_payload_recor
                             StromaEvent::AckMany { reqs: vec![] },
                             StromaEvent::Ack { off: 0 },
                         ],
+                        encoded: None,
                     },
                 )
                 .await
@@ -1665,6 +1670,7 @@ async fn combined_reseed_case(root: &Path, seal_during_copy: bool) {
             first_offset: 0,
             events,
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         },
     )
     .await
@@ -1867,6 +1873,7 @@ async fn combined_direct_settlement_paths_leave_no_metadata_frontier_holes() {
                 first_offset: 0,
                 events: batch.records.into_iter().map(|(_, event)| event).collect(),
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -2027,6 +2034,7 @@ async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
                     first_offset: 0,
                     events: vec![payload.clone(), invalid],
                     durability: Some(KDurability::AfterFsync),
+                    encoded: None,
                 },
             )
             .await
@@ -2049,6 +2057,7 @@ async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
                 first_offset: u64::MAX,
                 events: vec![payload.clone()],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -2069,6 +2078,7 @@ async fn combined_follower_rejects_entire_invalid_frame_before_dirty_fence() {
                 },
             ],
             durability: Some(KDurability::AfterFsync),
+            encoded: None,
         };
         st.apply_replicated_queue_batch("q", 0, None, batch)
             .await
@@ -2102,12 +2112,14 @@ async fn combined_open_group_keeps_dirty_fence_when_later_frame_is_invalid() {
             headers: headers().encode().unwrap(),
             payload: vec![42],
         }],
+        encoded: None,
     };
     let invalid = || ReplicatedEventBatch {
         epoch: 7,
         first_offset: 1,
         durability: None,
         events: vec![StromaEvent::Ack { off: 1 }],
+        encoded: None,
     };
     let frames = futures::stream::iter([Ok(first), Ok(invalid())]).boxed();
     let error = st
@@ -2206,6 +2218,7 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
                 first_offset: 0,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             }),
         )
         .await
@@ -2232,6 +2245,7 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
                 first_offset: 0,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await
@@ -2271,6 +2285,7 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
                 first_offset: 1,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             }),
         )
         .await
@@ -2566,6 +2581,7 @@ async fn single_log_queue_api_and_stream_api_refuse_the_other_kind() {
         first_offset,
         events,
         durability: Some(KDurability::AfterFsync),
+        encoded: None,
     };
     assert!(wrong_kind(
         follower

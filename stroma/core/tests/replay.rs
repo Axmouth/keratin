@@ -82,6 +82,7 @@ async fn delayed_publish_nack_preserves_retry_count_on_log_replay() {
                 first_offset: 0,
                 events: events.records.into_iter().map(|(_, event)| event).collect(),
                 durability: None,
+                encoded: None,
             },
         )
         .await

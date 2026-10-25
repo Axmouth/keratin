@@ -570,6 +570,7 @@ mod tests {
                     payload: payload.to_vec(),
                 }],
                 durability: Some(KDurability::AfterFsync),
+                encoded: None,
             },
         )
         .await

@@ -1843,6 +1843,7 @@ mod tests {
                                 payload: r.payload,
                             })
                             .collect(),
+                        encoded: None,
                     },
                 )
                 .await

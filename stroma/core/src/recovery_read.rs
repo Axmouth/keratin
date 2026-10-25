@@ -628,6 +628,7 @@ mod tests {
                         headers: vec![2, 3],
                         payload: vec![offset as u8; 80],
                     }],
+                    encoded: None,
                 },
             )
             .await

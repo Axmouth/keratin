@@ -36,6 +36,49 @@ pub struct ReplicatedEventBatch {
     pub first_offset: Offset,
     pub events: Vec<StromaEvent>,
     pub durability: Option<KDurability>,
+    /// The bytes each event was stored as on the owner, in order, when the
+    /// batch came from them. The follower appends these as they are instead
+    /// of encoding the events again. `None` encodes the events.
+    pub encoded: Option<Vec<EncodedEvent>>,
+}
+
+impl ReplicatedEventBatch {
+    /// Decode owner records for validation and state, and keep their bytes
+    /// to append unchanged.
+    pub fn from_encoded(
+        epoch: u64,
+        first_offset: Offset,
+        records: Vec<EncodedEvent>,
+        durability: Option<KDurability>,
+    ) -> Result<Self> {
+        let events = records
+            .iter()
+            .map(EncodedEvent::decode)
+            .collect::<Result<Vec<_>>>()?;
+        Ok(Self {
+            epoch,
+            first_offset,
+            events,
+            durability,
+            encoded: Some(records),
+        })
+    }
+}
+
+/// One queue log record as stored: an encoded `StromaEvent`. Owner reads
+/// return these without decoding, so the bytes travel to followers and into
+/// their logs unchanged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct EncodedEvent(pub Vec<u8>);
+
+impl EncodedEvent {
+    pub fn encode(event: &StromaEvent) -> Result<Self> {
+        Ok(Self(event.encode().map_err(io_err)?))
+    }
+
+    pub fn decode(&self) -> Result<StromaEvent> {
+        StromaEvent::decode(&self.0).map_err(decode_err)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -823,6 +866,63 @@ impl Stroma {
             .await
     }
 
+    /// `read_owner_queue_records` with each record left as its stored bytes.
+    pub async fn read_owner_queue_encoded(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<EncodedEvent>> {
+        self.read_owner_queue_encoded_inner(topic, part, group, from, max, max_bytes, false)
+            .await
+    }
+
+    /// `read_owner_queue_records_early` with each record left as its stored
+    /// bytes.
+    pub async fn read_owner_queue_encoded_early(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+    ) -> Result<OwnerReplicationRead<EncodedEvent>> {
+        self.read_owner_queue_encoded_inner(topic, part, group, from, max, max_bytes, true)
+            .await
+    }
+
+    async fn read_owner_queue_encoded_inner(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        from: Offset,
+        max: usize,
+        max_bytes: usize,
+        early: bool,
+    ) -> Result<OwnerReplicationRead<EncodedEvent>> {
+        let qh = self.queue_handle(topic, part, group).await?;
+        let qh = qh.resolve()?;
+        qh.work_queue()?;
+        ensure_owner(&qh)?;
+        read_owner_log(
+            &qh,
+            qh.event_log(),
+            "event",
+            from,
+            max,
+            max_bytes,
+            early,
+            qh.has_combined_log(),
+            |record| Ok(EncodedEvent(record.payload)),
+        )
+        .await
+    }
+
     async fn read_owner_queue_records_inner(
         &self,
         topic: &str,
@@ -1092,18 +1192,25 @@ impl Stroma {
         // Encode before either append so an encoding failure cannot leave one
         // side queued. Reject obvious epoch/gap cases through the serial path;
         // ordinary contiguous traffic overlaps the two independent writers.
+        let mut events = events;
         let event_records = events
-            .as_ref()
-            .map(|batch| {
-                batch
-                    .events
-                    .iter()
-                    .map(event_msg)
-                    .collect::<Result<Vec<_>>>()
+            .as_mut()
+            .map(|batch| match batch.encoded.take() {
+                Some(encoded) if encoded.len() == batch.events.len() => Ok(encoded
+                    .into_iter()
+                    .map(|EncodedEvent(payload)| Message {
+                        flags: 0,
+                        headers: vec![],
+                        payload,
+                    })
+                    .collect()),
+                Some(_) => Err(StromaError::InvalidArgument(
+                    "replicated event bytes do not match the events".into(),
+                )),
+                None => batch.events.iter().map(event_msg).collect::<Result<Vec<_>>>(),
             })
             .transpose()?;
         let events = {
-            let mut events = events;
             if qh.has_combined_log() {
                 if let Some(batch) = &mut events {
                     for event in &mut batch.events {

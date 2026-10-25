@@ -983,6 +983,7 @@ mod tests {
                     first_offset: 0,
                     durability: Some(KDurability::AfterFsync),
                     events: vec![retained_event()],
+                    encoded: None,
                 },
             )
             .await

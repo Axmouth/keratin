@@ -54,7 +54,7 @@ pub use stroma::{
     QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageReceipt, QueueRecoveryStageSpec,
     QueueReplicationRetention, QueueStateCheckpoint, QueueStateCheckpointInstallOutcome,
     RecoveryDiskUsage, RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
-    RecoverySealRequest, RecoverySequentialRead, RecoveryStageLimits, ReplicatedEventBatch,
+    RecoverySealRequest, RecoverySequentialRead, RecoveryStageLimits, ReplicatedEventBatch, EncodedEvent,
     ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, RetainedHistoryIdentity, RetainedLog,
     RetainedLogs, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding,
     StreamPromotionOutcome, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,

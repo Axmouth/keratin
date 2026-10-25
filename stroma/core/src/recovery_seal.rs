@@ -492,6 +492,7 @@ mod tests {
                         headers: vec![],
                         payload: b"confirmed".to_vec(),
                     }],
+                    encoded: None,
                 },
             )
             .await

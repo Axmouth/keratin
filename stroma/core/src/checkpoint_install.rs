@@ -761,6 +761,7 @@ mod tests {
                             first_offset: 0,
                             durability: Some(KDurability::AfterFsync),
                             events: vec![payload(b"backfill")],
+                            encoded: None,
                         },
                     )
                     .await
@@ -854,6 +855,7 @@ mod tests {
                     first_offset: 0,
                     events: vec![payload(b"a"), payload(b"b")],
                     durability: Some(KDurability::AfterFsync),
+                    encoded: None,
                 },
             )
             .await

@@ -288,6 +288,7 @@ async fn follower_resume_syncs_written_records() {
                 first_offset: 0,
                 events,
                 durability: Some(KDurability::AfterFlush),
+                encoded: None,
             },
         )
         .await

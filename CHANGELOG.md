@@ -11,6 +11,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Breaking changes
 
+- `ReplicatedEventBatch` gains `encoded`, the bytes each event was stored as
+  on the owner. Struct literals need the field, `None` keeps encoding the
+  events.
+
 - The writer experiment switches are removed: `KERATIN_STAGE_THEN_COMMIT`,
   `KERATIN_IDLE_COMMIT_WINDOW_US`, `KERATIN_FLUSH_ON_DRAIN`,
   `KERATIN_BACKGROUND_MANIFEST` and `STROMA_COMBINED_DELIVERY_SCAN_BYTES`.
@@ -115,6 +119,12 @@ tagged releases yet. Earlier history predates this changelog.
   [recovery segment reuse](experiments/RECOVERY_SEGMENT_REUSE.md).
 
 ### Added
+
+- `EncodedEvent`, `Stroma::read_owner_queue_encoded(_early)` and
+  `ReplicatedEventBatch::from_encoded`. Owner queue reads return records as
+  their stored bytes without decoding them, and a follower appends those same
+  bytes instead of encoding the events again. It still decodes them once to
+  validate the batch and apply state.
 
 - `LogRuntimeSettings::set_loaded_fsync_spacing` sets the least time between
   fsync starts on a log while an earlier fsync of that log is still running.
