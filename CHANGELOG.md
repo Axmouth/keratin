@@ -285,6 +285,33 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- Segment rollover syncs only the outgoing segment's log data on the writer.
+  The new segment's header, its directory entry and the sealed index sync
+  with the next fsync, before any record in the new segment counts as
+  durable. At 10k msg/s with three replicas on one drive, durable p99 went
+  from about 75 ms to 28-33 ms with `KERATIN_BACKGROUND_MANIFEST=1` and to
+  45-47 ms without it, and p50 from about 30 ms to 9 ms.
+
+- Truncation moves the head in memory and removes the files on the manifest
+  worker, after that log's outstanding manifest store. The caller hears back
+  once the files are gone. A crash before then only keeps more history.
+
+- Freed segments are kept as spares, up to 4 per log, and reused at
+  rollover. Appends then overwrite existing blocks, so their data syncs skip
+  the journal commit an extending write pays. A segment still linked from a
+  frozen fork is never reused.
+
+- The active index syncs at most every 500 ms. Recovery rebuilds a lost or
+  short index from the log, and drops entries past the recovered end.
+
+- Recovery stops a segment's scan at a record from below its base, which is
+  how a reused file's older records end. A trailing segment whose header was
+  never written, or still names an older segment, is removed. Readers stop a
+  segment on an offset jump.
+
+- The periodic snapshot runs every 8 to 12 s instead of exactly every 10 s,
+  so replicas stop compacting at the same moment.
+
 - `KeratinConfig` and `WriterSettings` gain `background_sync_interval`,
   100 ms by default and adjustable live. Zero turns the background sync off
   and leaves written records to the operating system with no bound on how
