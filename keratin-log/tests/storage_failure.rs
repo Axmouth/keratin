@@ -178,8 +178,9 @@ async fn failed_replicated_fsync_stops_the_log_until_reopen() {
     }
 }
 
-// Segment roll and checkpoint reset sync the outgoing segment before they
-// change any files. A failure there must stop the log like any other sync.
+// A checkpoint reset syncs the outgoing segment before it changes any files.
+// A roll hands that sync to the next fsync. Either failure must stop the log
+// like any other sync.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
     for reset in [false, true] {
@@ -203,19 +204,19 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
         if reset {
             assert!(log.destructive_reset_to_checkpoint(10).await.is_err());
         } else {
-            // Large enough to force a roll before staging.
+            // Large enough to force a roll before staging. The outgoing
+            // segment's sync runs with the next fsync.
             let big = vec![message(vec![7; 8192])];
-            assert!(
-                log.append_replicated_batch(epoch, 2, big, Some(KDurability::AfterWrite))
-                    .await
-                    .is_err()
-            );
+            log.append_replicated_batch(epoch, 2, big, Some(KDurability::AfterWrite))
+                .await
+                .unwrap();
+            assert!(log.sync().await.is_err());
         }
         assert_eq!(armed.hits(), 1, "reset={reset}");
         drop(armed);
 
         let error = log
-            .append_replicated_batch(epoch, 2, messages(2..3), Some(KDurability::AfterWrite))
+            .append_replicated_batch(epoch, 3, messages(3..4), Some(KDurability::AfterWrite))
             .await
             .expect_err("replicated append after failure must fail");
         assert!(error.to_string().contains("reopen required"), "{error}");
@@ -225,7 +226,7 @@ async fn failed_roll_or_reset_fsync_stops_the_log_until_reopen() {
         assert!(!manifest_clean_flag(&dir.root));
         drop(log);
 
-        // The failed sync covered both records, so the reopen drops them
+        // The failed sync covered every record, so the reopen drops them
         // rather than trusting pages it cannot prove reached the disk. A
         // follower fetches them again from its owner.
         let reopened = Keratin::open(&dir.root, cfg).await.unwrap();

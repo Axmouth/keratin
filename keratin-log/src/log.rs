@@ -706,7 +706,33 @@ impl Log {
 
         // Repair/scan all segments, compute true next_offset.
         let mut computed_next = 0u64;
-        for (base, _base_path) in &bases {
+        let mut previous_end: Option<u64> = None;
+        let mut index = 0;
+        while index < bases.len() {
+            let (base, _) = &bases[index];
+            index += 1;
+            // A roll hands the outgoing segment's sync to the next fsync, so a
+            // crash can leave a sealed segment short of the next one's base.
+            // Nothing after such a gap was acknowledged. A checkpoint reset
+            // starts at the manifest head, which is the one legitimate gap.
+            if let Some(end) = previous_end
+                && end < *base
+                && *base != manifest.head_offset
+            {
+                if preserve_history {
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        format!("segment {base} starts after a gap at {end}"),
+                    ));
+                }
+                for (dropped, _) in bases.drain(index - 1..) {
+                    tracing::warn!(base = dropped, end, "removing a segment after a sealed segment a crash left short");
+                    let _ = fs::remove_file(seg_idx_path(&root, dropped));
+                    fs::remove_file(seg_log_path(&root, dropped))?;
+                }
+                fsync_dir(&root.join("segments"))?;
+                break;
+            }
             let log_path = seg_log_path(&root, *base);
             let f = OpenOptions::new().read(true).write(true).open(&log_path)?;
             // open header to get header_len (fixed in our Segment::open, but we know it)
@@ -726,11 +752,9 @@ impl Log {
                 seg = Segment::open(f, *base)?;
                 seg.set_len(scan.last_good_pos)?;
             }
-            if let Some(last) = scan.last_offset {
-                computed_next = computed_next.max(last.saturating_add(1));
-            } else {
-                computed_next = computed_next.max(*base);
-            }
+            let end = scan.last_offset.map_or(*base, |last| last.saturating_add(1));
+            computed_next = computed_next.max(end);
+            previous_end = Some(end);
 
             // The index syncs lazily and may lag the log or be missing.
             let idx_path = seg_idx_path(&root, *base);
@@ -1735,8 +1759,11 @@ impl Log {
     }
 
     fn roll(&mut self, now_ms: u64) -> io::Result<()> {
+        let started = Instant::now();
         self.flush_buffers()?;
+        let seal_started = Instant::now();
         self.seal_active()?;
+        let seal = seal_started.elapsed();
 
         // Reclaim preallocated padding so it does not stay on disk for the
         // segment's lifetime.
@@ -1763,27 +1790,22 @@ impl Log {
         // depend on it.
         self.manifest.active_base_offset = new_base;
         self.publish_segment_policy(policy);
+        crate::drain_diagnostics::roll(started.elapsed(), seal);
 
         Ok(())
     }
 
-    /// Make the active segment's records durable before it is sealed. Recovery
-    /// takes every segment before the last as complete. Only the log data and
-    /// the syncs an earlier roll left pending are needed here: the index is
-    /// rebuilt after a crash. On a recycled file the log sync is an in-place
-    /// overwrite, which skips the journal commit an extending write pays.
+    /// Hand the outgoing segment's data sync to the next fsync instead of
+    /// holding the writer for it. Its records count as durable only once that
+    /// fsync finishes, and an fsync covering any later record syncs this file
+    /// first, so nothing acknowledged can sit past an unsynced segment.
+    /// Recovery trims a sealed segment a crash left short, and every segment
+    /// after it.
     fn seal_active(&mut self) -> io::Result<()> {
         self.check_storage()?;
-        let started = Instant::now();
-        let result = self
-            .active
-            .fsync()
-            .and_then(|()| std::mem::take(&mut self.pending_sync).sync());
-        self.latched(result)?;
-        self.stats.fsync += started.elapsed();
-        self.durable_end = self.next_offset;
-        self.log_state.sync.record_success();
-        self.debug_check_frontiers();
+        let sealed = self.active.file_ref().try_clone();
+        let sealed = self.latched(sealed)?;
+        self.pending_sync.files.insert(0, sealed);
         self.manifest.next_offset = self.next_offset;
         Ok(())
     }

@@ -313,6 +313,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- A segment roll hands the outgoing segment's data sync to the next fsync
+  instead of holding the writer for it. Recovery cuts the log at a sealed
+  segment a crash left short and removes the segments after it, which can
+  hold no acknowledged record. On a three-node cluster sharing one NVMe drive
+  the owner's roll time at saturation fell from 18-19 ms to about 1 ms on
+  average and throughput rose 2-5%.
+- `KERATIN_DRAIN_COUNTERS_PATH` output includes roll counts and times.
+
 - Preallocation fills the reserved space with synced zeros on a shared
   background worker, in 4 MiB chunks capped at 64 MiB/s across all logs.
   `fallocate` alone left unwritten extents, so a sync after a write into them

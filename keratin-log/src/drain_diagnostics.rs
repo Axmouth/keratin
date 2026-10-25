@@ -12,6 +12,11 @@ struct Counters {
     staged_bytes: AtomicU64,
     worker_fsync_jobs: AtomicU64,
     direct_fsync_jobs: AtomicU64,
+    rolls: AtomicU64,
+    roll_us: AtomicU64,
+    roll_max_us: AtomicU64,
+    roll_seal_us: AtomicU64,
+    roll_seal_max_us: AtomicU64,
 }
 static COUNTERS: OnceLock<Counters> = OnceLock::new();
 static STARTED: OnceLock<()> = OnceLock::new();
@@ -31,6 +36,11 @@ pub(crate) fn init() {
                         ("staged_bytes", &c.staged_bytes),
                         ("worker_fsync_jobs", &c.worker_fsync_jobs),
                         ("direct_fsync_jobs", &c.direct_fsync_jobs),
+                        ("rolls", &c.rolls),
+                        ("roll_us", &c.roll_us),
+                        ("roll_max_us", &c.roll_max_us),
+                        ("roll_seal_us", &c.roll_seal_us),
+                        ("roll_seal_max_us", &c.roll_seal_max_us),
                     ];
                     let values =
                         fields.map(|(name, v)| format!("\"{name}\":{}", v.load(Ordering::Relaxed)));
@@ -64,3 +74,16 @@ pub(crate) fn fsync(direct: bool) {
     }
 }
 
+/// One segment rollover on the writer: the whole roll, and the sync of the
+/// outgoing segment inside it.
+pub(crate) fn roll(total: Duration, seal: Duration) {
+    if let Some(c) = COUNTERS.get() {
+        let total = total.as_micros() as u64;
+        let seal = seal.as_micros() as u64;
+        c.rolls.fetch_add(1, Ordering::Relaxed);
+        c.roll_us.fetch_add(total, Ordering::Relaxed);
+        c.roll_max_us.fetch_max(total, Ordering::Relaxed);
+        c.roll_seal_us.fetch_add(seal, Ordering::Relaxed);
+        c.roll_seal_max_us.fetch_max(seal, Ordering::Relaxed);
+    }
+}
