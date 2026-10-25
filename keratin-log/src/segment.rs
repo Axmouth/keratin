@@ -53,6 +53,17 @@ pub struct Segment {
     prealloc_chunk: u64,
     allocation_error: Option<String>,
     runtime_status: Option<std::sync::Arc<parking_lot::RwLock<crate::LogRuntimeStatus>>>,
+    /// Written zeros ahead of the cursor while preallocation is on. See
+    /// `zero_ahead`.
+    zero: Option<std::sync::Arc<crate::zero_ahead::ZeroAhead>>,
+    /// The file is a reused segment, so its old blocks are already written.
+    recycled: bool,
+}
+
+impl Drop for Segment {
+    fn drop(&mut self) {
+        self.stop_zero();
+    }
 }
 
 impl Segment {
@@ -80,6 +91,8 @@ impl Segment {
             prealloc_chunk: 0,
             allocation_error: None,
             runtime_status: None,
+            zero: None,
+            recycled: false,
         })
     }
 
@@ -105,6 +118,8 @@ impl Segment {
             prealloc_chunk: 0,
             allocation_error: None,
             runtime_status: None,
+            zero: None,
+            recycled: true,
         })
     }
 
@@ -142,6 +157,8 @@ impl Segment {
             prealloc_chunk: 0,
             allocation_error: None,
             runtime_status: None,
+            zero: None,
+            recycled: false,
         })
     }
 
@@ -173,11 +190,19 @@ impl Segment {
         // Write at the logical cursor, not SeekFrom::End: with preallocation the
         // file end is past the data (zero padding).
         let start = self.bytes_written;
-        self.file.seek(SeekFrom::Start(start))?;
-        #[cfg(feature = "io-fault-injection")]
-        crate::io_fault_injection::write_all(&mut self.file, data)?;
-        #[cfg(not(feature = "io-fault-injection"))]
-        self.file.write_all(data)?;
+        let file = &mut self.file;
+        let mut write = move || {
+            file.seek(SeekFrom::Start(start))?;
+            #[cfg(feature = "io-fault-injection")]
+            crate::io_fault_injection::write_all(file, data)?;
+            #[cfg(not(feature = "io-fault-injection"))]
+            file.write_all(data)?;
+            Ok(())
+        };
+        match &self.zero {
+            Some(zero) => zero.write(write, start, data.len() as u64)?,
+            None => write()?,
+        }
         self.bytes_written += data.len() as u64;
         Ok(start)
     }
@@ -193,6 +218,26 @@ impl Segment {
         let need = self.bytes_written + chunk;
         if need > self.alloc_end {
             self.grow_alloc(need);
+        }
+        // fallocate only reserves space: a write into it still waits for a
+        // journal commit at the next sync. Zeros written and synced ahead of
+        // the cursor make that sync a plain data flush.
+        if self.prealloc_chunk > 0 && self.zero.is_none() {
+            let ready_end = if self.recycled { self.alloc_end } else { self.bytes_written };
+            match self.file.try_clone() {
+                Ok(file) => {
+                    self.zero = Some(crate::zero_ahead::ZeroAhead::new(file, self.bytes_written, ready_end, chunk))
+                }
+                Err(error) => tracing::warn!(%error, "zeroing ahead of the writer unavailable"),
+            }
+        }
+    }
+
+    /// Stop zeroing. The zeros may reach past the reserved space, so the file
+    /// end is taken from them.
+    fn stop_zero(&mut self) {
+        if let Some(zero) = self.zero.take() {
+            self.alloc_end = self.alloc_end.max(zero.stop());
         }
     }
 
@@ -222,6 +267,7 @@ impl Segment {
     /// preallocated padding. Called on clean shutdown so the next clean open sees
     /// file size == data size and needs no scan.
     pub fn trim_to_written(&mut self) -> io::Result<()> {
+        self.stop_zero();
         if self.alloc_end > self.bytes_written {
             self.file.set_len(self.bytes_written)?;
             self.alloc_end = self.bytes_written;
@@ -242,6 +288,7 @@ impl Segment {
     }
 
     pub fn set_len(&mut self, new_len: u64) -> io::Result<()> {
+        self.stop_zero();
         self.file.set_len(new_len)?;
         self.bytes_written = new_len;
         self.alloc_end = new_len;

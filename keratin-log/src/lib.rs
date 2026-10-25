@@ -21,6 +21,7 @@ mod record;
 mod recovery;
 pub mod reusable_buffer;
 mod segment;
+mod zero_ahead;
 mod shared_segment;
 pub use shared_segment::FrozenForkStats;
 mod suffix_repair;
