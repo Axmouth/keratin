@@ -285,6 +285,15 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- Preallocation fills the reserved space with synced zeros on a shared
+  background worker, in 4 MiB chunks capped at 64 MiB/s across all logs.
+  `fallocate` alone left unwritten extents, so a sync after a write into them
+  still waited for an ext4 journal commit, which runs almost constantly when
+  several logs share a filesystem. With 8 MiB ahead, 1k msg/s durable p50 on
+  three replicas sharing one NVMe drive went from about 9.5 ms to about 3 ms
+  and p99 from 28-30 ms to 13-16 ms. A writer that outruns its zeros stops
+  zeroing for that segment. Reused segments only get zeros past their old end.
+
 - Periodic manifest stores run on the background manifest worker by default.
   `KERATIN_BACKGROUND_MANIFEST=0` keeps them inline for comparison.
 

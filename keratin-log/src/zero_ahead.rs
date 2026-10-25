@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex, OnceLock};
 use std::time::{Duration, Instant};
 
 /// Bytes zeroed per request.
-const CHUNK: u64 = 1 << 20;
+const CHUNK: u64 = 4 << 20;
 /// Cap on zeroing across all segments.
 const MAX_BYTES_PER_SEC: u64 = 64 << 20;
 
