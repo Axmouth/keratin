@@ -100,7 +100,11 @@ async fn buffered_queue_confirms_delivers_and_settles_before_sync() {
         assert!(!log.sync_status().every_write_sync_expected);
 
         let offsets = publish(&st, "q", 0..8).await;
-        assert_eq!(log.durable_next(), synced, "cache {cache}: a publish synced");
+        assert_eq!(
+            log.durable_next(),
+            synced,
+            "cache {cache}: a publish synced"
+        );
         let delivered = ready(&st, "q").await;
         assert_eq!(delivered.len(), 8);
         for ((off, payload), (expected, value)) in delivered.iter().zip(offsets.iter().zip(0u8..)) {
@@ -115,7 +119,11 @@ async fn buffered_queue_confirms_delivers_and_settles_before_sync() {
         }
         assert_eq!(log.durable_next(), synced, "cache {cache}: a settle synced");
         assert!(log.written_next() > synced);
-        let again: Vec<u64> = ready(&st, "q").await.into_iter().map(|(off, _)| off).collect();
+        let again: Vec<u64> = ready(&st, "q")
+            .await
+            .into_iter()
+            .map(|(off, _)| off)
+            .collect();
         let expected: Vec<u64> = offsets
             .iter()
             .enumerate()
@@ -253,7 +261,10 @@ async fn follower_resume_syncs_written_records() {
     let follower_dir = keratin_log::test_dir!("buffered_queue_follower");
     let owner = open(&owner_dir.root, 0).await;
     let follower = open(&follower_dir.root, 0).await;
-    owner.ensure_queue_owner_epoch("q", 0, None, Some(3)).await.unwrap();
+    owner
+        .ensure_queue_owner_epoch("q", 0, None, Some(3))
+        .await
+        .unwrap();
     publish(&owner, "q", 0..3).await;
     let OwnerReplicationRead::Batch(batch) = owner
         .read_owner_queue_records("q", 0, None, 0, 10, usize::MAX)
@@ -439,7 +450,10 @@ async fn power_loss_keeps_what_the_checkpoint_synced() {
     // New records take the lost offsets (the requeue record first), and
     // new publishes carry their own bytes.
     let fresh = publish(&st, "q", 9..11).await;
-    assert!(fresh[0] >= durable && fresh[0] < next, "{fresh:?} {durable} {next}");
+    assert!(
+        fresh[0] >= durable && fresh[0] < next,
+        "{fresh:?} {durable} {next}"
+    );
     let delivered = ready(&st, "q").await;
     assert_eq!(
         delivered,

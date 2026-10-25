@@ -32,13 +32,18 @@ async fn zeros_stay_ahead_of_data_and_survive_a_crash() {
     let dir = test_dir!("zero_ahead");
     let log = Keratin::open(&dir.root, config()).await.unwrap();
     for i in 0..2_000 {
-        log.append_batch(vec![message(i)], Some(KDurability::AfterFsync)).await.unwrap();
+        log.append_batch(vec![message(i)], Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
     }
     let segment = util::latest_segment(&dir.root).unwrap();
     let deadline = Instant::now() + Duration::from_secs(5);
     let data = 2_000 * 300;
     while std::fs::metadata(&segment).unwrap().len() < data + 1024 * 1024 {
-        assert!(Instant::now() < deadline, "zeros never got ahead of the data");
+        assert!(
+            Instant::now() < deadline,
+            "zeros never got ahead of the data"
+        );
         tokio::time::sleep(Duration::from_millis(20)).await;
     }
     assert_all(&log, 2_000);
@@ -47,7 +52,9 @@ async fn zeros_stay_ahead_of_data_and_survive_a_crash() {
     let log = Keratin::open(&dir.root, config()).await.unwrap();
     assert_all(&log, 2_000);
     for i in 2_000..3_000 {
-        log.append_batch(vec![message(i)], Some(KDurability::AfterFsync)).await.unwrap();
+        log.append_batch(vec![message(i)], Some(KDurability::AfterFsync))
+            .await
+            .unwrap();
     }
     assert_all(&log, 3_000);
     log.shutdown().await.unwrap();

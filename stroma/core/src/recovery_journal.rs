@@ -1,8 +1,8 @@
 //! Durable tentative inspection pages. A journal is a download cache, never a
 //! witness, verified digest, state artifact, source choice or activation receipt.
 //! Every restored page must pass the ordinary sealed inspector again.
-use keratin_log::util::fsync_dir;
 use crate::{RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, SealedReplicaFrontiers};
+use keratin_log::util::fsync_dir;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},

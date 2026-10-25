@@ -54,8 +54,16 @@ impl GenerationRecord {
             generation: generation.name(),
         }
     }
-    fn generation_for(&self, topic: &str, part: u32, group: Option<&str>) -> Result<layout::Generation> {
-        if self.topic != topic || self.partition != part || self.group.as_deref() != normalize_group(group) {
+    fn generation_for(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Result<layout::Generation> {
+        if self.topic != topic
+            || self.partition != part
+            || self.group.as_deref() != normalize_group(group)
+        {
             return Err(StromaError::Corruption(
                 "retained generation resource mismatch".into(),
             ));
@@ -173,10 +181,11 @@ impl Stroma {
             let replacement = replacement_ticket.resolve()?;
             let _lifecycle = st.lock_partition_lifecycle(topic, part, group).await;
             for (storage, expected) in [(&st, &*old), (&view, &*replacement)] {
-                let registry=storage.queue_handles.load();
-                if slot_lookup_no_alloc(&registry,topic,part,group)
-                    .and_then(|slot|slot.handle.get())
-                    .is_none_or(|handle|!std::ptr::eq(handle.as_ref(),expected)) {
+                let registry = storage.queue_handles.load();
+                if slot_lookup_no_alloc(&registry, topic, part, group)
+                    .and_then(|slot| slot.handle.get())
+                    .is_none_or(|handle| !std::ptr::eq(handle.as_ref(), expected))
+                {
                     return Err(invalid("reseed incarnation changed during verification"));
                 }
             }
@@ -187,9 +196,9 @@ impl Stroma {
             old.ensure_not_recovery_sealed()?;
             replacement.ensure_not_recovery_sealed()?;
             if *new_apply
-                || replacement.role()!=QueueRole::Follower
-                || replacement.event_log().current_epoch()!=epoch
-                || replacement.ordered_applied_next()?!=Some(ready.next)
+                || replacement.role() != QueueRole::Follower
+                || replacement.event_log().current_epoch() != epoch
+                || replacement.ordered_applied_next()? != Some(ready.next)
                 || !matches!(old.role(), QueueRole::Follower | QueueRole::Frozen)
                 || old.event_log().current_epoch() != epoch
                 || ready.next < old.event_log().next_offset()
@@ -199,9 +208,13 @@ impl Stroma {
                     "reseed replacement does not cover the unchanged original history",
                 ));
             }
-            if let Some(wq)=replacement.as_work_queue() {
-                if wq.required_message_next().await.map_err(io_err)?>replacement.payload_log().next_offset() {
-                    return Err(invalid("reseed payload dependency changed during verification"));
+            if let Some(wq) = replacement.as_work_queue() {
+                if wq.required_message_next().await.map_err(io_err)?
+                    > replacement.payload_log().next_offset()
+                {
+                    return Err(invalid(
+                        "reseed payload dependency changed during verification",
+                    ));
                 }
             }
             let route_dir = st.lock_recovery_dir(topic, part, group)?;
@@ -211,7 +224,8 @@ impl Stroma {
             if disk != cached {
                 return Err(invalid("reseed generation changed in another process"));
             }
-            let original = cached.ok_or_else(|| invalid("reseed requires an existing generation"))?;
+            let original =
+                cached.ok_or_else(|| invalid("reseed requires an existing generation"))?;
             // Keep an explicit durable pointer to the original generation. No
             // original payload, event or checkpoint file is overwritten.
             save_meta(
@@ -225,8 +239,7 @@ impl Stroma {
                 "reseed-complete-{}",
                 blake3::Hash::from_bytes(intent)
             ));
-            if let Some((saved, saved_epoch, next)) =
-                read_meta::<ReseedCompletion>(&complete_path)?
+            if let Some((saved, saved_epoch, next)) = read_meta::<ReseedCompletion>(&complete_path)?
             {
                 if saved != receipt || saved_epoch != epoch || next > ready.next {
                     return Err(invalid(
@@ -249,7 +262,9 @@ impl Stroma {
                 if let Some(wq) = handle.as_work_queue() {
                     wq.shutdown().await;
                 }
-                for log in handle.physical_logs() { log.shutdown().await.map_err(io_err)?; }
+                for log in handle.physical_logs() {
+                    log.shutdown().await.map_err(io_err)?;
+                }
             }
             st.remove_queue(topic, part, group);
             view.remove_queue(topic, part, group);
@@ -445,7 +460,9 @@ impl Stroma {
                 if let Some(wq) = h.as_work_queue() {
                     wq.shutdown().await;
                 }
-                for log in h.physical_logs() { log.shutdown().await.map_err(io_err)?; }
+                for log in h.physical_logs() {
+                    log.shutdown().await.map_err(io_err)?;
+                }
             }
             st.remove_queue(&topic, part, group.as_deref());
             st.admitted_histories.remove(&resource_key);
@@ -501,8 +518,7 @@ impl Stroma {
         let _lifecycle = st
             .lock_partition_lifecycle(&spec.topic, spec.partition, spec.group.as_deref())
             .await;
-        let route_dir =
-            st.lock_recovery_dir(&spec.topic, spec.partition, spec.group.as_deref())?;
+        let route_dir = st.lock_recovery_dir(&spec.topic, spec.partition, spec.group.as_deref())?;
         let _lock = lock_existing_log(&route_dir).map_err(io_err)?;
         // A durable anchor prevents a missing current generation from
         // becoming an empty queue after an interrupted first installation.
@@ -581,7 +597,8 @@ impl Stroma {
                 &seal,
             )?;
             // Record the source generation BEFORE switching `current`.
-            let old = disk_current.ok_or_else(|| invalid("sealed data has no current generation"))?;
+            let old =
+                disk_current.ok_or_else(|| invalid("sealed data has no current generation"))?;
             save_meta(
                 &route_dir.join(format!(
                     "retained-{}",
@@ -610,7 +627,9 @@ impl Stroma {
             if let Some(wq) = h.as_work_queue() {
                 wq.shutdown().await;
             }
-            for log in h.physical_logs() { log.shutdown().await.map_err(io_err)?; }
+            for log in h.physical_logs() {
+                log.shutdown().await.map_err(io_err)?;
+            }
         }
         st.remove_queue(&spec.topic, spec.partition, spec.group.as_deref());
         st.admitted_histories
@@ -652,23 +671,29 @@ impl Stroma {
             let target = view.recovery_payload_path(&spec);
             let (guard, target) = tokio::task::spawn_blocking(move || {
                 recovery_stage::scan(&guard, true)?;
-                if let Some(parent) = target.parent() { fs::create_dir_all(parent).map_err(io_err)?; }
+                if let Some(parent) = target.parent() {
+                    fs::create_dir_all(parent).map_err(io_err)?;
+                }
                 Ok::<_, StromaError>((guard, target))
             })
             .await
             .map_err(io_err)??;
-            let stats = guard.log.fork_frozen(target, spec.fence_epoch, spec.log.head, spec.log.next)
-                .await.map_err(io_err)?;
-            tracing::info!(topic = spec.topic, partition = spec.partition,
-                shared_bytes = stats.shared_bytes, copied_bytes = stats.copied_bytes,
-                shared_segments = stats.shared_segments, "recovery installation reused staged payloads");
+            let stats = guard
+                .log
+                .fork_frozen(target, spec.fence_epoch, spec.log.head, spec.log.next)
+                .await
+                .map_err(io_err)?;
+            tracing::info!(
+                topic = spec.topic,
+                partition = spec.partition,
+                shared_bytes = stats.shared_bytes,
+                copied_bytes = stats.copied_bytes,
+                shared_segments = stats.shared_segments,
+                "recovery installation reused staged payloads"
+            );
             boundary("log");
             let installed = view
-                .open_keratin(
-                    view.recovery_payload_path(&spec),
-                    st.keratin_cfg_msg,
-                    true,
-                )
+                .open_keratin(view.recovery_payload_path(&spec), st.keratin_cfg_msg, true)
                 .await
                 .map_err(io_err)?;
             installed.freeze();
@@ -724,11 +749,7 @@ impl Stroma {
         // Reopen and verify the whole baseline, including a completed
         // generation whose receipt survived an interrupted `current` switch.
         let installed = view
-            .open_keratin(
-                view.recovery_payload_path(&spec),
-                st.keratin_cfg_msg,
-                true,
-            )
+            .open_keratin(view.recovery_payload_path(&spec), st.keratin_cfg_msg, true)
             .await
             .map_err(io_err)?;
         installed.freeze();
@@ -801,15 +822,11 @@ impl Stroma {
         {
             return Err(invalid("recovery receipt resource or binding mismatch"));
         }
-        let current = layout::read_current(&self.partition_dir(
-            &s.topic,
-            s.partition,
-            s.group.as_deref(),
-        ))?
-        .ok_or_else(|| invalid("recovery generation missing"))?;
+        let current =
+            layout::read_current(&self.partition_dir(&s.topic, s.partition, s.group.as_deref()))?
+                .ok_or_else(|| invalid("recovery generation missing"))?;
         if current != recovery_generation(s.plan, prepared.storage.storage_instance)
-            || self.partition_generation(&s.topic, s.partition, s.group.as_deref())
-                != Some(current)
+            || self.partition_generation(&s.topic, s.partition, s.group.as_deref()) != Some(current)
             || read_meta::<PreparedQueueRecovery>(
                 &self
                     .snap_dir(&s.topic, s.partition, s.group.as_deref())
@@ -836,8 +853,9 @@ impl Stroma {
             let _lifecycle = st
                 .lock_partition_lifecycle(&s.topic, s.partition, s.group.as_deref())
                 .await;
-            let _lock = lock_existing_log(&st.recovery_dir(&s.topic, s.partition, s.group.as_deref()))
-                .map_err(io_err)?;
+            let _lock =
+                lock_existing_log(&st.recovery_dir(&s.topic, s.partition, s.group.as_deref()))
+                    .map_err(io_err)?;
             st.verify_prepared_queue_recovery(&prepared)?;
             if st
                 .recovery_seal_path(&s.topic, s.partition, s.group.as_deref())

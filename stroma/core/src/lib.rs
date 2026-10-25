@@ -4,15 +4,15 @@ mod event;
 mod global;
 mod metrics;
 mod ordered_apply;
-mod replication;
-mod replication_diagnostics;
+pub mod recovery_budget;
+pub mod recovery_cache;
 pub mod recovery_inspection;
 pub mod recovery_journal;
-pub mod recovery_snapshot;
 pub mod recovery_phase;
-pub mod recovery_cache;
-pub mod recovery_budget;
 pub mod recovery_replay;
+pub mod recovery_snapshot;
+mod replication;
+mod replication_diagnostics;
 mod state;
 // Some stream-engine helpers (cursor introspection, retention axes) are wired in
 // by later Plexus steps (fibril stream actor, retention worker), so they are
@@ -30,10 +30,10 @@ pub use event::{
 };
 pub use global::{GlobalKey, GlobalStore, GlobalValue, PutOutcome};
 pub use keratin_log::{
-    AdaptiveStagingConfig, reusable_buffer::EmptyBufferResize,
-    AppendCompletion, AppendResult, CompletionPair, IoError, KDurability, KeratinAppendCompletion,
-    KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome, SyncStatus, WriterSettings,
-    WriterSettingsSnapshot, test_dir, util::TempDir,
+    AdaptiveStagingConfig, AppendCompletion, AppendResult, CompletionPair, IoError, KDurability,
+    KeratinAppendCompletion, KeratinConfig, Message, ReceivedMessage, ReplicatedAppendOutcome,
+    SyncStatus, WriterSettings, WriterSettingsSnapshot, reusable_buffer::EmptyBufferResize,
+    test_dir, util::TempDir,
 };
 pub use metrics::StromaMetrics;
 pub use state::{
@@ -44,20 +44,20 @@ pub use state::{
 };
 pub use stream_state::RetentionConfig;
 pub use stroma::{
-    QueueReplicationRetention,
-    QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointPin, QueueCheckpointTarget, QueueCheckpointContents, QueueCheckpointCapsule, QueueCheckpointBuildLimits,
-    DestroyOutcome, DiskUsedBreakdownEntry, EmptyQueueRemoval, RecoveryDiskUsage, EnqueuedStreamAppend, EvictOutcome,
-    GlobalDLQ,
-    GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
+    DestroyOutcome, DiskUsedBreakdownEntry, EmptyQueueRemoval, EnqueuedStreamAppend, EvictOutcome,
+    GlobalDLQ, GlobalDlqSnapshot, GlobalDlqUpdateOutcome, MessageContentType, MessageHeaders,
     MessageInspectionItem, MessageInspectionPage, OwnerReplicationBatch, OwnerReplicationRead,
-    PublishItem, QuarantineInfo, QueueDemotionOutcome, QueuePromotionOutcome, QueueStateCheckpoint,
-    QueueStateCheckpointInstallOutcome, StreamPromotionOutcome,
-    QueueLogSyncStatus, QueuePublishCommit, QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageSpec,
-    QueueRecoveryStageReceipt, RecoveryStageLimits, RecoveryReadPage, RecoveryReadRequest,
-    RecoveryReadSource, RecoveryRecord, RecoverySequentialRead, RecoverySealRequest, ReplicatedEventBatch,
-    ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, RetainedHistoryIdentity, RetainedLog, RetainedLogs,
-    PreparedQueueRecovery, PreparedStorageHistory, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding, Stroma,
-    StromaKeratinConfig, StromaOptions, TaskGroup,
+    PreparedQueueRecovery, PreparedStorageHistory, PublishItem, QuarantineInfo,
+    QueueCheckpointActivity, QueueCheckpointBase, QueueCheckpointBuildLimits,
+    QueueCheckpointCapsule, QueueCheckpointContents, QueueCheckpointPin, QueueCheckpointTarget,
+    QueueDemotionOutcome, QueueLogSyncStatus, QueuePromotionOutcome, QueuePublishCommit,
+    QueuePublishObserver, QueueRecoveryStage, QueueRecoveryStageReceipt, QueueRecoveryStageSpec,
+    QueueReplicationRetention, QueueStateCheckpoint, QueueStateCheckpointInstallOutcome,
+    RecoveryDiskUsage, RecoveryReadPage, RecoveryReadRequest, RecoveryReadSource, RecoveryRecord,
+    RecoverySealRequest, RecoverySequentialRead, RecoveryStageLimits, ReplicatedEventBatch,
+    ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, RetainedHistoryIdentity, RetainedLog,
+    RetainedLogs, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding,
+    StreamPromotionOutcome, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;

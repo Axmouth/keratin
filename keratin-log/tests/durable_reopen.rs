@@ -63,7 +63,11 @@ async fn crash_child_writes_unsynced_records() {
 
 fn crash_with_unsynced_tail(root: &Path) {
     let status = std::process::Command::new(std::env::current_exe().unwrap())
-        .args(["--exact", "crash_child_writes_unsynced_records", "--nocapture"])
+        .args([
+            "--exact",
+            "crash_child_writes_unsynced_records",
+            "--nocapture",
+        ])
         .env(CHILD_ROOT, root)
         .status()
         .unwrap();

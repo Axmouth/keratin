@@ -30,7 +30,10 @@ impl SealedEpochs {
     fn highest(self) -> u64 {
         match self {
             Self::Queue(epoch) => epoch,
-            Self::Stream { records, cursor_events } => records.max(cursor_events),
+            Self::Stream {
+                records,
+                cursor_events,
+            } => records.max(cursor_events),
         }
     }
 }
@@ -523,12 +526,7 @@ mod tests {
         );
         assert!(stroma.advance_queue_epoch("q", 0, None, 9).await.is_err());
         assert!(stroma.snapshot_partition("q", 0, None).await.is_err());
-        assert!(
-            stroma
-                .truncate_queue_before("q", 0, None, 1)
-                .await
-                .is_err()
-        );
+        assert!(stroma.truncate_queue_before("q", 0, None, 1).await.is_err());
         assert!(stroma.truncate_partition_log(qh.clone(), 1).await.is_err());
         assert!(stroma.destroy_partition("q", 0, None).await.is_err());
         assert_eq!(
@@ -584,15 +582,39 @@ mod tests {
         for (previous, fence, ok) in [
             (SealedEpochs::Queue(7), 8, true),
             (SealedEpochs::Queue(8), 8, false),
-            (SealedEpochs::Stream { records: 3, cursor_events: 7 }, 8, true),
-            (SealedEpochs::Stream { records: 8, cursor_events: 3 }, 8, false),
-            (SealedEpochs::Stream { records: 3, cursor_events: 8 }, 8, false),
+            (
+                SealedEpochs::Stream {
+                    records: 3,
+                    cursor_events: 7,
+                },
+                8,
+                true,
+            ),
+            (
+                SealedEpochs::Stream {
+                    records: 8,
+                    cursor_events: 3,
+                },
+                8,
+                false,
+            ),
+            (
+                SealedEpochs::Stream {
+                    records: 3,
+                    cursor_events: 8,
+                },
+                8,
+                false,
+            ),
         ] {
             let intent = SealIntent {
                 topic: "q".into(),
                 partition: 0,
                 group: None,
-                request: RecoverySealRequest { transition: [1; 32], fence_epoch: fence },
+                request: RecoverySealRequest {
+                    transition: [1; 32],
+                    fence_epoch: fence,
+                },
                 previous,
             };
             let mut bytes = MAGIC.to_vec();
@@ -754,7 +776,12 @@ mod tests {
                 reopened.queue_handle("q", 0, None).await,
                 Err(StromaError::HistoryAdmissionRequired { .. })
             ));
-            assert!(matches!(reopened.seal_replica_for_recovery("q", 0, None, request()).await, Err(StromaError::Corruption(_))));
+            assert!(matches!(
+                reopened
+                    .seal_replica_for_recovery("q", 0, None, request())
+                    .await,
+                Err(StromaError::Corruption(_))
+            ));
             reopened.shutdown().await.unwrap();
         }
     }

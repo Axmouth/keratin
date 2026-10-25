@@ -104,7 +104,9 @@ impl Stroma {
         let next = log.next_offset();
         log.shutdown().await.map_err(io_err)?;
         if next != 0 {
-            return Ok(kept(&format_args!("the queue log holds records (next offset {next})")));
+            return Ok(kept(&format_args!(
+                "the queue log holds records (next offset {next})"
+            )));
         }
 
         match self.destroy_partition_locked(topic, part, group).await? {
@@ -159,7 +161,9 @@ mod tests {
 
     async fn ack(st: &Stroma, topic: &str, off: u64) {
         let (completion, rx) = KeratinAppendCompletion::pair();
-        st.ack_enqueue(topic, 0, None, off, completion).await.unwrap();
+        st.ack_enqueue(topic, 0, None, off, completion)
+            .await
+            .unwrap();
         rx.await.unwrap().unwrap();
     }
 
@@ -169,7 +173,9 @@ mod tests {
         st.materialize(topic, 0, None).await.unwrap();
         st.advance_stream_epoch(topic, 0, 3).await.unwrap();
         st.become_queue_owner(topic, 0, None).await.unwrap();
-        st.ensure_queue_owner_epoch(topic, 0, None, Some(4)).await.unwrap();
+        st.ensure_queue_owner_epoch(topic, 0, None, Some(4))
+            .await
+            .unwrap();
     }
 
     #[tokio::test]
@@ -177,7 +183,10 @@ mod tests {
         let dir = test_dir!("empty_queue_removal_removes");
         let st = open(&dir.root).await;
         stray_queue(&st, "events").await;
-        assert_eq!(st.partition_kind_marker("events", 0, None), Some(PartitionKind::Queue));
+        assert_eq!(
+            st.partition_kind_marker("events", 0, None),
+            Some(PartitionKind::Queue)
+        );
 
         // While open in this process.
         assert!(matches!(
@@ -187,7 +196,9 @@ mod tests {
         assert!(!st.partition_dir("events", 0, None).exists());
         assert_eq!(st.partition_kind_marker("events", 0, None), None);
         assert_eq!(
-            st.remove_empty_queue_partition("events", 0, None).await.unwrap(),
+            st.remove_empty_queue_partition("events", 0, None)
+                .await
+                .unwrap(),
             EmptyQueueRemoval::Absent
         );
 
@@ -229,9 +240,18 @@ mod tests {
         st.shutdown().await.unwrap();
 
         let st = open(&dir.root).await;
-        let outcome = st.remove_empty_queue_partition("events", 0, None).await.unwrap();
-        assert!(matches!(outcome, EmptyQueueRemoval::Kept { .. }), "{outcome:?}");
-        assert_eq!(st.partition_kind_marker("events", 0, None), Some(PartitionKind::Queue));
+        let outcome = st
+            .remove_empty_queue_partition("events", 0, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, EmptyQueueRemoval::Kept { .. }),
+            "{outcome:?}"
+        );
+        assert_eq!(
+            st.partition_kind_marker("events", 0, None),
+            Some(PartitionKind::Queue)
+        );
         assert!(st.partition_dir("events", 0, None).exists());
         st.shutdown().await.unwrap();
     }
@@ -240,9 +260,17 @@ mod tests {
     async fn keeps_a_declared_queue_without_messages() {
         let dir = test_dir!("empty_queue_removal_keeps_declared");
         let st = open(&dir.root).await;
-        st.declare("orders", 0, None, DeclareMeta::default()).await.unwrap();
-        let outcome = st.remove_empty_queue_partition("orders", 0, None).await.unwrap();
-        assert!(matches!(outcome, EmptyQueueRemoval::Kept { .. }), "{outcome:?}");
+        st.declare("orders", 0, None, DeclareMeta::default())
+            .await
+            .unwrap();
+        let outcome = st
+            .remove_empty_queue_partition("orders", 0, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, EmptyQueueRemoval::Kept { .. }),
+            "{outcome:?}"
+        );
         assert!(st.partition_dir("orders", 0, None).exists());
         st.shutdown().await.unwrap();
     }
@@ -252,8 +280,14 @@ mod tests {
         let dir = test_dir!("empty_queue_removal_keeps_stream");
         let st = open(&dir.root).await;
         st.create_stream("events", 0, None).await.unwrap();
-        let outcome = st.remove_empty_queue_partition("events", 0, None).await.unwrap();
-        assert!(matches!(outcome, EmptyQueueRemoval::Kept { .. }), "{outcome:?}");
+        let outcome = st
+            .remove_empty_queue_partition("events", 0, None)
+            .await
+            .unwrap();
+        assert!(
+            matches!(outcome, EmptyQueueRemoval::Kept { .. }),
+            "{outcome:?}"
+        );
         assert_eq!(st.partition_kind("events", 0, None), PartitionKind::Stream);
         st.shutdown().await.unwrap();
     }

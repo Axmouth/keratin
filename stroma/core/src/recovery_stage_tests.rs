@@ -155,7 +155,10 @@ async fn stage_resumes_without_touching_active_bound_sealed_storage() {
         )
         .await
         .unwrap();
-    assert_eq!((read.from, read.end), (0, sealed.history.queue_log().unwrap().next));
+    assert_eq!(
+        (read.from, read.end),
+        (0, sealed.history.queue_log().unwrap().next)
+    );
     assert!(
         st.read_sealed_replica(
             "q",
@@ -247,9 +250,11 @@ async fn stage_adopts_runtime_policy_on_open_and_resume() {
         .open_queue_recovery_stage(spec.clone(), snapshot, Default::default())
         .await
         .unwrap();
-    assert!(runtime.logs().iter().any(
-        |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 1
-    ));
+    assert!(
+        runtime.logs().iter().any(
+            |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 1
+        )
+    );
     stage.append(page(&spec, &records)).await.unwrap();
     let receipt = stage.finish().await.unwrap();
     drop(stage);
@@ -266,9 +271,11 @@ async fn stage_adopts_runtime_policy_on_open_and_resume() {
         .await
         .unwrap();
     assert_eq!(stage.finish().await.unwrap(), receipt);
-    assert!(runtime.logs().iter().any(
-        |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 2
-    ));
+    assert!(
+        runtime.logs().iter().any(
+            |log| log.root.to_string_lossy().contains("/staging/") && log.applied.revision == 2
+        )
+    );
     drop(stage);
     st.shutdown().await.unwrap();
 }
@@ -608,7 +615,10 @@ async fn installation_preserves_source_requires_admission_and_never_resets_retry
         )
         .await
         .unwrap();
-    assert_eq!(next_seal.history.queue_log().unwrap().next, expected_event_next);
+    assert_eq!(
+        next_seal.history.queue_log().unwrap().next,
+        expected_event_next
+    );
     assert_eq!(
         next_seal.history.storage_history.unwrap().binding,
         spec.binding
@@ -925,8 +935,14 @@ fn stage_descriptor_binds_source_bounds_and_complete_target() {
     for next in [2, 4] {
         let mut bad = spec.clone();
         bad.log.next = next;
-        let intent = Intent { spec: bad, snapshot: snapshot.clone() };
-        assert!(validate(&intent, Default::default()).is_err(), "next {next}");
+        let intent = Intent {
+            spec: bad,
+            snapshot: snapshot.clone(),
+        };
+        assert!(
+            validate(&intent, Default::default()).is_err(),
+            "next {next}"
+        );
     }
     validate(&Intent { spec, snapshot }, Default::default()).unwrap();
 }
@@ -954,35 +970,80 @@ async fn snapshot_chunks_resume_before_stage_creation_and_bind_exact_plan() {
     let dir = keratin_log::test_dir!("staged_snapshot_chunks");
     let st = open(&dir.root).await;
     let (spec, snapshot, records) = fixture(3, 9);
-    let seal = RecoverySealRequest { transition: [9; 32], fence_epoch: spec.fence_epoch };
-    assert_eq!(st.transfer_queue_recovery_snapshot(spec.clone(), None).await.unwrap(), 0);
-    st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, snapshot[..30].to_vec()))).await.unwrap();
-    assert!(st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal.clone()).await.is_err());
+    let seal = RecoverySealRequest {
+        transition: [9; 32],
+        fence_epoch: spec.fence_epoch,
+    };
+    assert_eq!(
+        st.transfer_queue_recovery_snapshot(spec.clone(), None)
+            .await
+            .unwrap(),
+        0
+    );
+    st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, snapshot[..30].to_vec())))
+        .await
+        .unwrap();
+    assert!(
+        st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal.clone())
+            .await
+            .is_err()
+    );
     st.shutdown().await.unwrap();
     drop(st);
     let st = open(&dir.root).await;
-    assert_eq!(st.transfer_queue_recovery_snapshot(spec.clone(), None).await.unwrap(), 30);
-    assert!(st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, vec![0; 30]))).await.is_err());
+    assert_eq!(
+        st.transfer_queue_recovery_snapshot(spec.clone(), None)
+            .await
+            .unwrap(),
+        30
+    );
+    assert!(
+        st.transfer_queue_recovery_snapshot(spec.clone(), Some((0, vec![0; 30])))
+            .await
+            .is_err()
+    );
     let mut changed = spec.clone();
     changed.plan = [7; 32];
-    assert_eq!(st.transfer_queue_recovery_snapshot(changed, None).await.unwrap(), 0);
+    assert_eq!(
+        st.transfer_queue_recovery_snapshot(changed, None)
+            .await
+            .unwrap(),
+        0
+    );
     let mut from = 30;
     while from < snapshot.len() {
         let next = (from + 37).min(snapshot.len());
-        st.transfer_queue_recovery_snapshot(spec.clone(), Some((from as u64, snapshot[from..next].to_vec()))).await.unwrap();
+        st.transfer_queue_recovery_snapshot(
+            spec.clone(),
+            Some((from as u64, snapshot[from..next].to_vec())),
+        )
+        .await
+        .unwrap();
         from = next;
     }
-    let stage = st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal).await.unwrap();
+    let stage = st
+        .open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), seal)
+        .await
+        .unwrap();
     assert!(stage.completed_snapshot_chunk(0, 30).await.is_err());
     assert_eq!(stage.snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
     stage.append(page(&spec, &records)).await.unwrap();
     assert!(stage.completion_receipt().await.unwrap().is_none());
     let completed = stage.finish().await.unwrap();
-    assert_eq!(stage.completion_receipt().await.unwrap(), Some(completed.clone()));
-    assert_eq!(stage.completed_snapshot_chunk(0, 30).await.unwrap(), snapshot[..30]);
+    assert_eq!(
+        stage.completion_receipt().await.unwrap(),
+        Some(completed.clone())
+    );
+    assert_eq!(
+        stage.completed_snapshot_chunk(0, 30).await.unwrap(),
+        snapshot[..30]
+    );
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
     drop(stage);
-    let stage = st.resume_queue_recovery_stage(spec, Default::default()).await.unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec, Default::default())
+        .await
+        .unwrap();
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
     assert_eq!(stage.completion_receipt().await.unwrap(), Some(completed));
     drop(stage);
@@ -995,21 +1056,37 @@ async fn incremental_stage_rejects_disk_pressure_without_losing_existing_progres
     let st = open(&dir.root).await;
     let (spec, snapshot, records) = fixture(0, 3);
     let mut limits = RecoveryStageLimits::incremental();
-    let stage = st.open_queue_recovery_stage(spec.clone(), snapshot, limits).await.unwrap();
+    let stage = st
+        .open_queue_recovery_stage(spec.clone(), snapshot, limits)
+        .await
+        .unwrap();
     stage.append(page(&spec, &records[..1])).await.unwrap();
     drop(stage);
     limits.reserve_free_bytes = u64::MAX;
-    let stage = st.resume_queue_recovery_stage(spec.clone(), limits).await.unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec.clone(), limits)
+        .await
+        .unwrap();
     assert_eq!(stage.next_offset().await, 1);
-    let error = stage.append(page(&spec, &records[1..])).await.unwrap_err().to_string();
+    let error = stage
+        .append(page(&spec, &records[1..]))
+        .await
+        .unwrap_err()
+        .to_string();
     assert!(error.contains("disk reserve"), "{error}");
     assert_eq!(stage.next_offset().await, 1);
     // A duplicate read/validation needs no additional storage admission.
     stage.append(page(&spec, &records[..1])).await.unwrap();
     drop(stage);
-    let stage = st.resume_queue_recovery_stage(spec, RecoveryStageLimits::incremental()).await.unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec, RecoveryStageLimits::incremental())
+        .await
+        .unwrap();
     let resumed_spec = stage.inner.lock().await.intent.spec.clone();
-    stage.append(page(&resumed_spec, &records[1..])).await.unwrap();
+    stage
+        .append(page(&resumed_spec, &records[1..]))
+        .await
+        .unwrap();
     stage.finish().await.unwrap();
     drop(stage);
     st.shutdown().await.unwrap();
@@ -1022,17 +1099,32 @@ async fn incremental_stage_crosses_legacy_record_and_byte_budgets() {
     let st = open(&dir.root).await;
     let count = 1_100_002u64;
     let mut state = QueueInternalState::new("q".into(), 0);
-    for off in 0..count { state.ack(off); }
+    for off in 0..count {
+        state.ack(off);
+    }
     let state_digest = state.recovery_state_digest();
     let snapshot = state.into_recovery_snapshot(count);
     let make_record = |offset| RecoveryRecord {
-        offset, flags: 0, headers: vec![],
+        offset,
+        flags: 0,
+        headers: vec![],
         payload: if offset % 2 == 0 {
-            StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![42; 2048] }
-        } else { StromaEvent::Ack { off: offset - 1 } }.encode().unwrap(),
+            StromaEvent::PayloadEnqueue {
+                not_before: None,
+                expire_at: None,
+                headers: vec![],
+                payload: vec![42; 2048],
+            }
+        } else {
+            StromaEvent::Ack { off: offset - 1 }
+        }
+        .encode()
+        .unwrap(),
     };
     let mut digest = blake3::Hasher::new();
-    digest.update(b"fibril-retained-log-v1\0"); digest.update(&0u64.to_be_bytes()); digest.update(&count.to_be_bytes());
+    digest.update(b"fibril-retained-log-v1\0");
+    digest.update(&0u64.to_be_bytes());
+    digest.update(&count.to_be_bytes());
     let mut logical_bytes = 0;
     for off in 0..count {
         let r = make_record(off);
@@ -1047,22 +1139,45 @@ async fn incremental_stage_crosses_legacy_record_and_byte_budgets() {
     spec.snapshot_bytes = snapshot.len() as u64;
     spec.snapshot_digest = *blake3::hash(&snapshot).as_bytes();
     spec.state_digest = state_digest;
-    assert!(st.open_queue_recovery_stage(spec.clone(), snapshot.clone(), Default::default()).await.is_err());
-    let mut stage = st.open_queue_recovery_stage(spec.clone(), snapshot, RecoveryStageLimits::incremental()).await.unwrap();
+    assert!(
+        st.open_queue_recovery_stage(spec.clone(), snapshot.clone(), Default::default())
+            .await
+            .is_err()
+    );
+    let mut stage = st
+        .open_queue_recovery_stage(spec.clone(), snapshot, RecoveryStageLimits::incremental())
+        .await
+        .unwrap();
     for from in (0..count).step_by(4096) {
         let next = (from + 4096).min(count);
-        stage.append(RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Log,
-            from, next, end: count, records: (from..next).map(make_record).collect(), snapshot_bytes: vec![] }).await.unwrap();
+        stage
+            .append(RecoveryReadPage {
+                history_id: spec.source_history,
+                source: RecoveryReadSource::Log,
+                from,
+                next,
+                end: count,
+                records: (from..next).map(make_record).collect(),
+                snapshot_bytes: vec![],
+            })
+            .await
+            .unwrap();
         if next == 4096 * 100 {
             drop(stage);
-            stage = st.resume_queue_recovery_stage(spec.clone(), RecoveryStageLimits::incremental()).await.unwrap();
+            stage = st
+                .resume_queue_recovery_stage(spec.clone(), RecoveryStageLimits::incremental())
+                .await
+                .unwrap();
             assert_eq!(stage.next_offset().await, next);
         }
     }
     stage.finish().await.unwrap();
     assert_eq!(stage.inner.lock().await.used, logical_bytes);
     drop(stage);
-    let stage = st.resume_queue_recovery_stage(spec, RecoveryStageLimits::incremental()).await.unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec, RecoveryStageLimits::incremental())
+        .await
+        .unwrap();
     stage.finish().await.unwrap();
     println!("large_stage_acceptance records={count} logical_bytes={logical_bytes}");
     drop(stage);

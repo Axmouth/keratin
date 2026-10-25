@@ -1425,8 +1425,13 @@ impl QueueHandleInner {
             // Only combined learner recovery can have an authorized snapshot
             // ahead of its payload backfill. Separate-log repair may lower a tail.
             let next = if self.msg_log.is_none() {
-                order.applied_next().unwrap_or(physical_next).max(physical_next)
-            } else { physical_next };
+                order
+                    .applied_next()
+                    .unwrap_or(physical_next)
+                    .max(physical_next)
+            } else {
+                physical_next
+            };
             order.reset(next);
         }
         self.recovery_complete.store(true, Ordering::Release);
@@ -1446,7 +1451,10 @@ impl QueueHandleInner {
 
     pub fn role(&self) -> QueueRole {
         if self.recovery_gate.sealed.load(Ordering::Acquire)
-            || self.recovery_gate.checkpoint_pending.load(Ordering::Acquire)
+            || self
+                .recovery_gate
+                .checkpoint_pending
+                .load(Ordering::Acquire)
         {
             return QueueRole::Frozen;
         }
@@ -1499,8 +1507,14 @@ impl QueueHandleInner {
     }
 
     pub fn ensure_owner(&self) -> Result<(), QueueHandleError> {
-        if self.ordered_apply.as_ref().is_some_and(|order| order.failed()) {
-            return Err(QueueHandleError::Internal("ordered application interrupted; recovery required".into()));
+        if self
+            .ordered_apply
+            .as_ref()
+            .is_some_and(|order| order.failed())
+        {
+            return Err(QueueHandleError::Internal(
+                "ordered application interrupted; recovery required".into(),
+            ));
         }
         let actual = self.role();
         if actual == QueueRole::Owner {
@@ -1891,7 +1905,9 @@ impl QueueHandleInner {
             }
             QueueCommand::ActivateDelayed { now, max, response } => {
                 dirty = state.activate_delayed(now, max as usize) > 0;
-                if let Some(r) = response { let _ = r.send(()); }
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
             }
             QueueCommand::CollectExpired { now, max, response } => {
                 let result = state.collect_expired_leases(now, max);
@@ -2015,7 +2031,11 @@ impl QueueHandleInner {
                     }
                 });
             }
-            QueueCommand::CaptureExactCheckpoint { permit, mark_clean, response } => {
+            QueueCommand::CaptureExactCheckpoint {
+                permit,
+                mark_clean,
+                response,
+            } => {
                 let capture = permit.event_next().map(|event_next| {
                     let started = Instant::now();
                     handle.metrics.snapshot.attempts.incr();
@@ -2028,8 +2048,14 @@ impl QueueHandleInner {
                         metrics: handle.metrics.clone(),
                         started,
                     };
-                    handle.metrics.snapshot.clone_latency.observe(started.elapsed());
-                    if mark_clean { handle.set_dirty_snapshot(false); }
+                    handle
+                        .metrics
+                        .snapshot
+                        .clone_latency
+                        .observe(started.elapsed());
+                    if mark_clean {
+                        handle.set_dirty_snapshot(false);
+                    }
                     captured
                 });
                 drop(permit);
@@ -2885,9 +2911,9 @@ impl QueueHandleInner {
 
     /// A separate payload log exists only in the two-log layout.
     pub fn msg_log(&self) -> Result<Arc<Keratin>, StromaError> {
-        self.msg_log.clone().ok_or_else(|| StromaError::Unsupported(
-            "combined queue has no separate message log".into(),
-        ))
+        self.msg_log.clone().ok_or_else(|| {
+            StromaError::Unsupported("combined queue has no separate message log".into())
+        })
     }
 
     /// The physical layout belongs to this partition, even in mixed roots.
@@ -2900,11 +2926,16 @@ impl QueueHandleInner {
     }
 
     pub fn physical_logs(&self) -> impl Iterator<Item = Arc<Keratin>> + '_ {
-        self.msg_log.iter().cloned().chain(std::iter::once(self.event_log.clone()))
+        self.msg_log
+            .iter()
+            .cloned()
+            .chain(std::iter::once(self.event_log.clone()))
     }
 
     pub fn payload_log(&self) -> Arc<Keratin> {
-        self.msg_log.clone().unwrap_or_else(|| self.event_log.clone())
+        self.msg_log
+            .clone()
+            .unwrap_or_else(|| self.event_log.clone())
     }
 
     pub fn event_log(&self) -> Arc<Keratin> {
@@ -2915,7 +2946,6 @@ impl QueueHandleInner {
         self.follower_apply.lock().await
     }
 
-
     pub fn applied_upto(&self) -> Arc<AtomicU64> {
         self.applied_upto.clone()
     }
@@ -2924,32 +2954,50 @@ impl QueueHandleInner {
         self.ordered_apply.as_ref().map(|order| order.scope())
     }
 
-    pub(crate) fn has_ordered_apply(&self) -> bool { self.ordered_apply.is_some() }
+    pub(crate) fn has_ordered_apply(&self) -> bool {
+        self.ordered_apply.is_some()
+    }
 
-    pub(crate) async fn capture_exact_checkpoint(&self, mark_clean: bool) -> crate::Result<CapturedQueueCheckpoint> {
-        let order = self.ordered_apply.as_ref().ok_or_else(||
-            StromaError::InvalidArgument("exact capture requires ordered queue application".into()))?;
+    pub(crate) async fn capture_exact_checkpoint(
+        &self,
+        mark_clean: bool,
+    ) -> crate::Result<CapturedQueueCheckpoint> {
+        let order = self.ordered_apply.as_ref().ok_or_else(|| {
+            StromaError::InvalidArgument("exact capture requires ordered queue application".into())
+        })?;
         let permit = order.checkpoint().await?;
         let (response, rx) = oneshot::channel();
-        self.command_enqueue(QueueCommand::CaptureExactCheckpoint { permit, mark_clean, response }).await
-            .map_err(|err| StromaError::Io(err.to_string()))?;
+        self.command_enqueue(QueueCommand::CaptureExactCheckpoint {
+            permit,
+            mark_clean,
+            response,
+        })
+        .await
+        .map_err(|err| StromaError::Io(err.to_string()))?;
         rx.await.map_err(|_| StromaError::QueueActorGone)?
     }
 
     /// Only completed recovery or a validated, installed checkpoint can reset
     /// an interrupted sequence. A role change is not evidence of application.
     pub(crate) fn reset_ordered_apply_after_recovery(&self, event_next: u64) {
-        if let Some(order) = &self.ordered_apply { order.reset(event_next); }
+        if let Some(order) = &self.ordered_apply {
+            order.reset(event_next);
+        }
     }
 
     pub(crate) fn ordered_applied_next(&self) -> crate::Result<Option<u64>> {
-        self.ordered_apply.as_ref().map(|order| order.applied_next()).transpose()
+        self.ordered_apply
+            .as_ref()
+            .map(|order| order.applied_next())
+            .transpose()
     }
 
     /// Caller holds follower_apply and has checked there is no interrupted apply.
     pub(crate) fn align_follower_checkpoint_boundary(&self) -> crate::Result<()> {
         if self.ordered_applied_next()? != Some(self.event_log.next_offset()) {
-            return Err(StromaError::Io("follower checkpoint has unapplied events".into()));
+            return Err(StromaError::Io(
+                "follower checkpoint has unapplied events".into(),
+            ));
         }
         Ok(())
     }
@@ -2969,8 +3017,10 @@ impl QueueHandleInner {
     }
 
     pub(crate) fn record_checkpoint_persisted(&self, event_next: u64, timestamp: u64) {
-        self.last_snapshot_event_offset.store(event_next.saturating_sub(1), Ordering::Release);
-        self.last_snapshot_timestamp.store(timestamp, Ordering::Release);
+        self.last_snapshot_event_offset
+            .store(event_next.saturating_sub(1), Ordering::Release);
+        self.last_snapshot_timestamp
+            .store(timestamp, Ordering::Release);
     }
 
     pub fn last_snapshot_timestamp(&self) -> u64 {
@@ -4006,8 +4056,12 @@ impl QueueInternalState {
     pub fn encode_snapshot(&self, last_snapshot_event_offset: u64) -> Vec<u8> {
         self.encode_snapshot_with_entries(
             last_snapshot_event_offset,
-            self.delayed_enqueue_heap.iter().map(|(Reverse(d), off)| (*d, *off)),
-            self.delayed_retry_heap.iter().map(|(Reverse(d), off)| (*d, *off)),
+            self.delayed_enqueue_heap
+                .iter()
+                .map(|(Reverse(d), off)| (*d, *off)),
+            self.delayed_retry_heap
+                .iter()
+                .map(|(Reverse(d), off)| (*d, *off)),
             self.retries.iter().map(|(off, retries)| (*off, *retries)),
         )
     }
@@ -4165,7 +4219,11 @@ impl QueueInternalState {
     pub fn load_snapshot(&mut self, bytes: &[u8]) -> std::io::Result<SnapshotMeta> {
         // Decode into isolated state. A rejected checkpoint must not erase or
         // partially mutate the actor that is already serving valid state.
-        let mut decoded = Self::new_with_waker(self.topic.clone(), self.partition, self.deadline_waker.clone());
+        let mut decoded = Self::new_with_waker(
+            self.topic.clone(),
+            self.partition,
+            self.deadline_waker.clone(),
+        );
         let meta = decoded.load_snapshot_inner(bytes)?;
         *self = decoded;
         Ok(meta)
@@ -4185,16 +4243,23 @@ impl QueueInternalState {
 
         fn count(b: &mut &[u8], minimum_entry_bytes: usize) -> std::io::Result<usize> {
             let value = u64::from_be_bytes(take::<8>(b)?);
-            let value = usize::try_from(value).map_err(|_| Error::new(ErrorKind::InvalidData, "snapshot count overflow"))?;
+            let value = usize::try_from(value)
+                .map_err(|_| Error::new(ErrorKind::InvalidData, "snapshot count overflow"))?;
             if value > b.len() / minimum_entry_bytes {
-                return Err(Error::new(ErrorKind::UnexpectedEof, "snapshot count exceeds remaining bytes"));
+                return Err(Error::new(
+                    ErrorKind::UnexpectedEof,
+                    "snapshot count exceeds remaining bytes",
+                ));
             }
             Ok(value)
         }
         fn offset(b: &mut &[u8]) -> std::io::Result<u64> {
             let value = u64::from_be_bytes(take::<8>(b)?);
             if value == u64::MAX {
-                return Err(Error::new(ErrorKind::InvalidData, "snapshot offset has no exclusive successor"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "snapshot offset has no exclusive successor",
+                ));
             }
             Ok(value)
         }
@@ -4202,7 +4267,10 @@ impl QueueInternalState {
             let start = u64::from_be_bytes(take::<8>(b)?);
             let end = u64::from_be_bytes(take::<8>(b)?);
             if start >= end || start < *previous_end {
-                return Err(Error::new(ErrorKind::InvalidData, "invalid or overlapping snapshot ranges"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "invalid or overlapping snapshot ranges",
+                ));
             }
             *previous_end = end;
             Ok(start..end)
@@ -4236,7 +4304,10 @@ impl QueueInternalState {
             let off = offset(&mut bytes)?;
             let dl = u64::from_be_bytes(take::<8>(&mut bytes)?);
             if self.inflight.insert(off, dl).is_some() {
-                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot inflight offset"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "duplicate snapshot inflight offset",
+                ));
             }
         }
 
@@ -4262,7 +4333,10 @@ impl QueueInternalState {
             let off = offset(&mut bytes)?;
             let retries = u32::from_be_bytes(take::<4>(&mut bytes)?);
             if self.retries.insert(off, retries).is_some() {
-                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot retry offset"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "duplicate snapshot retry offset",
+                ));
             }
         }
 
@@ -4316,7 +4390,10 @@ impl QueueInternalState {
                 }
             };
             if self.pending_dlq.insert(off, target).is_some() {
-                return Err(Error::new(ErrorKind::InvalidData, "duplicate snapshot DLQ offset"));
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "duplicate snapshot DLQ offset",
+                ));
             }
         }
 
@@ -4360,7 +4437,12 @@ impl QueueInternalState {
         self.default_message_ttl_ms = match take::<1>(&mut bytes)?[0] {
             0 => None,
             1 => Some(u64::from_be_bytes(take::<8>(&mut bytes)?)),
-            _ => return Err(Error::new(ErrorKind::InvalidData, "snapshot TTL presence tag")),
+            _ => {
+                return Err(Error::new(
+                    ErrorKind::InvalidData,
+                    "snapshot TTL presence tag",
+                ));
+            }
         };
 
         if !bytes.is_empty() {
@@ -4531,11 +4613,25 @@ pub struct CapturedQueueCheckpoint {
 impl CapturedQueueCheckpoint {
     pub(crate) fn encode(self) -> Vec<u8> {
         let start = Instant::now();
-        let bytes = self.state.encode_snapshot(self.event_next.saturating_sub(1));
-        self.metrics.snapshot.encode_latency.observe(start.elapsed());
-        self.metrics.snapshot.bytes_written.fetch_add(bytes.len() as u64, Ordering::Relaxed);
-        self.metrics.snapshot.last_snapshot_size_bytes.store(bytes.len() as u64, Ordering::Relaxed);
-        self.metrics.snapshot.total_latency.observe(self.started.elapsed());
+        let bytes = self
+            .state
+            .encode_snapshot(self.event_next.saturating_sub(1));
+        self.metrics
+            .snapshot
+            .encode_latency
+            .observe(start.elapsed());
+        self.metrics
+            .snapshot
+            .bytes_written
+            .fetch_add(bytes.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .snapshot
+            .last_snapshot_size_bytes
+            .store(bytes.len() as u64, Ordering::Relaxed);
+        self.metrics
+            .snapshot
+            .total_latency
+            .observe(self.started.elapsed());
         bytes
     }
 }
@@ -6026,7 +6122,10 @@ mod tests {
             for off in 0..count {
                 state.enqueue(off, 0, Some(1_000_000 + off));
             }
-            eprintln!("distinct TTL enqueue count={count} elapsed_us={}", start.elapsed().as_micros());
+            eprintln!(
+                "distinct TTL enqueue count={count} elapsed_us={}",
+                start.elapsed().as_micros()
+            );
             assert_eq!(state.ttl_deadlines.len(), count as usize);
             assert_eq!(state.min_ttl_deadline(), Some(1_000_000));
             assert_eq!(state.collect_ttl_expired(1_000_003, 8), vec![0, 1, 2, 3]);
@@ -6038,14 +6137,20 @@ mod tests {
         let mut state = QueueInternalState::new("ttl-wake".into(), 0);
         let wake = state.deadline_waker.clone();
         state.enqueue(0, 0, Some(100));
-        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
         state.enqueue(1, 0, Some(50));
-        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
         assert_eq!(state.next_expiry_hint(), Some(50));
         state.ack(1);
         assert_eq!(state.next_expiry_hint(), Some(100));
         state.enqueue(2, 0, Some(75));
-        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified()).await.unwrap();
+        tokio::time::timeout(std::time::Duration::from_secs(1), wake.notified())
+            .await
+            .unwrap();
         assert_eq!(state.next_expiry_hint(), Some(75));
         assert_eq!(state.collect_ttl_expired(75, 8), vec![2]);
     }

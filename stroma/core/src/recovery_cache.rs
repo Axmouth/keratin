@@ -24,7 +24,14 @@ fn hashed_name(path: &Path) -> bool {
 fn lock(root: &Path) -> io::Result<Option<FileLock>> {
     match FileLock::try_exclusive(&root.join("lock")) {
         Ok(lock) => Ok(Some(lock)),
-        Err(e) if matches!(e.kind(), io::ErrorKind::NotFound | io::ErrorKind::WouldBlock) => Ok(None),
+        Err(e)
+            if matches!(
+                e.kind(),
+                io::ErrorKind::NotFound | io::ErrorKind::WouldBlock
+            ) =>
+        {
+            Ok(None)
+        }
         Err(e) => Err(e),
     }
 }

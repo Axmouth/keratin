@@ -56,9 +56,15 @@ async fn written_reads_see_unsynced_records_from_cache_and_file() {
         }
         // Start in the middle, cap the count, and keep the byte lookahead.
         let tail = written(&log, 2, 2, usize::MAX);
-        assert_eq!(tail.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![2, 3]);
+        assert_eq!(
+            tail.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![2, 3]
+        );
         let budgeted = written(&log, 1, 10, 300);
-        assert_eq!(budgeted.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![1, 2]);
+        assert_eq!(
+            budgeted.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![1, 2]
+        );
         assert!(written(&log, 5, 10, usize::MAX).is_empty());
 
         log.sync().await.unwrap();
@@ -86,7 +92,12 @@ async fn written_reads_cross_a_segment_roll() {
     assert!(log.segment_infos().unwrap().len() > 1);
     let records = written(&log, 0, 100, usize::MAX);
     assert_eq!(records.len(), 40);
-    assert!(records.iter().enumerate().all(|(i, r)| r.offset == i as u64));
+    assert!(
+        records
+            .iter()
+            .enumerate()
+            .all(|(i, r)| r.offset == i as u64)
+    );
     log.shutdown().await.unwrap();
 }
 
@@ -96,7 +107,9 @@ async fn written_reads_cross_a_segment_roll() {
 #[tokio::test]
 async fn epoch_fence_syncs_unwaited_written_records() {
     let dir = test_dir!("written_fence_sync");
-    let log = Keratin::open(&dir.root, config(64 * 1024 * 1024)).await.unwrap();
+    let log = Keratin::open(&dir.root, config(64 * 1024 * 1024))
+        .await
+        .unwrap();
     for value in 0..4 {
         log.append(message(value), Some(KDurability::AfterFlush))
             .await
@@ -104,7 +117,11 @@ async fn epoch_fence_syncs_unwaited_written_records() {
     }
     assert_eq!(log.durable_next(), 0);
     log.advance_epoch(1).await.unwrap();
-    assert_eq!(log.durable_next(), 4, "the fence must cover the written records");
+    assert_eq!(
+        log.durable_next(),
+        4,
+        "the fence must cover the written records"
+    );
     assert_eq!(log.reader().scan_from(0, 10).unwrap().len(), 4);
     log.shutdown().await.unwrap();
 }

@@ -5,7 +5,9 @@
 
 use crate::recovery_budget::{RecoveryBudget as Budget, RecoveryBudgetExceeded as Limit};
 use crate::recovery_inspection::{decode_evidence_semantics, hash_record};
-use crate::{QueueInternalState, RecoveryRecord, RetainedHistoryIdentity, RetainedLog, StromaEvent};
+use crate::{
+    QueueInternalState, RecoveryRecord, RetainedHistoryIdentity, RetainedLog, StromaEvent,
+};
 use std::collections::BTreeSet;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -69,15 +71,24 @@ pub struct RecoveryQueueStateSummary {
     snapshot_bytes: u64,
 }
 impl RecoveryQueueStateSummary {
-    pub fn evidence(&self) -> &RecoveryQueueReplayEvidence { &self.evidence }
-    pub fn snapshot_digest(&self) -> [u8; 32] { self.snapshot_digest }
-    pub fn snapshot_bytes(&self) -> u64 { self.snapshot_bytes }
+    pub fn evidence(&self) -> &RecoveryQueueReplayEvidence {
+        &self.evidence
+    }
+    pub fn snapshot_digest(&self) -> [u8; 32] {
+        self.snapshot_digest
+    }
+    pub fn snapshot_bytes(&self) -> u64 {
+        self.snapshot_bytes
+    }
 }
 
 impl RecoveryQueueStateArtifact {
     pub fn summary(&self) -> RecoveryQueueStateSummary {
-        RecoveryQueueStateSummary { evidence: self.evidence.clone(),
-            snapshot_digest: self.snapshot_digest, snapshot_bytes: self.state_snapshot.len() as u64 }
+        RecoveryQueueStateSummary {
+            evidence: self.evidence.clone(),
+            snapshot_digest: self.snapshot_digest,
+            snapshot_bytes: self.state_snapshot.len() as u64,
+        }
     }
 
     pub fn evidence(&self) -> &RecoveryQueueReplayEvidence {
@@ -116,7 +127,9 @@ impl QueueReplay {
         target: u64,
         limits: RecoveryReplayLimits,
     ) -> Result<Self, String> {
-        let log = *history.queue_log().ok_or("queue replay requires a queue history")?;
+        let log = *history
+            .queue_log()
+            .ok_or("queue replay requires a queue history")?;
         if log.head != 0 {
             return Err("recovery replay needs a proven checkpoint for compacted history".into());
         }
@@ -155,8 +168,12 @@ impl QueueReplay {
         envelope: &[u8],
     ) -> Result<Self, String> {
         // The enclosing inspector verifies the receipt's resource binding.
-        let log = *history.queue_log().ok_or("queue replay requires a queue history")?;
-        if !history.valid_version() || history.snapshot_digest != Some(*blake3::hash(envelope).as_bytes()) {
+        let log = *history
+            .queue_log()
+            .ok_or("queue replay requires a queue history")?;
+        if !history.valid_version()
+            || history.snapshot_digest != Some(*blake3::hash(envelope).as_bytes())
+        {
             return Err("checkpoint differs from sealed snapshot digest".into());
         }
         if envelope.len() < 28
@@ -180,7 +197,12 @@ impl QueueReplay {
         // entries; ranges stay compressed and are never expanded into offsets.
         let cost = len as u64;
         if cost > limits.operations_per_replica {
-            return Err(Limit::message(Budget::ReplayOperations, limits.operations_per_replica, 0, cost));
+            return Err(Limit::message(
+                Budget::ReplayOperations,
+                limits.operations_per_replica,
+                0,
+                cost,
+            ));
         }
         let mut state = QueueInternalState::new(topic.into(), partition);
         let meta = state
@@ -225,10 +247,18 @@ impl QueueReplay {
 
     fn check_retained_state(&self) -> Result<(), String> {
         if let Some(limit) = self.state_entry_limit {
-            let entries = self.state.recovery_retained_entries()
-                .checked_add(self.missing_enqueues.len() as u64).ok_or("replay state entry overflow")?;
+            let entries = self
+                .state
+                .recovery_retained_entries()
+                .checked_add(self.missing_enqueues.len() as u64)
+                .ok_or("replay state entry overflow")?;
             if entries > limit {
-                return Err(Limit::message(Budget::ReplayStateEntries, limit, 0, entries));
+                return Err(Limit::message(
+                    Budget::ReplayStateEntries,
+                    limit,
+                    0,
+                    entries,
+                ));
             }
         }
         Ok(())
@@ -249,8 +279,10 @@ impl QueueReplay {
             .live_ranges
             .get_or_insert_with(|| self.state.recovery_live_ranges());
         if live.contains(&record.offset) {
-            if !matches!(decode_evidence_semantics(record), Ok(StromaEvent::PayloadEnqueue { .. }))
-            {
+            if !matches!(
+                decode_evidence_semantics(record),
+                Ok(StromaEvent::PayloadEnqueue { .. })
+            ) {
                 return Err("live payload points to a non-payload combined record".into());
             }
             hash_record(&mut self.live_hash, record);
@@ -274,7 +306,11 @@ impl QueueReplay {
         let ev = decode_evidence_semantics(record)
             .map_err(|gap| format!("recovery replay event {}: {gap:?}", record.offset))?;
         let payload = matches!(ev, StromaEvent::PayloadEnqueue { .. });
-        if !payload && ev.max_combined_referenced_offset().is_some_and(|off| off >= record.offset) {
+        if !payload
+            && ev
+                .max_combined_referenced_offset()
+                .is_some_and(|off| off >= record.offset)
+        {
             return Err("combined recovery event has a forward payload reference".into());
         }
         let refs = ev.referenced_msg_offsets();
@@ -285,7 +321,12 @@ impl QueueReplay {
                 _ => 0,
             };
         if work > self.remaining {
-            return Err(Limit::message(Budget::ReplayOperations, self.operations + self.remaining, self.operations, work));
+            return Err(Limit::message(
+                Budget::ReplayOperations,
+                self.operations + self.remaining,
+                self.operations,
+                work,
+            ));
         }
         self.remaining -= work;
         self.operations += work;
@@ -320,7 +361,9 @@ impl QueueReplay {
         // external DLQ copies, priority scheduling or snapshot mutations.
         let ev = ev.into_record_state(record.offset);
         match ev {
-            StromaEvent::PayloadEnqueue { .. } => unreachable!("payload event converted to state operation"),
+            StromaEvent::PayloadEnqueue { .. } => {
+                unreachable!("payload event converted to state operation")
+            }
             StromaEvent::ActivateDelayed { now, max } => {
                 self.state.activate_delayed(now, max as usize);
             }
@@ -391,7 +434,10 @@ impl QueueReplay {
         self,
         max_bytes: usize,
     ) -> Result<RecoveryQueueStateArtifact, String> {
-        if !self.verify_live || max_bytes == 0 || max_bytes > crate::recovery_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES {
+        if !self.verify_live
+            || max_bytes == 0
+            || max_bytes > crate::recovery_snapshot::MAX_RECOVERY_SNAPSHOT_BYTES
+        {
             return Err(
                 "artifact requires live payload verification and a bounded output limit".into(),
             );
@@ -400,7 +446,12 @@ impl QueueReplay {
         let (evidence, state) = self.finish_parts()?;
         let state_snapshot = state.into_recovery_snapshot(evidence.next);
         if state_snapshot.len() > max_bytes {
-            return Err(Limit::message(Budget::ArtifactBytes, max_bytes as u64, 0, state_snapshot.len() as u64));
+            return Err(Limit::message(
+                Budget::ArtifactBytes,
+                max_bytes as u64,
+                0,
+                state_snapshot.len() as u64,
+            ));
         }
         // Confirm the existing snapshot codec preserves the exact projected
         // state, including optional values that might otherwise be normalized.
@@ -442,8 +493,7 @@ impl QueueReplay {
                 .unwrap_or_else(|| self.state.recovery_live_ranges());
             let mut count = 0u64;
             for range in live.iter() {
-                if range.start < payload_head || range.end > payload_next
-                {
+                if range.start < payload_head || range.end > payload_next {
                     return Err("live checkpoint payload is outside retained coverage".into());
                 }
                 count = count

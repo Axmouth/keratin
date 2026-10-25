@@ -115,10 +115,7 @@ impl ManifestWorker {
     /// it as the outstanding work, so metadata writes for one log never
     /// overlap. Runs inline when the pool is full. The snapshot's result is
     /// passed on, since the job takes its place.
-    pub(crate) fn submit_after(
-        &mut self,
-        job: impl FnOnce() + Send + 'static,
-    ) -> io::Result<()> {
+    pub(crate) fn submit_after(&mut self, job: impl FnOnce() + Send + 'static) -> io::Result<()> {
         let previous = self.pending.take();
         let (tx, rx) = bounded(1);
         let chained: Job = Box::new(move || {

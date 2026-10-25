@@ -17,7 +17,7 @@ use crate::event::StromaEvent;
 use crate::state::{QueueHandleInner, QueueRole, SnapshotMeta};
 use crate::stream_state::StreamCommand;
 use crate::stroma::{
-    QueueDemotionOutcome, QueuePromotionOutcome, Stroma, StreamPromotionOutcome, decode_err,
+    QueueDemotionOutcome, QueuePromotionOutcome, StreamPromotionOutcome, Stroma, decode_err,
     event_msg, io_err, replicated_append_outcome_allows_state_apply,
 };
 use crate::{Offset, Result, StromaError};
@@ -122,9 +122,17 @@ async fn read_owner_message_log(
 ) -> Result<OwnerReplicationRead<Message>> {
     ensure_owner(qh)?;
     let log = qh.msg_log()?;
-    read_owner_log(qh, log, "message", from, max, max_bytes, early, false, |record| {
-        Ok(record.to_message())
-    })
+    read_owner_log(
+        qh,
+        log,
+        "message",
+        from,
+        max,
+        max_bytes,
+        early,
+        false,
+        |record| Ok(record.to_message()),
+    )
     .await
 }
 
@@ -140,9 +148,17 @@ async fn read_owner_event_log(
     // Queue records carry payloads, so they get the same byte cap a payload
     // log read has. Stream cursor events are small and rely on the scan budget.
     let payload_cap = qh.has_combined_log();
-    read_owner_log(qh, qh.event_log(), "event", from, max, max_bytes, early, payload_cap, |record| {
-        StromaEvent::decode(&record.payload).map_err(decode_err)
-    })
+    read_owner_log(
+        qh,
+        qh.event_log(),
+        "event",
+        from,
+        max,
+        max_bytes,
+        early,
+        payload_cap,
+        |record| StromaEvent::decode(&record.payload).map_err(decode_err),
+    )
     .await
 }
 
@@ -199,8 +215,14 @@ async fn read_owner_log<T>(
             if payload_cap {
                 // The reader includes one lookahead record. Always allow one
                 // oversized record so the cursor can advance.
-                let bytes = record.headers.len().saturating_add(record.payload.len()).saturating_add(32);
-                if !records.is_empty() && used_bytes.saturating_add(bytes) > max_bytes { break; }
+                let bytes = record
+                    .headers
+                    .len()
+                    .saturating_add(record.payload.len())
+                    .saturating_add(32);
+                if !records.is_empty() && used_bytes.saturating_add(bytes) > max_bytes {
+                    break;
+                }
                 used_bytes = used_bytes.saturating_add(bytes);
             }
             if record.offset != expected {
@@ -261,10 +283,19 @@ pub struct QueueStateCheckpointInstallOutcome {
 /// piece of code.
 enum LocalPromotion {
     Promoted(LocalTails),
-    LogBehind { local_next: Offset, expected_next: Offset },
-    LogAhead { local_next: Offset, expected_next: Offset },
+    LogBehind {
+        local_next: Offset,
+        expected_next: Offset,
+    },
+    LogAhead {
+        local_next: Offset,
+        expected_next: Offset,
+    },
     NotApplied(LocalTails),
-    PayloadsMissing { log_next: Offset, required_next: Offset },
+    PayloadsMissing {
+        log_next: Offset,
+        required_next: Offset,
+    },
 }
 
 struct LocalTails {
@@ -291,12 +322,16 @@ impl Stroma {
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         qh.freeze_owner_and_wait_operations().await?;
-        for log in qh.physical_logs() { log.freeze(); }
+        for log in qh.physical_logs() {
+            log.freeze();
+        }
 
         let tails = local_tails(&qh)?;
 
         qh.become_follower();
-        for log in qh.physical_logs() { log.become_follower(); }
+        for log in qh.physical_logs() {
+            log.become_follower();
+        }
 
         Ok(QueueDemotionOutcome {
             next: tails.log_next,
@@ -315,7 +350,9 @@ impl Stroma {
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
         qh.become_follower();
-        for log in qh.physical_logs() { log.become_follower(); }
+        for log in qh.physical_logs() {
+            log.become_follower();
+        }
         Ok(())
     }
 
@@ -347,9 +384,13 @@ impl Stroma {
                 )));
             }
         }
-        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
+        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner {
+            qh.align_follower_checkpoint_boundary()?;
+        }
         qh.become_owner();
-        for log in qh.physical_logs() { log.become_owner(); }
+        for log in qh.physical_logs() {
+            log.become_owner();
+        }
         Ok(())
     }
 
@@ -366,7 +407,9 @@ impl Stroma {
         let h = qh.resolve()?;
         let _operation = h.begin_owner_operation().await?;
         if let Some(epoch) = epoch {
-            for log in h.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
+            for log in h.physical_logs() {
+                log.advance_epoch(epoch).await.map_err(io_err)?;
+            }
         }
         Ok(())
     }
@@ -388,7 +431,9 @@ impl Stroma {
         let qh = qh.resolve()?;
         let _apply = qh.follower_apply_state().await;
         qh.ensure_not_recovery_sealed()?;
-        for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
+        for log in qh.physical_logs() {
+            log.advance_epoch(epoch).await.map_err(io_err)?;
+        }
         Ok(epoch)
     }
 
@@ -581,9 +626,7 @@ impl Stroma {
         }
         let log = qh.event_log();
         let next = log.next_offset();
-        if log.current_epoch() != epoch
-            || next < target
-            || qh.ordered_applied_next()? != Some(next)
+        if log.current_epoch() != epoch || next < target || qh.ordered_applied_next()? != Some(next)
         {
             return Err(StromaError::InvalidArgument(
                 "learner has not reached its exact history and application cut".into(),
@@ -597,7 +640,11 @@ impl Stroma {
             ));
         }
         log.sync().await.map_err(io_err)?;
-        Ok(crate::QueuePublishCommit { next, epoch, buffered: false })
+        Ok(crate::QueuePublishCommit {
+            next,
+            epoch,
+            buffered: false,
+        })
     }
 
     /// Promote a follower whose single queue log ends exactly at
@@ -613,7 +660,10 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         qh.work_queue()?;
-        Ok(queue_promotion(self.promote_follower(&qh, None, Some(expected_next)).await?))
+        Ok(queue_promotion(
+            self.promote_follower(&qh, None, Some(expected_next))
+                .await?,
+        ))
     }
 
     /// Promote a follower to owner at its own local log tail.
@@ -632,7 +682,9 @@ impl Stroma {
         let qh = self.queue_handle(topic, part, group).await?;
         let qh = qh.resolve()?;
         qh.work_queue()?;
-        Ok(queue_promotion(self.promote_follower(&qh, Some(epoch), None).await?))
+        Ok(queue_promotion(
+            self.promote_follower(&qh, Some(epoch), None).await?,
+        ))
     }
 
     /// Shared promotion core. With `epoch` the follower is fenced at that
@@ -664,10 +716,16 @@ impl Stroma {
         let tails = local_tails(qh)?;
         if let Some(expected_next) = expected_next {
             if tails.log_next < expected_next {
-                return Ok(LocalPromotion::LogBehind { local_next: tails.log_next, expected_next });
+                return Ok(LocalPromotion::LogBehind {
+                    local_next: tails.log_next,
+                    expected_next,
+                });
             }
             if tails.log_next > expected_next {
-                return Ok(LocalPromotion::LogAhead { local_next: tails.log_next, expected_next });
+                return Ok(LocalPromotion::LogAhead {
+                    local_next: tails.log_next,
+                    expected_next,
+                });
             }
         }
         if tails.applied_next != tails.log_next {
@@ -678,19 +736,28 @@ impl Stroma {
             let required = wq.required_message_next().await.map_err(io_err)?;
             let log_next = self.payload_log_for(qh).next_offset();
             if log_next < required {
-                return Ok(LocalPromotion::PayloadsMissing { log_next, required_next: required });
+                return Ok(LocalPromotion::PayloadsMissing {
+                    log_next,
+                    required_next: required,
+                });
             }
         }
         if let Some(epoch) = epoch {
             // Persist the fencing epoch BEFORE serving as owner: from here on,
             // replicated traffic from the previous (older-epoch) owner is
             // rejected by every log.
-            for log in qh.physical_logs() { log.advance_epoch(epoch).await.map_err(io_err)?; }
+            for log in qh.physical_logs() {
+                log.advance_epoch(epoch).await.map_err(io_err)?;
+            }
         }
 
-        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner { qh.align_follower_checkpoint_boundary()?; }
+        if qh.has_ordered_apply() && qh.role() != QueueRole::Owner {
+            qh.align_follower_checkpoint_boundary()?;
+        }
         qh.become_owner();
-        for log in qh.physical_logs() { log.become_owner(); }
+        for log in qh.physical_logs() {
+            log.become_owner();
+        }
         Ok(LocalPromotion::Promoted(tails))
     }
 
@@ -884,12 +951,16 @@ impl Stroma {
         let state_checkpoint = if qh.has_ordered_apply() {
             let captured = qh.capture_exact_checkpoint(false).await?;
             if captured.event_next != next_offset {
-                return Err(StromaError::Io("owner checkpoint has unapplied events".into()));
+                return Err(StromaError::Io(
+                    "owner checkpoint has unapplied events".into(),
+                ));
             }
             tokio::task::spawn_blocking(move || crate::state::QueueStateCheckpointSnapshot {
                 message_checkpoint_offset: captured.message_floor,
                 state_snapshot: captured.encode(),
-            }).await.map_err(io_err)?
+            })
+            .await
+            .map_err(io_err)?
         } else {
             qh
             .work_queue()?
@@ -921,11 +992,18 @@ impl Stroma {
         batch: ReplicatedEventBatch,
     ) -> Result<ReplicatedAppendOutcome> {
         if batch.events.is_empty() {
-            return Err(StromaError::InvalidArgument("replicated queue batch is empty".into()));
+            return Err(StromaError::InvalidArgument(
+                "replicated queue batch is empty".into(),
+            ));
         }
         let outcome = self
             .apply_replicated_two_log_batch(
-                topic, part, group, None, Some(batch), FollowerApplyTarget::Queue,
+                topic,
+                part,
+                group,
+                None,
+                Some(batch),
+                FollowerApplyTarget::Queue,
             )
             .await?;
         single_queue_log_outcome(outcome)
@@ -945,7 +1023,12 @@ impl Stroma {
         events: Option<ReplicatedEventBatch>,
     ) -> Result<ReplicatedStreamApplyOutcome> {
         self.apply_replicated_two_log_batch(
-            topic, part, None, messages, events, FollowerApplyTarget::Stream,
+            topic,
+            part,
+            None,
+            messages,
+            events,
+            FollowerApplyTarget::Stream,
         )
         .await
     }
@@ -956,24 +1039,49 @@ impl Stroma {
         apply_state: &mut bool,
         messages: Option<ReplicatedMessageBatch>,
         events: Option<ReplicatedEventBatch>,
-    ) -> Result<(ReplicatedStreamApplyOutcome, Option<ReplicatedEventBatch>, Option<u64>, bool)> {
+    ) -> Result<(
+        ReplicatedStreamApplyOutcome,
+        Option<ReplicatedEventBatch>,
+        Option<u64>,
+        bool,
+    )> {
         // Queue payloads travel as records of the single queue log, so a
         // queue frame never carries a record batch.
         if qh.has_combined_log() && messages.is_some() {
-            return Err(StromaError::InvalidArgument("queue partition has no record log".into()));
+            return Err(StromaError::InvalidArgument(
+                "queue partition has no record log".into(),
+            ));
         }
-        if !qh.has_combined_log() && events.as_ref().is_some_and(|batch| batch.events.iter().any(|event|matches!(event,StromaEvent::PayloadEnqueue{..}))) {
-            return Err(StromaError::InvalidArgument("queue payload event received by a stream".into()));
+        if !qh.has_combined_log()
+            && events.as_ref().is_some_and(|batch| {
+                batch
+                    .events
+                    .iter()
+                    .any(|event| matches!(event, StromaEvent::PayloadEnqueue { .. }))
+            })
+        {
+            return Err(StromaError::InvalidArgument(
+                "queue payload event received by a stream".into(),
+            ));
         }
         // Validate the entire incoming frame before enqueueing any writes or
         // setting the dirty-apply fence. This also covers open durability groups.
         if qh.has_combined_log() {
             if let Some(batch) = &events {
-                batch.first_offset.checked_add(batch.events.len() as u64)
-                    .ok_or_else(|| StromaError::InvalidArgument("combined event offset exhausted".into()))?;
+                batch
+                    .first_offset
+                    .checked_add(batch.events.len() as u64)
+                    .ok_or_else(|| {
+                        StromaError::InvalidArgument("combined event offset exhausted".into())
+                    })?;
                 for (index, event) in batch.events.iter().enumerate() {
-                    if event.max_combined_referenced_offset().is_some_and(|off| off >= batch.first_offset + index as u64) {
-                        return Err(StromaError::InvalidArgument("combined follower event has a forward payload reference".into()));
+                    if event
+                        .max_combined_referenced_offset()
+                        .is_some_and(|off| off >= batch.first_offset + index as u64)
+                    {
+                        return Err(StromaError::InvalidArgument(
+                            "combined follower event has a forward payload reference".into(),
+                        ));
                     }
                 }
             }
@@ -999,7 +1107,10 @@ impl Stroma {
             if qh.has_combined_log() {
                 if let Some(batch) = &mut events {
                     for event in &mut batch.events {
-                        if let StromaEvent::PayloadEnqueue { headers, payload, .. } = event {
+                        if let StromaEvent::PayloadEnqueue {
+                            headers, payload, ..
+                        } = event
+                        {
                             *headers = Vec::new();
                             *payload = Vec::new();
                         }
@@ -1101,7 +1212,15 @@ impl Stroma {
             };
             (message, event)
         };
-        Ok((ReplicatedStreamApplyOutcome { message_log, event_log }, events, message_next, parallel))
+        Ok((
+            ReplicatedStreamApplyOutcome {
+                message_log,
+                event_log,
+            },
+            events,
+            message_next,
+            parallel,
+        ))
     }
 
     async fn apply_follower_events(
@@ -1109,41 +1228,56 @@ impl Stroma {
         qh: &crate::state::QueueHandleInner,
         batch: ReplicatedEventBatch,
     ) -> Result<()> {
-                // A verified overlap may contain already-applied NACKs, whose
-                // retry increment must not run a second time. The exclusive
-                // frontier also distinguishes an unapplied event zero.
-                let applied_next = qh.ordered_applied_next()?;
-                let skip = match applied_next {
-                    Some(next) if batch.first_offset > next => {
-                        return Err(StromaError::Io("follower event application gap".into()));
-                    }
-                    Some(next) => next.saturating_sub(batch.first_offset)
-                        .min(batch.events.len() as u64) as usize,
-                    None => 0,
-                };
-                // Snapshot backfill may skip old state events, but its physical
-                // payload dependencies must be checked before that cut is ready.
-                if qh.has_combined_log() && skip > 0
-                    && applied_next.is_some_and(|next| batch.first_offset.saturating_add(batch.events.len() as u64) >= next) {
-                    self.verify_combined_payload_coverage(qh, false).await?;
-                }
-                let count = batch.events.len() - skip;
-                if count > 0 {
-                    let scope = qh.ordered_apply_scope();
-                    let turn = crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64).await?;
-                    if qh.has_combined_log() {
-                        self.apply_combined_records(batch.events.into_iter().skip(skip).collect(),batch.first_offset+skip as u64,qh).await?;
-                        qh.applied_upto().fetch_max(batch.first_offset+skip as u64+count as u64-1,Ordering::Release);
-                        crate::ordered_apply::finish(turn,scope)?;
-                        return Ok(());
-                    }
-                    for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
-                        self.apply_event_inmem(event, qh).await?;
-                        qh.applied_upto()
-                            .fetch_max(batch.first_offset + idx as u64, Ordering::Release);
-                    }
-                    crate::ordered_apply::finish(turn, scope)?;
-                }
+        // A verified overlap may contain already-applied NACKs, whose
+        // retry increment must not run a second time. The exclusive
+        // frontier also distinguishes an unapplied event zero.
+        let applied_next = qh.ordered_applied_next()?;
+        let skip = match applied_next {
+            Some(next) if batch.first_offset > next => {
+                return Err(StromaError::Io("follower event application gap".into()));
+            }
+            Some(next) => next
+                .saturating_sub(batch.first_offset)
+                .min(batch.events.len() as u64) as usize,
+            None => 0,
+        };
+        // Snapshot backfill may skip old state events, but its physical
+        // payload dependencies must be checked before that cut is ready.
+        if qh.has_combined_log()
+            && skip > 0
+            && applied_next.is_some_and(|next| {
+                batch.first_offset.saturating_add(batch.events.len() as u64) >= next
+            })
+        {
+            self.verify_combined_payload_coverage(qh, false).await?;
+        }
+        let count = batch.events.len() - skip;
+        if count > 0 {
+            let scope = qh.ordered_apply_scope();
+            let turn =
+                crate::ordered_apply::enter(&scope, batch.first_offset + skip as u64, count as u64)
+                    .await?;
+            if qh.has_combined_log() {
+                self.apply_combined_records(
+                    batch.events.into_iter().skip(skip).collect(),
+                    batch.first_offset + skip as u64,
+                    qh,
+                )
+                .await?;
+                qh.applied_upto().fetch_max(
+                    batch.first_offset + skip as u64 + count as u64 - 1,
+                    Ordering::Release,
+                );
+                crate::ordered_apply::finish(turn, scope)?;
+                return Ok(());
+            }
+            for (idx, event) in batch.events.into_iter().enumerate().skip(skip) {
+                self.apply_event_inmem(event, qh).await?;
+                qh.applied_upto()
+                    .fetch_max(batch.first_offset + idx as u64, Ordering::Release);
+            }
+            crate::ordered_apply::finish(turn, scope)?;
+        }
         Ok(())
     }
 
@@ -1164,7 +1298,9 @@ impl Stroma {
             .map(|frame| {
                 let batch = frame?;
                 if batch.events.is_empty() {
-                    return Err(StromaError::InvalidArgument("replicated queue batch is empty".into()));
+                    return Err(StromaError::InvalidArgument(
+                        "replicated queue batch is empty".into(),
+                    ));
                 }
                 Ok((None, Some(batch)))
             })
@@ -1181,7 +1317,10 @@ impl Stroma {
         topic: &str,
         part: u32,
         group: Option<&str>,
-        mut frames: futures::stream::BoxStream<'_, Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>>,
+        mut frames: futures::stream::BoxStream<
+            '_,
+            Result<(Option<ReplicatedMessageBatch>, Option<ReplicatedEventBatch>)>,
+        >,
         target: FollowerApplyTarget,
     ) -> Result<Vec<ReplicatedStreamApplyOutcome>> {
         use futures::StreamExt;
@@ -1190,12 +1329,19 @@ impl Stroma {
         target.check_kind(&qh)?;
         let mut apply_state = qh.follower_apply_state().await;
         if *apply_state {
-            return Err(StromaError::Io("incomplete follower apply; recover or install a checkpoint before retry".into()));
+            return Err(StromaError::Io(
+                "incomplete follower apply; recover or install a checkpoint before retry".into(),
+            ));
         }
         if qh.role() != QueueRole::Follower {
-            return Err(StromaError::WrongQueueRole { expected: QueueRole::Follower, actual: qh.role() });
+            return Err(StromaError::WrongQueueRole {
+                expected: QueueRole::Follower,
+                actual: qh.role(),
+            });
         }
-        for log in qh.physical_logs() { log.become_follower(); }
+        for log in qh.physical_logs() {
+            log.become_follower();
+        }
         let mut pending_events = Vec::new();
         let mut sync_messages = false;
         let mut sync_events = false;
@@ -1204,14 +1350,31 @@ impl Stroma {
             let (mut messages, mut events) = frame?;
             sync_messages |= messages.as_ref().is_some_and(|b| !b.records.is_empty());
             sync_events |= events.is_some();
-            if let Some(batch) = &mut messages { batch.durability = Some(KDurability::AfterWrite); }
-            if let Some(batch) = &mut events { batch.durability = Some(KDurability::AfterWrite); }
-            let (outcome, events, _, _) = self.append_follower_frame(&qh, &mut apply_state, messages, events).await?;
-            if !outcome.message_log.as_ref().is_none_or(replicated_append_outcome_allows_state_apply)
-                || !outcome.event_log.as_ref().is_none_or(replicated_append_outcome_allows_state_apply) {
-                return Err(StromaError::Io("open follower batch rejected a frame; resync required".into()));
+            if let Some(batch) = &mut messages {
+                batch.durability = Some(KDurability::AfterWrite);
             }
-            if let Some(events) = events { pending_events.push(events); }
+            if let Some(batch) = &mut events {
+                batch.durability = Some(KDurability::AfterWrite);
+            }
+            let (outcome, events, _, _) = self
+                .append_follower_frame(&qh, &mut apply_state, messages, events)
+                .await?;
+            if !outcome
+                .message_log
+                .as_ref()
+                .is_none_or(replicated_append_outcome_allows_state_apply)
+                || !outcome
+                    .event_log
+                    .as_ref()
+                    .is_none_or(replicated_append_outcome_allows_state_apply)
+            {
+                return Err(StromaError::Io(
+                    "open follower batch rejected a frame; resync required".into(),
+                ));
+            }
+            if let Some(events) = events {
+                pending_events.push(events);
+            }
             outcomes.push(outcome);
         }
         if !outcomes.is_empty() {
@@ -1220,12 +1383,29 @@ impl Stroma {
             let messages = qh.optional_message_log();
             let events = qh.event_log();
             let (m, e) = tokio::join!(
-                async { if sync_messages { match messages { Some(log) => log.sync().await, None => Err(std::io::Error::other("missing message log")) } } else { Ok(()) } },
-                async { if sync_events { events.sync().await } else { Ok(()) } },
+                async {
+                    if sync_messages {
+                        match messages {
+                            Some(log) => log.sync().await,
+                            None => Err(std::io::Error::other("missing message log")),
+                        }
+                    } else {
+                        Ok(())
+                    }
+                },
+                async {
+                    if sync_events {
+                        events.sync().await
+                    } else {
+                        Ok(())
+                    }
+                },
             );
             m.map_err(io_err)?;
             e.map_err(io_err)?;
-            for batch in pending_events { self.apply_follower_events(&qh, batch).await?; }
+            for batch in pending_events {
+                self.apply_follower_events(&qh, batch).await?;
+            }
             *apply_state = false;
         }
         Ok(outcomes)
@@ -1260,11 +1440,17 @@ impl Stroma {
                 actual: role,
             });
         }
-        for log in qh.physical_logs() { log.become_follower(); }
+        for log in qh.physical_logs() {
+            log.become_follower();
+        }
 
         let (outcome, events, message_next, parallel) = self
-            .append_follower_frame(&qh, &mut apply_state, messages, events).await?;
-        let ReplicatedStreamApplyOutcome { message_log, event_log } = outcome;
+            .append_follower_frame(&qh, &mut apply_state, messages, events)
+            .await?;
+        let ReplicatedStreamApplyOutcome {
+            message_log,
+            event_log,
+        } = outcome;
         let messages_allowed = message_log
             .as_ref()
             .is_none_or(replicated_append_outcome_allows_state_apply);
@@ -1322,9 +1508,14 @@ impl FollowerApplyTarget {
 
 /// A queue partition has no separate message log, so a queue batch yields
 /// exactly one event-log outcome.
-fn single_queue_log_outcome(outcome: ReplicatedStreamApplyOutcome) -> Result<ReplicatedAppendOutcome> {
+fn single_queue_log_outcome(
+    outcome: ReplicatedStreamApplyOutcome,
+) -> Result<ReplicatedAppendOutcome> {
     match outcome {
-        ReplicatedStreamApplyOutcome { message_log: None, event_log: Some(outcome) } => Ok(outcome),
+        ReplicatedStreamApplyOutcome {
+            message_log: None,
+            event_log: Some(outcome),
+        } => Ok(outcome),
         other => Err(StromaError::Internal(format!(
             "queue log apply produced unexpected outcomes: {other:?}"
         ))),
@@ -1351,19 +1542,33 @@ fn local_tails(qh: &QueueHandleInner) -> Result<LocalTails> {
 
 fn queue_promotion(outcome: LocalPromotion) -> QueuePromotionOutcome {
     match outcome {
-        LocalPromotion::Promoted(tails) => QueuePromotionOutcome::Promoted { next: tails.log_next },
-        LocalPromotion::LogBehind { local_next, expected_next } => {
-            QueuePromotionOutcome::LogBehind { local_next, expected_next }
-        }
-        LocalPromotion::LogAhead { local_next, expected_next } => {
-            QueuePromotionOutcome::LogAhead { local_next, expected_next }
-        }
+        LocalPromotion::Promoted(tails) => QueuePromotionOutcome::Promoted {
+            next: tails.log_next,
+        },
+        LocalPromotion::LogBehind {
+            local_next,
+            expected_next,
+        } => QueuePromotionOutcome::LogBehind {
+            local_next,
+            expected_next,
+        },
+        LocalPromotion::LogAhead {
+            local_next,
+            expected_next,
+        } => QueuePromotionOutcome::LogAhead {
+            local_next,
+            expected_next,
+        },
         LocalPromotion::NotApplied(tails) => QueuePromotionOutcome::NotApplied {
             applied_next: tails.applied_next,
             log_next: tails.log_next,
         },
-        LocalPromotion::PayloadsMissing { log_next, required_next } => {
-            QueuePromotionOutcome::PayloadsMissing { log_next, required_next }
-        }
+        LocalPromotion::PayloadsMissing {
+            log_next,
+            required_next,
+        } => QueuePromotionOutcome::PayloadsMissing {
+            log_next,
+            required_next,
+        },
     }
 }

@@ -296,7 +296,9 @@ impl FrozenLogReader {
         if from < self.head || from > self.next {
             return Err(invalid("frozen suffix starts outside retained history"));
         }
-        if from == self.head { return self.into_retained_cursor(); }
+        if from == self.head {
+            return self.into_retained_cursor();
+        }
         FrozenLogCursor::durable_prefix(self.segments, from, self.next, u64::MAX)
     }
 

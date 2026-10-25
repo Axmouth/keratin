@@ -489,9 +489,16 @@ impl Keratin {
         if self.role() != KeratinRole::Frozen
             || self.log_state.durable.load().first_non_durable() < next
         {
-            return Err(io::Error::other("strict live scan requires a frozen, fully durable log"));
+            return Err(io::Error::other(
+                "strict live scan requires a frozen, fully durable log",
+            ));
         }
-        crate::FrozenLogReader::open_live(&self.root, self.current_epoch(), self.head_offset(), next)
+        crate::FrozenLogReader::open_live(
+            &self.root,
+            self.current_epoch(),
+            self.head_offset(),
+            next,
+        )
     }
 
     /// Strict disk scan of an externally pinned, fully durable prefix while
@@ -500,11 +507,21 @@ impl Keratin {
     /// grants no retention or history authority. Sparse indexes only locate the
     /// first record; CRCs, exact offsets and a total byte budget remain enforced.
     pub fn retained_durable_cursor(
-        &self, epoch: u64, head: u64, next: u64, max_scan_bytes: u64,
+        &self,
+        epoch: u64,
+        head: u64,
+        next: u64,
+        max_scan_bytes: u64,
     ) -> io::Result<crate::FrozenLogCursor> {
-        if self.current_epoch() != epoch || head < self.head_offset() || head > next
+        if self.current_epoch() != epoch
+            || head < self.head_offset()
+            || head > next
             || next > self.log_state.durable.load().first_non_durable()
-        { return Err(io::Error::other("retained scan exceeds durable history or has stale epoch")); }
+        {
+            return Err(io::Error::other(
+                "retained scan exceeds durable history or has stale epoch",
+            ));
+        }
         let segments = self.segment_mapping.read().clone();
         crate::FrozenLogCursor::durable_prefix(segments, head, next, max_scan_bytes)
     }
@@ -742,9 +759,15 @@ impl Keratin {
     pub async fn advance_retained_head(&self, before: u64, epoch: u64) -> io::Result<u64> {
         self.ensure_running()?;
         let (respond_to, rx) = oneshot::channel();
-        self.tx.send(WriterCmd::AdvanceRetainedHead { before, epoch, respond_to })
+        self.tx
+            .send(WriterCmd::AdvanceRetainedHead {
+                before,
+                epoch,
+                respond_to,
+            })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
-        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     pub async fn truncate_before(&self, before: u64) -> std::io::Result<u64> {
@@ -796,7 +819,10 @@ impl Keratin {
     /// past this check.
     fn ensure_running(&self) -> io::Result<()> {
         if self.shutdown_started.load(Ordering::Acquire) {
-            return Err(io::Error::new(io::ErrorKind::BrokenPipe, "log is shut down"));
+            return Err(io::Error::new(
+                io::ErrorKind::BrokenPipe,
+                "log is shut down",
+            ));
         }
         Ok(())
     }
@@ -845,14 +871,24 @@ impl Keratin {
     /// quiesce other operations and readers; the writer drains outstanding I/O.
     /// The epoch is checked in writer order before mutation. A repair I/O failure
     /// stops this writer; reopen resumes the durable journal before normal access.
-    pub async fn repair_suffix_at_epoch(&self, next_offset: u64, expected_epoch: u64) -> io::Result<()> {
+    pub async fn repair_suffix_at_epoch(
+        &self,
+        next_offset: u64,
+        expected_epoch: u64,
+    ) -> io::Result<()> {
         self.ensure_running()?;
         self.ensure_role(KeratinRole::Follower, "repair_suffix_at_epoch")
             .map_err(|e| io::Error::new(io::ErrorKind::PermissionDenied, e))?;
         let (respond_to, rx) = oneshot::channel();
-        self.tx.send(WriterCmd::RepairSuffix { next_offset, expected_epoch, respond_to })
+        self.tx
+            .send(WriterCmd::RepairSuffix {
+                next_offset,
+                expected_epoch,
+                respond_to,
+            })
             .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer gone"))?;
-        rx.await.map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
+        rx.await
+            .map_err(|_| io::Error::new(io::ErrorKind::BrokenPipe, "writer dropped"))?
     }
 
     async fn reset_checkpoint_inner(

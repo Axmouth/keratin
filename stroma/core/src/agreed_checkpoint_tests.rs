@@ -21,7 +21,8 @@ async fn open(root: &Path) -> Stroma {
     let st = Stroma::open_with_options(
         root,
         StromaKeratinConfig::from_message_log(config),
-        SnapshotConfig::default(), options,
+        SnapshotConfig::default(),
+        options,
     )
     .await
     .unwrap();
@@ -420,7 +421,7 @@ async fn capsule_limits_incomplete_dependencies_and_old_live_payloads_fail_close
             1 => limits.bytes = 32,
             2 => target.next += 100,
             3 => target.payload_head = 1, // Message zero is still live.
-            4 => target.next = 1, // Below the pinned applied boundary.
+            4 => target.next = 1,         // Below the pinned applied boundary.
             _ => target.payload_head = target.next + 1,
         }
         assert!(
@@ -491,11 +492,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             .await
             .unwrap();
         let target = st
-            .queue_checkpoint_target(
-                storage.clone(),
-                base.pin.log_next,
-                base.pin.payload_head,
-            )
+            .queue_checkpoint_target(storage.clone(), base.pin.log_next, base.pin.payload_head)
             .await
             .unwrap();
         let capsule = st
@@ -531,11 +528,7 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             .await
             .unwrap();
         let next = st
-            .queue_checkpoint_target(
-                storage,
-                new.pin.log_next,
-                new.pin.payload_head,
-            )
+            .queue_checkpoint_target(storage, new.pin.log_next, new.pin.payload_head)
             .await
             .unwrap();
         let capsule = st
@@ -573,7 +566,10 @@ async fn accepted_checkpoint_retries_every_publication_boundary_and_replaces_old
             )
             .await
             .unwrap();
-        assert_eq!(sealed.history.queue_log().unwrap().head, capsule.contents.payload_head);
+        assert_eq!(
+            sealed.history.queue_log().unwrap().head,
+            capsule.contents.payload_head
+        );
         st.shutdown().await.unwrap();
     }
 }
@@ -594,11 +590,7 @@ async fn agreement_crash_child() {
         .await
         .unwrap();
     let target = st
-        .queue_checkpoint_target(
-            storage,
-            base.pin.log_next,
-            base.pin.payload_head,
-        )
+        .queue_checkpoint_target(storage, base.pin.log_next, base.pin.payload_head)
         .await
         .unwrap();
     let capsule = st
@@ -686,16 +678,34 @@ async fn agreement_sigkill_at_every_publication_boundary_retains_recoverable_his
                 assert_eq!(snapshot.as_ref().unwrap().0.event_next(), log.next);
             }
             let mut inspector = crate::recovery_inspection::RecoveryPairInspector::new(
-                "q", 0, None, seal.clone(), seal, Default::default(),
-            ).unwrap().with_queue_checkpoint_replay(20, Default::default(), 16384).unwrap();
+                "q",
+                0,
+                None,
+                seal.clone(),
+                seal,
+                Default::default(),
+            )
+            .unwrap()
+            .with_queue_checkpoint_replay(20, Default::default(), 16384)
+            .unwrap();
             while let Some((side, request)) = inspector.next_read().unwrap() {
-                let page = st.read_sealed_replica("q", 0, None, PartitionKind::Queue, request).await.unwrap();
+                let page = st
+                    .read_sealed_replica("q", 0, None, PartitionKind::Queue, request)
+                    .await
+                    .unwrap();
                 inspector.accept_page(side, page).unwrap();
             }
             let (_, [artifact, _]) = inspector.finish_with_queue_artifacts(16384).unwrap();
             let mut state = QueueInternalState::new("q".into(), 0);
             state.load_snapshot(artifact.state_snapshot()).unwrap();
-            assert_eq!(state.recovery_live_ranges().iter().cloned().collect::<Vec<_>>(), vec![8..12]);
+            assert_eq!(
+                state
+                    .recovery_live_ranges()
+                    .iter()
+                    .cloned()
+                    .collect::<Vec<_>>(),
+                vec![8..12]
+            );
             st.shutdown().await.unwrap();
         }
     }
@@ -713,11 +723,7 @@ async fn missing_agreed_capsule_falls_back_but_corruption_cannot_authorize_recov
             .await
             .unwrap();
         let target = st
-            .queue_checkpoint_target(
-                storage,
-                base.pin.log_next,
-                base.pin.payload_head,
-            )
+            .queue_checkpoint_target(storage, base.pin.log_next, base.pin.payload_head)
             .await
             .unwrap();
         let capsule = st
@@ -781,10 +787,14 @@ async fn activity_hint_does_not_materialize_and_observes_local_append_work() {
     let activity = tokio::time::timeout(std::time::Duration::from_secs(1), async {
         loop {
             let activity = st.queue_checkpoint_activity("q", 0, None).unwrap();
-            if activity.local_append_bytes >= 1024 { break activity; }
+            if activity.local_append_bytes >= 1024 {
+                break activity;
+            }
             tokio::task::yield_now().await;
         }
-    }).await.unwrap();
+    })
+    .await
+    .unwrap();
     assert_eq!(activity.next, 2);
     assert_eq!(activity.head, 0);
     assert!(activity.local_append_bytes >= 1024);
@@ -862,9 +872,8 @@ fn contents_reject_bounds_beyond_the_cut() {
 #[test]
 fn target_must_cover_pin_log_tail_and_applied_boundary() {
     let pin = sample_pin();
-    let covers = |next, payload_head| {
-        target_covers_pin(&pin, &QueueCheckpointTarget { next, payload_head })
-    };
+    let covers =
+        |next, payload_head| target_covers_pin(&pin, &QueueCheckpointTarget { next, payload_head });
     assert!(covers(14, 4));
     assert!(covers(20, 8));
     assert!(!covers(13, 4), "cut below the pin log tail");
@@ -887,7 +896,9 @@ async fn compaction_stops_at_unsettled_payload_below_applied_boundary() {
     st.write_exact_queue_checkpoint(ticket.clone(), true)
         .await
         .unwrap();
-    st.truncate_queue_before("q", 0, None, u64::MAX).await.unwrap();
+    st.truncate_queue_before("q", 0, None, u64::MAX)
+        .await
+        .unwrap();
     st.truncate_partition_log(ticket.clone(), u64::MAX)
         .await
         .unwrap();
@@ -899,7 +910,10 @@ async fn compaction_stops_at_unsettled_payload_below_applied_boundary() {
     assert!(boundary.event_next() > 3);
     assert!(h.event_log().head_offset() <= 3);
     assert_eq!(
-        crate::stroma::combined::fetch_payload(&h, 3, false).unwrap().unwrap().payload,
+        crate::stroma::combined::fetch_payload(&h, 3, false)
+            .unwrap()
+            .unwrap()
+            .payload,
         vec![3; 512]
     );
     drop(h);

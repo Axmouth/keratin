@@ -18,9 +18,16 @@ pub struct QueueCheckpointActivity {
     pub epoch: u64,
 }
 impl Stroma {
-    pub fn queue_checkpoint_activity(&self, topic: &str, part: u32, group: Option<&str>) -> Option<QueueCheckpointActivity> {
+    pub fn queue_checkpoint_activity(
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+    ) -> Option<QueueCheckpointActivity> {
         let current = self.queue_handles.load();
-        let h = slot_lookup_no_alloc(current.as_ref(), topic, part, group)?.handle.get()?;
+        let h = slot_lookup_no_alloc(current.as_ref(), topic, part, group)?
+            .handle
+            .get()?;
         h.as_work_queue()?;
         let log = h.event_log();
         Some(QueueCheckpointActivity {
@@ -554,10 +561,11 @@ impl Stroma {
             let index = load_index(&root, &topic, part, group.as_deref())?;
             let floor = payload_floor.min(applied_floor).min(replica);
             Ok(index.pins.values().fold(floor, |floor, pin| {
-                let (payload, applied) = match index.accepted.as_ref().filter(|a| a.attempt == pin.attempt) {
-                    Some(accepted) => (accepted.contents.payload_head, accepted.contents.next),
-                    None => (pin.payload_head, pin.applied_next),
-                };
+                let (payload, applied) =
+                    match index.accepted.as_ref().filter(|a| a.attempt == pin.attempt) {
+                        Some(accepted) => (accepted.contents.payload_head, accepted.contents.next),
+                        None => (pin.payload_head, pin.applied_next),
+                    };
                 floor.min(payload).min(applied)
             }))
         })
@@ -784,10 +792,7 @@ impl Stroma {
             h.ensure_not_recovery_sealed()?;
             stroma.verify_admitted_storage_history(s)?;
             stroma.verify_prepared_storage_history(s)?;
-            if *apply
-                || h.ordered_applied_next()?
-                    .is_none_or(|n| n < target.next)
-            {
+            if *apply || h.ordered_applied_next()?.is_none_or(|n| n < target.next) {
                 return Err(invalid(
                     "replica has not fully applied the checkpoint target",
                 ));

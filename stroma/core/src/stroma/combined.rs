@@ -378,7 +378,11 @@ impl Stroma {
                     let h = qh.resolve()?;
                     #[cfg(test)]
                     {
-                        let pause = stroma.publish_apply_pause.lock().unwrap().clone()
+                        let pause = stroma
+                            .publish_apply_pause
+                            .lock()
+                            .unwrap()
+                            .clone()
                             .filter(|p| p.topic == qh.topic() && p.base == ar.base_offset);
                         if let Some(pause) = pause {
                             pause.entered.notify_one();
@@ -454,11 +458,18 @@ pub(super) fn recover_events(
             }
             let event = match StromaEvent::decode(&record.payload) {
                 Ok(event) => event,
-                Err(error) => return Ok(RecoveryScanOutcome {
-                    events, events_count: count,
-                    mismatch: Some(RecoveryMismatchFound { event_offset: record.offset,
-                        kind: RecoveryMismatchKind::CorruptRecord { detail: error.to_string() } }),
-                }),
+                Err(error) => {
+                    return Ok(RecoveryScanOutcome {
+                        events,
+                        events_count: count,
+                        mismatch: Some(RecoveryMismatchFound {
+                            event_offset: record.offset,
+                            kind: RecoveryMismatchKind::CorruptRecord {
+                                detail: error.to_string(),
+                            },
+                        }),
+                    });
+                }
             };
             let carries_payload = matches!(event, StromaEvent::PayloadEnqueue { .. });
             if event
@@ -470,11 +481,14 @@ pub(super) fn recover_events(
                 // Preserve the valid prefix and use the existing corruption
                 // policy, including its bound-history prohibition on repair.
                 return Ok(RecoveryScanOutcome {
-                    events, events_count: count,
-                    mismatch: Some(RecoveryMismatchFound { event_offset: record.offset,
+                    events,
+                    events_count: count,
+                    mismatch: Some(RecoveryMismatchFound {
+                        event_offset: record.offset,
                         kind: RecoveryMismatchKind::CorruptRecord {
                             detail: "single-log replay has forward payload reference".into(),
-                        } }),
+                        },
+                    }),
                 });
             }
             events.push(event.into_record_state(record.offset));
@@ -498,28 +512,51 @@ pub(super) fn recover_events(
 mod tests;
 
 impl Stroma {
-    pub(crate) async fn verify_combined_payload_coverage(&self, h: &QueueHandleInner, pending_backfill: bool) -> Result<()> {
+    pub(crate) async fn verify_combined_payload_coverage(
+        &self,
+        h: &QueueHandleInner,
+        pending_backfill: bool,
+    ) -> Result<()> {
         let captured = h.capture_exact_checkpoint(false).await?;
         let ranges = captured.state.recovery_live_ranges();
         let log = h.event_log();
         tokio::task::spawn_blocking(move || {
             let reader = log.reader();
             for range in ranges.iter() {
-                let end = if pending_backfill { range.end.min(log.next_offset()) } else { range.end };
+                let end = if pending_backfill {
+                    range.end.min(log.next_offset())
+                } else {
+                    range.end
+                };
                 let mut off = range.start;
                 while off < end {
-                    let records = reader.scan_from_disk(off, (end-off).min(1024) as usize).map_err(io_err)?;
-                    if records.is_empty() { return Err(StromaError::Corruption("live combined payload was not retained".into())); }
+                    let records = reader
+                        .scan_from_disk(off, (end - off).min(1024) as usize)
+                        .map_err(io_err)?;
+                    if records.is_empty() {
+                        return Err(StromaError::Corruption(
+                            "live combined payload was not retained".into(),
+                        ));
+                    }
                     for record in records {
-                        if record.offset != off || !matches!(StromaEvent::decode(&record.payload).map_err(decode_err)?, StromaEvent::PayloadEnqueue{..}) {
-                            return Err(StromaError::Corruption("live state does not identify a retained payload enqueue".into()));
+                        if record.offset != off
+                            || !matches!(
+                                StromaEvent::decode(&record.payload).map_err(decode_err)?,
+                                StromaEvent::PayloadEnqueue { .. }
+                            )
+                        {
+                            return Err(StromaError::Corruption(
+                                "live state does not identify a retained payload enqueue".into(),
+                            ));
                         }
                         off += 1;
                     }
                 }
             }
             Ok::<_, StromaError>(())
-        }).await.map_err(io_err)??;
+        })
+        .await
+        .map_err(io_err)??;
         Ok(())
     }
 }

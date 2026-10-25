@@ -31,14 +31,20 @@ fn files_with_extension(root: &Path, ext: &str) -> Vec<PathBuf> {
 
 async fn append_range(log: &Keratin, from: u32, to: u32) {
     for i in from..to {
-        log.append_batch(vec![message(format!("r{i:05}-{}", "x".repeat(200)))], Some(KDurability::AfterFsync))
-            .await
-            .unwrap();
+        log.append_batch(
+            vec![message(format!("r{i:05}-{}", "x".repeat(200)))],
+            Some(KDurability::AfterFsync),
+        )
+        .await
+        .unwrap();
     }
 }
 
 fn assert_reads(log: &Keratin, from: u64, to: u64) {
-    let got = log.reader().scan_from(from, (to - from) as usize + 10).unwrap();
+    let got = log
+        .reader()
+        .scan_from(from, (to - from) as usize + 10)
+        .unwrap();
     assert_eq!(got.len() as u64, to - from, "records {from}..{to}");
     for (i, rec) in got.iter().enumerate() {
         let offset = from + i as u64;
@@ -52,7 +58,10 @@ async fn log_with_recycled_active(root: &Path) -> Keratin {
     let log = Keratin::open(root, small_segments()).await.unwrap();
     append_range(&log, 0, 300).await;
     log.truncate_before(200).await.unwrap();
-    assert!(!files_with_extension(root, "spare").is_empty(), "truncate keeps spares");
+    assert!(
+        !files_with_extension(root, "spare").is_empty(),
+        "truncate keeps spares"
+    );
     let spares_before = files_with_extension(root, "spare").len();
     append_range(&log, 300, 400).await;
     assert!(
@@ -89,7 +98,9 @@ async fn recycled_active_segment_opens_as_bound_history() {
     let head = log.head_offset();
     log.force_close().await.unwrap();
 
-    let log = Keratin::open_preserving_history(&dir.root, small_segments()).await.unwrap();
+    let log = Keratin::open_preserving_history(&dir.root, small_segments())
+        .await
+        .unwrap();
     assert_eq!(log.next_offset(), 400);
     assert_reads(&log, head, 400);
     log.shutdown().await.unwrap();

@@ -4,7 +4,11 @@ use parking_lot::{Mutex, RwLock};
 use std::{
     io,
     path::PathBuf,
-    sync::{Arc, Weak},
+    sync::{
+        Arc, Weak,
+        atomic::{AtomicU64, Ordering},
+    },
+    time::Duration,
 };
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -42,6 +46,8 @@ pub struct LogRuntimeStatus {
 pub struct LogRuntimeSettings {
     current: RwLock<LogRuntimeSnapshot>,
     logs: Mutex<Vec<Weak<RwLock<LogRuntimeStatus>>>>,
+    /// See `set_loaded_fsync_spacing`. Microseconds.
+    loaded_fsync_spacing_us: AtomicU64,
 }
 impl LogRuntimeSettings {
     pub fn new(config: LogRuntimeConfig) -> io::Result<Self> {
@@ -52,7 +58,22 @@ impl LogRuntimeSettings {
                 config,
             }),
             logs: Mutex::new(Vec::new()),
+            loaded_fsync_spacing_us: AtomicU64::new(0),
         })
+    }
+    /// Least time between fsync starts on a log while an earlier fsync of
+    /// that log is still running. A log whose fsync worker is idle syncs at
+    /// once, so sparse traffic pays nothing. Under load this stops many small
+    /// overlapping syncs, each paying the drive's fixed cost, and the next
+    /// sync still starts as soon as one completes. Only applies while commits
+    /// are small enough to pipeline. Zero turns it off. Writers read it on
+    /// every commit decision, so a change applies to open logs right away.
+    pub fn set_loaded_fsync_spacing(&self, spacing: Duration) {
+        let us = u64::try_from(spacing.as_micros()).unwrap_or(u64::MAX);
+        self.loaded_fsync_spacing_us.store(us, Ordering::Relaxed);
+    }
+    pub fn loaded_fsync_spacing(&self) -> Duration {
+        Duration::from_micros(self.loaded_fsync_spacing_us.load(Ordering::Relaxed))
     }
     pub fn current(&self) -> LogRuntimeSnapshot {
         *self.current.read()

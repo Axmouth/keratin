@@ -23,7 +23,11 @@ impl Index {
     }
 
     /// Start an empty index without syncing it. Recovery rebuilds a lost one.
-    pub(crate) fn create_unsynced(mut file: File, base_offset: u64, created_ts_ms: u64) -> io::Result<Self> {
+    pub(crate) fn create_unsynced(
+        mut file: File,
+        base_offset: u64,
+        created_ts_ms: u64,
+    ) -> io::Result<Self> {
         // header_len fixed for v1
         let header_len: u32 = IDX_HEADER_LEN;
 
@@ -47,7 +51,10 @@ impl Index {
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
 
-        Ok(Self { file, last_sync: std::time::Instant::now() })
+        Ok(Self {
+            file,
+            last_sync: std::time::Instant::now(),
+        })
     }
 
     pub fn open(mut file: File, expected_base: u64) -> io::Result<Self> {
@@ -76,7 +83,10 @@ impl Index {
         let end = file.metadata()?.len();
         file.seek(SeekFrom::Start(end))?;
 
-        Ok(Self { file, last_sync: std::time::Instant::now() })
+        Ok(Self {
+            file,
+            last_sync: std::time::Instant::now(),
+        })
     }
 
     pub fn fsync(&self) -> io::Result<()> {
@@ -116,7 +126,8 @@ impl Index {
         if len < header {
             return Err(io::Error::new(io::ErrorKind::InvalidData, "idx too small"));
         }
-        let mut entries = vec![0u8; ((len - header) / IDX_ENTRY_LEN as u64) as usize * IDX_ENTRY_LEN];
+        let mut entries =
+            vec![0u8; ((len - header) / IDX_ENTRY_LEN as u64) as usize * IDX_ENTRY_LEN];
         self.file.read_exact_at(&mut entries, header)?;
         let log_start = crate::segment::LOG_HEADER_LEN as u64;
         let mut kept = 0usize;

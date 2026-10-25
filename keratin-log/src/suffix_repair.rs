@@ -153,7 +153,9 @@ pub(crate) fn pending_cut(root: &Path) -> io::Result<Option<u64>> {
         return Err(invalid("invalid suffix repair journal checksum or version"));
     }
     // Field order: epoch, head, old_next, next.
-    Ok(Some(u64::from_be_bytes(bytes[8 + 3 * 8..16 + 3 * 8].try_into().unwrap())))
+    Ok(Some(u64::from_be_bytes(
+        bytes[8 + 3 * 8..16 + 3 * 8].try_into().unwrap(),
+    )))
 }
 
 pub(crate) fn resume(root: &Path) -> io::Result<bool> {

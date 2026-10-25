@@ -281,12 +281,14 @@ fn should_pipeline(log: &Log, threshold: u64) -> bool {
 /// allows up to `max_inflight_fsyncs` in-flight commits so the worker can fuse them
 /// into one fdatasync; otherwise it keeps a single fsync in flight (the eager
 /// cadence that makes fat batches, optimal for bandwidth-bound writes). The idle
-/// floor keeps the fsync rate bounded on storage where that matters.
+/// floor keeps the fsync rate bounded on storage where that matters, and the
+/// loaded spacing applies on top while an fsync is in flight.
 #[inline]
 fn commit_when_idle(
     inflight_fsyncs: usize,
     last_fsync: &Instant,
     min_fsync_interval: Duration,
+    loaded_fsync_spacing: Duration,
     pipeline: bool,
     max_inflight_fsyncs: usize,
 ) -> bool {
@@ -295,7 +297,12 @@ fn commit_when_idle(
     } else {
         1
     };
-    inflight_fsyncs < max_inflight && last_fsync.elapsed() >= min_fsync_interval
+    let floor = if inflight_fsyncs > 0 {
+        min_fsync_interval.max(loaded_fsync_spacing)
+    } else {
+        min_fsync_interval
+    };
+    inflight_fsyncs < max_inflight && last_fsync.elapsed() >= floor
 }
 
 fn pending_needs_fsync(pending: &PendingAcks) -> bool {
@@ -600,9 +607,13 @@ fn writer_loop(
 ) -> Refusal {
     let stage_then_commit = std::env::var("KERATIN_STAGE_THEN_COMMIT").as_deref() == Ok("1");
     let startup_delay = std::env::var("KERATIN_IDLE_COMMIT_WINDOW_US")
-        .ok().and_then(|v| v.parse::<u64>().ok()).unwrap_or(0).min(5_000);
+        .ok()
+        .and_then(|v| v.parse::<u64>().ok())
+        .unwrap_or(0)
+        .min(5_000);
     let mut startup = crate::commit_policy::StartupWindow::new(
-        Duration::from_micros(startup_delay), Duration::from_millis(20),
+        Duration::from_micros(startup_delay),
+        Duration::from_millis(20),
     );
     let mut deferred_command = None;
     let flush_on_drain = std::env::var("KERATIN_FLUSH_ON_DRAIN").as_deref() == Ok("1");
@@ -778,8 +789,15 @@ fn writer_loop(
             // busy loop for the whole fsync.
             && inflight_fsyncs < cfg.max_inflight_fsyncs.max(1)
         {
+            let loaded_spacing = log.loaded_fsync_spacing();
             let horizon = if inflight_fsyncs == 0 {
                 min_fsync_interval
+            } else if loaded_spacing > Duration::ZERO
+                // Only a pipelined commit can start while one is in flight.
+                // Otherwise an early wake finds nothing to do and spins.
+                && should_pipeline(log, cfg.pipeline_commit_records)
+            {
+                min_fsync_interval.max(loaded_spacing).min(fsync_interval)
             } else {
                 fsync_interval
             };
@@ -805,7 +823,9 @@ fn writer_loop(
         // Observe idle only immediately before receiving. Do not treat a brief
         // drain while pending or syncing as a new idle-to-busy transition.
         startup.observe(
-            now, !pending.is_empty(), inflight_fsyncs,
+            now,
+            !pending.is_empty(),
+            inflight_fsyncs,
             deferred_command.is_none() && writes_rx.is_empty(),
         );
 
@@ -888,7 +908,9 @@ fn writer_loop(
         };
 
         // Explicit barriers and history controls bypass the startup window.
-        if !matches!(&cmd, WriterCmd::Append(_)) { startup.reset(); }
+        if !matches!(&cmd, WriterCmd::Append(_)) {
+            startup.reset();
+        }
         // (E) Process command.
         match cmd {
             WriterCmd::ReadSettings { respond_to } => {
@@ -960,9 +982,7 @@ fn writer_loop(
                     // The writer cannot tell what state storage is in, so stop
                     // the log. The loop top then fails pending work and every
                     // later command until reopen.
-                    log.record_storage_failure(format!(
-                        "writer settings sync failed: {error}"
-                    ));
+                    log.record_storage_failure(format!("writer settings sync failed: {error}"));
                     let _ = respond_to.send(Err(error));
                     continue;
                 }
@@ -1036,10 +1056,8 @@ fn writer_loop(
                                 #[cfg(feature = "writer-stage-trace")]
                                 &tracer,
                             );
-                            let refusal = Refusal::stopped(
-                                log,
-                                format!("flushing staged data: {error}"),
-                            );
+                            let refusal =
+                                Refusal::stopped(log, format!("flushing staged data: {error}"));
                             // Staging may have pulled the next command early.
                             if let Some(cmd) = deferred_command.take() {
                                 reject_command(cmd, &refusal, Some(log));
@@ -1237,8 +1255,10 @@ fn writer_loop(
                     || next_offset < log.manifest.head_offset
                     || next_offset > log.next_offset()
                 {
-                    let _ = respond_to.send(Err(io::Error::new(io::ErrorKind::InvalidInput,
-                        "suffix repair requires the current epoch and a retained cut")));
+                    let _ = respond_to.send(Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "suffix repair requires the current epoch and a retained cut",
+                    )));
                     continue;
                 }
                 shutdown_fail_reqs(batcher.flush(), "writer repairing suffix", &notify_tx);
@@ -1993,6 +2013,7 @@ fn maybe_commit_due(
             *inflight_fsyncs,
             last_fsync,
             min_fsync_interval,
+            log.loaded_fsync_spacing(),
             pipeline,
             max_inflight_fsyncs,
         ) || (last_fsync.elapsed() >= fsync_interval && *inflight_fsyncs < hard_cap));
@@ -2079,6 +2100,7 @@ fn post_stage_commit_and_tune(
             *inflight_fsyncs,
             last_fsync,
             min_fsync_interval,
+            log.loaded_fsync_spacing(),
             pipeline,
             cfg.max_inflight_fsyncs,
         ) || (last_fsync.elapsed() >= fsync_interval && *inflight_fsyncs < hard_cap));
@@ -2289,15 +2311,24 @@ pub(crate) mod test_hooks {
     pub(crate) fn pause_after_shutdown(root: &Path) -> (Receiver<()>, Sender<()>) {
         let (reached_tx, reached_rx) = crossbeam_channel::bounded(1);
         let (release_tx, release_rx) = crossbeam_channel::bounded(1);
-        HOOKS.lock().unwrap().entry(root.to_path_buf()).or_default().shutdown_pause =
-            Some((reached_tx, release_rx));
+        HOOKS
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .shutdown_pause = Some((reached_tx, release_rx));
         (reached_rx, release_tx)
     }
 
     /// Fires (or disconnects) when the writer thread for `root` exits.
     pub(crate) fn on_writer_exit(root: &Path) -> Receiver<()> {
         let (tx, rx) = crossbeam_channel::bounded(1);
-        HOOKS.lock().unwrap().entry(root.to_path_buf()).or_default().exited = Some(tx);
+        HOOKS
+            .lock()
+            .unwrap()
+            .entry(root.to_path_buf())
+            .or_default()
+            .exited = Some(tx);
         rx
     }
 
@@ -2314,7 +2345,11 @@ pub(crate) mod test_hooks {
     }
 
     pub(super) fn writer_exited(root: &Path) {
-        let exited = HOOKS.lock().unwrap().remove(root).and_then(|hooks| hooks.exited);
+        let exited = HOOKS
+            .lock()
+            .unwrap()
+            .remove(root)
+            .and_then(|hooks| hooks.exited);
         if let Some(exited) = exited {
             let _ = exited.send(());
         }
@@ -2725,7 +2760,10 @@ fn maybe_start_background_sync(
     // cannot park (see `ensure_fsync_slot`).
     if let Err(err) = fsync_tx.send(req) {
         let FsyncReq { ready, .. } = err.into_inner();
-        send_notify_items(notify_tx, fail_notify_items(ready, "fsync worker disconnected"));
+        send_notify_items(
+            notify_tx,
+            fail_notify_items(ready, "fsync worker disconnected"),
+        );
         return;
     }
     *inflight_fsyncs += 1;
@@ -3002,10 +3040,55 @@ mod drain_batch_tests {
     #[test]
     fn drain_preserves_minimum_interval_and_pipeline_capacity() {
         let now = Instant::now();
-        assert!(!commit_when_idle(0, &now, Duration::from_secs(60), true, 8));
-        assert!(!commit_when_idle(8, &now, Duration::ZERO, true, 8));
-        assert!(!commit_when_idle(1, &now, Duration::ZERO, false, 8));
-        assert!(commit_when_idle(0, &now, Duration::ZERO, true, 8));
+        assert!(!commit_when_idle(
+            0,
+            &now,
+            Duration::from_secs(60),
+            Duration::ZERO,
+            true,
+            8
+        ));
+        assert!(!commit_when_idle(
+            8,
+            &now,
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            8
+        ));
+        assert!(!commit_when_idle(
+            1,
+            &now,
+            Duration::ZERO,
+            Duration::ZERO,
+            false,
+            8
+        ));
+        assert!(commit_when_idle(
+            0,
+            &now,
+            Duration::ZERO,
+            Duration::ZERO,
+            true,
+            8
+        ));
+    }
+
+    #[test]
+    fn loaded_spacing_applies_only_while_an_fsync_is_in_flight() {
+        let now = Instant::now();
+        let spacing = Duration::from_secs(60);
+        assert!(commit_when_idle(0, &now, Duration::ZERO, spacing, true, 8));
+        assert!(!commit_when_idle(1, &now, Duration::ZERO, spacing, true, 8));
+        let earlier = now - Duration::from_millis(5);
+        assert!(commit_when_idle(
+            1,
+            &earlier,
+            Duration::ZERO,
+            Duration::from_millis(2),
+            true,
+            8
+        ));
     }
 }
 
@@ -3438,7 +3521,11 @@ mod held_pipeline_test {
         let first = requests.recv_timeout(Duration::from_secs(5)).unwrap();
         assert!(first.background);
         assert_eq!(first.job.durable_end(), 2);
-        assert_eq!(first.ready.len(), 1, "the waiting AfterFsync ack rides along");
+        assert_eq!(
+            first.ready.len(),
+            1,
+            "the waiting AfterFsync ack rides along"
+        );
         assert_eq!(state.written.load(), 2);
         assert!(state.sync.status(2, 0).background_sync_pending);
 
@@ -3448,7 +3535,10 @@ mod held_pipeline_test {
         let _ = append(2, KDurability::AfterFlush);
         wait_for("third record written", &|| state.written.load() == 3);
         std::thread::sleep(Duration::from_millis(100));
-        assert!(requests.try_recv().is_err(), "one background sync at a time");
+        assert!(
+            requests.try_recv().is_err(),
+            "one background sync at a time"
+        );
         assert_eq!(state.durable.load().first_non_durable(), 0);
         assert!(matches!(
             fsync_ack.try_recv(),

@@ -365,14 +365,18 @@ async fn dlq_routing_preserves_distinct_payloads() {
     // The next offset counts records before they are durable, and the combined
     // fetch reads through `scan_from`, which only returns durable records. This
     // holds in both writer modes, so wait until every record reads back.
-    wait_until(Duration::from_secs(5), "all dlq records readable", || async {
-        for i in 0..offs.len() as u64 {
-            if st.fetch_message_by_offset(&qh, i).await.unwrap().is_none() {
-                return false;
+    wait_until(
+        Duration::from_secs(5),
+        "all dlq records readable",
+        || async {
+            for i in 0..offs.len() as u64 {
+                if st.fetch_message_by_offset(&qh, i).await.unwrap().is_none() {
+                    return false;
+                }
             }
-        }
-        true
-    })
+            true
+        },
+    )
     .await;
     for i in 0..offs.len() as u64 {
         let m = st.fetch_message_by_offset(&qh, i).await.unwrap().unwrap();

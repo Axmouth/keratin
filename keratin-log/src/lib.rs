@@ -1,7 +1,7 @@
-#[cfg(feature = "io-fault-injection")]
-pub mod io_fault_injection;
 mod batcher;
 mod config;
+#[cfg(feature = "io-fault-injection")]
+pub mod io_fault_injection;
 mod runtime_config;
 mod writer_settings;
 pub use writer_settings::{WriterSettings, WriterSettingsSnapshot};
@@ -9,8 +9,8 @@ mod durability;
 mod sync_status;
 pub use sync_status::SyncStatus;
 mod diagnostics;
-mod index;
 mod frozen_reader;
+mod index;
 mod keratin;
 pub mod lock;
 mod log;
@@ -21,30 +21,37 @@ mod record;
 mod recovery;
 pub mod reusable_buffer;
 mod segment;
-mod zero_ahead;
 mod shared_segment;
+mod zero_ahead;
 pub use shared_segment::FrozenForkStats;
-mod suffix_repair;
+mod commit_policy;
+mod drain_diagnostics;
 mod latched_cut;
+mod suffix_repair;
 mod tail_cache;
 pub mod util;
 mod writer;
-mod commit_policy;
-mod drain_diagnostics;
 #[cfg(feature = "writer-stage-trace")]
 mod writer_stage_trace;
 #[cfg(feature = "writer-stage-trace")]
-pub use writer_stage_trace::{flush_writer_stage_trace, finish_writer_stage_trace};
+pub use writer_stage_trace::{finish_writer_stage_trace, flush_writer_stage_trace};
 
 pub use config::*;
-pub use runtime_config::{LogRuntimeConfig, LogRuntimeSettings, LogRuntimeSnapshot, LogRuntimeStatus};
-pub use diagnostics::{LogControlEvent, LogControlKind, ReplicationOverlapDiagnostic, CONTROL_HISTORY_LIMIT};
+pub use diagnostics::{
+    CONTROL_HISTORY_LIMIT, LogControlEvent, LogControlKind, ReplicationOverlapDiagnostic,
+};
 pub use durability::{DurableFrontier, DurableWatermark, KDurability, WrittenWatermark};
-pub use frozen_reader::{FrozenLogCursor, FrozenLogReader, MAX_FROZEN_RECORD_BYTES, create_log_lock_file, lock_existing_log};
+pub use frozen_reader::{
+    FrozenLogCursor, FrozenLogReader, MAX_FROZEN_RECORD_BYTES, create_log_lock_file,
+    lock_existing_log,
+};
 pub use keratin::{Keratin, KeratinReplicaExt, KeratinRole};
 pub use log::{AppendResult, ReplicatedAppendMode, ReplicatedAppendOutcome};
 pub use reader::{LogReader, OwnedRecord};
 pub use record::{Message, ReceivedMessage};
+pub use runtime_config::{
+    LogRuntimeConfig, LogRuntimeSettings, LogRuntimeSnapshot, LogRuntimeStatus,
+};
 pub use segment::SegmentInfo;
 pub use writer::IoError;
 

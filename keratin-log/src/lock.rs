@@ -319,14 +319,21 @@ mod tests {
     #[cfg(unix)]
     fn other_process_sees(path: &Path, expect: &str) {
         let status = std::process::Command::new(std::env::current_exe().unwrap())
-            .args(["--exact", "lock::tests::child_lock_probe", "--test-threads=1"])
+            .args([
+                "--exact",
+                "lock::tests::child_lock_probe",
+                "--test-threads=1",
+            ])
             .env("KERATIN_LOCK_PROBE", path)
             .env("KERATIN_LOCK_EXPECT", expect)
             .stdout(std::process::Stdio::null())
             .stderr(std::process::Stdio::null())
             .status()
             .unwrap();
-        assert!(status.success(), "other process did not see the lock as {expect}");
+        assert!(
+            status.success(),
+            "other process did not see the lock as {expect}"
+        );
     }
 
     #[cfg(target_os = "linux")]
@@ -413,8 +420,9 @@ mod tests {
                 std::thread::spawn(move || {
                     let mut rounds = 0u64;
                     while rounds < 200_000 && Instant::now() < deadline {
-                        let held = FileLock::try_exclusive(&path)
-                            .unwrap_or_else(|e| panic!("spurious refusal after {rounds} rounds: {e}"));
+                        let held = FileLock::try_exclusive(&path).unwrap_or_else(|e| {
+                            panic!("spurious refusal after {rounds} rounds: {e}")
+                        });
                         drop(held);
                         rounds += 1;
                     }
@@ -425,6 +433,9 @@ mod tests {
         let rounds: u64 = lockers.into_iter().map(|t| t.join().unwrap()).sum();
         stop.store(true, Ordering::Relaxed);
         let spawned: u64 = spawners.into_iter().map(|t| t.join().unwrap()).sum();
-        assert!(rounds > 0 && spawned > 0, "rounds={rounds} spawned={spawned}");
+        assert!(
+            rounds > 0 && spawned > 0,
+            "rounds={rounds} spawned={spawned}"
+        );
     }
 }

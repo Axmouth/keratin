@@ -59,7 +59,12 @@ impl ZeroAhead {
     }
 
     /// Write `data` at `start`. Inside zeroed space this takes no lock.
-    pub(crate) fn write(self: &Arc<Self>, write: impl FnOnce() -> std::io::Result<()>, start: u64, len: u64) -> std::io::Result<()> {
+    pub(crate) fn write(
+        self: &Arc<Self>,
+        write: impl FnOnce() -> std::io::Result<()>,
+        start: u64,
+        len: u64,
+    ) -> std::io::Result<()> {
         let need = start + len;
         if need <= self.zeroed_end.load(Ordering::Acquire) {
             write()?;
@@ -82,7 +87,10 @@ impl ZeroAhead {
         if self.stopped.load(Ordering::Acquire) {
             return;
         }
-        let lead = self.zeroed_end.load(Ordering::Acquire).saturating_sub(self.written.load(Ordering::Acquire));
+        let lead = self
+            .zeroed_end
+            .load(Ordering::Acquire)
+            .saturating_sub(self.written.load(Ordering::Acquire));
         if lead < self.window / 2 && !self.requested.swap(true, Ordering::AcqRel) {
             worker().send(self.clone());
         }
@@ -158,12 +166,14 @@ fn worker() -> &'static Worker {
     static WORKER: OnceLock<Worker> = OnceLock::new();
     WORKER.get_or_init(|| {
         let (tx, rx) = crossbeam_channel::unbounded::<Arc<ZeroAhead>>();
-        let started = std::thread::Builder::new().name("keratin-zero".into()).spawn(move || {
-            let mut pace = Pace;
-            while let Ok(segment) = rx.recv() {
-                segment.fill(&mut pace);
-            }
-        });
+        let started = std::thread::Builder::new()
+            .name("keratin-zero".into())
+            .spawn(move || {
+                let mut pace = Pace;
+                while let Ok(segment) = rx.recv() {
+                    segment.fill(&mut pace);
+                }
+            });
         if let Err(error) = started {
             tracing::warn!(%error, "starting the zeroing worker failed");
         }

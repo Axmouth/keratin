@@ -734,7 +734,12 @@ impl Log {
 
             // The index syncs lazily and may lag the log or be missing.
             let idx_path = seg_idx_path(&root, *base);
-            let idxf = OpenOptions::new().create(true).truncate(false).read(true).write(true).open(&idx_path)?;
+            let idxf = OpenOptions::new()
+                .create(true)
+                .truncate(false)
+                .read(true)
+                .write(true)
+                .open(&idx_path)?;
             let mut idx = match Index::open(idxf.try_clone()?, *base) {
                 Ok(idx) => idx,
                 Err(_) => {
@@ -742,7 +747,12 @@ impl Log {
                     Index::create(idxf, *base, now_ms)?
                 }
             };
-            idx.repair_against_log(seg.file_ref(), *base, scan.last_good_pos, index_stride_bytes)?;
+            idx.repair_against_log(
+                seg.file_ref(),
+                *base,
+                scan.last_good_pos,
+                index_stride_bytes,
+            )?;
             idx.fsync()?;
         }
 
@@ -1400,7 +1410,11 @@ impl Log {
         Ok(FsyncJob {
             durable_end: self.next_offset,
             active: self.active.try_clone_file()?,
-            index: if self.index.sync_due() { Some(self.index.try_clone_file()?) } else { None },
+            index: if self.index.sync_due() {
+                Some(self.index.try_clone_file()?)
+            } else {
+                None
+            },
             pending: std::mem::take(&mut self.pending_sync),
         })
     }
@@ -1678,6 +1692,16 @@ impl Log {
     #[inline]
     pub fn should_flush(&self) -> bool {
         self.write_buf.len() >= self.flush_target_bytes
+    }
+
+    /// See `LogRuntimeSettings::set_loaded_fsync_spacing`. Zero for a log
+    /// without shared runtime settings.
+    pub(crate) fn loaded_fsync_spacing(&self) -> Duration {
+        self.runtime
+            .as_ref()
+            .map_or(Duration::ZERO, |(settings, _)| {
+                settings.loaded_fsync_spacing()
+            })
     }
 
     pub(crate) fn attach_runtime(
@@ -2138,9 +2162,7 @@ impl Log {
         let requested_end = readable_first_offset
             .checked_add(payloads.len() as u64)
             .ok_or_else(|| io::Error::other("replicated overlap range overflow"))?;
-        let got = if written_overlap
-            && !self.durable_end_exclusive().covers(requested_end - 1)
-        {
+        let got = if written_overlap && !self.durable_end_exclusive().covers(requested_end - 1) {
             // An AfterFlush retry can overlap a written prefix that is not yet
             // durable. Raw reads under this writer's exclusive access check the
             // exact bytes. This does not advance durability or count as
@@ -2485,7 +2507,11 @@ fn keep_as_spare(root: &Path, base: u64, log_path: &Path) -> io::Result<bool> {
 
 /// Open the next active segment pair without syncing, in a spare file when
 /// one is free. See `Log::roll` for how it becomes durable.
-fn start_segment_pair(root: &Path, base: u64, now_ms: u64) -> io::Result<(Segment, Index, PathBuf)> {
+fn start_segment_pair(
+    root: &Path,
+    base: u64,
+    now_ms: u64,
+) -> io::Result<(Segment, Index, PathBuf)> {
     let log_path = seg_log_path(root, base);
     let idx_path = seg_idx_path(root, base);
     crate::shared_segment::make_private(&log_path)?;

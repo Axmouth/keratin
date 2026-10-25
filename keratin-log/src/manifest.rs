@@ -131,7 +131,10 @@ impl Manifest {
         // Corrupting just its version header cannot make an old reader accept
         // shared storage as an ordinary version 2 log.
         if ver == 3 && &payload[56..] != SHARED_MARKER {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid shared manifest marker"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "invalid shared manifest marker",
+            ));
         }
         let created_ts_ms =
             u64::from_be_bytes(payload[0..8].try_into().expect("exact-length slice"));
@@ -184,7 +187,11 @@ impl Manifest {
         let header_len: u32 = (8 + 2 + 2 + 4 + 4) as u32;
         let mut out = Vec::new();
         out.extend_from_slice(MAN_MAGIC);
-        let version = if self.shared_segments { 3u16 } else { MAN_VERSION };
+        let version = if self.shared_segments {
+            3u16
+        } else {
+            MAN_VERSION
+        };
         out.extend_from_slice(&version.to_be_bytes());
         let flags = if self.clean_shutdown {
             MAN_FLAG_CLEAN_SHUTDOWN
@@ -204,7 +211,9 @@ impl Manifest {
         payload.extend_from_slice(&self.next_offset.to_be_bytes());
         payload.extend_from_slice(&self.head_offset.to_be_bytes());
         payload.extend_from_slice(&self.epoch.to_be_bytes());
-        if self.shared_segments { payload.extend_from_slice(SHARED_MARKER); }
+        if self.shared_segments {
+            payload.extend_from_slice(SHARED_MARKER);
+        }
 
         let crc = crc32c(&payload);
         out.extend_from_slice(&crc.to_be_bytes());
@@ -304,7 +313,11 @@ fn shared_manifest_cannot_be_downgraded_by_corrupting_version_header() {
     manifest.shared_segments = true;
     manifest.store_atomic(&dir.root).unwrap();
     let path = Manifest::path(&dir.root);
-    assert!(Manifest::read_from(&mut File::open(&path).unwrap()).unwrap().shared_segments);
+    assert!(
+        Manifest::read_from(&mut File::open(&path).unwrap())
+            .unwrap()
+            .shared_segments
+    );
     let mut bytes = fs::read(&path).unwrap();
     assert_eq!(bytes.len(), 84);
     bytes[8..10].copy_from_slice(&2u16.to_be_bytes());

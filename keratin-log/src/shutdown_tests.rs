@@ -40,7 +40,11 @@ async fn commands_queued_behind_shutdown_are_answered() {
     // Bypass the handle's shutdown check to land in the race window.
     let append = queue_append(&log);
     let (sync_tx, sync) = oneshot::channel();
-    log.tx.send(WriterCmd::Sync { respond_to: sync_tx }).unwrap();
+    log.tx
+        .send(WriterCmd::Sync {
+            respond_to: sync_tx,
+        })
+        .unwrap();
     let (settings_tx, settings) = oneshot::channel();
     log.tx
         .send(WriterCmd::ReadSettings {
@@ -49,7 +53,9 @@ async fn commands_queued_behind_shutdown_are_answered() {
         .unwrap();
     let (again_tx, again) = oneshot::channel();
     log.tx
-        .send(WriterCmd::Shutdown { notify_tx: again_tx })
+        .send(WriterCmd::Shutdown {
+            notify_tx: again_tx,
+        })
         .unwrap();
     release.send(()).unwrap();
 

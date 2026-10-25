@@ -125,13 +125,8 @@ fn entry_names(dir: &Path) -> Result<Vec<String>> {
 }
 
 fn utf8_name(dir: &Path, name: OsString) -> Result<String> {
-    name.into_string().map_err(|name| {
-        corrupt(format!(
-            "unexpected entry {:?} in {}",
-            name,
-            dir.display()
-        ))
-    })
+    name.into_string()
+        .map_err(|name| corrupt(format!("unexpected entry {:?} in {}", name, dir.display())))
 }
 
 fn check_marker(root: &Path, bytes: &[u8]) -> Result<()> {
@@ -147,7 +142,12 @@ fn check_marker(root: &Path, bytes: &[u8]) -> Result<()> {
         .next()
         .and_then(|line| line.strip_prefix("version "))
         .and_then(|v| v.parse::<u32>().ok())
-        .ok_or_else(|| corrupt(format!("{} has an unreadable {MARKER} marker", root.display())))?;
+        .ok_or_else(|| {
+            corrupt(format!(
+                "{} has an unreadable {MARKER} marker",
+                root.display()
+            ))
+        })?;
     if version != VERSION {
         return Err(invalid(format!(
             "{} uses Stroma storage layout version {version}, this build only opens version {VERSION}",
@@ -186,7 +186,10 @@ pub(super) fn prepare_root(root: &Path) -> Result<()> {
         // A temporary marker left by an interrupted first start is the only
         // thing a fresh root may contain.
         if names.iter().any(|n| *n != pending_marker) {
-            if names.iter().any(|n| OLD_LAYOUT_ENTRIES.contains(&n.as_str())) {
+            if names
+                .iter()
+                .any(|n| OLD_LAYOUT_ENTRIES.contains(&n.as_str()))
+            {
                 return Err(invalid(format!(
                     "{} holds an older Stroma storage layout that this version cannot open. Move it aside and start from an empty directory",
                     root.display()
@@ -336,7 +339,11 @@ pub(super) fn write_current(part_dir: &Path, generation: &Generation) -> Result<
     if !part_dir.join(generation.name()).is_dir() {
         return Err(corrupt("cannot switch to a missing generation"));
     }
-    write_atomic(part_dir, CURRENT, format!("{}\n", generation.name()).as_bytes())
+    write_atomic(
+        part_dir,
+        CURRENT,
+        format!("{}\n", generation.name()).as_bytes(),
+    )
 }
 
 pub(super) fn read_kind(part_dir: &Path) -> Result<Option<PartitionKind>> {
@@ -519,7 +526,11 @@ mod tests {
     fn old_layouts_and_foreign_directories_are_refused() {
         let dir = test_dir!("layout_refuse");
         for (name, entry, expect) in [
-            ("single-log", "combined-queue-log.v1", "older Stroma storage layout"),
+            (
+                "single-log",
+                "combined-queue-log.v1",
+                "older Stroma storage layout",
+            ),
             ("separate", "events", "older Stroma storage layout"),
             ("routes", "recovery-routes", "older Stroma storage layout"),
             ("foreign", "setup_complete", "has no stroma-layout marker"),
@@ -540,13 +551,24 @@ mod tests {
         prepare_root(&dir.root).unwrap();
         fs::write(dir.root.join("recovery-inspection"), b"x").unwrap();
         let err = prepare_root(&dir.root).unwrap_err();
-        assert!(err.to_string().contains("unknown entry `recovery-inspection`"), "{err}");
+        assert!(
+            err.to_string()
+                .contains("unknown entry `recovery-inspection`"),
+            "{err}"
+        );
         fs::remove_file(dir.root.join("recovery-inspection")).unwrap();
 
         for older in [1, 2] {
-            fs::write(dir.root.join(MARKER), format!("stroma-layout\nversion {older}\n")).unwrap();
+            fs::write(
+                dir.root.join(MARKER),
+                format!("stroma-layout\nversion {older}\n"),
+            )
+            .unwrap();
             let err = prepare_root(&dir.root).unwrap_err();
-            assert!(err.to_string().contains(&format!("version {older}")), "{err}");
+            assert!(
+                err.to_string().contains(&format!("version {older}")),
+                "{err}"
+            );
             assert!(err.to_string().contains("only opens version 3"), "{err}");
         }
         fs::write(dir.root.join(MARKER), b"stroma-layout\nversion 4\n").unwrap();
@@ -626,13 +648,20 @@ mod tests {
         // A crash after writing current.next but before the rename leaves
         // the previous generation current.
         fs::create_dir(part.join(second.name())).unwrap();
-        fs::write(part.join(pending_name(CURRENT)), format!("{}\n", second.name())).unwrap();
+        fs::write(
+            part.join(pending_name(CURRENT)),
+            format!("{}\n", second.name()),
+        )
+        .unwrap();
         assert_eq!(read_current(&part).unwrap(), Some(first));
         write_current(&part, &second).unwrap();
         assert_eq!(read_current(&part).unwrap(), Some(second));
         assert!(!part.join(pending_name(CURRENT)).exists());
 
         fs::write(part.join(CURRENT), b"garbage\n").unwrap();
-        assert!(matches!(read_current(&part), Err(StromaError::Corruption(_))));
+        assert!(matches!(
+            read_current(&part),
+            Err(StromaError::Corruption(_))
+        ));
     }
 }

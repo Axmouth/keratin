@@ -142,7 +142,10 @@ impl LogReader {
         max: usize,
         max_bytes: usize,
     ) -> io::Result<Vec<OwnedRecord>> {
-        if let Some(records) = self.tail_cache.read_written_with_byte_budget(from, max, max_bytes) {
+        if let Some(records) = self
+            .tail_cache
+            .read_written_with_byte_budget(from, max, max_bytes)
+        {
             return Ok(records);
         }
         self.scan_from_with_byte_budget(from, max, max_bytes)
@@ -156,7 +159,8 @@ impl LogReader {
         max: usize,
         max_bytes: usize,
     ) -> Option<Vec<OwnedRecord>> {
-        self.tail_cache.read_from_with_byte_budget(from, max, max_bytes)
+        self.tail_cache
+            .read_from_with_byte_budget(from, max, max_bytes)
     }
 
     /// The cached part of `scan_written_with_byte_budget`. `None` on a miss,
@@ -181,7 +185,10 @@ impl LogReader {
     ) -> Option<Vec<OwnedRecord>> {
         self.tail_cache
             .read_written_with_byte_budget(from, max, max_bytes)
-            .or_else(|| self.tail_cache.read_from_with_byte_budget(from, max, max_bytes))
+            .or_else(|| {
+                self.tail_cache
+                    .read_from_with_byte_budget(from, max, max_bytes)
+            })
     }
 
     /// Like `scan_from_with_byte_budget`, but bounded by the written frontier
@@ -235,7 +242,6 @@ impl LogReader {
         max_bytes: usize,
         durable: DurableFrontier,
     ) -> io::Result<Vec<OwnedRecord>> {
-
         let mut out = Vec::with_capacity(max);
         let mut cur = from;
         let mut budget = ScanByteBudget::new(max_bytes);

@@ -51,7 +51,10 @@ impl RetainedLogs {
     pub fn sources(&self) -> Vec<(RecoveryReadSource, &RetainedLog)> {
         match self {
             Self::Queue(log) => vec![(RecoveryReadSource::Log, log)],
-            Self::Stream { records, cursor_events } => vec![
+            Self::Stream {
+                records,
+                cursor_events,
+            } => vec![
                 (RecoveryReadSource::StreamRecords, records),
                 (RecoveryReadSource::Log, cursor_events),
             ],
@@ -61,9 +64,10 @@ impl RetainedLogs {
     fn well_formed(&self) -> bool {
         match self {
             Self::Queue(log) => log.head <= log.next,
-            Self::Stream { records, cursor_events } => {
-                records.head <= records.next && cursor_events.head <= cursor_events.next
-            }
+            Self::Stream {
+                records,
+                cursor_events,
+            } => records.head <= records.next && cursor_events.head <= cursor_events.next,
         }
     }
 }
@@ -106,7 +110,9 @@ impl RetainedHistoryIdentity {
                 RetainedLogs::Queue(_) => {
                     self.version == 2 && self.storage_history.as_ref().is_some_and(|h| !h.stream)
                 }
-                RetainedLogs::Stream { .. } => self.storage_history.as_ref().is_none_or(|h| h.stream),
+                RetainedLogs::Stream { .. } => {
+                    self.storage_history.as_ref().is_none_or(|h| h.stream)
+                }
             }
     }
 
@@ -216,21 +222,41 @@ impl Stroma {
     /// This restates recorded evidence and does not revalidate physical bytes.
     /// Inspection and installation must still verify every required record.
     pub fn completed_queue_recovery_seal(
-        &self, topic: &str, part: u32, group: Option<&str>, request: &RecoverySealRequest,
+        &self,
+        topic: &str,
+        part: u32,
+        group: Option<&str>,
+        request: &RecoverySealRequest,
     ) -> Result<Option<SealedReplicaFrontiers>> {
         let group = normalize_group(group);
-        if !self.recovery_seal_path(topic, part, group).try_exists().map_err(io_err)? { return Ok(None); }
+        if !self
+            .recovery_seal_path(topic, part, group)
+            .try_exists()
+            .map_err(io_err)?
+        {
+            return Ok(None);
+        }
         self.require_matching_recovery_seal(topic, part, group, request)?;
         if self.read_partition_kind(topic, part, group) != PartitionKind::Queue {
-            return Err(StromaError::InvalidArgument("completed queue seal cannot describe a stream".into()));
+            return Err(StromaError::InvalidArgument(
+                "completed queue seal cannot describe a stream".into(),
+            ));
         }
         let path = self.snap_dir(topic, part, group).join("recovery.history");
-        let Some(receipt) = read_receipt(&path)? else { return Ok(None); };
-        let history = self.require_retained_history(topic, part, group, false, request, receipt.history.id)?;
+        let Some(receipt) = read_receipt(&path)? else {
+            return Ok(None);
+        };
+        let history =
+            self.require_retained_history(topic, part, group, false, request, receipt.history.id)?;
         // Complete a visible publication barrier left by an interrupted caller.
-        fs::File::open(&path).and_then(|file| file.sync_all()).map_err(io_err)?;
+        fs::File::open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(io_err)?;
         recovery_seal::sync_directories(path.parent().unwrap())?;
-        Ok(Some(SealedReplicaFrontiers { request: request.clone(), history }))
+        Ok(Some(SealedReplicaFrontiers {
+            request: request.clone(),
+            history,
+        }))
     }
 
     pub(super) fn recovery_snapshot_path(
@@ -302,13 +328,7 @@ impl Stroma {
         let agreed = if stream {
             None
         } else {
-            self.agreed_recovery_snapshot(
-                topic,
-                part,
-                group,
-                storage_history.as_ref(),
-                events,
-            )?
+            self.agreed_recovery_snapshot(topic, part, group, storage_history.as_ref(), events)?
         };
         let checkpoint_snapshot = agreed.is_some();
         let snapshot = if let Some(bytes) = agreed {
@@ -430,7 +450,11 @@ mod tests {
 
     #[test]
     fn retained_logs_variant_is_explicit_and_bound_to_identity() {
-        let log = RetainedLog { head: 2, next: 9, digest: [5; 32] };
+        let log = RetainedLog {
+            head: 2,
+            next: 9,
+            digest: [5; 32],
+        };
         let mut queue = RetainedHistoryIdentity {
             version: 2,
             storage_history: Some(storage(false)),
@@ -441,15 +465,24 @@ mod tests {
         assert!(queue.valid_version());
         assert_eq!(queue.queue_log(), Some(&log));
         assert_eq!(queue.logs.for_source(RecoveryReadSource::Log), Some(&log));
-        assert_eq!(queue.logs.for_source(RecoveryReadSource::StreamRecords), None);
+        assert_eq!(
+            queue.logs.for_source(RecoveryReadSource::StreamRecords),
+            None
+        );
         assert_eq!(queue.logs.for_source(RecoveryReadSource::Snapshot), None);
         let encoded = rmp_serde::to_vec_named(&queue).unwrap();
-        assert_eq!(rmp_serde::from_slice::<RetainedHistoryIdentity>(&encoded).unwrap(), queue);
+        assert_eq!(
+            rmp_serde::from_slice::<RetainedHistoryIdentity>(&encoded).unwrap(),
+            queue
+        );
 
         // The same bounds as a stream history never share a queue id.
         let mut stream = queue.clone();
         stream.storage_history = Some(storage(true));
-        stream.logs = RetainedLogs::Stream { records: log, cursor_events: log };
+        stream.logs = RetainedLogs::Stream {
+            records: log,
+            cursor_events: log,
+        };
         assert!(stream.valid_version());
         assert_eq!(stream.queue_log(), None);
         assert_ne!(
@@ -474,8 +507,15 @@ mod tests {
         stream.version = 1;
         assert!(stream.valid_version());
         // Inverted bounds are refused for either kind.
-        let inverted = RetainedLog { head: 9, next: 2, digest: [5; 32] };
-        stream.logs = RetainedLogs::Stream { records: log, cursor_events: inverted };
+        let inverted = RetainedLog {
+            head: 9,
+            next: 2,
+            digest: [5; 32],
+        };
+        stream.logs = RetainedLogs::Stream {
+            records: log,
+            cursor_events: inverted,
+        };
         assert!(!stream.valid_version());
         let mut queue = RetainedHistoryIdentity {
             version: 2,
@@ -565,7 +605,10 @@ mod tests {
             .await
             .unwrap();
         assert_ne!(x.history.id, y.history.id);
-        assert_ne!(x.history.storage_history.as_ref().unwrap().storage_instance, y.history.storage_history.as_ref().unwrap().storage_instance);
+        assert_ne!(
+            x.history.storage_history.as_ref().unwrap().storage_instance,
+            y.history.storage_history.as_ref().unwrap().storage_instance
+        );
         let log = |s: &SealedReplicaFrontiers| *s.history.queue_log().unwrap();
         assert_eq!(log(&x), log(&y));
         assert_ne!(x.history.id, z.history.id);
@@ -580,24 +623,53 @@ mod tests {
     async fn completed_queue_seal_survives_reopen_and_rejects_mismatched_or_damaged_evidence() {
         let dir = test_dir!("completed_history_receipt");
         let s = populated(&dir.root, b"data").await;
-        assert_eq!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap(), None);
-        let expected = s.seal_replica_for_recovery("q", 0, None, request(8)).await.unwrap();
-        assert_eq!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap(), Some(expected.clone()));
-        assert!(s.completed_queue_recovery_seal("q", 0, None, &request(9)).is_err());
+        assert_eq!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap(),
+            None
+        );
+        let expected = s
+            .seal_replica_for_recovery("q", 0, None, request(8))
+            .await
+            .unwrap();
+        assert_eq!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap(),
+            Some(expected.clone())
+        );
+        assert!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(9))
+                .is_err()
+        );
         s.shutdown().await.unwrap();
         drop(s);
-        let s = Stroma::open(&dir.root,
+        let s = Stroma::open(
+            &dir.root,
             StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
-            SnapshotConfig::default()).await.unwrap();
-        assert_eq!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap(), Some(expected));
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap(),
+            Some(expected)
+        );
         let path = s.snap_dir("q", 0, None).join("recovery.history");
         let original = fs::read(&path).unwrap();
         fs::remove_file(&path).unwrap();
-        assert_eq!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap(), None);
+        assert_eq!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap(),
+            None
+        );
         // A seal intent without its completed receipt remains fenced.
         assert!(s.queue_handle("q", 0, None).await.is_err());
         fs::write(&path, b"damaged").unwrap();
-        assert!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).is_err());
+        assert!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .is_err()
+        );
         fs::write(&path, &original).unwrap();
         // A valid frame cannot rebind the receipt to a different resource.
         let mut receipt = read_receipt(&path).unwrap().unwrap();
@@ -606,9 +678,16 @@ mod tests {
         frame.extend(rmp_serde::to_vec_named(&receipt).unwrap());
         frame.extend(crc32c::crc32c(&frame).to_be_bytes());
         fs::write(&path, frame).unwrap();
-        assert!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).is_err());
+        assert!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .is_err()
+        );
         fs::write(&path, original).unwrap();
-        assert!(s.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap().is_some());
+        assert!(
+            s.completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap()
+                .is_some()
+        );
         s.shutdown().await.unwrap();
     }
 
@@ -630,7 +709,12 @@ mod tests {
         .unwrap();
         // Restating a completed receipt does not bless changed bytes. The
         // strict sealing path must still detect a valid but different record.
-        assert!(first.completed_queue_recovery_seal("q", 0, None, &request(8)).unwrap().is_some());
+        assert!(
+            first
+                .completed_queue_recovery_seal("q", 0, None, &request(8))
+                .unwrap()
+                .is_some()
+        );
         assert!(matches!(
             first
                 .seal_replica_for_recovery("q", 0, None, request(8))

@@ -19,10 +19,15 @@ async fn older_message_ack_obeys_selected_application_order() {
         )
         .await
         .unwrap();
-        async fn publish(st: &Stroma, id: u8) -> tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>> {
+        async fn publish(
+            st: &Stroma,
+            id: u8,
+        ) -> tokio::sync::oneshot::Receiver<std::result::Result<AppendResult, IoError>> {
             let (completion, rx) = KeratinAppendCompletion::pair();
             st.append_message_batch(
-                "ordering", 0, None,
+                "ordering",
+                0,
+                None,
                 vec![PublishItem {
                     headers: MessageHeaders {
                         published: Default::default(),
@@ -30,20 +35,30 @@ async fn older_message_ack_obeys_selected_application_order() {
                         content_type: None,
                         extra: Default::default(),
                     },
-                    payload: vec![id], completion, not_before: None, expire_at: None,
+                    payload: vec![id],
+                    completion,
+                    not_before: None,
+                    expire_at: None,
                 }],
-            ).await.unwrap();
+            )
+            .await
+            .unwrap();
             rx
         }
         // A real publish completes, then the ordinary delivery path leases it.
         publish(&st, 0).await.await.unwrap().unwrap();
-        let delivered = st.poll_ready("ordering", 0, None, 1, unix_millis() + 60_000, u64::MAX).await.unwrap();
+        let delivered = st
+            .poll_ready("ordering", 0, None, 1, unix_millis() + 60_000, u64::MAX)
+            .await
+            .unwrap();
         assert_eq!(delivered.len(), 1);
         assert_eq!(delivered[0].0, 0);
 
         let pause = Arc::new(PublishApplyPause {
-            topic: "ordering", base: 1,
-            entered: Notify::new(), release: Notify::new(),
+            topic: "ordering",
+            base: 1,
+            entered: Notify::new(),
+            release: Notify::new(),
         });
         *st.publish_apply_pause.lock().unwrap() = Some(pause.clone());
         let new_confirm = publish(&st, 1).await;
@@ -57,12 +72,23 @@ async fn older_message_ack_obeys_selected_application_order() {
         // This is the fast ACK storage API used by the broker, for the message
         // actually delivered above. It does not ACK the paused new publish.
         let (completion, mut ack_done) = KeratinAppendCompletion::pair();
-        st.ack_enqueue_many("ordering", 0, None, vec![AckEventMeta { off: 0 }], completion).await.unwrap();
+        st.ack_enqueue_many(
+            "ordering",
+            0,
+            None,
+            vec![AckEventMeta { off: 0 }],
+            completion,
+        )
+        .await
+        .unwrap();
         let wq = h.work_queue().unwrap();
         while h.event_log().durable_offset() < 2 {
             tokio::task::yield_now().await;
         }
-        assert!(matches!(ack_done.try_recv(), Err(tokio::sync::oneshot::error::TryRecvError::Empty)));
+        assert!(matches!(
+            ack_done.try_recv(),
+            Err(tokio::sync::oneshot::error::TryRecvError::Empty)
+        ));
         assert!(!wq.is_settled(0).await);
         assert!(!wq.is_ready(1).await);
         assert_eq!(h.applied_upto().load(Ordering::Acquire), 0);
@@ -73,7 +99,9 @@ async fn older_message_ack_obeys_selected_application_order() {
         assert!(wq.is_ready(1).await);
         assert_eq!(h.applied_upto().load(Ordering::Acquire), 2);
         st.shutdown().await.unwrap();
-    }).await.expect("storage ordering scenario timed out");
+    })
+    .await
+    .expect("storage ordering scenario timed out");
 }
 
 #[test]

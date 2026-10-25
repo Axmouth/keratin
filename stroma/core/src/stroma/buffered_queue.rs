@@ -13,8 +13,8 @@
 //! queue back to an earlier consistent state and the message is delivered
 //! again. Writes that ask for `AfterFsync` explicitly keep it. A dead-letter
 //! copy lands in the target queue under the target's own mode.
-use super::*;
 use super::write_sync_expectation::set_log_expects_synced;
+use super::*;
 
 impl Stroma {
     /// Declare whether a queue partition is buffered. Refuses stream

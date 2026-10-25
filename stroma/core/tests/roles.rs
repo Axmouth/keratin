@@ -257,7 +257,10 @@ async fn demotion_freezes_drains_and_switches_owner_to_follower() {
         .unwrap();
     assert_eq!(
         outcome,
-        QueueDemotionOutcome { next: 1, applied_next: 1 }
+        QueueDemotionOutcome {
+            next: 1,
+            applied_next: 1
+        }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(2, 0).await, QueueRole::Follower);
@@ -576,10 +579,7 @@ async fn caught_up_follower_can_promote_and_accept_owner_writes() {
         .promote_queue_follower_if_caught_up("topic-a", 0, None, 1)
         .await
         .unwrap();
-    assert_eq!(
-        promoted,
-        QueuePromotionOutcome::Promoted { next: 1 }
-    );
+    assert_eq!(promoted, QueuePromotionOutcome::Promoted { next: 1 });
     assert_eq!(qh.role(), QueueRole::Owner);
 
     let headers = MessageHeaders {
@@ -615,7 +615,10 @@ async fn promotion_reports_follower_lag_without_changing_role() {
         .unwrap();
     assert_eq!(
         outcome,
-        QueuePromotionOutcome::LogBehind { local_next: 0, expected_next: 1 }
+        QueuePromotionOutcome::LogBehind {
+            local_next: 0,
+            expected_next: 1
+        }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);
@@ -649,7 +652,10 @@ async fn promotion_refuses_unexpected_local_tail_without_changing_role() {
         .unwrap();
     assert_eq!(
         outcome,
-        QueuePromotionOutcome::LogAhead { local_next: 1, expected_next: 0 }
+        QueuePromotionOutcome::LogAhead {
+            local_next: 1,
+            expected_next: 0
+        }
     );
     assert_eq!(qh.role(), QueueRole::Follower);
     assert_wrong_role(qh.enqueue(0, 0).await, QueueRole::Follower);

@@ -86,22 +86,27 @@ impl RecoverySequentialRead {
         if request.source == RecoveryReadSource::Snapshot {
             return Err(invalid("snapshot is not a sequential log"));
         }
-        let RetainedLog { head, next: end, digest } = *self
+        let RetainedLog {
+            head,
+            next: end,
+            digest,
+        } = *self
             .history
             .logs
             .for_source(request.source)
             .ok_or_else(|| invalid("read source names no log in this history"))?;
         // A completed queue log scan can restart at its retained head for
         // live-payload verification. No incomplete scan may rewind.
-        let repeat_queue = self.history.queue_log().is_some()
-            && self.next == self.end
-            && request.from == head;
+        let repeat_queue =
+            self.history.queue_log().is_some() && self.next == self.end && request.from == head;
         if self.source != Some(request.source) || repeat_queue {
             if self.source.is_some() && self.next != self.end {
                 return Err(invalid("previous sequential log is incomplete"));
             }
             if request.from < head || request.from > end {
-                return Err(invalid("sequential inspection starts outside retained history"));
+                return Err(invalid(
+                    "sequential inspection starts outside retained history",
+                ));
             }
             self.cursor = Some(
                 FrozenLogReader::open(root, request.seal.fence_epoch, head, end)
@@ -170,7 +175,11 @@ impl RecoverySequentialRead {
             page.records.push(record);
         }
         if self.next == end {
-            if self.hash.as_ref().is_some_and(|hash| hash.finalize().as_bytes() != &digest) {
+            if self
+                .hash
+                .as_ref()
+                .is_some_and(|hash| hash.finalize().as_bytes() != &digest)
+            {
                 return Err(corrupt("sequential history does not match sealed digest"));
             }
             self.cursor = None;
@@ -374,7 +383,15 @@ impl Stroma {
                         )?;
                     }
                 } else {
-                    for (source, &RetainedLog { head, next: end, digest }) in history.logs.sources() {
+                    for (
+                        source,
+                        &RetainedLog {
+                            head,
+                            next: end,
+                            digest,
+                        },
+                    ) in history.logs.sources()
+                    {
                         let selected = source == request.source;
                         if selected {
                             if request.from < head || request.from > end {
@@ -835,22 +852,41 @@ mod tests {
         let dir = test_dir!("sequential_resumed_digest");
         let s = populate(&dir.root).await;
         let request = seal(&s).await;
-        let sealed = s.seal_replica_for_recovery("q", 0, None, request.seal.clone()).await.unwrap();
-        let mut inspector = RecoveryPairInspector::new("q", 0, None, sealed.clone(), sealed,
-            RecoveryInspectionLimits { page_records: 2, page_bytes: 300, ..Default::default() })
-            .unwrap().with_single_source().unwrap();
+        let sealed = s
+            .seal_replica_for_recovery("q", 0, None, request.seal.clone())
+            .await
+            .unwrap();
+        let mut inspector = RecoveryPairInspector::new(
+            "q",
+            0,
+            None,
+            sealed.clone(),
+            sealed,
+            RecoveryInspectionLimits {
+                page_records: 2,
+                page_bytes: 300,
+                ..Default::default()
+            },
+        )
+        .unwrap()
+        .with_single_source()
+        .unwrap();
         let (side, request) = inspector.next_read().unwrap().unwrap();
         let (page, cursor) = sequential(&s, request, None).await.unwrap();
         inspector.accept_page(side, page).unwrap();
         drop(cursor); // connection/process restart after retained prefix
-        let mut paths: Vec<_> = fs::read_dir(s.tp_part_dir("q", 0, None).join("segments")).unwrap()
-            .map(|e| e.unwrap().path()).filter(|p| p.extension().is_some_and(|e| e == "log")).collect();
+        let mut paths: Vec<_> = fs::read_dir(s.tp_part_dir("q", 0, None).join("segments"))
+            .unwrap()
+            .map(|e| e.unwrap().path())
+            .filter(|p| p.extension().is_some_and(|e| e == "log"))
+            .collect();
         paths.sort();
         let path = paths.pop().unwrap();
         let mut bytes = fs::read(&path).unwrap();
         let start = 68;
         let headers = u32::from_be_bytes(bytes[start + 8..start + 12].try_into().unwrap()) as usize;
-        let payload = u32::from_be_bytes(bytes[start + 12..start + 16].try_into().unwrap()) as usize;
+        let payload =
+            u32::from_be_bytes(bytes[start + 12..start + 16].try_into().unwrap()) as usize;
         let end = start + 32 + headers + payload;
         bytes[end - 1] ^= 1;
         let crc = crc32c::crc32c(&bytes[start + 2..end]);
@@ -866,7 +902,8 @@ mod tests {
                 assert!(result.unwrap_err().contains("sealed digest"));
                 break;
             }
-            result.unwrap(); cursor = next_cursor;
+            result.unwrap();
+            cursor = next_cursor;
         }
         assert!(inspector.finish().is_err());
         s.shutdown().await.unwrap();

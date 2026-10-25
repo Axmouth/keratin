@@ -192,10 +192,16 @@ mod tests {
         st.set_queue_background_sync_default(Duration::from_millis(40))
             .await;
         let status = st.queue_log_sync_status("q", 0, None).await.unwrap();
-        assert_eq!(status.event_log.background_sync_interval, Duration::from_millis(40));
+        assert_eq!(
+            status.event_log.background_sync_interval,
+            Duration::from_millis(40)
+        );
         st.evict("q", 0, None).await.unwrap();
         let status = st.queue_log_sync_status("q", 0, None).await.unwrap();
-        assert_eq!(status.event_log.background_sync_interval, Duration::from_millis(40));
+        assert_eq!(
+            status.event_log.background_sync_interval,
+            Duration::from_millis(40)
+        );
 
         st.create_stream("s", 0, None).await.unwrap();
         assert!(matches!(

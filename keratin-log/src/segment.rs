@@ -34,7 +34,9 @@ pub(crate) fn read_header_base(mut file: &File) -> io::Result<Option<u64>> {
     if &hdr[0..8] != LOG_MAGIC || crc32c::crc32c(&hdr[..body]) != crc {
         return Ok(None);
     }
-    Ok(Some(u64::from_be_bytes(hdr[16..24].try_into().expect("exact-length slice"))))
+    Ok(Some(u64::from_be_bytes(
+        hdr[16..24].try_into().expect("exact-length slice"),
+    )))
 }
 
 pub struct Segment {
@@ -223,10 +225,19 @@ impl Segment {
         // journal commit at the next sync. Zeros written and synced ahead of
         // the cursor make that sync a plain data flush.
         if self.prealloc_chunk > 0 && self.zero.is_none() {
-            let ready_end = if self.recycled { self.alloc_end } else { self.bytes_written };
+            let ready_end = if self.recycled {
+                self.alloc_end
+            } else {
+                self.bytes_written
+            };
             match self.file.try_clone() {
                 Ok(file) => {
-                    self.zero = Some(crate::zero_ahead::ZeroAhead::new(file, self.bytes_written, ready_end, chunk))
+                    self.zero = Some(crate::zero_ahead::ZeroAhead::new(
+                        file,
+                        self.bytes_written,
+                        ready_end,
+                        chunk,
+                    ))
                 }
                 Err(error) => tracing::warn!(%error, "zeroing ahead of the writer unavailable"),
             }

@@ -1,7 +1,6 @@
 //! Completed local inspection phases. Only this node's durable result directory
 //! may be opened here. These files are never accepted from peers as evidence.
 //! Fresh lineage, witness membership and activation authority remain external.
-use keratin_log::util::fsync_dir;
 use crate::{
     QueueInternalState,
     recovery_inspection::{
@@ -13,6 +12,7 @@ use crate::{
     },
     recovery_snapshot::{RecoverySnapshotFile, RecoverySnapshotIdentity, SNAPSHOT_CHUNK_BYTES},
 };
+use keratin_log::util::fsync_dir;
 use serde::{Deserialize, Serialize};
 use std::{
     fs::{self, File, OpenOptions},
@@ -47,10 +47,7 @@ impl RecoveryPhaseRecipe {
     /// Shared configuration validation for a new pass and a cached complete pass.
     pub fn inspector(&self) -> Result<RecoveryPairInspector, String> {
         let [a, b] = &self.sources;
-        if a.topic != b.topic
-            || a.partition != b.partition
-            || a.group != b.group
-        {
+        if a.topic != b.topic || a.partition != b.partition || a.group != b.group {
             return Err("phase sources belong to different resources".into());
         }
         let mut inspector = RecoveryPairInspector::new(
@@ -85,11 +82,8 @@ impl RecoveryPhaseRecipe {
                     .queue_log()
                     .ok_or("source artifact requires a queue history")?
                     .next;
-                inspector = inspector.with_queue_checkpoint_replay(
-                    next,
-                    replay,
-                    checkpoint_bytes,
-                )?;
+                inspector =
+                    inspector.with_queue_checkpoint_replay(next, replay, checkpoint_bytes)?;
             }
         }
         inspector = inspector.with_incremental_work(self.state_entries)?;

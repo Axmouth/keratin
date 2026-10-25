@@ -79,9 +79,7 @@ async fn live_settings_upgrade_persists_prefix_and_keeps_explicit_overrides() {
 #[tokio::test]
 async fn live_settings_cas_invalid_updates_and_lost_response() {
     let dir = crate::test_dir!("live_settings_cas");
-    let log = Keratin::open(&dir.root, config())
-        .await
-        .unwrap();
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
     let initial = log.writer_settings().await.unwrap();
     let mut invalid = initial.settings;
     invalid.max_batch_records = 0;
@@ -123,9 +121,7 @@ async fn live_settings_cas_invalid_updates_and_lost_response() {
 #[tokio::test]
 async fn live_settings_apply_to_follower_default_and_preserve_override() {
     let dir = crate::test_dir!("live_settings_follower");
-    let log = Keratin::open(&dir.root, config())
-        .await
-        .unwrap();
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
     log.become_follower();
     let old = log.writer_settings().await.unwrap();
     let mut next = old.settings;
@@ -147,9 +143,7 @@ async fn live_settings_apply_to_follower_default_and_preserve_override() {
 async fn live_settings_fifo_downgrade_never_releases_old_durable_ack_early() {
     use crate::io_fault_injection::{Fault, arm_gated};
     let dir = crate::test_dir!("live_settings_fifo");
-    let log = Keratin::open(&dir.root, config())
-        .await
-        .unwrap();
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
     let original = log.writer_settings().await.unwrap();
     let gate = arm_gated(
         &dir.root.join("segments/00000000000000000000.log"),
@@ -275,9 +269,7 @@ async fn live_settings_full_mailbox_does_not_block_async_runtime() {
 #[tokio::test]
 async fn live_settings_closure_edits_copy_and_validates_before_adoption() {
     let dir = crate::test_dir!("live_settings_closure");
-    let log = Keratin::open(&dir.root, config())
-        .await
-        .unwrap();
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
     let original = log.writer_settings().await.unwrap();
     let applied = log
         .update_writer_settings(|next| {
@@ -308,9 +300,7 @@ async fn live_settings_closure_edits_copy_and_validates_before_adoption() {
 #[tokio::test]
 async fn live_settings_closure_conflict_does_not_replay_or_overwrite() {
     let dir = crate::test_dir!("live_settings_closure_conflict");
-    let log = Keratin::open(&dir.root, config())
-        .await
-        .unwrap();
+    let log = Keratin::open(&dir.root, config()).await.unwrap();
     let original = log.writer_settings().await.unwrap();
     let mut calls = 0;
     let captured = String::from("consumed once");

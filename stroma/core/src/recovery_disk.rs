@@ -47,11 +47,7 @@ impl Stroma {
 //
 // `currents` caches each partition's current generation name, read once per
 // sample from `partitions/<group>/<topic>/<part>/current`.
-fn category(
-    root: &Path,
-    path: &Path,
-    currents: &mut HashMap<PathBuf, Option<String>>,
-) -> usize {
+fn category(root: &Path, path: &Path, currents: &mut HashMap<PathBuf, Option<String>>) -> usize {
     let Ok(relative) = path.strip_prefix(root.join(layout::PARTITIONS)) else {
         return 4;
     };
@@ -71,14 +67,12 @@ fn category(
     if layout::Generation::parse(&entry).is_none() {
         return 4;
     }
-    let current = currents
-        .entry(part_dir.clone())
-        .or_insert_with(|| {
-            layout::read_current(&part_dir)
-                .ok()
-                .flatten()
-                .map(|g| g.name())
-        });
+    let current = currents.entry(part_dir.clone()).or_insert_with(|| {
+        layout::read_current(&part_dir)
+            .ok()
+            .flatten()
+            .map(|g| g.name())
+    });
     if current.as_deref() != Some(&*entry) {
         return 2;
     }
@@ -197,15 +191,36 @@ mod tests {
         fs::create_dir_all(&part).unwrap();
         fs::write(part.join("current"), format!("{new}\n")).unwrap();
         for (path, want) in [
-            (format!("partitions/@none/q/0000000000/{new}/log/segment"), 0),
-            (format!("partitions/@none/q/0000000000/{old}/log/segment"), 2),
-            (format!("partitions/@none/q/0000000000/{new}/state/snapshot"), 0),
-            (format!("partitions/@none/q/0000000000/{new}/state/agreed-checkpoints/base"), 1),
-            (format!("partitions/@none/q/0000000000/{old}/state/agreed-checkpoints/base"), 2),
-            ("partitions/@none/q/0000000000/staging/plan/messages/segment".into(), 3),
+            (
+                format!("partitions/@none/q/0000000000/{new}/log/segment"),
+                0,
+            ),
+            (
+                format!("partitions/@none/q/0000000000/{old}/log/segment"),
+                2,
+            ),
+            (
+                format!("partitions/@none/q/0000000000/{new}/state/snapshot"),
+                0,
+            ),
+            (
+                format!("partitions/@none/q/0000000000/{new}/state/agreed-checkpoints/base"),
+                1,
+            ),
+            (
+                format!("partitions/@none/q/0000000000/{old}/state/agreed-checkpoints/base"),
+                2,
+            ),
+            (
+                "partitions/@none/q/0000000000/staging/plan/messages/segment".into(),
+                3,
+            ),
             ("partitions/@none/q/0000000000/recovery/started".into(), 4),
             ("partitions/@none/q/0000000000/current".into(), 4),
-            (format!("partitions/@none/other/0000000000/{new}/log/segment"), 2),
+            (
+                format!("partitions/@none/other/0000000000/{new}/log/segment"),
+                2,
+            ),
             ("global/segment".into(), 4),
         ] {
             assert_eq!(
@@ -250,8 +265,6 @@ mod tests {
             sparse.metadata().unwrap().blocks() * 512
         );
         assert_eq!(report.skipped_entries, 1);
-        assert!(
-            scan(root, 1, Duration::from_secs(5)).is_err()
-        );
+        assert!(scan(root, 1, Duration::from_secs(5)).is_err());
     }
 }

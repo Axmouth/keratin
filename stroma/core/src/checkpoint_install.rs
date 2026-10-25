@@ -66,7 +66,8 @@ fn validate(
             state.lowest_not_settled_offset(),
             state.required_message_next(),
         )));
-    }    Ok((state, meta))
+    }
+    Ok((state, meta))
 }
 
 fn read_journal(path: &Path) -> Result<Option<Journal>> {
@@ -372,10 +373,7 @@ impl Stroma {
                 }
                 self.checkpoint_boundary("follower")?;
                 h.event_log()
-                    .destructive_reset_to_checkpoint_at_epoch(
-                        install.start_offset,
-                        install.epoch,
-                    )
+                    .destructive_reset_to_checkpoint_at_epoch(install.start_offset, install.epoch)
                     .await
                     .map_err(io_err)?;
                 self.checkpoint_boundary("log_reset")?;
@@ -699,7 +697,12 @@ mod tests {
     async fn learner_checkpoint_restart_retains_authority_and_requires_payload_backfill() {
         for count in [0, 1] {
             for boundary in [
-                "intent", "follower", "log_reset", "state", "snapshot", "complete",
+                "intent",
+                "follower",
+                "log_reset",
+                "state",
+                "snapshot",
+                "complete",
             ] {
                 let dir = test_dir!("learner_checkpoint_restart");
                 let st = open(&dir.root).await;
@@ -783,7 +786,12 @@ mod tests {
     #[tokio::test]
     async fn checkpoint_each_interruption_resumes_on_live_access() {
         for boundary in [
-            "intent", "follower", "log_reset", "state", "snapshot", "complete",
+            "intent",
+            "follower",
+            "log_reset",
+            "state",
+            "snapshot",
+            "complete",
         ] {
             let dir = test_dir!("checkpoint_live_boundaries");
             let stroma = open(&dir.root).await;
@@ -808,7 +816,12 @@ mod tests {
     async fn checkpoint_each_interruption_resumes_after_restart_including_zero() {
         for count in [0, 1, 2] {
             for boundary in [
-                "intent", "follower", "log_reset", "state", "snapshot", "complete",
+                "intent",
+                "follower",
+                "log_reset",
+                "state",
+                "snapshot",
+                "complete",
             ] {
                 let dir = test_dir!("checkpoint_restart_boundaries");
                 let stroma = open(&dir.root).await;
@@ -1067,7 +1080,12 @@ mod tests {
             }
         }
         for boundary in [
-            "intent", "follower", "log_reset", "state", "snapshot", "complete",
+            "intent",
+            "follower",
+            "log_reset",
+            "state",
+            "snapshot",
+            "complete",
         ] {
             let dir = test_dir!("checkpoint_sigkill");
             let ready = dir.root.join("tmp/child-ready");

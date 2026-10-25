@@ -1167,11 +1167,7 @@ mod tests {
                 .seal_replica_for_recovery("q", 0, None, seal.clone())
                 .await
                 .unwrap();
-            assert_eq!(
-                evidence.history.queue_log().unwrap().next,
-                1,
-                "{boundary}"
-            );
+            assert_eq!(evidence.history.queue_log().unwrap().next, 1, "{boundary}");
             let page = st
                 .read_sealed_replica(
                     "q",

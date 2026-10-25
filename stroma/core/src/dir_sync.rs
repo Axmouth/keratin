@@ -34,7 +34,11 @@ pub(crate) fn sync_dir_chain(path: &Path) -> io::Result<()> {
 /// `dir` already exists, since a retry after a crash may find an entry that
 /// was created but never made durable.
 pub(crate) fn create_dir_all_synced(dir: &Path) -> io::Result<()> {
-    let parent_of = |path: &Path| path.parent().filter(|p| !p.as_os_str().is_empty()).map(Path::to_path_buf);
+    let parent_of = |path: &Path| {
+        path.parent()
+            .filter(|p| !p.as_os_str().is_empty())
+            .map(Path::to_path_buf)
+    };
     let mut missing = Vec::new();
     let mut cursor = Some(dir.to_path_buf());
     while let Some(path) = cursor {

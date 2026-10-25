@@ -270,7 +270,9 @@ fn record_id(record: &RecoveryRecord) -> [u8; 32] {
     *hash.finalize().as_bytes()
 }
 fn queue_log(seal: &SealedReplicaFrontiers) -> &RetainedLog {
-    seal.history.queue_log().expect("inspector admits queue histories only")
+    seal.history
+        .queue_log()
+        .expect("inspector admits queue histories only")
 }
 
 impl RecoveryPairInspector {
@@ -387,7 +389,10 @@ impl RecoveryPairInspector {
         {
             return Err("invalid checkpoint replay configuration".into());
         }
-        self.live_payloads = Some(LogPair::new(queue_log(&self.seals[0]), queue_log(&self.seals[1])));
+        self.live_payloads = Some(LogPair::new(
+            queue_log(&self.seals[0]),
+            queue_log(&self.seals[1]),
+        ));
         self.checkpoint_replay = Some(CheckpointReplayPlan {
             target: next,
             limits,
@@ -416,9 +421,13 @@ impl RecoveryPairInspector {
         self.limits.total_pages = u64::MAX;
         self.limits.total_records = u64::MAX;
         self.limits.total_bytes = u64::MAX;
-        if let Some(plan) = &mut self.checkpoint_replay { plan.limits.operations_per_replica = u64::MAX; }
+        if let Some(plan) = &mut self.checkpoint_replay {
+            plan.limits.operations_per_replica = u64::MAX;
+        }
         if let Some(replay) = &mut self.replay {
-            for state in replay { state.enable_incremental_work(max_state_entries)?; }
+            for state in replay {
+                state.enable_incremental_work(max_state_entries)?;
+            }
         }
         Ok(self)
     }
@@ -471,7 +480,9 @@ impl RecoveryPairInspector {
         self.replay = Some([build(0)?, build(1)?]);
         plan.buffers = Default::default(); // release raw snapshots after decoding
         if let (Some(limit), Some(replay)) = (self.incremental_state_entries, &mut self.replay) {
-            for state in replay { state.enable_incremental_work(limit)?; }
+            for state in replay {
+                state.enable_incremental_work(limit)?;
+            }
         }
         Ok(())
     }
@@ -810,10 +821,13 @@ pub(crate) fn decode_evidence_semantics(
         return Err(RecoverySemanticGap::UnknownOrMalformedEncoding);
     }
     if let Some(view) = crate::event::strict_payload_enqueue(&record.payload)
-        .map_err(|_| RecoverySemanticGap::UnknownOrMalformedEncoding)? {
+        .map_err(|_| RecoverySemanticGap::UnknownOrMalformedEncoding)?
+    {
         return Ok(StromaEvent::PayloadEnqueue {
-            not_before: view.not_before, expire_at: view.expire_at,
-            headers: Vec::new(), payload: Vec::new(),
+            not_before: view.not_before,
+            expire_at: view.expire_at,
+            headers: Vec::new(),
+            payload: Vec::new(),
         });
     }
     let payload = &record.payload;
@@ -1215,9 +1229,12 @@ mod tests {
             ..Default::default()
         };
         assert!(
-            run(inspector(sealed.clone(), sealed.clone(), limits), [&log, &log])
-                .unwrap_err()
-                .contains("records budget")
+            run(
+                inspector(sealed.clone(), sealed.clone(), limits),
+                [&log, &log]
+            )
+            .unwrap_err()
+            .contains("records budget")
         );
         let single = || {
             inspector(sealed.clone(), sealed.clone(), limits)
@@ -1265,7 +1282,10 @@ mod tests {
         let queue = seal(0, &records(0, 2));
         let mut stream = queue.clone();
         let log = *queue.history.queue_log().unwrap();
-        stream.history.logs = crate::RetainedLogs::Stream { records: log, cursor_events: log };
+        stream.history.logs = crate::RetainedLogs::Stream {
+            records: log,
+            cursor_events: log,
+        };
         stream.history.storage_history.as_mut().unwrap().stream = true;
         stream.history.id = stream.history.compute_id("q", 0, None, true).unwrap();
         for (left, right) in [
@@ -1415,11 +1435,8 @@ mod tests {
                                 page_bytes: 45,
                                 ..Default::default()
                             };
-                            let check = inspector(
-                                seal(left_head, &left),
-                                seal(right_head, &right),
-                                limits,
-                            );
+                            let check =
+                                inspector(seal(left_head, &left), seal(right_head, &right), limits);
                             let report = run(check, [&left, &right]).unwrap();
                             let (from, next) =
                                 (left_head.max(right_head), left_next.min(right_next));
@@ -1630,15 +1647,8 @@ mod tests {
         let mut wrong = left.clone();
         wrong.request.transition[0] ^= 1;
         assert!(
-            RecoveryPairInspector::new(
-                "q",
-                0,
-                None,
-                left.clone(),
-                wrong,
-                Default::default()
-            )
-            .is_err()
+            RecoveryPairInspector::new("q", 0, None, left.clone(), wrong, Default::default())
+                .is_err()
         );
         for case in 0..10 {
             let mut check = inspector(left.clone(), left.clone(), Default::default());
@@ -1670,7 +1680,8 @@ mod tests {
                 1 => limits.total_records = 1,
                 _ => limits.total_bytes = 1,
             }
-            let error = run(inspector(left.clone(), left.clone(), limits), [&log, &log]).unwrap_err();
+            let error =
+                run(inspector(left.clone(), left.clone(), limits), [&log, &log]).unwrap_err();
             let budget = Limit::from_message(&error).unwrap();
             assert_eq!(
                 budget.budget,
@@ -1723,7 +1734,11 @@ mod tests {
         let mut sealed = seal(0, &left);
         sealed.history.snapshot_digest = Some([8; 32]);
         sealed.history.id = sealed.history.compute_id("q", 0, None, false).unwrap();
-        let report = run(inspector(sealed.clone(), sealed, Default::default()), [&left, &left]).unwrap();
+        let report = run(
+            inspector(sealed.clone(), sealed, Default::default()),
+            [&left, &left],
+        )
+        .unwrap();
         assert!(
             report
                 .remaining_proofs

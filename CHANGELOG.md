@@ -109,6 +109,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- `LogRuntimeSettings::set_loaded_fsync_spacing` sets the least time between
+  fsync starts on a log while an earlier fsync of that log is still running.
+  A log with no fsync in flight syncs at once. Applies to every open log that
+  shares the settings, on its next commit decision. Off by default.
+
 - Written frontier. `Keratin::written_next` is the exclusive end of the
   records written through Keratin's buffers to the OS, where an `AfterFlush`
   append completes, and `watch_written_next` wakes a reader when it moves.

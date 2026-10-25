@@ -243,7 +243,10 @@ pub enum StromaEvent {
     },
     /// Advance delayed publishes/retries at an explicit clock boundary. The
     /// bounded transition is applied in event order on every replica.
-    ActivateDelayed { now: UnixMillis, max: u32 },
+    ActivateDelayed {
+        now: UnixMillis,
+        max: u32,
+    },
     /// Remove pending enqueues without declaring their offsets settled. The
     /// targets must precede this record. Single-log publishing does not emit
     /// cancellation records on I/O failure.
@@ -427,11 +430,18 @@ pub(crate) struct PayloadEnqueueView<'a> {
     pub payload: &'a [u8],
 }
 
-fn payload_enqueue_fields<'a>(bytes: &'a [u8], i: &mut usize, strict: bool) -> io::Result<PayloadEnqueueView<'a>> {
+fn payload_enqueue_fields<'a>(
+    bytes: &'a [u8],
+    i: &mut usize,
+    strict: bool,
+) -> io::Result<PayloadEnqueueView<'a>> {
     let mut optional = || -> io::Result<Option<u64>> {
         let flag = rd_u8(bytes, i)?;
         if strict && flag > 1 {
-            return Err(io::Error::new(io::ErrorKind::InvalidData, "noncanonical presence flag"));
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidData,
+                "noncanonical presence flag",
+            ));
         }
         (flag != 0).then(|| rd_u64(bytes, i)).transpose()
     };
@@ -439,20 +449,37 @@ fn payload_enqueue_fields<'a>(bytes: &'a [u8], i: &mut usize, strict: bool) -> i
     let expire_at = optional()?;
     let mut field = || -> io::Result<&'a [u8]> {
         let len = rd_u32(bytes, i)? as usize;
-        let end = i.checked_add(len).ok_or_else(|| io::Error::new(io::ErrorKind::InvalidData, "combined enqueue length overflow"))?;
-        let data = bytes.get(*i..end).ok_or_else(|| io::Error::new(io::ErrorKind::UnexpectedEof, "combined enqueue truncated"))?;
+        let end = i.checked_add(len).ok_or_else(|| {
+            io::Error::new(
+                io::ErrorKind::InvalidData,
+                "combined enqueue length overflow",
+            )
+        })?;
+        let data = bytes.get(*i..end).ok_or_else(|| {
+            io::Error::new(io::ErrorKind::UnexpectedEof, "combined enqueue truncated")
+        })?;
         *i = end;
         Ok(data)
     };
-    Ok(PayloadEnqueueView { not_before, expire_at, headers: field()?, payload: field()? })
+    Ok(PayloadEnqueueView {
+        not_before,
+        expire_at,
+        headers: field()?,
+        payload: field()?,
+    })
 }
 
 /// Strict payload-only proof decoder. None identifies another event type, whose
 /// complete semantic validation remains the caller's responsibility.
 pub(crate) fn strict_payload_enqueue(bytes: &[u8]) -> io::Result<Option<PayloadEnqueueView<'_>>> {
-    if bytes.len() < 12 || &bytes[..8] != STROMA_MAGIC
-        || u16::from_be_bytes([bytes[8], bytes[9]]) != STROMA_VER {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid stroma event header"));
+    if bytes.len() < 12
+        || &bytes[..8] != STROMA_MAGIC
+        || u16::from_be_bytes([bytes[8], bytes[9]]) != STROMA_VER
+    {
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "invalid stroma event header",
+        ));
     }
     if u16::from_be_bytes([bytes[10], bytes[11]]) != EventType::PayloadEnqueue as u16 {
         return Ok(None);
@@ -460,7 +487,10 @@ pub(crate) fn strict_payload_enqueue(bytes: &[u8]) -> io::Result<Option<PayloadE
     let mut i = 12;
     let view = payload_enqueue_fields(bytes, &mut i, true)?;
     if i != bytes.len() {
-        return Err(io::Error::new(io::ErrorKind::InvalidData, "trailing payload enqueue fields"));
+        return Err(io::Error::new(
+            io::ErrorKind::InvalidData,
+            "trailing payload enqueue fields",
+        ));
     }
     Ok(Some(view))
 }
@@ -468,8 +498,19 @@ pub(crate) fn strict_payload_enqueue(bytes: &[u8]) -> io::Result<Option<PayloadE
 impl StromaEvent {
     pub(crate) fn into_record_state(self, off: Offset) -> Self {
         match self {
-            Self::PayloadEnqueue { not_before: Some(not_before), .. } => Self::EnqueueDelayed { off, not_before },
-            Self::PayloadEnqueue { not_before: None, expire_at, .. } => Self::Enqueue { off, retries: 0, expire_at },
+            Self::PayloadEnqueue {
+                not_before: Some(not_before),
+                ..
+            } => Self::EnqueueDelayed { off, not_before },
+            Self::PayloadEnqueue {
+                not_before: None,
+                expire_at,
+                ..
+            } => Self::Enqueue {
+                off,
+                retries: 0,
+                expire_at,
+            },
             other => other,
         }
     }
@@ -568,19 +609,32 @@ impl StromaEvent {
         put_u16(&mut out, STROMA_VER);
 
         match self {
-            StromaEvent::PayloadEnqueue { not_before, expire_at, headers, payload } => {
+            StromaEvent::PayloadEnqueue {
+                not_before,
+                expire_at,
+                headers,
+                payload,
+            } => {
                 put_u16(&mut out, EventType::PayloadEnqueue as u16);
                 put_opt_u64(&mut out, *not_before);
                 put_opt_u64(&mut out, *expire_at);
                 for bytes in [headers, payload] {
-                    let len = u32::try_from(bytes.len()).map_err(|_| io::Error::new(io::ErrorKind::InvalidInput, "combined enqueue field too large"))?;
+                    let len = u32::try_from(bytes.len()).map_err(|_| {
+                        io::Error::new(
+                            io::ErrorKind::InvalidInput,
+                            "combined enqueue field too large",
+                        )
+                    })?;
                     put_u32(&mut out, len);
                     out.extend_from_slice(bytes);
                 }
             }
             StromaEvent::ActivateDelayed { now, max } => {
                 if *max == 0 || *max > MAX_DELAYED_ACTIVATION {
-                    return Err(io::Error::new(io::ErrorKind::InvalidInput, "invalid delayed activation limit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidInput,
+                        "invalid delayed activation limit",
+                    ));
                 }
                 put_u16(&mut out, EventType::ActivateDelayed as u16);
                 put_u64(&mut out, *now);
@@ -817,8 +871,10 @@ impl StromaEvent {
             x if x == EventType::PayloadEnqueue as u16 => {
                 let view = payload_enqueue_fields(bytes, &mut i, false)?;
                 Ok(Self::PayloadEnqueue {
-                    not_before: view.not_before, expire_at: view.expire_at,
-                    headers: view.headers.to_vec(), payload: view.payload.to_vec(),
+                    not_before: view.not_before,
+                    expire_at: view.expire_at,
+                    headers: view.headers.to_vec(),
+                    payload: view.payload.to_vec(),
                 })
             }
             x if x == EventType::Enqueue as u16 => {
@@ -850,7 +906,10 @@ impl StromaEvent {
                 let now = rd_u64(bytes, &mut i)?;
                 let max = rd_u32(bytes, &mut i)?;
                 if max == 0 || max > MAX_DELAYED_ACTIVATION {
-                    return Err(io::Error::new(io::ErrorKind::InvalidData, "invalid delayed activation limit"));
+                    return Err(io::Error::new(
+                        io::ErrorKind::InvalidData,
+                        "invalid delayed activation limit",
+                    ));
                 }
                 Ok(StromaEvent::ActivateDelayed { now, max })
             }

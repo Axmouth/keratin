@@ -156,7 +156,12 @@ impl TailCache {
         max: usize,
         max_bytes: usize,
     ) -> Option<Vec<OwnedRecord>> {
-        self.read_bounded(from, max, max_bytes, Some(self.durable_frontier().first_non_durable()))
+        self.read_bounded(
+            from,
+            max,
+            max_bytes,
+            Some(self.durable_frontier().first_non_durable()),
+        )
     }
 
     #[cfg(test)]
@@ -385,17 +390,37 @@ mod tests {
         let (b, n, bytes) = encode_batch(0, 10, 128);
         c.push_batch(b, n, bytes);
         let record_bytes = crate::record::RECORD_HEADER_LEN + 1 + 128;
-        let bounded = c.read_written_with_byte_budget(0, 10, record_bytes * 2).unwrap();
-        assert_eq!(bounded.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let bounded = c
+            .read_written_with_byte_budget(0, 10, record_bytes * 2)
+            .unwrap();
+        assert_eq!(
+            bounded.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         let oversized = c.read_written_with_byte_budget(3, 10, 1).unwrap();
-        assert_eq!(oversized.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![3, 4]);
+        assert_eq!(
+            oversized.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![3, 4]
+        );
         assert_eq!(c.read_written_with_byte_budget(3, 1, 1).unwrap().len(), 1);
-        assert!(c.read_from_with_byte_budget(0, 10, record_bytes * 2).unwrap().is_empty());
+        assert!(
+            c.read_from_with_byte_budget(0, 10, record_bytes * 2)
+                .unwrap()
+                .is_empty()
+        );
         c.durable.advance(DurableFrontier::from_exclusive(10));
-        let durable = c.read_from_with_byte_budget(0, 10, record_bytes * 2).unwrap();
-        assert_eq!(durable.iter().map(|r| r.offset).collect::<Vec<_>>(), vec![0, 1, 2]);
+        let durable = c
+            .read_from_with_byte_budget(0, 10, record_bytes * 2)
+            .unwrap();
+        assert_eq!(
+            durable.iter().map(|r| r.offset).collect::<Vec<_>>(),
+            vec![0, 1, 2]
+        );
         c.clear();
-        assert!(c.read_written_with_byte_budget(0, 10, record_bytes * 2).is_none());
+        assert!(
+            c.read_written_with_byte_budget(0, 10, record_bytes * 2)
+                .is_none()
+        );
     }
 
     #[test]

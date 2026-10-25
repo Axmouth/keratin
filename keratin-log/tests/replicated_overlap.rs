@@ -42,7 +42,9 @@ fn assert_durable_if_present(log: &Keratin, result: &Result<ReplicatedAppendOutc
 }
 
 fn assert_not_durable_error(result: &Result<ReplicatedAppendOutcome, IoError>) {
-    let error = result.as_ref().expect_err("retry over a non-durable range must fail");
+    let error = result
+        .as_ref()
+        .expect_err("retry over a non-durable range must fail");
     assert!(error.to_string().contains("not durable yet"), "{error}");
 }
 
@@ -59,9 +61,13 @@ async fn after_fsync_retry_over_unsynced_range_never_succeeds() {
                 .unwrap();
             assert_eq!(log.durable_next(), 0);
 
-            let exact = log.append_replicated_batch(epoch, 0, messages(0..3), retry).await;
+            let exact = log
+                .append_replicated_batch(epoch, 0, messages(0..3), retry)
+                .await;
             assert_not_durable_error(&exact);
-            let contained = log.append_replicated_batch(epoch, 1, messages(1..2), retry).await;
+            let contained = log
+                .append_replicated_batch(epoch, 1, messages(1..2), retry)
+                .await;
             assert_not_durable_error(&contained);
             let suffix = log
                 .append_replicated_batch_with_mode(
@@ -74,7 +80,9 @@ async fn after_fsync_retry_over_unsynced_range_never_succeeds() {
                 .await;
             assert_not_durable_error(&suffix);
 
-            let partial = log.append_replicated_batch(epoch, 1, messages(1..5), retry).await;
+            let partial = log
+                .append_replicated_batch(epoch, 1, messages(1..5), retry)
+                .await;
             assert!(
                 matches!(partial, Ok(ReplicatedAppendOutcome::Overlap { .. })),
                 "{first:?} cache={cache}: {partial:?}"
@@ -97,8 +105,14 @@ async fn after_fsync_already_present_implies_durable() {
             .await
             .unwrap();
 
-        for (first, batch) in [(0, messages(0..3)), (1, messages(1..2)), (2, messages(2..3))] {
-            let result = log.append_replicated_batch(epoch, first, batch, fsync).await;
+        for (first, batch) in [
+            (0, messages(0..3)),
+            (1, messages(1..2)),
+            (2, messages(2..3)),
+        ] {
+            let result = log
+                .append_replicated_batch(epoch, first, batch, fsync)
+                .await;
             assert!(
                 matches!(result, Ok(ReplicatedAppendOutcome::AlreadyPresent { .. })),
                 "{result:?}"
@@ -117,7 +131,10 @@ async fn after_fsync_already_present_implies_durable() {
         assert!(
             matches!(
                 suffix,
-                Ok(ReplicatedAppendOutcome::AppliedSuffix { skipped_count: 2, .. })
+                Ok(ReplicatedAppendOutcome::AppliedSuffix {
+                    skipped_count: 2,
+                    ..
+                })
             ),
             "{suffix:?}"
         );
@@ -141,7 +158,9 @@ async fn after_flush_retry_accepts_written_overlap_without_advancing_durability(
             .unwrap();
 
         for (first, batch) in [(0, messages(0..3)), (1, messages(1..2))] {
-            let result = log.append_replicated_batch(epoch, first, batch, flush).await;
+            let result = log
+                .append_replicated_batch(epoch, first, batch, flush)
+                .await;
             assert!(
                 matches!(result, Ok(ReplicatedAppendOutcome::AlreadyPresent { .. })),
                 "{result:?}"
@@ -159,7 +178,10 @@ async fn after_flush_retry_accepts_written_overlap_without_advancing_durability(
         assert!(
             matches!(
                 suffix,
-                Ok(ReplicatedAppendOutcome::AppliedSuffix { skipped_count: 2, .. })
+                Ok(ReplicatedAppendOutcome::AppliedSuffix {
+                    skipped_count: 2,
+                    ..
+                })
             ),
             "{suffix:?}"
         );
@@ -217,7 +239,9 @@ async fn after_fsync_retry_while_sync_is_held() {
     gate.release();
     sync.await.unwrap().unwrap();
     assert_eq!(log.durable_next(), 3);
-    let after = log.append_replicated_batch(epoch, 0, messages(0..3), fsync).await;
+    let after = log
+        .append_replicated_batch(epoch, 0, messages(0..3), fsync)
+        .await;
     assert!(
         matches!(after, Ok(ReplicatedAppendOutcome::AlreadyPresent { .. })),
         "{after:?}"

@@ -118,7 +118,11 @@ fn take(file: &File, write: bool) -> io::Result<Option<Fault>> {
     let key = key(file)?;
     let mut faults = FAULTS.lock().unwrap();
     if let Some(entry) = faults.get_mut(&key) {
-        if entry.remaining > 0 && matches!(entry.fault, Fault::Write | Fault::PartialWrite | Fault::WritePause) == write
+        if entry.remaining > 0
+            && matches!(
+                entry.fault,
+                Fault::Write | Fault::PartialWrite | Fault::WritePause
+            ) == write
         {
             entry.hits.fetch_add(1, Ordering::SeqCst);
             entry.remaining -= 1;

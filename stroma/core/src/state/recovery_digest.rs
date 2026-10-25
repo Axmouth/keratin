@@ -53,10 +53,20 @@ impl QueueInternalState {
     /// Compressed ranges count once. Include stale timer entries because they
     /// still occupy memory. Each replay event is separately encoding-bounded.
     pub(crate) fn recovery_retained_entries(&self) -> u64 {
-        [self.settled.len(), self.ready.len(), self.inflight.len(), self.pending_dlq.len(),
-         self.retries.len(), self.ttl_deadlines.len(), self.expiry_heap.len(),
-         self.delayed_enqueue_heap.len(), self.delayed_retry_heap.len()]
-            .into_iter().map(|n| n as u64).sum()
+        [
+            self.settled.len(),
+            self.ready.len(),
+            self.inflight.len(),
+            self.pending_dlq.len(),
+            self.retries.len(),
+            self.ttl_deadlines.len(),
+            self.expiry_heap.len(),
+            self.delayed_enqueue_heap.len(),
+            self.delayed_retry_heap.len(),
+        ]
+        .into_iter()
+        .map(|n| n as u64)
+        .sum()
     }
 
     pub(crate) fn recovery_resource(&self) -> (String, u32) {
@@ -112,11 +122,17 @@ impl QueueInternalState {
 
     pub(crate) fn recovery_live_ranges(&self) -> RangeSet<u64> {
         let mut live = self.ready.clone();
-        for off in self.inflight.keys().chain(self.pending_dlq.keys()).copied()
+        for off in self
+            .inflight
+            .keys()
+            .chain(self.pending_dlq.keys())
+            .copied()
             .chain(self.delayed_enqueue_heap.iter().map(|(_, off)| *off))
             .chain(self.delayed_retry_heap.iter().map(|(_, off)| *off))
         {
-            if !self.is_settled(off) { live.insert(off..off + 1); }
+            if !self.is_settled(off) {
+                live.insert(off..off + 1);
+            }
         }
         live
     }
@@ -439,54 +455,135 @@ mod tests {
 #[tokio::test]
 #[ignore = "large snapshot transfer acceptance probe"]
 async fn large_recovery_state_transfers_in_bounded_chunks() {
-    use crate::{QueueRecoveryStageSpec, RecoveryReadSource, StorageHistoryBinding, Stroma, StromaKeratinConfig, SnapshotConfig, KeratinConfig};
     use crate::recovery_snapshot::SNAPSHOT_CHUNK_BYTES;
+    use crate::{
+        KeratinConfig, QueueRecoveryStageSpec, RecoveryReadSource, SnapshotConfig,
+        StorageHistoryBinding, Stroma, StromaKeratinConfig,
+    };
     let dir = keratin_log::test_dir!("large_recovery_snapshot");
     let count = 100_000u64;
     let mut state = QueueInternalState::new("q".into(), 0);
     // Valid bounded topic names repeated across many pending DLQ entries make
     // the state artifact large without unbounded strings or a million entries.
     for off in 0..count {
-        state.pending_dlq.insert(off, Some(ResolvedDlqTarget {
-            tp: "d".repeat(180), part: 0, group: Some("workers".into()),
-        }));
+        state.pending_dlq.insert(
+            off,
+            Some(ResolvedDlqTarget {
+                tp: "d".repeat(180),
+                part: 0,
+                group: Some("workers".into()),
+            }),
+        );
     }
     let state_digest = state.recovery_state_digest();
     let snapshot = state.into_recovery_snapshot(count);
     assert!(snapshot.len() > 16 * 1024 * 1024);
     let mut digest = blake3::Hasher::new();
-    digest.update(b"fibril-retained-log-v1\0"); digest.update(&0u64.to_be_bytes()); digest.update(&count.to_be_bytes());
-    let mut live = blake3::Hasher::new(); live.update(b"fibril-recovery-live-payloads-v1\0");
-    let record = |offset| crate::RecoveryRecord { offset, flags: 0, headers: vec![], payload: crate::StromaEvent::PayloadEnqueue { not_before: None, expire_at: None, headers: vec![], payload: vec![1] }.encode().unwrap() };
+    digest.update(b"fibril-retained-log-v1\0");
+    digest.update(&0u64.to_be_bytes());
+    digest.update(&count.to_be_bytes());
+    let mut live = blake3::Hasher::new();
+    live.update(b"fibril-recovery-live-payloads-v1\0");
+    let record = |offset| crate::RecoveryRecord {
+        offset,
+        flags: 0,
+        headers: vec![],
+        payload: crate::StromaEvent::PayloadEnqueue {
+            not_before: None,
+            expire_at: None,
+            headers: vec![],
+            payload: vec![1],
+        }
+        .encode()
+        .unwrap(),
+    };
     for off in 0..count {
         let r = record(off);
         crate::recovery_inspection::hash_record(&mut digest, &r);
         crate::recovery_inspection::hash_record(&mut live, &r);
     }
     let spec = QueueRecoveryStageSpec {
-        plan: [7; 32], topic: "q".into(), partition: 0, group: None,
-        binding: StorageHistoryBinding { resource_incarnation: [1; 16], accepted_history: [2; 16], writer_session: [3; 16] },
-        fence_epoch: 8, source_history: [4; 32],
-        log: crate::RetainedLog { head: 0, next: count, digest: *digest.finalize().as_bytes() },
-        snapshot_digest: *blake3::hash(&snapshot).as_bytes(), snapshot_bytes: snapshot.len() as u64,
-        state_digest, live_payload_digest: *live.finalize().as_bytes(),
+        plan: [7; 32],
+        topic: "q".into(),
+        partition: 0,
+        group: None,
+        binding: StorageHistoryBinding {
+            resource_incarnation: [1; 16],
+            accepted_history: [2; 16],
+            writer_session: [3; 16],
+        },
+        fence_epoch: 8,
+        source_history: [4; 32],
+        log: crate::RetainedLog {
+            head: 0,
+            next: count,
+            digest: *digest.finalize().as_bytes(),
+        },
+        snapshot_digest: *blake3::hash(&snapshot).as_bytes(),
+        snapshot_bytes: snapshot.len() as u64,
+        state_digest,
+        live_payload_digest: *live.finalize().as_bytes(),
     };
-    let st = Stroma::open(&dir.root, StromaKeratinConfig::from_message_log(KeratinConfig::test_default()), SnapshotConfig::default()).await.unwrap();
+    let st = Stroma::open(
+        &dir.root,
+        StromaKeratinConfig::from_message_log(KeratinConfig::test_default()),
+        SnapshotConfig::default(),
+    )
+    .await
+    .unwrap();
     for (i, chunk) in snapshot.chunks(SNAPSHOT_CHUNK_BYTES).enumerate() {
-        st.transfer_queue_recovery_snapshot(spec.clone(), Some(((i * SNAPSHOT_CHUNK_BYTES) as u64, chunk.to_vec()))).await.unwrap();
+        st.transfer_queue_recovery_snapshot(
+            spec.clone(),
+            Some(((i * SNAPSHOT_CHUNK_BYTES) as u64, chunk.to_vec())),
+        )
+        .await
+        .unwrap();
     }
-    let stage = st.open_queue_recovery_stage_from_snapshot(spec.clone(), Default::default(), crate::RecoverySealRequest { transition: [5; 32], fence_epoch: 8 }).await.unwrap();
+    let stage = st
+        .open_queue_recovery_stage_from_snapshot(
+            spec.clone(),
+            Default::default(),
+            crate::RecoverySealRequest {
+                transition: [5; 32],
+                fence_epoch: 8,
+            },
+        )
+        .await
+        .unwrap();
     for from in (0..count).step_by(4096) {
         let next = (from + 4096).min(count);
-        stage.append(crate::RecoveryReadPage { history_id: spec.source_history, source: RecoveryReadSource::Log, from, next, end: count, records: (from..next).map(record).collect(), snapshot_bytes: vec![] }).await.unwrap();
+        stage
+            .append(crate::RecoveryReadPage {
+                history_id: spec.source_history,
+                source: RecoveryReadSource::Log,
+                from,
+                next,
+                end: count,
+                records: (from..next).map(record).collect(),
+                snapshot_bytes: vec![],
+            })
+            .await
+            .unwrap();
     }
     stage.finish().await.unwrap();
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
     drop(stage);
-    let stage = st.resume_queue_recovery_stage(spec.clone(), Default::default()).await.unwrap();
+    let stage = st
+        .resume_queue_recovery_stage(spec.clone(), Default::default())
+        .await
+        .unwrap();
     assert_eq!(stage.completed_snapshot().await.unwrap(), snapshot);
-    assert_eq!(stage.completed_snapshot_chunk(16 * 1024 * 1024, SNAPSHOT_CHUNK_BYTES).await.unwrap(), snapshot[16 * 1024 * 1024..17 * 1024 * 1024]);
-    println!("large_snapshot_acceptance bytes={} retained_entries={count} staged_records={count}", snapshot.len());
+    assert_eq!(
+        stage
+            .completed_snapshot_chunk(16 * 1024 * 1024, SNAPSHOT_CHUNK_BYTES)
+            .await
+            .unwrap(),
+        snapshot[16 * 1024 * 1024..17 * 1024 * 1024]
+    );
+    println!(
+        "large_snapshot_acceptance bytes={} retained_entries={count} staged_records={count}",
+        snapshot.len()
+    );
     drop(stage);
     st.shutdown().await.unwrap();
 }
