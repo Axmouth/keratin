@@ -801,6 +801,7 @@ impl Keratin {
 
     fn set_role(&self, role: KeratinRole, kind: crate::LogControlKind) {
         self.log_state.sync.set_owner(role == KeratinRole::Owner);
+        self.tail_cache.set_active(role == KeratinRole::Owner);
         if self.role.swap(role.as_u8(), Ordering::AcqRel) != role.as_u8() {
             self.record_control_event(kind, self.next_offset());
         }

@@ -313,6 +313,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- The tail cache only fills while the log is owner. A follower serves no
+  reads from its own tail, so caching there only held memory, up to the full
+  budget per busy log. Demotion drops the cache, and promotion starts a fresh
+  one. On a three-node cluster at 10k msg/s each follower node's peak memory
+  fell from about 185 MiB to about 110 MiB.
+
 - A segment roll hands the outgoing segment's data sync to the next fsync
   instead of holding the writer for it. Recovery cuts the log at a sealed
   segment a crash left short and removes the segments after it, which can

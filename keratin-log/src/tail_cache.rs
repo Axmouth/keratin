@@ -54,6 +54,9 @@ pub(crate) struct TailCache {
     written_next: WrittenWatermark,
     /// Total cached bytes cap. `0` disables the cache (all reads go to the file).
     byte_budget: usize,
+    /// Off while the log is not the owner. Followers serve no reads from
+    /// their own tail, so caching there only holds memory.
+    active: std::sync::atomic::AtomicBool,
     written: tokio::sync::watch::Sender<()>,
 }
 
@@ -71,6 +74,7 @@ impl TailCache {
             durable,
             written_next,
             byte_budget,
+            active: std::sync::atomic::AtomicBool::new(true),
             written: tokio::sync::watch::channel(()).0,
         }
     }
@@ -94,6 +98,11 @@ impl TailCache {
     /// Append a just-flushed batch. Called once per flush (~fsync rate). Evicts
     /// from the front while over budget, always keeping at least one batch.
     pub(crate) fn push_batch(&self, base_offset: u64, next_offset: u64, bytes: Arc<[u8]>) {
+        if !self.active.load(std::sync::atomic::Ordering::Acquire) {
+            // Readers still wait on new writes, from the file.
+            self.written.send_replace(());
+            return;
+        }
         if self.byte_budget == 0 || bytes.is_empty() || next_offset <= base_offset {
             return;
         }
@@ -121,6 +130,15 @@ impl TailCache {
         }
         drop(inner);
         self.written.send_replace(());
+    }
+
+    /// Start or stop caching. Stopping drops what is cached. The next push
+    /// after a restart begins a new contiguous run.
+    pub(crate) fn set_active(&self, active: bool) {
+        if !self.active.swap(active, std::sync::atomic::Ordering::AcqRel) || active {
+            return;
+        }
+        self.clear();
     }
 
     pub(crate) fn subscribe_written(&self) -> tokio::sync::watch::Receiver<()> {
@@ -306,6 +324,29 @@ mod tests {
             WrittenWatermark::new(durable_excl),
             budget,
         )
+    }
+
+    /// A follower caches nothing, demotion drops what the owner cached, and
+    /// promotion starts a fresh run from the next batch.
+    #[test]
+    fn inactive_cache_holds_nothing_until_reactivated() {
+        let c = cache(1 << 20, 30);
+        let (b, n, bytes) = encode_batch(0, 10, 16);
+        c.push_batch(b, n, bytes);
+        assert_eq!(c.read_from(0, 10).map(|r| r.len()), Some(10));
+
+        c.set_active(false);
+        assert!(c.read_from(0, 10).is_none());
+        let (b, n, bytes) = encode_batch(10, 10, 16);
+        c.push_batch(b, n, bytes);
+        assert!(c.read_from(10, 10).is_none());
+        assert_eq!(c.inner.read().bytes, 0);
+
+        c.set_active(true);
+        let (b, n, bytes) = encode_batch(20, 10, 16);
+        c.push_batch(b, n, bytes);
+        assert_eq!(c.read_from(20, 10).map(|r| r.len()), Some(10));
+        assert!(c.read_from(10, 10).is_none());
     }
 
     #[test]
