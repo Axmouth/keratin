@@ -10,6 +10,11 @@
 //! Zeroing shares one bandwidth cap. A writer that overtakes its zeros stops
 //! zeroing for that segment, because at that rate the extra writes would only
 //! double the disk traffic. Fast logs mostly reuse freed segments instead.
+//!
+//! Stopping is permanent for the segment, so the overtake check must be made
+//! under the lock: the worker can write zeros past a write that was waiting
+//! for it. Getting that wrong shows as zero-ahead silently off, with fewer and
+//! slower fsyncs at low rates and a higher p50.
 
 use std::fs::File;
 use std::os::unix::fs::FileExt;
