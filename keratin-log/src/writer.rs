@@ -306,6 +306,164 @@ struct FsyncDone {
     work_id: u64,
 }
 
+/// How long a log's fsync or notify thread may sit unused before the writer
+/// retires it. An idle log then keeps only its writer thread, and the next
+/// send starts a fresh worker.
+#[cfg(not(test))]
+const WORKER_IDLE: Duration = Duration::from_secs(10);
+/// Short in unit tests, so their writers start and retire workers often.
+#[cfg(test)]
+const WORKER_IDLE: Duration = Duration::from_millis(200);
+
+type FsyncSpawn = Box<dyn Fn(Receiver<FsyncReq>, Sender<FsyncDone>) + Send>;
+
+/// The writer's link to its fsync worker. The worker starts on the first send
+/// and the writer retires it once nothing is in flight and nothing was sent
+/// for `WORKER_IDLE`, by dropping both channels, so no queued job can be
+/// lost. While a worker runs, its completion channel only closes if the
+/// worker died, which the writer treats as before.
+struct FsyncLink {
+    spawn: Option<FsyncSpawn>,
+    capacity: usize,
+    current: std::cell::RefCell<Option<(Sender<FsyncReq>, Receiver<FsyncDone>)>>,
+    last_send: std::cell::Cell<Instant>,
+}
+
+impl FsyncLink {
+    fn on_demand(capacity: usize, spawn: FsyncSpawn) -> Self {
+        Self {
+            spawn: Some(spawn),
+            capacity,
+            current: Default::default(),
+            last_send: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    /// Fixed channels to a worker the caller runs, never retired.
+    #[cfg(test)]
+    fn fixed(tx: Sender<FsyncReq>, rx: Receiver<FsyncDone>) -> Self {
+        Self {
+            spawn: None,
+            capacity: 0,
+            current: std::cell::RefCell::new(Some((tx, rx))),
+            last_send: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    fn send(&self, req: FsyncReq) -> Result<(), crossbeam_channel::SendError<FsyncReq>> {
+        self.last_send.set(Instant::now());
+        let tx = {
+            let mut current = self.current.borrow_mut();
+            if current.is_none()
+                && let Some(spawn) = &self.spawn
+            {
+                let (tx, rx) = crossbeam_channel::bounded::<FsyncReq>(self.capacity);
+                let (done_tx, done_rx) = crossbeam_channel::bounded::<FsyncDone>(self.capacity);
+                spawn(rx, done_tx);
+                *current = Some((tx, done_rx));
+            }
+            match &*current {
+                Some((tx, _)) => tx.clone(),
+                None => return Err(crossbeam_channel::SendError(req)),
+            }
+        };
+        tx.send(req)
+    }
+
+    fn receiver(&self) -> Option<Receiver<FsyncDone>> {
+        self.current.borrow().as_ref().map(|(_, rx)| rx.clone())
+    }
+
+    fn try_recv(&self) -> Result<FsyncDone, TryRecvError> {
+        match self.receiver() {
+            Some(rx) => rx.try_recv(),
+            None => Err(TryRecvError::Empty),
+        }
+    }
+
+    fn recv(&self) -> Result<FsyncDone, crossbeam_channel::RecvError> {
+        match self.receiver() {
+            Some(rx) => rx.recv(),
+            None => Err(crossbeam_channel::RecvError),
+        }
+    }
+
+    fn running(&self) -> bool {
+        self.current.borrow().is_some()
+    }
+
+    fn retire_if_idle(&self, inflight: usize) {
+        if self.spawn.is_some()
+            && inflight == 0
+            && self.last_send.get().elapsed() >= WORKER_IDLE
+        {
+            self.current.borrow_mut().take();
+        }
+    }
+}
+
+type NotifySpawn = Box<dyn Fn(Receiver<NotifyMsg>) + Send>;
+
+/// The writer's link to its notify thread, started on the first send and
+/// retired after `WORKER_IDLE` without one. Notifications already queued are
+/// still delivered: the thread drains its channel before it exits.
+struct NotifyLink {
+    spawn: Option<NotifySpawn>,
+    capacity: usize,
+    current: std::cell::RefCell<Option<Sender<NotifyMsg>>>,
+    last_send: std::cell::Cell<Instant>,
+}
+
+impl NotifyLink {
+    fn on_demand(capacity: usize, spawn: NotifySpawn) -> Self {
+        Self {
+            spawn: Some(spawn),
+            capacity,
+            current: Default::default(),
+            last_send: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    #[cfg(test)]
+    fn fixed(tx: Sender<NotifyMsg>) -> Self {
+        Self {
+            spawn: None,
+            capacity: 0,
+            current: std::cell::RefCell::new(Some(tx)),
+            last_send: std::cell::Cell::new(Instant::now()),
+        }
+    }
+
+    fn send(&self, msg: NotifyMsg) -> Result<(), crossbeam_channel::SendError<NotifyMsg>> {
+        self.last_send.set(Instant::now());
+        let tx = {
+            let mut current = self.current.borrow_mut();
+            if current.is_none()
+                && let Some(spawn) = &self.spawn
+            {
+                let (tx, rx) = crossbeam_channel::bounded::<NotifyMsg>(self.capacity);
+                spawn(rx);
+                *current = Some(tx);
+            }
+            match &*current {
+                Some(tx) => tx.clone(),
+                None => return Err(crossbeam_channel::SendError(msg)),
+            }
+        };
+        tx.send(msg)
+    }
+
+    fn running(&self) -> bool {
+        self.current.borrow().is_some()
+    }
+
+    fn retire_if_idle(&self) {
+        if self.spawn.is_some() && self.last_send.get().elapsed() >= WORKER_IDLE {
+            self.current.borrow_mut().take();
+        }
+    }
+}
+
 enum WriterEvent {
     Command(WriterCmd),
     FsyncDone(FsyncDone),
@@ -331,7 +489,6 @@ pub fn spawn_writer(
     state: Arc<LogState>,
     channel_capacity: usize,
 ) -> WriterHandle {
-    let (notify_tx, notify_rx) = crossbeam_channel::bounded::<NotifyMsg>(channel_capacity);
 
     #[cfg(feature = "writer-stage-trace")]
     let tracer = WriterStageTracer::from_env(log.trace_path(), log.current_epoch());
@@ -341,31 +498,41 @@ pub fn spawn_writer(
     let fsync_tracer = tracer.clone();
 
     // Named so profiles and per-thread counters can tell a log's threads
-    // from the runtime's. Linux keeps the first 15 bytes.
-    spawn_named("keratin-notify", move || {
-        notifier_loop(
-            notify_rx,
+    // from the runtime's. Linux keeps the first 15 bytes. The notify and fsync
+    // threads start when the writer first needs them and stop after
+    // `WORKER_IDLE` unused, so an idle log keeps only its writer thread.
+    let notify_tx = NotifyLink::on_demand(
+        channel_capacity,
+        Box::new(move |notify_rx| {
             #[cfg(feature = "writer-stage-trace")]
-            notifier_tracer,
-        );
-        tracing::info!("Notifier loop exited");
-    });
+            let notifier_tracer = notifier_tracer.clone();
+            spawn_named("keratin-notify", move || {
+                notifier_loop(
+                    notify_rx,
+                    #[cfg(feature = "writer-stage-trace")]
+                    notifier_tracer,
+                );
+            });
+        }),
+    );
 
     // Sized to the in-flight fsync budget so the channel capacity does not cap the
     // configured pipeline depth below `max_inflight_fsyncs`.
-    let fsync_channel_cap = cfg.max_inflight_fsyncs.max(1);
-    let (fsync_tx, fsync_rx) = crossbeam_channel::bounded::<FsyncReq>(fsync_channel_cap);
-    let (fsync_done_tx, fsync_done_rx) = crossbeam_channel::bounded::<FsyncDone>(fsync_channel_cap);
-
-    spawn_named("keratin-fsync", move || {
-        fsync_loop(
-            fsync_rx,
-            fsync_done_tx,
+    let fsync_tx = FsyncLink::on_demand(
+        cfg.max_inflight_fsyncs.max(1),
+        Box::new(move |fsync_rx, fsync_done_tx| {
             #[cfg(feature = "writer-stage-trace")]
-            fsync_tracer,
-        );
-        tracing::info!("Fsync loop exited");
-    });
+            let fsync_tracer = fsync_tracer.clone();
+            spawn_named("keratin-fsync", move || {
+                fsync_loop(
+                    fsync_rx,
+                    fsync_done_tx,
+                    #[cfg(feature = "writer-stage-trace")]
+                    fsync_tracer,
+                );
+            });
+        }),
+    );
 
     let (tx, rx) = crossbeam_channel::bounded::<WriterCmd>(channel_capacity);
 
@@ -381,7 +548,6 @@ pub fn spawn_writer(
             state,
             notify_tx,
             fsync_tx,
-            fsync_done_rx,
             #[cfg(feature = "writer-stage-trace")]
             tracer,
         );
@@ -567,11 +733,12 @@ fn writer_loop(
     mut cfg: KeratinConfig,
     writes_rx: &Receiver<WriterCmd>,
     state: Arc<LogState>,
-    notify_tx: Sender<NotifyMsg>,
-    fsync_tx: Sender<FsyncReq>,
-    fsync_done_rx: Receiver<FsyncDone>,
+    notify_tx: NotifyLink,
+    fsync_tx: FsyncLink,
     #[cfg(feature = "writer-stage-trace")] tracer: WriterStageTracer,
 ) -> Refusal {
+    // Jobs go out and completions come back through the same link.
+    let fsync_done_rx = &fsync_tx;
     crate::drain_diagnostics::init();
     let mut fsync_interval = Duration::from_millis(cfg.fsync_interval_ms.max(1));
     let mut min_fsync_interval = Duration::from_millis(cfg.min_fsync_interval_ms);
@@ -604,6 +771,8 @@ fn writer_loop(
 
     let mut settings_revision = 0u64;
     loop {
+        fsync_tx.retire_if_idle(inflight_fsyncs);
+        notify_tx.retire_if_idle();
         drain_fsync_done(
             log,
             &state,
@@ -741,8 +910,13 @@ fn writer_loop(
             Deadline::None => {}
         }
 
+        // Wake in time to retire a worker that has gone idle.
+        if fsync_tx.running() || notify_tx.running() {
+            wait = wait.min(WORKER_IDLE);
+        }
+
         // (D) Fetch next event (bounded).
-        let event = recv_writer_event(writes_rx, &fsync_done_rx, wait);
+        let event = recv_writer_event(writes_rx, fsync_done_rx, wait);
 
         let cmd = match event {
             WriterEvent::Command(cmd) => cmd,
@@ -1631,7 +1805,7 @@ fn stage_reqs(
     state: &Arc<LogState>,
     pending: &mut PendingAcks,
     reqs: Vec<AppendReq>,
-    notify_tx: &Sender<NotifyMsg>,
+    notify_tx: &NotifyLink,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
     #[cfg(feature = "writer-stage-trace")] work_id: u64,
 ) -> usize {
@@ -1783,9 +1957,9 @@ fn maybe_commit_due(
     min_fsync_interval: Duration,
     max_inflight_fsyncs: usize,
     pipeline_commit_records: u64,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -1867,9 +2041,9 @@ fn post_stage_commit_and_tune(
     last_fsync: &mut Instant,
     fsync_interval: Duration,
     total_bytes: usize,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     linger: &mut Duration,
     linger_min: Duration,
@@ -1931,12 +2105,12 @@ fn shutdown_fail_unstaged(
     batcher: &mut BatcherCore<AppendReq, impl FnMut(&AppendReq) -> (usize, usize)>,
     msg: &str,
     _why: FlushReason,
-    notify_tx: &Sender<NotifyMsg>,
+    notify_tx: &NotifyLink,
 ) {
     shutdown_fail_reqs(batcher.flush(), msg, notify_tx);
 }
 
-fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &Sender<NotifyMsg>) {
+fn shutdown_fail_reqs(reqs: Vec<AppendReq>, msg: &str, notify_tx: &NotifyLink) {
     let mut items = Vec::new();
     for r in reqs {
         items.push(NotifyItem {
@@ -2047,8 +2221,8 @@ fn serve_after_storage_failure(
     unstaged: Vec<AppendReq>,
     pending: &mut PendingAcks,
     writes_rx: &Receiver<WriterCmd>,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) -> Refusal {
@@ -2152,16 +2326,18 @@ thread_local! {
 
 fn recv_writer_event(
     writes_rx: &Receiver<WriterCmd>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    fsync: &FsyncLink,
     wait: Duration,
 ) -> WriterEvent {
+    // With no fsync worker running there is nothing to complete.
+    let done_rx = fsync.receiver().unwrap_or_else(crossbeam_channel::never);
     if wait == Duration::MAX {
         crossbeam_channel::select! {
             recv(writes_rx) -> msg => match msg {
                 Ok(cmd) => WriterEvent::Command(cmd),
                 Err(_) => WriterEvent::WritesDisconnected,
             },
-            recv(fsync_done_rx) -> msg => match msg {
+            recv(done_rx) -> msg => match msg {
                 Ok(done) => WriterEvent::FsyncDone(done),
                 Err(_) => WriterEvent::FsyncDisconnected,
             },
@@ -2172,7 +2348,7 @@ fn recv_writer_event(
                 Ok(cmd) => WriterEvent::Command(cmd),
                 Err(_) => WriterEvent::WritesDisconnected,
             },
-            recv(fsync_done_rx) -> msg => match msg {
+            recv(done_rx) -> msg => match msg {
                 Ok(done) => WriterEvent::FsyncDone(done),
                 Err(_) => WriterEvent::FsyncDisconnected,
             },
@@ -2184,8 +2360,8 @@ fn recv_writer_event(
 fn drain_fsync_done(
     log: &mut Log,
     state: &Arc<LogState>,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -2213,9 +2389,9 @@ fn settings_sync_boundary(
     log: &mut Log,
     state: &Arc<LogState>,
     pending: &mut PendingAcks,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) -> io::Result<()> {
@@ -2272,8 +2448,8 @@ fn settings_sync_boundary(
 fn wait_for_inflight_fsyncs(
     log: &mut Log,
     state: &Arc<LogState>,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -2307,8 +2483,8 @@ fn wait_for_inflight_fsyncs(
 fn ensure_fsync_slot(
     log: &mut Log,
     state: &Arc<LogState>,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     max_inflight: usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
@@ -2338,7 +2514,7 @@ fn ensure_fsync_slot(
 fn handle_fsync_done(
     log: &mut Log,
     state: &Arc<LogState>,
-    notify_tx: &Sender<NotifyMsg>,
+    notify_tx: &NotifyLink,
     done: FsyncDone,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
@@ -2416,7 +2592,7 @@ fn answer_sync_acks(
     }
 }
 
-fn send_notify_items(notify_tx: &Sender<NotifyMsg>, mut items: Vec<NotifyItem>) {
+fn send_notify_items(notify_tx: &NotifyLink, mut items: Vec<NotifyItem>) {
     if items.is_empty() {
         return;
     }
@@ -2487,8 +2663,8 @@ fn maybe_start_background_sync(
     last_fsync: &mut Instant,
     interval: Duration,
     expect_every_write_synced: bool,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
 ) {
@@ -2565,9 +2741,9 @@ fn commit(
     state: &Arc<LogState>,
     pending: &mut PendingAcks,
     last_fsync: &mut Instant,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     max_inflight: usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
@@ -2600,9 +2776,9 @@ fn commit_all(
     state: &Arc<LogState>,
     pending: &mut PendingAcks,
     last_fsync: &mut Instant,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     max_inflight: usize,
     #[cfg(feature = "writer-stage-trace")] tracer: &WriterStageTracer,
@@ -2632,9 +2808,9 @@ fn commit_inner(
     state: &Arc<LogState>,
     pending: &mut PendingAcks,
     last_fsync: &mut Instant,
-    notify_tx: &Sender<NotifyMsg>,
-    fsync_tx: &Sender<FsyncReq>,
-    fsync_done_rx: &Receiver<FsyncDone>,
+    notify_tx: &NotifyLink,
+    fsync_tx: &FsyncLink,
+    fsync_done_rx: &FsyncLink,
     inflight_fsyncs: &mut usize,
     max_inflight: usize,
     all: bool,
@@ -2747,7 +2923,7 @@ fn take_covered_acks(pending: &mut PendingAcks, durable_end: u64) -> Vec<NotifyI
 fn fail_all_pending(
     pending: &mut PendingAcks,
     err_msg: impl AsRef<str>,
-    notify_tx: &Sender<NotifyMsg>,
+    notify_tx: &NotifyLink,
     error: bool,
 ) {
     if error {
@@ -2838,6 +3014,67 @@ mod drain_batch_tests {
             true,
             8
         ));
+    }
+}
+
+#[cfg(test)]
+mod worker_link_tests {
+    use super::*;
+    use std::sync::atomic::AtomicUsize;
+
+    /// A worker starts on the first send, retires once idle with nothing in
+    /// flight, and a later send starts a fresh one.
+    #[test]
+    fn notify_worker_starts_on_demand_and_retires_when_idle() {
+        let spawned = Arc::new(AtomicUsize::new(0));
+        let delivered = Arc::new(AtomicUsize::new(0));
+        let link = {
+            let spawned = spawned.clone();
+            let delivered = delivered.clone();
+            NotifyLink::on_demand(
+                4,
+                Box::new(move |rx: Receiver<NotifyMsg>| {
+                    spawned.fetch_add(1, Ordering::SeqCst);
+                    let delivered = delivered.clone();
+                    std::thread::spawn(move || {
+                        while rx.recv().is_ok() {
+                            delivered.fetch_add(1, Ordering::SeqCst);
+                        }
+                    });
+                }),
+            )
+        };
+        assert!(!link.running());
+        link.send(NotifyMsg::Batch(Vec::new())).unwrap();
+        assert!(link.running());
+        assert_eq!(spawned.load(Ordering::SeqCst), 1);
+        link.retire_if_idle();
+        assert!(link.running(), "retired before the idle period");
+        std::thread::sleep(WORKER_IDLE + Duration::from_millis(50));
+        link.retire_if_idle();
+        assert!(!link.running());
+        link.send(NotifyMsg::Batch(Vec::new())).unwrap();
+        assert_eq!(spawned.load(Ordering::SeqCst), 2);
+        let deadline = Instant::now() + Duration::from_secs(2);
+        while delivered.load(Ordering::SeqCst) < 2 {
+            assert!(Instant::now() < deadline, "a notification was lost across the restart");
+            std::thread::sleep(Duration::from_millis(5));
+        }
+    }
+
+    /// The fsync worker is never retired with a job in flight.
+    #[test]
+    fn fsync_worker_stays_while_a_job_is_in_flight() {
+        let link = FsyncLink::on_demand(1, Box::new(|_rx, _done| {}));
+        let (tx, rx) = crossbeam_channel::bounded::<FsyncReq>(1);
+        let (_done_tx, done_rx) = crossbeam_channel::bounded::<FsyncDone>(1);
+        drop((tx, rx));
+        *link.current.borrow_mut() = Some((crossbeam_channel::bounded(1).0, done_rx));
+        link.last_send.set(Instant::now() - WORKER_IDLE * 2);
+        link.retire_if_idle(1);
+        assert!(link.running());
+        link.retire_if_idle(0);
+        assert!(!link.running());
     }
 }
 
@@ -2954,9 +3191,8 @@ mod held_pipeline_test {
                 cfg,
                 &input,
                 writer_state,
-                notifications,
-                jobs,
-                completed,
+                NotifyLink::fixed(notifications),
+                FsyncLink::fixed(jobs, completed),
             );
             super::RECEIVE_TIMEOUTS.with(|count| count.get())
         });
@@ -3060,9 +3296,8 @@ mod held_pipeline_test {
                 cfg,
                 &input,
                 writer_state,
-                notifications,
-                jobs,
-                completed,
+                NotifyLink::fixed(notifications),
+                FsyncLink::fixed(jobs, completed),
             );
         });
         let append = |id, durability| {
