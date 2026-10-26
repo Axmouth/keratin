@@ -70,11 +70,14 @@ impl ZeroAhead {
             write()?;
         } else {
             let _guard = self.lock.lock().unwrap_or_else(|e| e.into_inner());
+            // The worker may have zeroed past this write while it waited for
+            // the lock. Only a write still past the zeros overtakes them.
+            let overtook = need > self.zeroed_end.load(Ordering::Acquire);
             write()?;
             self.zeroed_end.fetch_max(need, Ordering::AcqRel);
             // Zeroing cannot keep up at this rate. Stop rather than double
             // the writes.
-            if self.filled.load(Ordering::Acquire) {
+            if overtook && self.filled.load(Ordering::Acquire) {
                 self.stopped.store(true, Ordering::Release);
             }
         }

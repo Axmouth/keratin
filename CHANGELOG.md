@@ -402,6 +402,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A writer racing the zeroing worker for its lock could take the worker's
+  first zeros as proof it had overtaken them and stop zeroing that segment for
+  good. It now checks under the lock. Starting zero-ahead during traffic made
+  the race common and took 1k msg/s p50 from about 2.7 to 6.3 ms.
+
 - An epoch advance, a frozen fork and a retained head advance sync every
   written record before they proceed, also when no append waits for an
   fsync. Records written by `AfterFlush` appends were left unsynced, so a
