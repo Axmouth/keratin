@@ -69,24 +69,32 @@ fn allocated_bytes(path: &std::path::Path) -> u64 {
     std::fs::metadata(path).unwrap().blocks() * 512
 }
 
-/// A log that never gets a record reserves and zeroes nothing. Its first
-/// record reserves one chunk ahead, rounded to a MiB, or the zeroing window
-/// of at least 4 MiB when that is larger.
+/// A log with only a few small records reserves and zeroes nothing. Once it
+/// holds 64 KiB it reserves one chunk ahead, rounded to a MiB, and zeros stay
+/// within the zeroing window of at least 4 MiB.
 #[tokio::test]
-async fn an_idle_log_reserves_nothing_until_its_first_record() {
+async fn an_idle_log_reserves_nothing_until_it_holds_records() {
     let dir = test_dir!("zero_ahead_idle");
     let log = Keratin::open(&dir.root, config()).await.unwrap();
     let segment = util::latest_segment(&dir.root).unwrap();
     tokio::time::sleep(Duration::from_millis(200)).await;
     assert!(allocated_bytes(&segment) < 64 * 1024, "idle segment reserved space");
 
+    // A few small records, like a queue declaration, still reserve nothing.
     log.append_batch(vec![message(0)], Some(KDurability::AfterFsync)).await.unwrap();
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let small = allocated_bytes(&segment);
+    assert!(small < 64 * 1024, "a small record reserved {small}");
+
+    for i in 1..400 {
+        log.append_batch(vec![message(i)], Some(KDurability::AfterFsync)).await.unwrap();
+    }
     let allocated = allocated_bytes(&segment);
     let chunk = config().segment_preallocate_bytes as u64;
-    assert!(allocated >= chunk, "first record reserved {allocated}");
+    assert!(allocated >= chunk, "reserved {allocated}");
     let window = chunk.max(4 << 20);
     tokio::time::sleep(Duration::from_millis(500)).await;
     let allocated = allocated_bytes(&segment);
-    assert!(allocated <= window + (1 << 20), "first record reserved {allocated}");
+    assert!(allocated <= window + (1 << 20), "reserved {allocated}");
     log.shutdown().await.unwrap();
 }

@@ -5,6 +5,10 @@ pub const LOG_MAGIC: &[u8; 8] = b"KLOG\0\0\0\0";
 pub const LOG_VERSION: u16 = 1;
 pub const LOG_HEADER_LEN: u32 = 8 + 2 + 2 + 4 + 8 + 8 + 32 + 4;
 
+/// Bytes a fresh segment holds before it reserves and zeroes ahead. Small
+/// enough that a busy log crosses it within its first second.
+const PREALLOC_START_BYTES: u64 = 64 * 1024;
+
 fn encode_header(base_offset: u64, created_ts_ms: u64) -> Vec<u8> {
     let mut hdr = Vec::with_capacity(LOG_HEADER_LEN as usize);
     hdr.extend_from_slice(LOG_MAGIC);
@@ -53,8 +57,9 @@ pub struct Segment {
     /// the active segment. Turned off automatically if the filesystem rejects
     /// `fallocate`.
     prealloc_chunk: u64,
-    /// Preallocation is on but waits for the first append. A segment that never
-    /// gets a record, such as an idle queue's, reserves and zeroes nothing.
+    /// Preallocation is on but waits until the segment holds
+    /// `PREALLOC_START_BYTES`. A segment with only a few small records, such as
+    /// an idle queue's declaration, reserves and zeroes nothing.
     prealloc_pending: bool,
     allocation_error: Option<String>,
     runtime_status: Option<std::sync::Arc<parking_lot::RwLock<crate::LogRuntimeStatus>>>,
@@ -189,11 +194,13 @@ impl Segment {
         // Preallocate ahead of the cursor so the write lands in already-allocated
         // blocks. fdatasync of an in-place write skips the block-allocation
         // metadata flush that an extending write pays.
-        if self.prealloc_pending {
+        if self.prealloc_pending
+            && self.bytes_written + data.len() as u64 >= PREALLOC_START_BYTES
+        {
             self.prealloc_pending = false;
             self.start_prealloc();
         }
-        if self.prealloc_chunk > 0 {
+        if self.prealloc_chunk > 0 && !self.prealloc_pending {
             let need = self.bytes_written + data.len() as u64;
             if need > self.alloc_end {
                 self.grow_alloc(need + self.prealloc_chunk);
@@ -227,7 +234,7 @@ impl Segment {
             return;
         }
         self.prealloc_chunk = chunk;
-        if !self.recycled && self.bytes_written <= LOG_HEADER_LEN as u64 {
+        if !self.recycled && self.bytes_written < PREALLOC_START_BYTES {
             self.prealloc_pending = true;
             return;
         }
@@ -405,9 +412,9 @@ mod runtime_tests {
                 segment.attach_runtime_status(status.clone(), snapshot);
             }
             segment.enable_prealloc(4096);
-            // A fresh segment reserves at its first append. The write itself
-            // fails on the read-only descriptor after the reservation does.
-            assert!(segment.append_bytes(b"record").is_err());
+            // A fresh segment reserves once it holds PREALLOC_START_BYTES. The
+            // write itself fails on the read-only descriptor after that.
+            assert!(segment.append_bytes(&vec![0; PREALLOC_START_BYTES as usize]).is_err());
             if !attach_first {
                 segment.attach_runtime_status(status.clone(), snapshot);
             }

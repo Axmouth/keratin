@@ -313,8 +313,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
-- A fresh segment reserves and zeroes ahead only from its first record, so an
-  idle log takes no extra disk and causes no zero writes. Reservations round
+- A fresh segment reserves and zeroes ahead only once it holds 64 KiB, so a
+  log with only a few small records, such as an idle queue's declaration,
+  takes no extra disk and causes no zero writes. Zeros stop at the window
+  instead of running up to a whole zeroing step past it. Reservations round
   to whole MiB rather than to whole chunks, so a new segment reserves about
   one chunk instead of up to two.
 

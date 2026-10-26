@@ -114,16 +114,18 @@ impl ZeroAhead {
                     break;
                 }
                 let zeroed = self.zeroed_end.load(Ordering::Acquire);
-                let written = self.written.load(Ordering::Acquire);
-                if zeroed >= written + self.window {
+                let target = self.written.load(Ordering::Acquire) + self.window;
+                if zeroed >= target {
                     break;
                 }
-                if let Err(error) = self.file.write_all_at(&ZEROS, zeroed) {
+                // Never past the window, so zeros stay within the reservation.
+                let len = (target - zeroed).min(CHUNK);
+                if let Err(error) = self.file.write_all_at(&ZEROS[..len as usize], zeroed) {
                     tracing::warn!(%error, "zeroing ahead of the writer failed, segment grows by plain writes");
                     self.stopped.store(true, Ordering::Release);
                     break;
                 }
-                self.zeroed_end.store(zeroed + CHUNK, Ordering::Release);
+                self.zeroed_end.store(zeroed + len, Ordering::Release);
                 self.filled.store(true, Ordering::Release);
             }
             if let Err(error) = crate::util::sync_file_data(&self.file) {
