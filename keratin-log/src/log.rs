@@ -139,6 +139,12 @@ impl FsyncJob {
         self.durable_end
     }
 
+    /// Only the syncs a roll left for this job. A merged group runs these for
+    /// every member before the newest member's full sync.
+    pub(crate) fn sync_deferred(&self) -> io::Result<()> {
+        self.pending.sync()
+    }
+
     pub(crate) fn sync(&self) -> io::Result<Duration> {
         self.sync_inner(
             #[cfg(feature = "writer-stage-trace")]

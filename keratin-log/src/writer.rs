@@ -457,14 +457,14 @@ fn fsync_loop_with(
     // Reused across wakeups so the coalescing buffer is not reallocated per fsync.
     let mut reqs: Vec<FsyncReq> = Vec::new();
     while let Ok(first) = rx.recv() {
-        // Drain every queued request and make them all
-        // durable by syncing the newest job's log and index fds. Within a segment this
-        // is safe because fdatasync flushes everything written so far. Across a
-        // segment roll it is safe because `roll` fsyncs the outgoing segment
-        // synchronously before swapping the active segment, so any queued job on a
-        // prior segment is already durable by the time it is drained here. Turns the
-        // fsync-count-bound small-batch regime into fat-batch throughput without
-        // waiting for a bigger linger.
+        // Drain every queued request and make them all durable with one pass:
+        // the deferred syncs each job carries from a roll (the outgoing segment,
+        // its index, the new directory entry), then the newest job's log and
+        // index. Within a segment the newest sync covers everything written
+        // before it. Across a roll, the job that carries the outgoing segment
+        // may not be the newest, so every job's deferred syncs run. Turns the
+        // fsync-count-bound small-batch regime into fat-batch throughput
+        // without waiting for a bigger linger.
         reqs.push(first);
         while let Ok(more) = rx.try_recv() {
             reqs.push(more);
@@ -497,7 +497,11 @@ fn fsync_loop_with(
             Some((0, reqs.last().unwrap().job.durable_end())),
         );
         let result = trace_writer_stage!(tracer, group_id, "fsync", (reqs.len(), 0), {
-            sync(&reqs.last().expect("at least one request").job, group_id)
+            let (newest, earlier) = reqs.split_last().expect("at least one request");
+            earlier
+                .iter()
+                .try_for_each(|req| req.job.sync_deferred())
+                .and_then(|()| sync(&newest.job, group_id))
         });
         #[cfg(feature = "writer-stage-trace")]
         tracer.event(
@@ -2834,6 +2838,76 @@ mod drain_batch_tests {
             true,
             8
         ));
+    }
+}
+
+#[cfg(all(test, feature = "io-fault-injection", not(feature = "writer-stage-trace")))]
+mod merged_fsync_test {
+    use super::*;
+    use crate::DurableFrontier;
+
+    /// A roll hands the outgoing segment's sync to the next fsync job. When
+    /// that job is merged with a later one, its deferred syncs must still run:
+    /// a failing sync of the old segment has to fail the whole group.
+    #[test]
+    fn merged_fsync_group_runs_every_jobs_deferred_syncs() {
+        let dir = crate::test_dir!("merged_fsync_deferred");
+        let cfg = KeratinConfig {
+            segment_max_bytes: 64 * 1024,
+            tail_cache_bytes: 0,
+            ..KeratinConfig::test_default()
+        };
+        let state = Arc::new(LogState::new(0, 0, DurableFrontier::from_exclusive(0)));
+        let (mut log, _) = Log::open(
+            &dir.root,
+            crate::util::unix_millis(),
+            cfg.segment_max_bytes,
+            cfg.index_stride_bytes,
+            cfg.flush_target_bytes,
+            0,
+            0,
+            false,
+            false,
+            state,
+            None,
+        )
+        .unwrap();
+        let message = Message {
+            flags: 0,
+            headers: vec![],
+            payload: vec![7; 1024],
+        };
+        let mut ts = 1;
+        while log.active.base_offset == 0 {
+            log.stage_append(&message, ts).unwrap();
+            ts += 1;
+        }
+        let old_segment = dir.root.join("segments/00000000000000000000.log");
+        // The first job after the roll carries the old segment's sync.
+        let first = log.prepare_fsync_job().unwrap();
+        log.stage_append(&message, ts).unwrap();
+        let second = log.prepare_fsync_job().unwrap();
+        let _armed = crate::io_fault_injection::arm(&old_segment, crate::io_fault_injection::Fault::Fsync).unwrap();
+
+        let (jobs, requests) = crossbeam_channel::unbounded::<FsyncReq>();
+        let (done, completed) = crossbeam_channel::unbounded();
+        for job in [first, second] {
+            jobs.send(FsyncReq {
+                job,
+                ready: Vec::new(),
+                sync_acks: Vec::new(),
+                background: false,
+            })
+            .unwrap();
+        }
+        drop(jobs);
+        fsync_loop_with(requests, done, |job, _| job.sync());
+        let results: Vec<FsyncDone> = completed.try_iter().collect();
+        assert_eq!(results.len(), 2);
+        assert!(
+            results.iter().all(|r| r.error.is_some()),
+            "a merged group reported success without syncing the old segment"
+        );
     }
 }
 

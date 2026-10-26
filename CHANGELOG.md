@@ -402,6 +402,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A merged group of fsync jobs synced only the newest job's files. The syncs
+  a roll leaves for the next job (the outgoing segment, its index and the new
+  segment's directory entry) were skipped when that job was not the newest,
+  yet every job in the group was reported durable. Under a power loss the
+  tail of the outgoing segment or the new segment's directory entry could be
+  lost after acknowledgement. Every member's deferred syncs now run before the
+  newest member's sync.
+
 - A writer racing the zeroing worker for its lock could take the worker's
   first zeros as proof it had overtaken them and stop zeroing that segment for
   good. It now checks under the lock. Starting zero-ahead during traffic made
