@@ -313,6 +313,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- A log's fsync and notify threads start when the writer first needs them
+  and stop after 10 seconds unused, so an idle log keeps only its writer
+  thread. With 200 idle queues on a three-node cluster, threads per node fell
+  from 644 to 240, with idle CPU, memory and latency unchanged.
+
 - A fresh segment reserves and zeroes ahead only once it holds 64 KiB, so a
   log with only a few small records, such as an idle queue's declaration,
   takes no extra disk and causes no zero writes. Zeros stop at the window
