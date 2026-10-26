@@ -53,6 +53,9 @@ pub struct Segment {
     /// the active segment. Turned off automatically if the filesystem rejects
     /// `fallocate`.
     prealloc_chunk: u64,
+    /// Preallocation is on but waits for the first append. A segment that never
+    /// gets a record, such as an idle queue's, reserves and zeroes nothing.
+    prealloc_pending: bool,
     allocation_error: Option<String>,
     runtime_status: Option<std::sync::Arc<parking_lot::RwLock<crate::LogRuntimeStatus>>>,
     /// Written zeros ahead of the cursor while preallocation is on. See
@@ -91,6 +94,7 @@ impl Segment {
             bytes_written: LOG_HEADER_LEN as u64,
             alloc_end: LOG_HEADER_LEN as u64,
             prealloc_chunk: 0,
+            prealloc_pending: false,
             allocation_error: None,
             runtime_status: None,
             zero: None,
@@ -118,6 +122,7 @@ impl Segment {
             bytes_written: LOG_HEADER_LEN as u64,
             alloc_end: len,
             prealloc_chunk: 0,
+            prealloc_pending: false,
             allocation_error: None,
             runtime_status: None,
             zero: None,
@@ -157,6 +162,7 @@ impl Segment {
             bytes_written: len,
             alloc_end: len,
             prealloc_chunk: 0,
+            prealloc_pending: false,
             allocation_error: None,
             runtime_status: None,
             zero: None,
@@ -183,10 +189,14 @@ impl Segment {
         // Preallocate ahead of the cursor so the write lands in already-allocated
         // blocks. fdatasync of an in-place write skips the block-allocation
         // metadata flush that an extending write pays.
+        if self.prealloc_pending {
+            self.prealloc_pending = false;
+            self.start_prealloc();
+        }
         if self.prealloc_chunk > 0 {
             let need = self.bytes_written + data.len() as u64;
             if need > self.alloc_end {
-                self.grow_alloc(need);
+                self.grow_alloc(need + self.prealloc_chunk);
             }
         }
         // Write at the logical cursor, not SeekFrom::End: with preallocation the
@@ -217,6 +227,18 @@ impl Segment {
             return;
         }
         self.prealloc_chunk = chunk;
+        if !self.recycled && self.bytes_written <= LOG_HEADER_LEN as u64 {
+            self.prealloc_pending = true;
+            return;
+        }
+        self.start_prealloc();
+    }
+
+    fn start_prealloc(&mut self) {
+        let chunk = self.prealloc_chunk;
+        if chunk == 0 {
+            return;
+        }
         let need = self.bytes_written + chunk;
         if need > self.alloc_end {
             self.grow_alloc(need);
@@ -257,8 +279,10 @@ impl Segment {
     /// preallocation is turned off and writes fall back to plain extend.
     fn grow_alloc(&mut self, need: u64) {
         use fs2::FileExt;
-        let chunk = self.prealloc_chunk.max(1);
-        let target = need.div_ceil(chunk).saturating_mul(chunk).max(need);
+        // Whole MiB keeps allocations aligned without reserving most of a
+        // second chunk past what was asked for.
+        const ALIGN: u64 = 1 << 20;
+        let target = need.div_ceil(ALIGN).saturating_mul(ALIGN).max(need);
         match self.file.allocate(target) {
             Ok(()) => self.alloc_end = target,
             Err(error) => {
@@ -381,6 +405,9 @@ mod runtime_tests {
                 segment.attach_runtime_status(status.clone(), snapshot);
             }
             segment.enable_prealloc(4096);
+            // A fresh segment reserves at its first append. The write itself
+            // fails on the read-only descriptor after the reservation does.
+            assert!(segment.append_bytes(b"record").is_err());
             if !attach_first {
                 segment.attach_runtime_status(status.clone(), snapshot);
             }

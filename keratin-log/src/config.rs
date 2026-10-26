@@ -69,14 +69,13 @@ pub struct KeratinConfig {
     /// (which otherwise costs ~40% of delivery throughput under mixed load on a
     /// real drive). Node-local: the useful size tracks the fsync-lag window.
     pub tail_cache_bytes: usize,
-    /// Preallocate this many bytes ahead of the active segment's write cursor
-    /// (`0` = off). Writes then land in already-allocated blocks, so an fdatasync
-    /// skips the block-allocation metadata flush that an extending write pays
-    /// (measured ~2.4ms -> ~0.7ms per fdatasync on a consumer nvme). The chunk is
-    /// preallocated ahead and grown as the segment fills, and trimmed on clean
-    /// shutdown, so disk use tracks written data plus at most one chunk. Set it to
-    /// `segment_max_bytes` to preallocate whole segments. Falls back to the extend
-    /// path on a filesystem without `fallocate`.
+    /// Reserve this many bytes ahead of the active segment's write cursor and
+    /// fill them with synced zeros (`0` = off). Writes then overwrite blocks
+    /// that already exist, so a sync skips the allocation and journal work an
+    /// extending write pays. A fresh segment starts at its first record, so an
+    /// idle log reserves nothing. The reservation is trimmed at clean shutdown,
+    /// so disk use tracks written data plus about one chunk. Falls back to
+    /// extending writes on a filesystem without `fallocate`.
     pub segment_preallocate_bytes: usize,
     /// How many commits may be in flight to the fsync worker at once. Above 1 the
     /// writer keeps issuing small commits while a fsync runs and the worker coalesces

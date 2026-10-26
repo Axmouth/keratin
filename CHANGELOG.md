@@ -313,6 +313,11 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- A fresh segment reserves and zeroes ahead only from its first record, so an
+  idle log takes no extra disk and causes no zero writes. Reservations round
+  to whole MiB rather than to whole chunks, so a new segment reserves about
+  one chunk instead of up to two.
+
 - The tail cache only fills while the log is owner. A follower serves no
   reads from its own tail, so caching there only held memory, up to the full
   budget per busy log. Demotion drops the cache, and promotion starts a fresh
