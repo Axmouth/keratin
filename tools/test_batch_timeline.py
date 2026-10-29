@@ -5,7 +5,7 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from batch_timeline import extract
+from batch_timeline import extract, writer_lane
 
 
 def event(ident, stage, start, end=None, first=0, nxt=2, parent=None):
@@ -133,6 +133,20 @@ class TimelineTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, "same-host"):
             self.extract()
 
+
+
+class WriterLaneTests(unittest.TestCase):
+    def test_older_data_layout(self):
+        self.assertEqual(writer_lane("/r/node-2/data/events/orders/0"), (2, "events"))
+
+    def test_partition_layout(self):
+        root = "/r/node-1/storage/partitions/@none/orders/0/g3"
+        self.assertEqual(writer_lane(root + "/log"), (1, "events"))
+        self.assertEqual(writer_lane(root + "/messages"), (1, "messages"))
+
+    def test_unknown_layout_is_refused(self):
+        with self.assertRaises(ValueError):
+            writer_lane("/r/node-0/elsewhere/orders")
 
 if __name__ == "__main__":
     unittest.main()

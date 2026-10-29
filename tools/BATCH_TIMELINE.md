@@ -38,10 +38,13 @@ For a stream, which keeps a separate payload log and cursor event log, leave
 out both keys. They default to `"payload_log": "messages"` and
 `"logs": ["messages", "events"]`.
 
-The renderer finds each writer's lane from its log path, expecting
-`node-N/data/{messages,events}/TOPIC/`. Stroma layout version 2 and later keep
-logs under `partitions/<group>/<topic>/<part>/<generation>/`, so captures from
-current builds do not match that pattern until the path parsing is updated.
+The renderer finds each writer's node and lane from its log path. The node
+comes from a `node-N` path segment, numbered from 0 as Fibril's cluster bench
+harness names them. Under the current Stroma layout,
+`partitions/<group>/<topic>/<part>/<generation>/log` is the `events` lane (a
+queue's only log, or a stream's cursor events) and `.../messages` is the
+`messages` lane (stream payloads). Captures from the older
+`data/{messages,events}/<topic>/` layout still parse.
 
 The tool expects version-1 captures with zero dropped events and a matching
 emission count. A missing final close marker normally stops rendering. If the

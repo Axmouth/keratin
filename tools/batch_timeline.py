@@ -11,6 +11,25 @@ import sys
 from pathlib import Path
 
 
+# Stroma layout 2 and later: .../partitions/<group>/<topic>/<part>/<gen>/log
+# holds a queue's only log or a stream's cursor events, and .../messages holds
+# stream payloads. Older captures used .../data/{messages,events}/<topic>/.
+LAYOUT_LANES = {"log": "events", "messages": "messages"}
+
+
+def writer_lane(log_path):
+    """Return (node index, lane) for a writer's log path."""
+    node = int(log_path.split("/node-")[1].split("/")[0])
+    if "/data/" in log_path:
+        return node, log_path.split("/data/")[1].split("/")[0]
+    parts = log_path.rstrip("/").split("/")
+    if "partitions" in parts:
+        tail = parts[parts.index("partitions") + 1 :]
+        if len(tail) >= 5:
+            return node, LAYOUT_LANES.get(tail[4], tail[4])
+    raise ValueError(f"unrecognized writer log path: {log_path}")
+
+
 def extract(config, base, allow_open=False):
     all_cases = []
     audit = []
@@ -71,8 +90,7 @@ def extract(config, base, allow_open=False):
                 if r.get("type") == "writer"
                 and "/" + config["topic"] + "/" in r["path"]
             ]:
-                node = int(w["path"].split("/node-")[1].split("/")[0])
-                kind = w["path"].split("/data/")[1].split("/")[0]
+                node, kind = writer_lane(w["path"])
                 if kind not in log_kinds:
                     continue
                 events = []
