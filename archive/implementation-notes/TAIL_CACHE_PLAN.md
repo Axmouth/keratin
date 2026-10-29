@@ -1,16 +1,8 @@
 # Tail-read cache for keratin-log
 
-> **Status: shipped.** The **Safety invariants (as-built)** and **Review
-> follow-ups** sections at the bottom are the authoritative contract; the code
-> (`src/tail_cache.rs`) is the source of truth. Some mechanism details in the
-> plan below were superseded in implementation: the flush hook tracks
-> `Log::flushed_through` rather than `write_buf_base_offset`; it keeps an
-> `Arc::from(write_buf)` copy rather than `mem::take` (the flushed batch is
-> usually small under group commit, so copying `len` bytes beats moving the
-> full-capacity buffer and reallocating one per flush); the read entry point is
-> `read_from` (not `read_into`); and `scan_from` accepts full
-> coverage up to the captured durable frontier, including a durable tail shorter
-> than the requested page.
+> Archived. The plan for the tail cache, which shipped. The rules the cache
+> keeps live in the module doc of `keratin-log/src/tail_cache.rs`. Open
+> follow-ups moved to the Fibril optimization log.
 
 ## Why
 

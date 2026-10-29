@@ -1,20 +1,48 @@
-//! In-memory tail cache for hot-path (tail-following) reads.
+//! In-memory tail cache for tail-following reads.
 //!
-//! Under mixed publish+deliver on one partition, delivery `scan_from`s the tail
-//! segment that the writer is concurrently appending and fsyncing. On a real
-//! drive the fsync/writeback contends with the read at the page-cache/inode
-//! level (measured ~48% delivery loss on nvme, ~8% on tmpfs where fsync is a
-//! no-op). Fibril delivery is tail-following, so the records it reads are still
-//! in memory when written.
+//! Delivery reads the records the writer has just appended. Reading them back
+//! from the active segment contends with that segment's fsync and writeback on
+//! real drives, while the bytes are still in memory. The cache keeps a bounded
+//! ring of the most recent flush batches, as the exact encoded on-disk bytes,
+//! and serves reads near the tail from it. Older offsets miss and go to the
+//! file.
 //!
-//! This cache keeps a bounded, offset-indexed ring of the most recent flush
-//! batches (encoded record bytes, the exact on-disk wire format). Tail-following
-//! reads decode from memory and never touch the file under writeback; older
-//! offsets (lagging consumers) miss and fall back to the file scan.
+//! Rules the cache keeps:
 //!
-//! Ordinary reads use it as a pure cache: a miss is always correct, serving offsets
-//! below the exclusive durable frontier (`0` means nothing durable, `1` includes
-//! offset zero), so durability semantics are unchanged.
+//! 1. A miss is always correct. The cache is never a source of truth. A read
+//!    below the window, a disabled cache, a gap or a decode error returns a
+//!    miss and the caller scans the file. A hit covers the whole requested
+//!    range up to its frontier, never part of it, so callers do not stitch.
+//! 2. Each read names its frontier. Ordinary reads (`scan_from`) stop at the
+//!    durable frontier, so they never see a record whose fsync has not
+//!    completed. `scan_written_with_byte_budget` stops at the written
+//!    frontier, for logs whose readers accept records that reached the OS but
+//!    not the drive, such as buffered queues. Replication reads
+//!    (`scan_for_replication`) may return any cached batch, which can be ahead
+//!    of both frontiers. Their callers fence the history and gate confirmation
+//!    on owner durability. That path misses while the cache is over budget.
+//!    Batches are pushed after the file write and before fsync, so the
+//!    frontier check is what keeps the first two kinds correct.
+//! 3. Clear on every backward move. `Log::reset_to_checkpoint` and
+//!    `Log::repair_suffix` clear the cache. `truncate_before` only moves the
+//!    head forward and readers never ask below the head, so stale entries
+//!    there are never read and need no clear. As a backstop, `push_batch`
+//!    drops everything when a batch does not continue the previous one.
+//! 4. Batches are contiguous and ascending. Each base equals the previous
+//!    batch's next offset, tracked by `Log::flushed_through`. Reads rely on
+//!    this to binary search the covering batch and return a contiguous run.
+//! 5. Cached bytes are decoded with the same `decode_record_prefix` as the
+//!    file path, so cache hits and file reads return identical records.
+//!    Recovery verification reads the disk explicitly (`scan_from_disk`).
+//! 6. Only the owner fills the cache. Followers and frozen logs serve no tail
+//!    reads, so caching there would only hold memory. Demotion drops the
+//!    contents and promotion starts a new run from the next flush.
+//! 7. `tail_cache_bytes` is a node-local setting, not replicated, since it
+//!    trades memory for read latency on that node's hardware. `0` disables
+//!    the cache. A queue's single log takes the message log setting. Fibril
+//!    runs the separate event logs (stream cursors and metadata) at `0`.
+//!    `push_batch` keeps the newest batch even when it alone exceeds the
+//!    budget, so the cap is soft when a flush is larger than the budget.
 
 use std::collections::VecDeque;
 use std::sync::Arc;

@@ -1,37 +1,43 @@
 # Stroma
 
-Stroma is a broker state machine layer built on top of Keratin, responsible for managing and coordinating state transitions in a predictable way.
+Stroma is the broker storage and state layer built on top of Keratin. It is
+the internal core of Fibril. It turns Keratin logs into queue and stream
+partitions with durable state, and it owns how that state is recovered.
 
-It is currently used as the internal core of Fibril.
+## Crates
 
-## What it is
+* `stroma/core` (`stroma-core`): the storage engine.
+* `stroma/common` (`stroma-common`): small shared value types such as
+  `Partition` and `Offset`. It depends only on `serde`, so network clients
+  can use these types without pulling in the engine.
 
-Stroma provides:
+## What stroma-core does
 
-* a **state machine model** for system behavior
-* separation between **state** and **side effects**
-* integration with **Keratin** for durable state
-
-The goal is to make system behavior easier to reason about, especially in the presence of failures.
+* **Partition storage.** A work queue keeps payload-bearing enqueues and state
+  events in one ordered Keratin log. A stream keeps a payload log and a cursor
+  event log. Each partition lives in its own directory with an active
+  generation, as described in `core/src/stroma/layout.rs`.
+* **Queue state.** Events are applied in log order to a state machine that
+  tracks ready, in-flight, acknowledged and dead-lettered messages.
+* **Snapshots and checkpoints.** Periodic snapshots bound replay at restart.
+  Agreed checkpoints give replicas a common cut that an outside coordinator
+  can certify, see [agreed queue checkpoints](../docs/AGREED_QUEUE_CHECKPOINTS.md).
+* **Retention.** Compaction truncates a log only below the payload floor, the
+  applied snapshot, protected followers and retained checkpoint pins.
+* **Replication support.** Owner reads, follower apply and the owner, follower
+  and frozen roles that Fibril assigns.
+* **Recovery.** Sealing a replica's history, inspecting and replaying it,
+  staging a verified copy and installing it as a new generation, see
+  [recovery segment reuse](../docs/RECOVERY_SEGMENT_REUSE.md).
 
 ## Role in the system
 
-Within the broader stack:
+* **Keratin** handles persistence of individual logs.
+* **Stroma** defines partition storage, state and recovery on top of them.
+* **Fibril** builds broker semantics, networking and coordination on top.
 
-* **Keratin** handles persistence
-* **Stroma** defines how state evolves
-* **Fibril** builds broker semantics on top
-
-## Direction
-
-Areas being explored:
-
-* stricter modeling of state transitions
-* recovery and replay from persisted logs
-* coordination patterns for concurrent components
-* clearer boundaries between logic and I/O
-
-The design is still evolving as it is exercised through Fibril.
+Consensus and authority decisions stay in Fibril. Stroma checks the evidence it
+is given but cannot establish authority itself.
 
 ## Naming
 
@@ -41,6 +47,5 @@ Here, it represents the structure that organizes and governs system state.
 
 ## Status
 
-Early and closely tied to Fibril's development.
-
-The concepts are still being refined, and the boundaries between components may shift.
+Closely tied to Fibril's development. The on-disk layout is versioned, and
+roots from older layouts are refused rather than migrated.

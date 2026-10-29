@@ -15,21 +15,33 @@ fragment and a capture audit beside it. Change the case, payload offset window
 or log using the selectors. Hover for intervals, fsync substeps and offset
 ranges. Click to retain the closest operation in the detail line.
 
-A minimal `cases.json` follows. Trace globs resolve relative to that file.
-Node labels follow the harness's zero-based `node-N` directories. Node 0 is the
-owner. Each selected topic needs one active payload writer and event writer per
-node, under `node-N/data/{messages,events}/TOPIC/`.
+A minimal `cases.json` for a work queue follows. A queue keeps payloads and
+state events in one log, so `payload_log` names the `events` lane and `logs`
+lists only that lane. Trace globs resolve relative to that file. Node labels
+follow the harness's zero-based `node-N` directories. Node 0 is the owner. Each
+selected topic needs one active writer per listed lane per node.
 
 ```json
 {
   "clock": "same-host",
   "topic": "topic1",
   "payload_bytes": 1024,
+  "payload_log": "events",
+  "logs": ["events"],
   "nodes": ["Owner · SATA", "Follower 1 · NVMe", "Follower 2 · NVMe"],
   "windows": [{"first": 600, "count": 200}, {"first": 800, "count": 100}],
   "cases": [{"id": "control", "name": "Control", "traces": "captures/control-*.jsonl"}]
 }
 ```
+
+For a stream, which keeps a separate payload log and cursor event log, leave
+out both keys. They default to `"payload_log": "messages"` and
+`"logs": ["messages", "events"]`.
+
+The renderer finds each writer's lane from its log path, expecting
+`node-N/data/{messages,events}/TOPIC/`. Stroma layout version 2 and later keep
+logs under `partitions/<group>/<topic>/<part>/<generation>/`, so captures from
+current builds do not match that pattern until the path parsing is updated.
 
 The tool expects version-1 captures with zero dropped events and a matching
 emission count. A missing final close marker normally stops rendering. If the

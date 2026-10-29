@@ -1,5 +1,8 @@
 # Keratin Performance Notes
 
+> Archived. An investigation record from June and July 2026. Open items moved
+> to the Fibril optimization log (fibril `website/src/content/docs/development/optimization-log.md`).
+
 Status: investigative
 
 Date: 2026-06-14
