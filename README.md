@@ -98,8 +98,17 @@ Other use cases may emerge over time as the design stabilizes and it is meant to
 
 ## Diagnostics
 
-[Batch tracing](experiments/BATCH_TRACING.md) captures staging, commit and fsync
+[Batch tracing](docs/BATCH_TRACING.md) captures staging, commit and fsync
 overlap with optional buffered diagnostics.
+
+## Feature notes
+
+The [docs](docs/) folder holds notes on shipped features:
+
+* [Adaptive staging](docs/ADAPTIVE_STAGING.md): opt-in staging buffers that grow lazily and release memory when idle
+* [Agreed queue checkpoints](docs/AGREED_QUEUE_CHECKPOINTS.md): storage side of externally coordinated queue checkpoints
+* [Batch tracing](docs/BATCH_TRACING.md): diagnostic timeline of staging, commit and fsync work
+* [Recovery segment reuse](docs/RECOVERY_SEGMENT_REUSE.md): recovery forks that hard-link closed payload segments
 
 ## Direction
 

@@ -116,7 +116,7 @@ tagged releases yet. Earlier history predates this changelog.
 - Recovery forks that share closed payload segments persist manifest version 3
   before linking. Older binaries reject participating logs; this implementation
   continues to read version 2. Unshared logs retain version 2. See
-  [recovery segment reuse](experiments/RECOVERY_SEGMENT_REUSE.md).
+  [recovery segment reuse](docs/RECOVERY_SEGMENT_REUSE.md).
 
 ### Added
 
@@ -241,7 +241,7 @@ tagged releases yet. Earlier history predates this changelog.
   with commit-to-fsync links, offset bounds, drop counters and emission timing.
   Instrumented and ordinary builds now use the same fsync coalescing loop.
   The diagnostic output changes from per-writer CSV to versioned JSON Lines.
-  See [batch tracing](experiments/BATCH_TRACING.md).
+  See [batch tracing](docs/BATCH_TRACING.md).
 
 - Add compaction retention constraints for queue replication and a separate
   replacement-generation path for admitted follower repair. Original storage stays
@@ -287,7 +287,7 @@ tagged releases yet. Earlier history predates this changelog.
 - Opt-in `KeratinConfig::adaptive_staging` and reusable, caller-maintained buffers
   with lazy growth, configurable empty-buffer decay and full idle release.
   Retained staging remains the default; durable completion and the on-disk format
-  are unchanged. See `experiments/ADAPTIVE_STAGING.md` for policy and tradeoffs.
+  are unchanged. See [adaptive staging](docs/ADAPTIVE_STAGING.md) for policy and tradeoffs.
 
 - Externally authorized non-voting queue learner preparation, exact-history
   checkpoint installation and durable/applied readiness checks. Partial learners
