@@ -313,6 +313,10 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Changed
 
+- The `keratin_trace_summary` binary is removed. It read the CSV writer trace,
+  which the JSON Lines capture replaced. Use `tools/batch_trace.py` or
+  `tools/batch_timeline.py` with current captures.
+
 - A log's fsync and notify threads start when the writer first needs them
   and stop after 10 seconds unused, so an idle log keeps only its writer
   thread. With 200 idle queues on a three-node cluster, threads per node fell
