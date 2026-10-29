@@ -2,6 +2,12 @@
 name = "stroma-common"
 version = "0.1.0"
 edition = "2024"
+description = "Value types shared upward from Stroma storage, such as partition, offset, topic and group"
+readme = "../README.md"
+keywords = ["fibril", "stroma"]
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 # Dependency-light home for the value types that originate at the stroma/storage
 # layer and are shared upward (Partition, Offset, Topic, Group). Kept free of the

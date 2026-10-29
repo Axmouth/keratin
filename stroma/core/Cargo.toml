@@ -2,6 +2,13 @@
 name = "stroma-core"
 version = "0.1.0"
 edition = "2024"
+description = "Queue and stream partition storage on Keratin logs, with snapshots, checkpoints and recovery, used by the Fibril broker"
+readme = "../README.md"
+keywords = ["message-broker", "storage", "queue", "fibril"]
+categories = ["database-implementations"]
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [features]
 writer-stage-trace = ["keratin-log/writer-stage-trace"]
@@ -15,8 +22,8 @@ io-fault-injection = ["keratin-log/io-fault-injection"]
 unexpected_cfgs = { level = "warn", check-cfg = ['cfg(tokio_unstable)'] }
 
 [dependencies]
-keratin-log ={ path = "../../keratin-log" }
-stroma-common = { path = "../common" }
+keratin-log = { path = "../../keratin-log", version = "0.1.0" }
+stroma-common = { path = "../common", version = "0.1.0" }
 arc-swap = "1.9"
 async-trait = "0.1"
 bitvec = "1.0"

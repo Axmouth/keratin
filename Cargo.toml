@@ -2,6 +2,11 @@
 resolver = "3"
 members = ["keratin-log", "stroma/common", "stroma/core"]
 
+[workspace.package]
+license = "MIT"
+repository = "https://github.com/Axmouth/keratin"
+authors = ["Axmouth"]
+
 [workspace.metadata.sovereignty]
 ai-training = "prohibited"
-policy-url = "https://github.com/axmouth/stroma/blob/main/AI_POLICY.md"
+policy-url = "https://github.com/Axmouth/keratin/blob/main/AI_POLICY.md"

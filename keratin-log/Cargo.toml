@@ -2,6 +2,13 @@
 name = "keratin-log"
 version = "0.1.0"
 edition = "2024"
+description = "A small, fast append-only segmented log with group commit, crash recovery and replication support"
+readme = "../README.md"
+keywords = ["log", "wal", "storage", "append-only", "durability"]
+categories = ["database-implementations", "filesystem"]
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
 
 [features]
 # Test-only file-operation faults. Never enable in deployed binaries.
