@@ -411,6 +411,14 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Fixed
 
+- A stream could reopen with its tail and named cursors past the end of its
+  record log. The tail advances when a record is staged, so a snapshot taken
+  before the fsync could save records that a crash then dropped, and recovery
+  only ever raised the tail. New records after the restart take the lost
+  offsets, so a consumer resuming from such a cursor skipped them. Recovery
+  now sets the tail to the record log's next offset, even when that is lower,
+  and pulls cursors above it back down.
+
 - A merged group of fsync jobs synced only the newest job's files. The syncs
   a roll leaves for the next job (the outgoing segment, its index and the new
   segment's directory entry) were skipped when that job was not the newest,

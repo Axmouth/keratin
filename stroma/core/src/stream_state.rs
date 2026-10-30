@@ -144,6 +144,20 @@ impl StreamState {
         }
     }
 
+    /// Set the tail to the message log's real next offset after recovery and
+    /// pull any cursor above it back down. A snapshot can record a tail (and
+    /// cursors) covering staged records that a crash then dropped, and new
+    /// records reuse those offsets, so a tail or cursor left there would skip
+    /// them. The tail never drops below the head so the window stays valid.
+    pub fn reconcile_tail(&mut self, log_next: Offset) {
+        self.tail = log_next.max(self.head);
+        for off in self.cursors.values_mut() {
+            if *off > self.tail {
+                *off = self.tail;
+            }
+        }
+    }
+
     /// Apply a retention truncation that dropped everything below `new_head`.
     /// Advances head (monotonic) and clamps any cursor that fell behind up to the
     /// new head. Returns the names of clamped cursors so the actor can flag those
@@ -350,6 +364,13 @@ pub enum StreamCommand {
         next_offset: Offset,
         response: Option<oneshot::Sender<()>>,
     },
+    /// Set the tail to the message log's next offset during recovery, even if
+    /// that lowers it, and clamp cursors to it. See
+    /// [`StreamState::reconcile_tail`].
+    ReconcileTail {
+        log_next: Offset,
+        response: Option<oneshot::Sender<()>>,
+    },
     /// Apply a retention truncation that dropped everything below `new_head`.
     /// Returns the names of cursors that fell behind and were clamped up (lagged).
     ApplyTruncation {
@@ -434,6 +455,12 @@ pub async fn run_stream_control(mut state: StreamState, mut rx: mpsc::Receiver<S
                 response,
             } => {
                 state.advance_tail(next_offset);
+                if let Some(r) = response {
+                    let _ = r.send(());
+                }
+            }
+            StreamCommand::ReconcileTail { log_next, response } => {
+                state.reconcile_tail(log_next);
                 if let Some(r) = response {
                     let _ = r.send(());
                 }
@@ -523,6 +550,24 @@ mod tests {
         let lagged = s.apply_truncation(100);
         assert!(lagged.is_empty());
         assert_eq!(s.head(), 300);
+    }
+
+    #[test]
+    fn reconcile_tail_lowers_to_the_log_and_clamps_cursors() {
+        let mut s = StreamState::new("t".into(), 0);
+        s.advance_tail(10);
+        s.commit_cursor("ahead", 9);
+        s.commit_cursor("behind", 4);
+        s.reconcile_tail(6);
+        assert_eq!(s.tail(), 6);
+        assert_eq!(s.cursor("ahead"), Some(6));
+        assert_eq!(s.cursor("behind"), Some(4));
+
+        // The tail never drops below the head.
+        s.apply_truncation(5);
+        s.reconcile_tail(3);
+        assert_eq!((s.head(), s.tail()), (5, 5));
+        assert_eq!(s.cursor("ahead"), Some(5));
     }
 
     #[test]

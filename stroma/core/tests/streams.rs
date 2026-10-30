@@ -419,3 +419,101 @@ async fn handle_projects_only_to_its_own_kind() {
         })
     ));
 }
+
+/// The `messages` log root of a stream partition somewhere below `dir`.
+#[cfg(feature = "io-fault-injection")]
+fn find_message_log_root(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().is_some_and(|n| n == "messages") && path.join("segments").is_dir() {
+            return Some(path);
+        }
+        if let Some(found) = find_message_log_root(&path) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// A snapshot taken while records were staged but not yet synced must not
+/// bring the stream back with its tail or cursors past the records that
+/// survived a power loss. New records after the restart reuse the lost
+/// offsets, so a cursor left at the old tail would skip them.
+#[cfg(feature = "io-fault-injection")]
+#[tokio::test]
+async fn stream_snapshot_past_lost_records_reopens_at_the_log_end() {
+    let (st, dir) = open_test_stroma().await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    for _ in 0..3 {
+        append(&st, "sensors", b"kept").await;
+    }
+    st.sync_stream("sensors", 0).await.unwrap();
+    let durable = st.stream_durable_next("sensors", 0).await.unwrap();
+    assert_eq!(durable, 3);
+    // An event at offset zero alone makes an ambiguous snapshot boundary that
+    // recovery ignores, so log one first.
+    st.commit_stream_cursor("sensors", 0, "early", 1)
+        .await
+        .unwrap();
+
+    // These two are lost below. The cursor and the snapshot both see them.
+    append(&st, "sensors", b"lost").await;
+    append(&st, "sensors", b"lost").await;
+    st.commit_stream_cursor("sensors", 0, "in-snapshot", 5)
+        .await
+        .unwrap();
+    st.snapshot_partition("sensors", 0, None).await.unwrap();
+    // Committed after the snapshot, so recovery replays it from the event log.
+    st.commit_stream_cursor("sensors", 0, "replayed", 5)
+        .await
+        .unwrap();
+    assert_eq!(st.stream_head_tail("sensors", 0).await.unwrap(), (0, 5));
+
+    st.shutdown().await.unwrap();
+    drop(st);
+    let log_root = find_message_log_root(&dir.root).expect("stream message log");
+    keratin_log::io_fault_injection::lose_unsynced_on_next_open(&log_root, durable).unwrap();
+
+    let st = open_on(&dir.root).await;
+    assert_eq!(
+        st.stream_head_tail("sensors", 0).await.unwrap(),
+        (0, durable),
+        "the tail must match the surviving log"
+    );
+    for name in ["in-snapshot", "replayed"] {
+        let cursor = st.stream_cursor("sensors", 0, name).await.unwrap();
+        assert_eq!(
+            cursor,
+            Some(durable),
+            "cursor {name} must not pass the tail"
+        );
+    }
+
+    let first = append(&st, "sensors", b"new-1").await;
+    let second = append(&st, "sensors", b"new-2").await;
+    assert_eq!((first, second), (durable, durable + 1));
+    assert_eq!(
+        st.stream_head_tail("sensors", 0).await.unwrap(),
+        (0, durable + 2)
+    );
+
+    for name in ["in-snapshot", "replayed"] {
+        let from = st.stream_cursor("sensors", 0, name).await.unwrap().unwrap();
+        let resumed: Vec<(Offset, Vec<u8>)> = st
+            .read_stream_records("sensors", 0, from, 10)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|(off, payload, _)| (off, payload))
+            .collect();
+        assert_eq!(
+            resumed,
+            vec![(first, b"new-1".to_vec()), (second, b"new-2".to_vec())],
+            "a consumer resuming from {name} must see the new records"
+        );
+    }
+    st.shutdown().await.unwrap();
+}

@@ -3880,12 +3880,13 @@ impl Stroma {
         // event (only cursor commits do), so recovery cannot replay the tail.
         // Reconcile it from the durable message log BEFORE replaying cursor
         // commits, so a committed cursor clamps against the real retained window
-        // rather than an empty one.
+        // rather than an empty one. The snapshot tail may count staged records
+        // a crash dropped, so the log wins even when it is lower.
         if h.kind() == PartitionKind::Stream {
             let next = h.msg_log()?.next_offset();
             let (tx, rx) = tokio::sync::oneshot::channel();
-            if h.stream_command_enqueue(StreamCommand::AdvanceTail {
-                next_offset: next,
+            if h.stream_command_enqueue(StreamCommand::ReconcileTail {
+                log_next: next,
                 response: Some(tx),
             })
             .await
