@@ -2179,6 +2179,18 @@ async fn mixed_queue_and_stream_replicate_retain_and_reopen_independently() {
         .commit_stream_cursor("s", 0, "reader", 1)
         .await
         .unwrap();
+    // Cursor commits wait for the background sync. Sync now so the durable
+    // owner read sees this one.
+    owner
+        .queue_handle("s", 0, None)
+        .await
+        .unwrap()
+        .resolve()
+        .unwrap()
+        .event_log()
+        .sync()
+        .await
+        .unwrap();
     let OwnerReplicationRead::Batch(messages) = owner
         .read_owner_stream_records("s", 0, 0, 100, usize::MAX)
         .await

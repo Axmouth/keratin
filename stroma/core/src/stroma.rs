@@ -3384,6 +3384,15 @@ impl Stroma {
     ) -> Result<()> {
         let qh = self.queue_handle(tp, part, group).await?;
         let qh = qh.resolve()?;
+        // Stream cursor commits are written without an fsync. The snapshot
+        // boundary must stay inside the durable log, or a power cut leaves
+        // the log ending before the snapshot and later events reuse offsets
+        // the snapshot already covers.
+        let event_log = qh.event_log();
+        let boundary_next = applied_upto
+            .saturating_add(1)
+            .min(event_log.next_offset());
+        checkpoint_capture::sync_through(&event_log, boundary_next).await?;
         let snapshot_generation = qh
             .recovery_gate
             .checkpoint_generation
@@ -4598,10 +4607,26 @@ impl Stroma {
         Ok(())
     }
 
+    /// Durability of stream cursor commits, on the owner and when a follower
+    /// applies them. A lost cursor advance only redelivers records, so commits
+    /// are written to the OS and left to the event log's background sync
+    /// instead of paying an fsync each. A power cut loses at most the commits
+    /// since the last sync. With the background sync off nothing would ever
+    /// sync them, so they keep the event log default.
+    pub(crate) fn cursor_commit_durability(&self) -> KDurability {
+        let default = self.keratin_cfg_event.default_durability;
+        if self.keratin_cfg_event.background_sync_interval.is_zero() {
+            return default;
+        }
+        // Variants are ordered weakest first, so a weaker default stays.
+        default.min(KDurability::AfterFlush)
+    }
+
     /// Commit a durable named cursor for a stream. The commit is logged as a
-    /// CursorCommit event (durable and replicated) and applied to the stream
-    /// engine, so it survives a crash or redeploy and a follower promoted after
-    /// owner loss resumes from it.
+    /// CursorCommit event (replicated) and applied to the stream engine, so it
+    /// survives a crash or redeploy and a follower promoted after owner loss
+    /// resumes from it. See `cursor_commit_durability` for what a power cut
+    /// can lose.
     pub async fn commit_stream_cursor(
         &self,
         tp: &str,
@@ -4613,7 +4638,7 @@ impl Stroma {
             name: name.into(),
             offset,
         };
-        let durability = self.keratin_cfg_event.default_durability;
+        let durability = self.cursor_commit_durability();
         self.append_events_durable(tp, part, None, vec![ev], durability)
             .await?;
         Ok(())
@@ -4623,6 +4648,7 @@ impl Stroma {
     /// in-memory apply (a single `CursorCommitBatch` event + one actor command),
     /// instead of one of each per cursor. Used by the broker's cursor-commit
     /// microbatcher to amortize high-fan-out auto-ack. Empty input is a no-op.
+    /// Same durability as `commit_stream_cursor`.
     pub async fn commit_stream_cursors(
         &self,
         tp: &str,
@@ -4638,7 +4664,7 @@ impl Stroma {
                 .map(|(name, offset)| (name.into_boxed_str(), offset))
                 .collect(),
         };
-        let durability = self.keratin_cfg_event.default_durability;
+        let durability = self.cursor_commit_durability();
         self.append_events_durable(tp, part, None, vec![ev], durability)
             .await?;
         Ok(())

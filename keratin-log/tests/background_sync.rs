@@ -213,6 +213,43 @@ async fn background_sync_makes_written_records_durable_after_an_interval() {
 }
 
 #[tokio::test]
+async fn durable_watch_wakes_when_a_background_sync_lands() {
+    let dir = test_dir!("durable_watch");
+    let log = Keratin::open(&dir.root, config(Duration::from_millis(20)))
+        .await
+        .unwrap();
+    let mut watch = log.watch_durable_next();
+    assert_eq!(*watch.borrow_and_update(), 0);
+    log.append(message(1), Some(KDurability::AfterFlush))
+        .await
+        .unwrap();
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while *watch.borrow_and_update() < 1 {
+            watch.changed().await.unwrap();
+        }
+    })
+    .await
+    .expect("background sync never woke the durable watch");
+    assert_eq!(log.durable_next(), 1);
+
+    // An explicit fsync append wakes it too.
+    log.append(message(2), Some(KDurability::AfterFsync))
+        .await
+        .unwrap();
+    assert!(watch.has_changed().unwrap());
+    assert_eq!(*watch.borrow_and_update(), 2);
+    log.shutdown().await.unwrap();
+    drop(log);
+
+    // A reopened log starts the watch at its recovered frontier.
+    let log = Keratin::open(&dir.root, config(Duration::ZERO))
+        .await
+        .unwrap();
+    assert_eq!(*log.watch_durable_next().borrow(), 2);
+    log.shutdown().await.unwrap();
+}
+
+#[tokio::test]
 async fn idle_and_synced_logs_never_background_sync() {
     let dir = test_dir!("background_sync_idle");
     let log = Keratin::open(&dir.root, config(Duration::from_millis(10)))

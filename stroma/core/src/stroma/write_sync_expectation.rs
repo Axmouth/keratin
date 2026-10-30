@@ -25,7 +25,8 @@ impl Stroma {
     }
 
     /// Whether the event log of a partition expects every owner write synced.
-    /// A stream's cursor commits use the event log default durability.
+    /// A stream's cursor commits are left to the background sync on purpose,
+    /// see `cursor_commit_durability`, so a stream event log never does.
     pub(crate) fn event_log_expects_synced(
         &self,
         kind: PartitionKind,
@@ -37,10 +38,7 @@ impl Stroma {
             PartitionKind::Queue => {
                 self.queue_writes_all_synced() && !self.queue_is_buffered(topic, part, group)
             }
-            PartitionKind::Stream => {
-                self.stream_declared_synced(topic, part)
-                    && self.keratin_cfg_event.default_durability == KDurability::AfterFsync
-            }
+            PartitionKind::Stream => false,
         }
     }
 
@@ -257,7 +255,8 @@ mod tests {
         st.set_stream_writes_synced("s", 0, true).await.unwrap();
         let (records, cursors) = statuses(&st).await;
         assert!(records.every_write_sync_expected);
-        assert!(cursors.every_write_sync_expected);
+        // Cursor commits are left to the background sync.
+        assert!(!cursors.every_write_sync_expected);
         for value in 0..10u8 {
             let headers = MessageHeaders {
                 published: 0,

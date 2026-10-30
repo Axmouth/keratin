@@ -548,6 +548,12 @@ impl Keratin {
         self.log_state.written.subscribe()
     }
 
+    /// Watch `durable_next`. The receiver holds the latest frontier and is
+    /// marked changed whenever it moves, including backward after a reset.
+    pub fn watch_durable_next(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.log_state.durable.subscribe()
+    }
+
     /// Durability lag and background sync state of this log, for reporting.
     pub fn sync_status(&self) -> crate::SyncStatus {
         // Durable first, so the written frontier read after it is never lower.

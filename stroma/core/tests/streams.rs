@@ -1,4 +1,4 @@
-use std::sync::Arc;
+use std::{sync::Arc, time::Duration};
 
 use keratin_log::{
     CompletionPair, KDurability, KeratinAppendCompletion, KeratinConfig, Message, test_dir,
@@ -515,5 +515,255 @@ async fn stream_snapshot_past_lost_records_reopens_at_the_log_end() {
             "a consumer resuming from {name} must see the new records"
         );
     }
+    st.shutdown().await.unwrap();
+}
+
+async fn open_with_sync_interval(dir: &std::path::Path, interval: Duration) -> Arc<Stroma> {
+    Arc::new(
+        Stroma::open(
+            dir,
+            StromaKeratinConfig::from_message_log(KeratinConfig {
+                background_sync_interval: interval,
+                ..KeratinConfig::test_default()
+            }),
+            SnapshotConfig::default(),
+        )
+        .await
+        .unwrap(),
+    )
+}
+
+async fn stream_event_log(st: &Arc<Stroma>, tp: &str) -> Arc<keratin_log::Keratin> {
+    let qh = st.queue_handle(tp, 0, None).await.unwrap();
+    qh.resolve().unwrap().event_log()
+}
+
+async fn stream_message_log(st: &Arc<Stroma>, tp: &str) -> Arc<keratin_log::Keratin> {
+    let qh = st.queue_handle(tp, 0, None).await.unwrap();
+    qh.resolve().unwrap().msg_log().unwrap()
+}
+
+fn record(payload: &[u8]) -> Message {
+    Message {
+        flags: 0,
+        headers: headers().encode().unwrap(),
+        payload: payload.to_vec(),
+    }
+}
+
+async fn wait_for(what: &str, mut check: impl FnMut() -> bool) {
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !check() {
+            tokio::time::sleep(Duration::from_millis(1)).await;
+        }
+    })
+    .await
+    .unwrap_or_else(|_| panic!("timed out waiting for {what}"));
+}
+
+/// Cursor commits are written to the OS without an fsync each and made
+/// durable by the event log's background sync. The commit is visible at once.
+#[tokio::test]
+async fn stream_cursor_commits_are_synced_in_the_background() {
+    let dir = test_dir!("cursor_commit_background_sync");
+    let interval = Duration::from_millis(300);
+    let opened = std::time::Instant::now();
+    let st = open_with_sync_interval(&dir.root, interval).await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    for _ in 0..4 {
+        append(&st, "sensors", b"x").await;
+    }
+    st.commit_stream_cursor("sensors", 0, "single", 1)
+        .await
+        .unwrap();
+    st.commit_stream_cursors("sensors", 0, vec![("batch".to_string(), 3)])
+        .await
+        .unwrap();
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "batch").await.unwrap(),
+        Some(3)
+    );
+    let events = stream_event_log(&st, "sensors").await;
+    assert_eq!(events.written_next(), 2);
+    if opened.elapsed() < interval {
+        // Open counts as the last sync, so nothing has synced them yet.
+        assert_eq!(events.durable_next(), 0);
+    }
+    wait_for("background sync", || events.durable_next() == 2).await;
+    assert!(events.sync_status().background_syncs_started >= 1);
+    // A stream event log is not expected to sync every write, so the
+    // background sync covering commits is not reported.
+    assert_eq!(events.sync_status().unexpected_background_syncs, 0);
+
+    // A snapshot syncs the event log through its boundary first.
+    st.commit_stream_cursor("sensors", 0, "single", 2)
+        .await
+        .unwrap();
+    st.snapshot_partition("sensors", 0, None).await.unwrap();
+    assert_eq!(events.durable_next(), 3);
+    st.shutdown().await.unwrap();
+}
+
+/// A follower writes a cursor-only event batch without an fsync, so the batch
+/// completes once the records are durable. A batch with any other event keeps
+/// the durability it asked for.
+#[tokio::test]
+async fn follower_cursor_events_do_not_wait_for_an_fsync() {
+    let dir = test_dir!("follower_cursor_no_fsync");
+    let st = open_with_sync_interval(&dir.root, Duration::from_secs(3600)).await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    st.become_stream_follower_with_epoch("sensors", 0, 0)
+        .await
+        .unwrap();
+
+    let outcome = st
+        .apply_replicated_stream_batch(
+            "sensors",
+            0,
+            Some(ReplicatedMessageBatch {
+                epoch: 0,
+                first_offset: 0,
+                records: vec![record(b"a"), record(b"b")],
+                durability: Some(KDurability::AfterFsync),
+            }),
+            Some(ReplicatedEventBatch {
+                epoch: 0,
+                first_offset: 0,
+                events: vec![
+                    StromaEvent::CursorCommit {
+                        name: "group-a".into(),
+                        offset: 1,
+                    },
+                    StromaEvent::CursorCommitBatch {
+                        commits: vec![("group-b".into(), 2)],
+                    },
+                ],
+                durability: Some(KDurability::AfterFsync),
+                encoded: None,
+            }),
+        )
+        .await
+        .unwrap();
+    assert!(outcome.message_log.is_some() && outcome.event_log.is_some());
+
+    let records = stream_message_log(&st, "sensors").await;
+    let events = stream_event_log(&st, "sensors").await;
+    assert_eq!(records.durable_next(), 2, "records are synced");
+    assert_eq!(events.written_next(), 2, "cursor events are written");
+    assert_eq!(events.durable_next(), 0, "cursor events wait for a sync");
+    assert_eq!(st.stream_head_tail("sensors", 0).await.unwrap(), (0, 2));
+    assert_eq!(
+        st.stream_cursor("sensors", 0, "group-b").await.unwrap(),
+        Some(2)
+    );
+
+    // A truncate in the batch keeps the fsync, which covers the earlier
+    // cursor events too.
+    st.apply_replicated_stream_batch(
+        "sensors",
+        0,
+        None,
+        Some(ReplicatedEventBatch {
+            epoch: 0,
+            first_offset: 2,
+            events: vec![
+                StromaEvent::CursorCommit {
+                    name: "group-a".into(),
+                    offset: 2,
+                },
+                StromaEvent::StreamTruncate { before: 0 },
+            ],
+            durability: Some(KDurability::AfterFsync),
+            encoded: None,
+        }),
+    )
+    .await
+    .unwrap();
+    assert_eq!(events.durable_next(), 4);
+    st.shutdown().await.unwrap();
+}
+
+#[cfg(feature = "io-fault-injection")]
+fn find_event_log_root(dir: &std::path::Path, topic: &str) -> Option<std::path::PathBuf> {
+    for entry in std::fs::read_dir(dir).ok()?.flatten() {
+        let path = entry.path();
+        if !path.is_dir() {
+            continue;
+        }
+        if path.file_name().is_some_and(|n| n == "log")
+            && path.join("segments").is_dir()
+            && path.to_string_lossy().contains(topic)
+        {
+            return Some(path);
+        }
+        if let Some(found) = find_event_log_root(&path, topic) {
+            return Some(found);
+        }
+    }
+    None
+}
+
+/// A power cut drops cursor commits no sync covered. The stream reopens
+/// cleanly with cursors from the snapshot and the surviving events, new
+/// commits take the freed offsets, and they survive another restart.
+#[cfg(feature = "io-fault-injection")]
+#[tokio::test]
+async fn unsynced_cursor_commits_lost_in_a_power_cut_reopen_cleanly() {
+    let dir = test_dir!("cursor_commit_power_cut");
+    let st = open_with_sync_interval(&dir.root, Duration::from_secs(3600)).await;
+    st.create_stream("sensors", 0, None).await.unwrap();
+    for _ in 0..6 {
+        append(&st, "sensors", b"x").await;
+    }
+    st.sync_stream("sensors", 0).await.unwrap();
+    // Two events, so the snapshot boundary is not the ambiguous zero.
+    st.commit_stream_cursor("sensors", 0, "r", 1).await.unwrap();
+    st.commit_stream_cursor("sensors", 0, "r", 2).await.unwrap();
+    st.snapshot_partition("sensors", 0, None).await.unwrap();
+    let events = stream_event_log(&st, "sensors").await;
+    let durable = events.durable_next();
+    assert_eq!(durable, 2, "the snapshot synced its boundary");
+
+    // Neither of these is synced before the cut.
+    st.commit_stream_cursor("sensors", 0, "r", 4).await.unwrap();
+    st.commit_stream_cursors(
+        "sensors",
+        0,
+        vec![("r".to_string(), 5), ("s".to_string(), 3)],
+    )
+    .await
+    .unwrap();
+    assert_eq!(events.written_next(), 4);
+    assert_eq!(events.durable_next(), durable);
+    drop(events);
+
+    st.shutdown().await.unwrap();
+    drop(st);
+    let root = find_event_log_root(&dir.root, "sensors").expect("stream event log");
+    keratin_log::io_fault_injection::lose_unsynced_on_next_open(&root, durable).unwrap();
+
+    let st = open_with_sync_interval(&dir.root, Duration::from_secs(3600)).await;
+    assert_eq!(st.stream_head_tail("sensors", 0).await.unwrap(), (0, 6));
+    assert_eq!(st.stream_cursor("sensors", 0, "r").await.unwrap(), Some(2));
+    assert_eq!(st.stream_cursor("sensors", 0, "s").await.unwrap(), None);
+    assert!(st.quarantined_partitions().is_empty());
+    assert_eq!(
+        stream_event_log(&st, "sensors").await.next_offset(),
+        durable
+    );
+
+    // New commits reuse the lost offsets.
+    st.commit_stream_cursor("sensors", 0, "r", 3).await.unwrap();
+    st.commit_stream_cursors("sensors", 0, vec![("s".to_string(), 4)])
+        .await
+        .unwrap();
+    assert_eq!(stream_event_log(&st, "sensors").await.next_offset(), 4);
+    st.shutdown().await.unwrap();
+    drop(st);
+
+    // A clean restart replays them past the old snapshot boundary.
+    let st = open_with_sync_interval(&dir.root, Duration::from_secs(3600)).await;
+    assert_eq!(st.stream_cursor("sensors", 0, "r").await.unwrap(), Some(3));
+    assert_eq!(st.stream_cursor("sensors", 0, "s").await.unwrap(), Some(4));
     st.shutdown().await.unwrap();
 }

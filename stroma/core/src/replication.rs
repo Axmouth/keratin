@@ -821,6 +821,21 @@ impl Stroma {
         ))
     }
 
+    /// Watch the durable frontier of a stream's cursor-event log. Cursor
+    /// commits become durable through the background sync, which no append
+    /// waits for, so an owner long-poll serving durable cursor events needs
+    /// this to wake for them. Refuses queue partitions.
+    pub async fn watch_stream_cursor_events_durable(
+        &self,
+        topic: &str,
+        part: u32,
+    ) -> Result<tokio::sync::watch::Receiver<u64>> {
+        let qh = self.queue_handle(topic, part, None).await?;
+        let qh = qh.resolve()?;
+        qh.stream()?;
+        Ok(qh.event_log().watch_durable_next())
+    }
+
     /// Write notifications for the single queue log.
     pub async fn subscribe_owner_queue_written(
         &self,
@@ -1115,6 +1130,10 @@ impl Stroma {
     /// follower's head/tail (and a promoted owner's fan-out + cursor clamping)
     /// reflect the applied records, mirroring the owner append path. Streams have
     /// no group. Refuses queue partitions.
+    ///
+    /// An event batch of only cursor commits is written with at most
+    /// `AfterFlush`, whatever durability it asks for, and synced by the event
+    /// log's background sync. The event outcome then reports written progress.
     pub async fn apply_replicated_stream_batch(
         &self,
         topic: &str,
@@ -1193,6 +1212,23 @@ impl Stroma {
         // side queued. Reject obvious epoch/gap cases through the serial path;
         // ordinary contiguous traffic overlaps the two independent writers.
         let mut events = events;
+        // A stream follower writes cursor-only batches like the owner does,
+        // without an fsync each. Cursor events never release a record
+        // confirm, so the record append must not wait on the cursor log sync.
+        // A batch with any other event, such as a truncate, keeps its
+        // durability.
+        if !qh.has_combined_log()
+            && let Some(batch) = &mut events
+            && batch.events.iter().all(|event| {
+                matches!(
+                    event,
+                    StromaEvent::CursorCommit { .. } | StromaEvent::CursorCommitBatch { .. }
+                )
+            })
+        {
+            let cursor = self.cursor_commit_durability();
+            batch.durability = Some(batch.durability.map_or(cursor, |d| d.min(cursor)));
+        }
         let event_records = events
             .as_mut()
             .map(|batch| match batch.encoded.take() {

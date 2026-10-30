@@ -52,23 +52,46 @@ impl DurableFrontier {
 /// to touch the cell is through the typed `load`/`advance`/`reset` below. That also
 /// pins the memory ordering (release on publish, acquire on observe) instead of
 /// leaving it to each call site.
+///
+/// Changes are also sent on a watch channel, like `WrittenWatermark`, so a
+/// reader can wait for records to become durable without polling.
 #[derive(Debug, Clone)]
-pub struct DurableWatermark(Arc<AtomicU64>);
+pub struct DurableWatermark {
+    next: Arc<AtomicU64>,
+    changed: Arc<tokio::sync::watch::Sender<u64>>,
+}
 
 impl DurableWatermark {
     pub fn new(frontier: DurableFrontier) -> Self {
-        Self(Arc::new(AtomicU64::new(frontier.0)))
+        Self {
+            next: Arc::new(AtomicU64::new(frontier.0)),
+            changed: Arc::new(tokio::sync::watch::channel(frontier.0).0),
+        }
     }
 
     pub fn load(&self) -> DurableFrontier {
-        DurableFrontier(self.0.load(Ordering::Acquire))
+        DurableFrontier(self.next.load(Ordering::Acquire))
+    }
+
+    /// Watch the exclusive frontier. The receiver starts at the current value.
+    pub fn subscribe(&self) -> tokio::sync::watch::Receiver<u64> {
+        self.changed.subscribe()
     }
 
     /// Publish forward progress after an fsync. Monotonic by construction: a
     /// `fetch_max`, so a stale or out-of-order frontier can never move the
     /// watermark backward. This is the steady-state publish path.
     pub fn advance(&self, frontier: DurableFrontier) {
-        self.0.fetch_max(frontier.0, Ordering::Release);
+        if self.next.fetch_max(frontier.0, Ordering::Release) < frontier.0 {
+            self.changed.send_if_modified(|current| {
+                if *current < frontier.0 {
+                    *current = frontier.0;
+                    true
+                } else {
+                    false
+                }
+            });
+        }
     }
 
     /// Authoritatively set the frontier, including moving it *backward*. Only for
@@ -76,7 +99,12 @@ impl DurableWatermark {
     /// legitimately shrinks. Never use this on the steady-state path (use
     /// `advance`), which must never rewind.
     pub fn reset(&self, frontier: DurableFrontier) {
-        self.0.store(frontier.0, Ordering::Release);
+        self.next.store(frontier.0, Ordering::Release);
+        self.changed.send_if_modified(|current| {
+            let modified = *current != frontier.0;
+            *current = frontier.0;
+            modified
+        });
     }
 }
 

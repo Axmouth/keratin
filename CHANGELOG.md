@@ -120,6 +120,12 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- `Keratin::watch_durable_next` watches the durable frontier, and
+  `DurableWatermark::subscribe` gives the same watch on the shared cell. Stroma
+  adds `watch_stream_cursor_events_durable` for a stream's cursor-event log,
+  so a replication long-poll can wake when the background sync makes cursor
+  commits durable.
+
 - The manifest records a log layout number in what was its first padding
   byte. Layout 0, segments named by base offset, is the only one today, and
   manifests written before the field read as 0. A build refuses a layout
@@ -312,6 +318,22 @@ tagged releases yet. Earlier history predates this changelog.
   policy or add ordinary append-path history recording.
 
 ### Changed
+
+- Stream cursor commits (`commit_stream_cursor`, `commit_stream_cursors`) are
+  written with `AfterFlush` and synced by the event log's background sync
+  instead of an fsync each. A follower applying a replicated event batch of
+  only cursor commits does the same, so the record append in that batch no
+  longer waits for the cursor log fsync. Batches with any other event, such as
+  `StreamTruncate`, keep their durability. A power cut can lose cursor
+  advances from the last background sync interval, which only redelivers
+  records. With the background sync off, commits keep the event log default
+  durability.
+
+- A stream event log no longer expects every owner write synced, since cursor
+  commits are left to the background sync on purpose.
+
+- A stream snapshot syncs the event log through its boundary before it is
+  written, so the boundary never passes the log a power cut leaves behind.
 
 - The `keratin_trace_summary` binary is removed. It read the CSV writer trace,
   which the JSON Lines capture replaced. Use `tools/batch_trace.py` or
