@@ -4610,6 +4610,16 @@ impl Stroma {
         Ok(())
     }
 
+    /// Sync a stream's cursor event log, so cursor commits written without an
+    /// fsync become durable now instead of at the next background sync. Used
+    /// when a caller needs its cursors to survive a power cut, such as a flush
+    /// before shutdown.
+    pub async fn sync_stream_cursor_events(&self, tp: &str, part: u32) -> Result<()> {
+        let qh = self.queue_handle(tp, part, None).await?;
+        qh.resolve()?.event_log().sync().await.map_err(io_err)?;
+        Ok(())
+    }
+
     /// Durability of stream cursor commits, on the owner and when a follower
     /// applies them. A lost cursor advance only redelivers records, so commits
     /// are written to the OS and left to the event log's background sync

@@ -118,12 +118,13 @@ fn inspection_journal_ignores_scratch_and_rejects_corrupt_committed_frames() {
         .unwrap();
     let response = page(&request, &records, 1);
     let journal = Journal::open(&dir.root, identity.clone()).unwrap();
+    // The root also holds the journal's lock file, and directory order varies
+    // by filesystem, so pick the journal directory explicitly.
     let root = std::fs::read_dir(&dir.root)
         .unwrap()
-        .next()
-        .unwrap()
-        .unwrap()
-        .path();
+        .map(|entry| entry.unwrap().path())
+        .find(|path| path.is_dir())
+        .unwrap();
     std::fs::write(root.join("page.writing"), b"interrupted download").unwrap();
     assert!(journal.read(&request).unwrap().is_none());
     journal.append(&request, &response).unwrap();
