@@ -101,19 +101,22 @@ pub(super) fn sync_directories(path: &Path) -> Result<()> {
     crate::dir_sync::sync_dir_chain(path).map_err(io_err)
 }
 
-fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
+/// `replace` lets a stream seal take a newer transition at the same fence.
+fn persist_intent(path: &Path, intent: &SealIntent, replace: bool) -> Result<()> {
     let parent = path.parent().expect("seal path has a parent");
     fs::create_dir_all(parent).map_err(io_err)?;
     if let Some(existing) = read_intent(path)? {
-        if &existing != intent {
+        if &existing == intent {
+            fs::File::open(path)
+                .and_then(|file| file.sync_all())
+                .map_err(io_err)?;
+            return sync_directories(parent);
+        }
+        if !replace {
             return Err(StromaError::InvalidArgument(
                 "conflicting recovery seal".into(),
             ));
         }
-        fs::File::open(path)
-            .and_then(|file| file.sync_all())
-            .map_err(io_err)?;
-        return sync_directories(parent);
     }
     let mut bytes = MAGIC.to_vec();
     bytes.extend(rmp_serde::to_vec_named(intent).map_err(encode_err)?);
@@ -134,6 +137,23 @@ fn persist_intent(path: &Path, intent: &SealIntent) -> Result<()> {
         let _ = fs::remove_file(temp);
     }
     result
+}
+
+/// Remove `path` if present and sync its directory.
+fn remove_durably(path: &Path) -> Result<()> {
+    match fs::remove_file(path) {
+        Ok(()) => sync_directories(path.parent().expect("seal file has a parent")),
+        Err(err) if err.kind() == io::ErrorKind::NotFound => Ok(()),
+        Err(err) => Err(io_err(err)),
+    }
+}
+
+/// A stream seal's fence epoch and the log epochs it replaced.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) struct SealedStreamEpochs {
+    pub fence_epoch: u64,
+    pub records: u64,
+    pub cursor_events: u64,
 }
 
 impl Stroma {
@@ -167,6 +187,38 @@ impl Stroma {
             ));
         }
         Ok(())
+    }
+
+    /// The durable seal of a stream partition, if any, with the log epochs
+    /// it replaced. Those epochs say which owner history the copy followed.
+    pub(super) fn sealed_stream_epochs(
+        &self,
+        topic: &str,
+        part: u32,
+    ) -> Result<Option<SealedStreamEpochs>> {
+        let Some(intent) = read_intent(&self.recovery_seal_path(topic, part, None))? else {
+            return Ok(None);
+        };
+        match intent.previous {
+            SealedEpochs::Stream {
+                records,
+                cursor_events,
+            } => Ok(Some(SealedStreamEpochs {
+                fence_epoch: intent.request.fence_epoch,
+                records,
+                cursor_events,
+            })),
+            SealedEpochs::Queue(_) => Err(StromaError::InvalidArgument(
+                "stream partition holds a queue recovery seal".into(),
+            )),
+        }
+    }
+
+    /// Release a stream seal once a new assignment includes this copy. The
+    /// receipt goes first, so a crash in between leaves the copy sealed.
+    pub(super) fn remove_stream_recovery_seal(&self, topic: &str, part: u32) -> Result<()> {
+        remove_durably(&self.snap_dir(topic, part, None).join("recovery.history"))?;
+        remove_durably(&self.recovery_seal_path(topic, part, None))
     }
 
     // Ordinary lifecycle mutation also requires admission to a bound history.
@@ -261,11 +313,19 @@ impl Stroma {
         self.ensure_checkpoint_not_pending(topic, part, group)?;
         let path = self.recovery_seal_path(topic, part, group);
         let previous = read_intent(&path)?;
+        // A stream seal only fences and reports tails, nothing is installed
+        // from it. A withdrawn recovery leaves the seal behind, so a newer
+        // transition at the same fence epoch takes it over.
+        let restamp = !excluded_learner
+            && actual == PartitionKind::Stream
+            && previous.as_ref().is_some_and(|intent| {
+                intent.request != request && intent.request.fence_epoch == request.fence_epoch
+            });
         if let Some(intent) = &previous {
             if intent.topic != topic
                 || intent.partition != part
                 || intent.group.as_deref() != group
-                || (!excluded_learner && intent.request != request)
+                || (!excluded_learner && intent.request != request && !restamp)
             {
                 return Err(StromaError::InvalidArgument(
                     "conflicting recovery seal request".into(),
@@ -340,7 +400,13 @@ impl Stroma {
                 handle.begin_recovery_seal();
                 handle.quiesce_for_teardown().await;
             }
-            let intent = previous.unwrap_or_else(|| SealIntent {
+            let intent = previous.map(|mut intent| {
+                if restamp {
+                    intent.request = request.clone();
+                }
+                intent
+            });
+            let intent = intent.unwrap_or_else(|| SealIntent {
                 topic: topic.to_owned(),
                 partition: part,
                 group: group.map(str::to_owned),
@@ -361,11 +427,18 @@ impl Stroma {
                 ));
             }
             let io_handle = handle.clone();
+            let receipt = self.snap_dir(topic, part, group).join("recovery.history");
             tokio::task::spawn_blocking(move || {
                 let _snapshot_io = io_handle
                     .as_ref()
                     .map(|h| h.recovery_gate.snapshot_io.lock());
-                persist_intent(&path, &intent)
+                if restamp {
+                    // The receipt names the old request. Drop it before the
+                    // intent changes, so a crash between the two leaves the
+                    // old intent and the restamp simply runs again.
+                    remove_durably(&receipt)?;
+                }
+                persist_intent(&path, &intent, restamp)
             })
             .await
             .map_err(io_err)??;
@@ -642,6 +715,7 @@ mod tests {
                     request: request(),
                     previous: SealedEpochs::Queue(7),
                 },
+                false,
             )
             .unwrap();
             h.begin_recovery_seal();

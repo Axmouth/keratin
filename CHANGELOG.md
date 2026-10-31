@@ -120,6 +120,20 @@ tagged releases yet. Earlier history predates this changelog.
 
 ### Added
 
+- `Stroma::rejoin_stream_at_epoch` brings a stream copy in line with a new
+  owner before it follows or owns at a newer epoch. Given where each epoch's
+  owner history starts (`StreamEpochStart`), it cuts the record log and the
+  cursor event log back to the first start the copy has not followed, lowers
+  a snapshot boundary past that point, and on the next open the stream tail
+  and any cursor above it come down to the record log end. Entries at or
+  below the start are never touched. A copy sealed for recovery uses the
+  epochs its seal replaced, and with `release_seal` the seal is removed
+  afterwards, so a stream seal no longer has to be installed over.
+
+- A stream recovery seal can be taken over by a newer transition at the same
+  fence epoch, for example after the first recovery request was withdrawn.
+  Queue seals still refuse any other request.
+
 - `Keratin::watch_durable_next` watches the durable frontier, and
   `DurableWatermark::subscribe` gives the same watch on the shared cell. Stroma
   adds `watch_stream_cursor_events_durable` for a stream's cursor-event log,

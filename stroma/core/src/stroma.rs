@@ -60,6 +60,9 @@ pub use storage_history::{PreparedStorageHistory, StorageHistoryBinding};
 mod recovery_history;
 #[path = "recovery_seal.rs"]
 mod recovery_seal;
+#[path = "stream_rejoin.rs"]
+mod stream_rejoin;
+pub use stream_rejoin::{StreamEpochStart, StreamRejoin};
 pub use recovery_history::{RetainedHistoryIdentity, RetainedLog, RetainedLogs};
 #[path = "recovery_read.rs"]
 mod recovery_read;

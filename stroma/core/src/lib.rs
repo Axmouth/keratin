@@ -57,7 +57,8 @@ pub use stroma::{
     RecoverySealRequest, RecoverySequentialRead, RecoveryStageLimits, ReplicatedEventBatch, EncodedEvent,
     ReplicatedMessageBatch, ReplicatedStreamApplyOutcome, RetainedHistoryIdentity, RetainedLog,
     RetainedLogs, SealedReplicaFrontiers, SnapshotConfig, StorageHistoryBinding,
-    StreamPromotionOutcome, Stroma, StromaKeratinConfig, StromaOptions, TaskGroup,
+    StreamEpochStart, StreamPromotionOutcome, StreamRejoin, Stroma, StromaKeratinConfig,
+    StromaOptions, TaskGroup,
 };
 
 pub type Offset = u64;
